@@ -3274,11 +3274,9 @@ struct TgFn {
             auto src = Temp(ot);
             tyg_copy(p, tyg_at_local(src, 0), x.a, M.Size(ot));
             auto r = MemTemp(ot, false);
-            ElemLeaves(ot, 0, u->line, [&](TypeExpr *tt, int64_t off) {
-                auto v = tyg_load(p, M.Scal(tt), tyg_at_local(src, off), 0);
-                auto d = r.a;
-                d.offset += off;
-                tyg_store(p, M.Scal(tt), d, ScalarNeg(tt, v, u->line), 0);
+            ElemLeaves(ot, 0, u->line, [&](TypeExpr *tt, int64_t off, const ElemDyn &dy) {
+                auto v = tyg_load(p, M.Scal(tt), ElemAt(tyg_at_local(src, 0), off, dy), 0);
+                tyg_store(p, M.Scal(tt), ElemAt(r.a, off, dy), ScalarNeg(tt, v, u->line), 0);
             });
             return r;
         }
@@ -3603,19 +3601,61 @@ struct TgFn {
     // Elementwise arithmetic on structs and fixed arrays (§6.1;
     // CodeGen::GenElemwiseInto): each numeric leaf of the result from the
     // same leaf of each operand, or from a scalar operand itself.
+    // A leaf's place in the value its operand lies in: the constant offset
+    // from the leaf's callback, and for an element of an array too big to
+    // unroll, the bytes to it from the array's start, kept in a local.
+    struct ElemDyn {
+        bool on;
+        tyg_local loc;
+    };
+    tyg_addr ElemAt(tyg_addr a, int64_t off, const ElemDyn &dy) {
+        if (!dy.on) {
+            a.offset += off;
+            return a;
+        }
+        return tyg_at_val(tyg_bin(p, TYG_ADD, tyg_addr_of(p, a), tyg_load(p, TYG_I64, tyg_at_local(dy.loc, 0), 0)), off);
+    }
+    // F(leaf type, offset, ElemDyn) for each scalar leaf, in order: the
+    // elements of an array of up to 256 unrolled, those of a bigger one
+    // (CodeGen's loop over it) in a counted loop.
     template <class F> void ElemLeaves(TypeExpr *t, int64_t off, Line l, F leaf) {
+        ElemLeaves(t, off, l, leaf, ElemDyn { false, 0 });
+    }
+    template <class F> void ElemLeaves(TypeExpr *t, int64_t off, Line l, F leaf, ElemDyn dy) {
         switch (t->kind) {
             case TY_INT: case TY_FLT:
                 if (t->kind == TY_INT && t->intstorage == IS_VARINT) No(l, "elementwise varint");
-                leaf(t, off);
+                leaf(t, off, dy);
                 return;
             case TY_STRUCT:
-                for (auto &f : M.Fields(t)) ElemLeaves(f.t, off + f.off, l, leaf);
+                for (auto &f : M.Fields(t)) ElemLeaves(f.t, off + f.off, l, leaf, dy);
                 return;
             case TY_ARRAY: {
-                if (t->arr->akind != A_FIXED || cg.ArrSize(t->arr) > 256) No(l, "elementwise array");
+                if (t->arr->akind != A_FIXED) No(l, "elementwise array");
                 auto esz = cg.FixedSize(t->arr->sub);
-                for (int64_t i = 0; i < cg.ArrSize(t->arr); i++) ElemLeaves(t->arr->sub, off + i * esz, l, leaf);
+                auto n = cg.ArrSize(t->arr);
+                if (n <= 256) {
+                    for (int64_t i = 0; i < n && !Ended(); i++) ElemLeaves(t->arr->sub, off + i * esz, l, leaf, dy);
+                    return;
+                }
+                auto il = tyg_local_new(p, 8, 8);
+                auto i = [&] { return tyg_load(p, TYG_I64, tyg_at_local(il, 0), 0); };
+                tyg_store(p, TYG_I64, tyg_at_local(il, 0), tyg_iconst(p, TYG_I64, 0), 0);
+                auto head = tyg_block_new(p), body = tyg_block_new(p), done = tyg_block_new(p);
+                tyg_jump(p, head);
+                tyg_block_set(p, head);
+                tyg_branch(p, tyg_cmp(p, TYG_SLT, i(), tyg_iconst(p, TYG_I64, n)), body, done);
+                tyg_block_set(p, body);
+                auto dl = tyg_local_new(p, 8, 8);
+                auto at = tyg_bin(p, TYG_MUL, i(), tyg_iconst(p, TYG_I64, esz));
+                if (dy.on) at = tyg_bin(p, TYG_ADD, at, tyg_load(p, TYG_I64, tyg_at_local(dy.loc, 0), 0));
+                tyg_store(p, TYG_I64, tyg_at_local(dl, 0), at, 0);
+                ElemLeaves(t->arr->sub, off, l, leaf, ElemDyn { true, dl });
+                if (!Ended()) {
+                    tyg_store(p, TYG_I64, tyg_at_local(il, 0), tyg_bin(p, TYG_ADD, i(), tyg_iconst(p, TYG_I64, 1)), 0);
+                    tyg_jump(p, head);
+                }
+                tyg_block_set(p, done);
                 return;
             }
             default: No(l, cat("elementwise ", M.NameWhy(t)));
@@ -3679,8 +3719,8 @@ struct TgFn {
         tyg_copy(p, tyg_at_local(o.mem, 0), x.a, M.Size(t));
         return o;
     }
-    tyg_val ElemLeaf(const ElemOp &o, TypeExpr *tt, int64_t off, Line l) {
-        if (!o.scalar) return tyg_load(p, M.Scal(tt), tyg_at_local(o.mem, off), 0);
+    tyg_val ElemLeaf(const ElemOp &o, TypeExpr *tt, int64_t off, const ElemDyn &dy, Line l) {
+        if (!o.scalar) return tyg_load(p, M.Scal(tt), ElemAt(tyg_at_local(o.mem, 0), off, dy), 0);
         return cg.TEq(o.t, tt) ? o.v : Conv(o.v, o.t, tt, l);
     }
     V GenElemwise(Binary *b) {
@@ -3690,11 +3730,9 @@ struct TgFn {
         auto ro = ElemOperand(b->right, et);
         if (Ended()) return Dummy(et);
         auto r = MemTemp(et, false);
-        ElemLeaves(et, 0, b->line, [&](TypeExpr *tt, int64_t off) {
-            auto d = r.a;
-            d.offset += off;
-            tyg_store(p, M.Scal(tt), d,
-                      ScalarArith(b->op, tt, ElemLeaf(lo, tt, off, b->line), ElemLeaf(ro, tt, off, b->line), b->line), 0);
+        ElemLeaves(et, 0, b->line, [&](TypeExpr *tt, int64_t off, const ElemDyn &dy) {
+            tyg_store(p, M.Scal(tt), ElemAt(r.a, off, dy),
+                      ScalarArith(b->op, tt, ElemLeaf(lo, tt, off, dy, b->line), ElemLeaf(ro, tt, off, dy, b->line), b->line), 0);
         });
         return r;
     }
@@ -7844,11 +7882,10 @@ struct TgFn {
             tyg_copy(p, tyg_at_local(old, 0), pl.a, M.Size(t));
             auto ro = ElemOperand(a->rhs, t);
             if (Ended()) return;
-            ElemLeaves(t, 0, a->line, [&](TypeExpr *tt, int64_t off) {
-                auto d = pl.a;
-                d.offset += off;
-                auto was = tyg_load(p, M.Scal(tt), tyg_at_local(old, off), 0);
-                tyg_store(p, M.Scal(tt), d, ScalarArith(a->op, tt, was, ElemLeaf(ro, tt, off, a->line), a->line), 0);
+            ElemLeaves(t, 0, a->line, [&](TypeExpr *tt, int64_t off, const ElemDyn &dy) {
+                auto was = tyg_load(p, M.Scal(tt), ElemAt(tyg_at_local(old, 0), off, dy), 0);
+                tyg_store(p, M.Scal(tt), ElemAt(pl.a, off, dy),
+                          ScalarArith(a->op, tt, was, ElemLeaf(ro, tt, off, dy, a->line), a->line), 0);
             });
             return;
         }
