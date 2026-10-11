@@ -190,6 +190,21 @@ struct TgModule {
     map<string, bool> rtapi;
     bool RuntimeApi(const string &name) {
         if (auto it = rtapi.find(name); it != rtapi.end()) return it->second;
+        // The C library's math functions are plain symbols the linker
+        // resolves (never macros, unlike isnan), so no trampoline either.
+        static const set<string> libm = [] {
+            set<string> r;
+            for (auto f : { "acos", "asin", "atan", "atan2", "cbrt", "ceil", "copysign", "cos", "cosh",
+                            "erf", "exp", "exp2", "expm1", "fabs", "fdim", "floor", "fma", "fmax",
+                            "fmin", "fmod", "hypot", "lgamma", "log", "log10", "log1p", "log2",
+                            "nearbyint", "pow", "remainder", "rint", "round", "sin", "sinh", "sqrt",
+                            "tan", "tanh", "tgamma", "trunc" }) {
+                r.insert(f);
+                r.insert(cat(f, "f"));
+            }
+            return r;
+        }();
+        if (libm.count(name)) return rtapi[name] = true;
         auto found = false;
         for (auto pos = rtdecls.find(cat(name, "(")); pos != string_view::npos && !found;
              pos = rtdecls.find(cat(name, "("), pos + 1)) {
