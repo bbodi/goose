@@ -2448,8 +2448,17 @@ struct TgFn {
                 // A string literal as a u8[:] (its bytes, read-only).
                 auto t = n->exprtype;
                 if (TgModule::IsLim(t)) return LimStr(static_cast<StrLit *>(n));
-                if (!t || t->kind != TY_SLICE || !IsU8(t->sub)) No(n->line, "string of this type");
                 auto &val = static_cast<StrLit *>(n)->val;
+                if (t && t->kind == TY_ARRAY && t->arr->akind == A_FIXED && IsU8(t->arr->sub) &&
+                    M.TypeOk(t) && (int64_t)val.size() == cg.FixedSize(t)) {
+                    // A u8[k] of exactly its bytes (§4.2): they, where they lie.
+                    V x;
+                    x.t = t;
+                    x.mem = true;
+                    x.a = tyg_at_sym(M.Bytes(val), 0);
+                    return x;
+                }
+                if (!t || t->kind != TY_SLICE || !IsU8(t->sub)) No(n->line, "string of this type");
                 auto tmp = tyg_local_new(p, 16, 8);
                 tyg_store(p, TYG_I64, tyg_at_local(tmp, 0),
                           tyg_addr_of(p, tyg_at_sym(M.Bytes(val), 0)), 0);
