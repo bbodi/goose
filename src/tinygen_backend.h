@@ -5295,6 +5295,7 @@ struct TgFn {
         tyg_local res = valued ? Temp(et) : 0;
         auto done = tyg_block_new(p);
         loops.push_back({ done, done, sscopes.size(), res, valued ? et : nullptr, true });
+        armwant = valued && et->kind == TY_SLICE ? et : nullptr;
         auto x = GenBlock(e->body, !valued);
         loops.pop_back();
         if (valued && !Ended() && x.t) Store(P { tyg_at_local(res, 0), et }, Fit(x, et, e->line));
