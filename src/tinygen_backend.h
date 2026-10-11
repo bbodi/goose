@@ -3950,6 +3950,24 @@ struct TgFn {
             GenRz(al, x.stk, x.a, t, al->line);
             return x;
         }
+        if (t && t->kind == TY_SLICE && M.TypeOk(t) && !al->capexpr && cg.IsFix(t->sub)) {
+            // A literal in slice position: a temporary fixed array, sliced
+            // whole (CodeGen::GenFixedArrayLit).
+            auto count = al->fillval ? (Is<IntLit>(al->fillcount) ? Is<IntLit>(al->fillcount)->val : -1)
+                                     : (int64_t)al->elems.size();
+            if (count < 0) No(al->line, "fill count");
+            auto at = M.ast.ArrayOf(t->sub, A_FIXED, al->line, count);
+            // Put back even when the literal is left to C.
+            struct Restore {
+                ArrayLit *al;
+                TypeExpr *t;
+                ~Restore() { al->exprtype = t; }
+            } restore { al, t };
+            al->exprtype = at;
+            auto av = GenArrayLit(al);
+            if (Ended() || !av.mem) return Dummy(t);
+            return SliceValue(t, tyg_addr_of(p, av.a), tyg_iconst(p, TYG_I64, count));
+        }
         if (!t || t->kind != TY_ARRAY || t->arr->akind != A_FIXED || !M.TypeOk(t) || al->capexpr)
             No(al->line, cat("array literal of type ", t ? M.NameWhy(t) : "?"));
         auto k = cg.ArrSize(t->arr);
