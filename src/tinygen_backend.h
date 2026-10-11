@@ -5097,6 +5097,14 @@ struct TgFn {
     V GenStr(Call *c) {
         auto t = c->exprtype;
         auto slice = t && t->kind == TY_SLICE && IsU8(t->sub);
+        if (t && TgModule::IsLim(t) && M.LimHeld(t) && IsU8(t->arr->sub)) {
+            // Typed as a static-capacity u8[..k]: the text rendered as a
+            // resizable's, then copied under the capacity check.
+            auto r = RzTemp(cg.GrowU8(), c->line);
+            GenRz(c, r.stk, r.a, r.t, c->line);
+            if (Ended()) return Dummy(t);
+            return LimFrom(r, t, c->line);
+        }
         if (!slice && (!t || !IsGrow(t) || !IsU8(t->arr->sub))) No(c->line, cat("str of type ", t ? M.Name(t) : "?"));
         auto x = RzTemp(slice ? cg.GrowU8() : t, c->line);
         GenRz(c, x.stk, x.a, x.t, c->line);
