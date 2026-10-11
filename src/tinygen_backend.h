@@ -5221,7 +5221,9 @@ struct TgFn {
     // through references, so no render functions are needed.
     void RenderInto(tyg_val stk, tyg_addr len, P pl, bool nested, Line l, int depth = 0) {
         if (depth > 32) No(l, "text of a type this deep");
-        while (IsPlainRef(pl.t)) pl = Step(pl);
+        // A reference renders what it refers to, a relative one decoded
+        // (CodeGen::RenderInto).
+        while (IsPlainRef(pl.t) || (TgModule::IsRel(pl.t) && !IsOptional(pl.t) && M.RelOk(pl.t, 1))) pl = Step(pl);
         auto t = pl.t;
         if (fmtc) {
             if (auto sp = cg.FmtSpecFor(fmtc, t)) {
