@@ -269,6 +269,9 @@ backend compiles:
 | third, so far (+ function values) | 2058 of 3811 (54%) | 172 of 172 |
 | third, so far (+ globals on dedicated stacks, whole resizables assigned) | 2146 of 3811 (56%) | 172 of 172 |
 | third, so far (+ `return from` with fixed results) | 2239 of 3811 (59%) | 172 of 172 |
+| third, so far (+ zero `default<T>()`, globals in whole programs) | 2253 of 3811 (59%) | 172 of 172 |
+| third, so far (+ composites rendered by `print` and `str`) | 2276 of 3811 (60%) | 172 of 172 |
+| third, so far (+ `.=`, `block`, `loop` values, integer `match`) | 2334 of 3811 (61%) | 172 of 172 |
 
 (The first stage's own write-up counted 394 of 3331 over 284 programs, an
 older sweep; the rows above come from the same one.) The step that added
@@ -587,9 +590,8 @@ flags of their own, all but `samples/24_call_c`, which needs its
 `--include` header, print the same and exit alike in all 580 pairs, the
 timings samples print to stderr aside), 36 programs took the whole path,
 with and without `--debug`, before the object held globals; 50 do since
-(next section). Beside them Goose-in-Goose and fourteen of the sixteen
-`test/tinygen/` fixtures (all but the strings one, whose `main` stays in
-C, and the extern one with C of its own) build whole. Goose-in-Goose
+(next section). Beside them Goose-in-Goose and every `test/tinygen/`
+fixture but the extern one, which has C of its own, build whole. Goose-in-Goose
 built so, plain and `--debug`, compiles itself to the same C, byte for
 byte, as the C backend's build.
 
@@ -702,6 +704,102 @@ What this says:
   tinygen building and writing 172 functions. What remains to win is in
   the front end and the link, not in code generation.
 
+## What keeps programs on the mixed path: a ranking by program
+
+The counts above are per function. What a whole program build needs is
+every function of a program, so a reason matters by how many programs it
+alone keeps mixed. `-v` names, for each function left to C, the first
+thing that sent it there, and a type reason now says why the type is not
+held (`TgModule::Blocker`: `parameter type Node& [struct with limited
+array]`). Over the sweep's 238 programs mixed because of functions left
+to C (of the 291; the others: 50 whole, `export fn` 1, a `block` global
+initializer 1, `samples/24_call_c` built without its header 1), with
+each function's reason put in a class (a type by what blocks it, `struct
+with X` as X, in any position: parameter, result, local, free variable,
+operand, global), a class *blocks* a program if one of its functions
+is left to C for it, and blocks it *alone* if it is the only class there:
+
+| Class | Functions | Programs blocked | Blocked by it alone |
+|---|---|---|---|
+| limited arrays `T[..k]` (`u8[..8]`, a struct with one) | 287 | 63 | 19 |
+| ADTs (`Shape`, `Shape.Circle`, `Msg..`) | 286 | 61 | 18 |
+| optionals (`T?`, a struct with one) | 216 | 50 | 21 |
+| variable-size structs (a `u8[]` field: `Employee`) | 144 | 43 | 14 |
+| `print` of composites | 41 | 38 | 14 |
+| slices and arrays of variable-size elements (`Employee[:]`) | 73 | 20 | 5 |
+| `match` expressions | 31 | 17 | 3 |
+| `block` expressions | 17 | 12 | 4 |
+| rebinding `.=` | 23 | 12 | 3 |
+| `print` with format overloads | 16 | 11 | 3 |
+| `return from` with a `u8[]` or resizable result | 53 | 10 | 0 |
+| SIMD vectors (`vec2<f32>`, `vec3<f32>`, `simd fn`) | 56 | 9 | 0 |
+| an `if` value of a type not held | 10 | 9 | 1 |
+| varints | 17 | 9 | 0 |
+| `bytes_of` | 24 | 8 | 2 |
+| struct equality | 18 | 6 | 1 |
+| `default` (not zero bytes) | 4 | 4 | 1 |
+
+119 of the 238 programs are blocked by exactly one class. Fixed in the
+order that frees the most programs at each step, the classes free, all
+told: optionals 21, + ADTs 43, + limited arrays 65, + print of
+composites 87, + variable-size structs 108, + `.=` 116, + `block` 122,
++ format overloads 128, + variable-size elements 134. The big classes
+are big pieces of work (each a representation); per unit of work the
+best are `print` of composites, `.=`, `block` and `match`, done since
+(below). Struct equality and SIMD vectors, which the per-function counts
+put first, free one program and none alone.
+
+The ranking is optimistic: only a function's first reason is known, and
+fixing it can show another (after the steps below, limited arrays block
+65 programs, not 63). It is measured by `goose build --backend=tinygen
+-v --dry-run` over the sweep, which needs no C compiler.
+
+### Composites rendered, `.=`, `block`, `loop` values, integer `match`
+
+* **`print` and `str` of composites.** A struct, fixed array, slice or
+  resizable array of held elements renders as `CodeGen::RenderLoc` does
+  (`TgFn::RenderInto`): through references to what they refer to, a
+  scalar by `gs_fmt_*`, `u8` elements as their bytes at the top and
+  `gs_fmt_quoted` inside a larger value, other arrays as `[a, b]` with
+  their elements and count read once, a struct as `Name { a, b }`. A
+  `print` with such an argument renders the whole line into a builder
+  on a stack of the statement's and writes it at once, as the C backend
+  writes every line. The types held never reach themselves through
+  references, so no render functions (`gs_render_*`) are needed; format
+  overloads still send the function to C.
+* **`.=`** stores the new address in the reference's slot
+  (`GenRebind`); optional, relative and pooled references stay in C.
+* **`block`, `loop` values, `break` and `continue`.** A break goes to
+  the innermost loop or block (`GenBreakPath`), its value evaluated into
+  the target's result before the stacks of the scopes left are restored;
+  continue passes blocks by to the innermost loop. A `block` delivers its
+  tail's value or a break's, a `loop` a break's, of a type held.
+* **Integer `match`** (`MatchExpr::CgAny`): the scrutinee evaluated once,
+  widened to 64 bits by its signedness, the arms tested in order, each
+  listed value or range compared signed or unsigned as the scrutinee's
+  type is. ADT matches stay in C with the ADTs.
+
+Over the sweep (0 of 580 runs differ), the whole path goes from 50
+programs to 59 with composites rendered and to 70 with the rest (the
+`block` global initializer's program among them), and per-function
+coverage from 2253 to 2334 of 3811 (59% to 61%); the strings fixture
+now builds whole. Goose-in-Goose stays whole, self-compiling byte for
+byte, plain and `--debug`. After them, 219 programs are mixed because
+of functions left to C, 116 of them by one class alone: limited arrays
+(65 programs, 24 alone), ADTs (62, 20), optionals (51, 23),
+variable-size structs (44, 16), variable-size elements (22, 5), format
+overloads (12, 5); then `return from` with `u8[]` results, SIMD
+vectors, `if` values of types not held and varints (9 or 10 each).
+
+One more thing keeps functions in C, outside any class: nine of them
+(`early_g`, `classify_g`, `choose_g`, `deep_fail_g`, ..., in five
+programs) are abandoned with tinygen's own `invalid value`
+(`tg_val_check`). The backend passes value 0, the empty `V {}` of an
+expression whose code ended (`if c { return 10; } else { return 20; }`
+as an operand; a `guard ... else { return }` before a fixed array is
+used), where it should pass a dummy. A backend bug, harmless since
+tinygen refuses the procedure; a dummy there would let them through.
+
 ## Testing
 
 `test/tinygen/` holds fixtures the backend covers whole: scalars,
@@ -709,8 +807,7 @@ structs, extern calls with C of their own (a sidecar), a division by zero
 that must abort with the Goose line, arrays and slices (ending in a failed
 bounds check), a slice whose bounds fail, multiple results, globals
 (mutable ones, static data, and one whose initializer calls a function),
-strings and resizable arrays handed to functions (whose `main`, which
-builds them as `u8[]` values, stays in C), and resizable arrays built,
+strings and resizable arrays handed to functions, and resizable arrays built,
 pushed and appended to, returned (alone and beside a fixed result) and
 given back on every way out of their scopes, u8[] values built in place
 and returned with `str`, `format` and string comparisons, and arrays
@@ -718,8 +815,11 @@ popped, resized and cleared (ending in a pop of an empty array),
 nested functions reading and writing their free variables of every
 kind held, function values of every parameter kind, and globals on
 dedicated stacks, read, grown and assigned anew, and `return from`
-of every fixed kind to targets through frames that own stacks. They
-are ordinary fixtures, run by the
+of every fixed kind to targets through frames that own stacks, structs,
+arrays, slices and resizable arrays rendered by `print` and `str`
+(`tinygen_render`), and `block` and `loop` values, breaks and
+continues through blocks, integer `match` and `.=` (`tinygen_control`).
+They are ordinary fixtures, run by the
 main suite through both C backends against `test/expected/`.
 `test/tinygen_backend.py` (the "tinygen backend" section of `run_tests.py`)
 builds them with `--backend=tinygen`, requires every function to go through
@@ -859,9 +959,12 @@ Recorded here rather than changed in tinygen, which other work is changing:
    variables of nested functions, function values, globals of resizable
    and `u8[]` types, assigning whole resizables (Goose-in-Goose whole);
    `return from` with fixed results, across frames of both halves.
-   Next: `return from` with `u8[]` and resizable results, rendering composites through the C half's render
-   functions (given external linkage), `default`, assigning `u8[]`
-   images.
+   `print`/`str` of composites (fixed, and arrays of fixed elements),
+   `.=`, `block` and `loop` values, integer `match`. Next, by programs
+   freed (the ranking above): optionals, ADTs and limited arrays as
+   representations, variable-size structs, format overloads; then
+   `return from` with `u8[]` and resizable results, `default`, assigning
+   `u8[]` images.
 4. **Driver and platforms**: `goose run --backend=tinygen` (build and start,
    or an in-memory loader, see above); Linux and Windows (CodeView) in CI; the
    x86-64 ABI checks; lldb/gdb formatters for Goose arrays shipped with the
