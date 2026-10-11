@@ -4067,8 +4067,11 @@ struct TgFn {
             auto at = GenImg(an[1], pl.stk, pl.t->arr->sub, c->line);
             if (Ended()) return Dummy(c->exprtype);
             tyg_store(p, TYG_I64, la, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, la, 0), tyg_iconst(p, TYG_I64, 1)), 0);
+            auto et = c->exprtype;
+            if (et && et->kind != TY_REF && !cg.IsVoidT(et) && M.IsScalar(et))
+                return Fit(Load(ElemPlace(at, pl.t->arr->sub), c->line), et, c->line);   // A varint, decoded.
             V r;
-            r.t = c->exprtype && c->exprtype->kind == TY_REF ? c->exprtype : nullptr;
+            r.t = et && et->kind == TY_REF ? et : nullptr;
             if (r.t) r.v = at;
             return r;
         }
@@ -4086,8 +4089,11 @@ struct TgFn {
             auto la = pl.a;
             la.offset += 8;
             tyg_store(p, TYG_I64, la, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, la, 0), tyg_iconst(p, TYG_I64, 1)), 0);
+            auto et = c->exprtype;
+            if (et && et->kind != TY_REF && !cg.IsVoidT(et) && M.IsScalar(et))
+                return Fit(Load(ElemPlace(at, pl.t->arr->sub), c->line), et, c->line);   // A varint, decoded.
             V r;
-            r.t = c->exprtype && c->exprtype->kind == TY_REF ? c->exprtype : nullptr;
+            r.t = et && et->kind == TY_REF ? et : nullptr;
             if (r.t) r.v = at;
             return r;
         }
