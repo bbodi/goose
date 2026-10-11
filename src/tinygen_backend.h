@@ -7913,11 +7913,8 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         if (!why.empty()) return false;
         for (auto sf : ast.functions)
             if (sf->isexport && !ExportOk(cg, sf, why)) return false;
-        for (auto sp : mod->externs) {
-            auto found = false;
-            for (auto &x : TgSupportExterns()) found = found || sp->sf->cname == x.name;
-            if (!found) return why = cat("extern ", sp->sf->cname), false;
-        }
+        for (auto sp : mod->externs)
+            if (!ExternHeld(sp)) return why = cat("extern ", sp->sf->cname), false;
         if (!GlobalsOk(cg, why)) return false;
         // A gs_init_globals built but not used stays in the object,
         // unreferenced, with what it asked of the C half.
@@ -7930,7 +7927,56 @@ struct TinyGenBackend : CodeGen::SpecBackend {
             }
         EmitGlobalStorage(cg);
         EmitExports(cg);
+        ForwardExterns();
         return true;
+    }
+
+    // Whether a whole program can call an extern fn through its trampoline
+    // (gs_tg_x_): the support object holds one (TgSupportExterns), or the
+    // object does (ForwardExterns) for a symbol the linker resolves, a
+    // package's or the C library's, which no header of the runtime defines.
+    bool ExternHeld(FnSpec *sp) {
+        auto &name = sp->sf->cname;
+        for (auto &x : TgSupportExterns())
+            if (name == x.name) return true;
+        return mod->rtdecls.find(cat(" ", name, "(")) == string_view::npos &&
+               mod->rtdecls.find(cat("*", name, "(")) == string_view::npos;
+    }
+
+    // The trampolines the object holds itself: a procedure of the name the
+    // calls use that calls the C symbol with the same C parameters.
+    void ForwardExterns() {
+        auto m = mod->m;
+        for (auto sp : mod->externs) {
+            auto &name = sp->sf->cname;
+            auto held = false;
+            for (auto &x : TgSupportExterns()) held = held || name == x.name;
+            if (held) continue;
+            auto sig = mod->ExternSig(sp);
+            auto p = tyg_proc_begin(m, mod->Sym(cat("gs_tg_x_", name), TYG_SYM_FUNC | TYG_SYM_GLOBAL), sig);
+            vector<tyg_arg> args;
+            for (size_t i = 0; i < sp->argtypes.size(); i++) {
+                tyg_arg a {};
+                if (mod->IsScalar(sp->argtypes[i])) a.val = tyg_param(p, (int)i);
+                else a.mem = tyg_at_val(tyg_param(p, (int)i), 0);
+                args.push_back(a);
+            }
+            auto callee = tyg_direct(mod->Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL));
+            auto rt = sp->rets.empty() ? nullptr : sp->rets[0];
+            if (!rt) {
+                tyg_call(p, sig, callee, args.data(), (int)args.size(), nullptr, nullptr);
+                tyg_ret(p, 0);
+            } else if (mod->IsScalar(rt)) {
+                tyg_ret(p, tyg_call(p, sig, callee, args.data(), (int)args.size(), nullptr, nullptr));
+            } else {
+                auto t = tyg_local_new(p, mod->Size(rt), 8);
+                auto ra = tyg_at_local(t, 0);
+                tyg_call(p, sig, callee, args.data(), (int)args.size(), nullptr, &ra);
+                tyg_ret_mem(p, ra);
+            }
+            if (tyg_proc_end(p) != 0)
+                throw CompileError { cat("tinygen: ", name, ": ", tyg_error(m) ? tyg_error(m) : "?") };
+        }
     }
 
     // Whether an `export fn`'s wrapper is one this object writes: a plain
@@ -8077,11 +8123,8 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         for (auto &c : fn.stackcalls) need = std::max(need, c.offset + cg.stackneed[c.callee]);
         if (need > cg.stackneed[nullptr]) return why = "global initializers' data stacks", false;
         // Extern fns: as for any function of a whole program.
-        for (auto sp : mod->externs) {
-            auto found = false;
-            for (auto &x : TgSupportExterns()) found = found || sp->sf->cname == x.name;
-            if (!found) return why = cat("extern ", sp->sf->cname), false;
-        }
+        for (auto sp : mod->externs)
+            if (!ExternHeld(sp)) return why = cat("extern ", sp->sf->cname), false;
         initsym = sym;
         return true;
     }
