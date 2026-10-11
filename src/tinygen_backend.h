@@ -2489,6 +2489,33 @@ struct TgFn {
         tyg_store(p, TYG_I64, len, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, len, 0), tot), 0);
     }
 
+    // to_bytes appended to a limited u8 array: the count's ULEB128 and then
+    // the payload, each copied under the capacity check (CodeGen::AppendBytes).
+    void ToBytesIntoLim(const P &out, Node *a, Line l) {
+        auto v = ViewOf(Place(a), l);
+        if (Ended()) return;
+        auto sl = tyg_local_new(p, 16, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(sl, 0), v.elems, 0);
+        tyg_store(p, TYG_I64, tyg_at_local(sl, 8),
+                  cg.IsFix(v.elem) ? tyg_bin(p, TYG_MUL, v.len, tyg_iconst(p, TYG_I64, cg.FixedSize(v.elem)))
+                                   : tyg_bin(p, TYG_SUB, RunEnd(v), v.elems), 0);
+        auto src = [&] { return tyg_load(p, TYG_I64, tyg_at_local(sl, 0), 0); };
+        auto sz = [&] { return tyg_load(p, TYG_I64, tyg_at_local(sl, 8), 0); };
+        auto pfx = tyg_local_new(p, 16, 8);
+        auto pn = tyg_local_new(p, 8, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(pn, 0), UlebWrite(tyg_addr_of(p, tyg_at_local(pfx, 0)), sz()), 0);
+        auto append = [&](tyg_val from, tyg_val n) {
+            auto ol = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(ol, 0), LimLen(out), 0);
+            auto o = [&] { return tyg_load(p, TYG_I64, tyg_at_local(ol, 0), 0); };
+            AbortUnless(tyg_cmp(p, TYG_SLE, tyg_bin(p, TYG_ADD, o(), n), LimCapOf(out)), "CAPACITY", l);
+            tyg_move_dyn(p, ElemAddr(LimView(out), o()), from, n);
+            LimSetLen(out, tyg_bin(p, TYG_ADD, o(), n));
+        };
+        append(tyg_addr_of(p, tyg_at_local(pfx, 0)), tyg_load(p, TYG_I64, tyg_at_local(pn, 0), 0));
+        append(src(), sz());
+    }
+
     // A resizable temporary: a stack of the statement's, its header.
     V RzTemp(TypeExpr *t, Line l) {
         V x;
@@ -5123,6 +5150,10 @@ struct TgFn {
         if (c->builtin == B_TO_BYTES && c->ArgNodes().size() == 2) {
             // Appended to a u8 resizable.
             auto out = Deref(Place(c->ArgNodes()[1]));
+            if (TgModule::IsLim(out.t) && M.LimHeld(out.t) && IsU8(out.t->arr->sub)) {
+                ToBytesIntoLim(out, c->ArgNodes()[0], c->line);
+                return V {};
+            }
             if (!IsGrow(out.t) || !IsU8(out.t->arr->sub) || !out.stk) No(c->line, "to_bytes into this kind");
             auto len = out.a;
             len.offset += 8;
