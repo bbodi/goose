@@ -129,7 +129,8 @@ inline const vector<TgSupportExtern> &TgSupportExterns() {
 // kept here (gs_stks, gs_gl).
 inline string TgSupportBody(string_view runtimeh) {
     string s = "\n/* ---- tinygen support (docs/design/tinygen_backend.md) ---- */\n"
-               "static GS_TLS int32_t gs_rf;\n";
+               "#ifdef _MSC_VER\n#define GS_TG_TLS __declspec(thread)\n#else\n#define GS_TG_TLS __thread\n#endif\n"
+               "static GS_TG_TLS int32_t gs_rf;\n";
     static const char *ops[] = { "add", "sub", "mul", "neg", "div", "mod" };
     static const IntStorage ints[] = { IS_I8, IS_I16, IS_I32, IS_I64, IS_U8, IS_U16, IS_U32, IS_U64 };
     for (auto op : ops)
@@ -163,8 +164,7 @@ inline string TgSupportBody(string_view runtimeh) {
     // thread-local of its own holds the block the procedures reach; a
     // worker's thunk opens one and its end frees it (the runtime's
     // gs_stack_block and gs_thread_run).
-    s += "#ifdef _MSC_VER\n#define GS_TG_TLS __declspec(thread)\n#else\n#define GS_TG_TLS __thread\n#endif\n"
-         "static GS_TG_TLS gs_stack *gs_tg_tstks;\n"
+    s += "static GS_TG_TLS gs_stack *gs_tg_tstks;\n"
          "void *gs_tg_stks(void) { return gs_tg_tstks; }\n"
          "void gs_tg_stack_block(int64_t n) {\n"
          "    gs_tg_tstks = (gs_stack *)calloc((size_t)(n > 0 ? n : 1), sizeof(gs_stack));\n"
@@ -9763,11 +9763,6 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         else if (!mainsp || !cg.sinfo.count(mainsp) || !mainsp->params.empty() ||
                  !cg.sinfo[mainsp].freevars.empty())
             why = "no plain main";
-        // Threads: the procedures' queues and worker thunks are the object's,
-        // but the `return from` channels and gs_rf, which the C half keeps
-        // thread-local, are plain data here.
-        else if ((cg.usesthreads || !cg.queues.empty()) && !cg.fromids.empty())
-            why = "threads with return from";
         if (!why.empty()) return false;
         for (auto sf : ast.functions)
             if (sf->isexport && !ExportOk(cg, sf, why)) return false;
@@ -10234,13 +10229,16 @@ struct TinyGenBackend : CodeGen::SpecBackend {
             accessor(n.first, flsyms.at(d).first);
             accessor(n.second, flsyms.at(d).second);
         }
-        // The `return from` channels, which the C half keeps thread-local:
-        // a whole program has one thread, so plain data (gap 6).
+        // The `return from` channels, which the C half keeps thread-local
+        // (gs_rf, the support object's, is one too): thread-local here in a
+        // program with threads, plain data in one with a single thread.
+        auto threaded = cg.usesthreads || !cg.queues.empty();
         for (auto &sh : mod->shims) {
             auto it = mod->channels.find(sh.first);
             if (it == mod->channels.end()) continue;
-            auto sym = tyg_symbol(m, cat("gs_", sh.first.substr(6)).c_str(), 0);   // gs_lret_<tid>_<i>
-            tyg_data(m, sym, TYG_SECTION_BSS, nullptr, std::max<int64_t>(it->second, 1), 8);
+            auto sym = tyg_symbol(m, cat("gs_", sh.first.substr(6)).c_str(), threaded ? TYG_SYM_TLS : 0);   // gs_lret_<tid>_<i>
+            tyg_data(m, sym, threaded ? TYG_SECTION_TBSS : TYG_SECTION_BSS, nullptr,
+                     std::max<int64_t>(it->second, 1), 8);
             accessor(sh.first, sym);
         }
     }
