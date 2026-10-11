@@ -111,7 +111,11 @@ struct TgModule {
             case TY_INT: return t->intstorage != IS_VARINT;
             case TY_FLT: case TY_BOOL: return true;
             case TY_REF:
-                return IsPlainRef(t) && cg.IsFix(t->ref->sub) && TypeOk(t->ref->sub, depth + 1);
+                // An address of a fixed value, or of a variable-size or
+                // resizable array it reads in place (RzOk): a fat reference
+                // { hdr, stk } for a resizable one (gs_rref).
+                return IsPlainRef(t) && ((cg.IsFix(t->ref->sub) && TypeOk(t->ref->sub, depth + 1)) ||
+                                         RzOk(t->ref->sub, depth + 1));
             case TY_ARRAY:
                 // T[k]: k elements, packed. A static-capacity T[..k] (a
                 // length beside them) is not held yet.
@@ -135,8 +139,42 @@ struct TgModule {
     }
     bool IsScalar(TypeExpr *t) {
         return t && (t->kind == TY_INT || t->kind == TY_FLT || t->kind == TY_BOOL ||
-                     t->kind == TY_REF);
+                     (t->kind == TY_REF && !cg.IsFatRef(t)));
     }
+
+    // A variable-size or resizable array of fixed elements, read and grown
+    // where it lies but never a slot's value: T[] / T[uN], a length prefix
+    // and then the elements, an image a uint8_t * points at (§6.1); and
+    // T[>..] / T[>..<], a gs_rhdr { base, len } with the elements on a data
+    // stack, whose top they end at. Held behind a reference or as a
+    // by-value parameter (the C passes the image's address, or the header
+    // and its stack).
+    bool RzOk(TypeExpr *t, int depth = 0) {
+        if (!t || t->kind != TY_ARRAY || depth > 32) return false;
+        auto k = t->arr->akind;
+        if (k == A_VAR) {
+            if (LenWidth(t) == 0) return false;
+        } else if (k != A_GROW && k != A_GROWSHRINK) {
+            return false;
+        }
+        return cg.IsFix(t->arr->sub) && TypeOk(t->arr->sub, depth + 1);
+    }
+    static bool IsGrow(TypeExpr *t) {
+        return t && t->kind == TY_ARRAY && (t->arr->akind == A_GROW || t->arr->akind == A_GROWSHRINK);
+    }
+    // A T[] length prefix's bytes: u32 by default, else its unsigned
+    // storage's; 0 for a varint or a signed one.
+    static int LenWidth(TypeExpr *t) {
+        switch (t->arr->lenstorage) {
+            case -1: case IS_U32: return 4;
+            case IS_U8: return 1;
+            case IS_U16: return 2;
+            case IS_U64: return 8;
+            default: return 0;
+        }
+    }
+    // A by-value parameter of a type RzOk holds.
+    bool RzParam(TypeExpr *t) { return t->kind == TY_ARRAY && RzOk(t); }
     tyg_scalar Scal(TypeExpr *t) {
         switch (t->kind) {
             case TY_INT:
@@ -180,7 +218,9 @@ struct TgModule {
     // their fields at their packed offsets, aligned to 1, as #pragma pack(1)
     // makes them in the C half.
     const tyg_type *AT(TypeExpr *t) {
+        if (t->kind == TY_REF && cg.IsFatRef(t)) return PairAT();
         if (t->kind == TY_REF) return tyg_type_ptr(m);
+        if (IsGrow(t)) return SliceAT();   // gs_rhdr { base, len }, as a slice.
         if (t->kind == TY_INT) return tyg_type_int(m, Scal(t), IsSigned(t));
         if (t->kind == TY_BOOL) return tyg_type_int(m, TYG_I8, 0);
         if (t->kind == TY_FLT) return tyg_type_scalar(m, Scal(t));
@@ -203,6 +243,13 @@ struct TgModule {
         if (sliceat) return sliceat;
         tyg_field fs[2] = { { tyg_type_ptr(m), 0 }, { tyg_type_int(m, TYG_I64, 1), 8 } };
         return sliceat = tyg_type_record(m, 16, 1, fs, 2);
+    }
+    // A fat reference, gs_rref: the header's address and the stack's.
+    const tyg_type *pairat = nullptr;
+    const tyg_type *PairAT() {
+        if (pairat) return pairat;
+        tyg_field fs[2] = { { tyg_type_ptr(m), 0 }, { tyg_type_ptr(m), 8 } };
+        return pairat = tyg_type_record(m, 16, 1, fs, 2);
     }
 
     // The type the debugger sees, under its Goose name.
@@ -236,8 +283,43 @@ struct TgModule {
                 d = scalar(Scal(t) == TYG_F32 ? "float" : "double", TYG_DT_FLOAT);
                 break;
             case TY_BOOL: d = scalar("_Bool", TYG_DT_BOOL); break;
-            case TY_REF: d = tyg_dt_pointer(m, DT(t->ref->sub)); break;
-            case TY_ARRAY: d = tyg_dt_array(m, DT(t->arr->sub), cg.ArrSize(t->arr)); break;
+            case TY_REF: {
+                if (!cg.IsFatRef(t)) {
+                    d = tyg_dt_pointer(m, DT(t->ref->sub));
+                    break;
+                }
+                // gs_rref, under the reference's Goose name: the header and
+                // the stack its elements grow on.
+                auto rec = tyg_dt_record(m, TYG_DT_STRUCT, name.c_str(), File(0), 0);
+                dtypes[name] = rec;
+                tyg_dt_member(m, rec, "hdr", tyg_dt_pointer(m, DT(t->ref->sub)), 0);
+                tyg_dt_member(m, rec, "stk", tyg_dt_pointer(m, StackDT()), 8);
+                tyg_dt_record_complete(m, rec, 16, 1);
+                return rec;
+            }
+            case TY_ARRAY: {
+                if (t->arr->akind == A_FIXED) {
+                    d = tyg_dt_array(m, DT(t->arr->sub), cg.ArrSize(t->arr));
+                    break;
+                }
+                auto rec = tyg_dt_record(m, TYG_DT_STRUCT, name.c_str(), File(0), 0);
+                dtypes[name] = rec;
+                if (t->arr->akind == A_VAR) {
+                    // The image: its length prefix, then the elements, as
+                    // many as it says (an array of unknown size).
+                    auto w = LenWidth(t);
+                    auto lt = ast.inttypes[w == 1 ? IS_U8 : w == 2 ? IS_U16 : w == 8 ? IS_U64 : IS_U32];
+                    tyg_dt_member(m, rec, "len", DT(lt), 0);
+                    tyg_dt_member(m, rec, "data", tyg_dt_array(m, DT(t->arr->sub), -1), w);
+                    tyg_dt_record_complete(m, rec, w, 1);
+                } else {
+                    // gs_rhdr: where the elements start, and their count.
+                    tyg_dt_member(m, rec, "base", tyg_dt_pointer(m, DT(t->arr->sub)), 0);
+                    tyg_dt_member(m, rec, "len", DT(ast.inttypes[IS_I64]), 8);
+                    tyg_dt_record_complete(m, rec, 16, 1);
+                }
+                return rec;
+            }
             case TY_SLICE: {
                 // A record of its two members: tinygen has no array type
                 // whose count is another member (the design doc's gaps).
@@ -261,6 +343,17 @@ struct TgModule {
             default: d = tyg_dt_void(m); break;
         }
         return dtypes[name] = d;
+    }
+
+    // gs_stack { top }: where the next element goes.
+    const tyg_dtype *stackdt = nullptr;
+    const tyg_dtype *StackDT() {
+        if (stackdt) return stackdt;
+        auto rec = tyg_dt_record(m, TYG_DT_STRUCT, "gs_stack", File(0), 0);
+        stackdt = rec;
+        tyg_dt_member(m, rec, "top", tyg_dt_pointer(m, DT(ast.inttypes[IS_U8])), 0);
+        tyg_dt_record_complete(m, rec, 8, 1);
+        return rec;
     }
 
     // ---- Globals -----------------------------------------------------------
@@ -413,7 +506,7 @@ struct TgModule {
             return false;
         }
         for (size_t i = 0; i < sp->argtypes.size(); i++)
-            if (cg.IsPoolParam(sp, i) || !TypeOk(sp->argtypes[i])) {
+            if (cg.IsPoolParam(sp, i) || !(TypeOk(sp->argtypes[i]) || RzParam(sp->argtypes[i]))) {
                 why = "parameter type";
                 return false;
             }
@@ -423,7 +516,16 @@ struct TgModule {
     tyg_sig *Sig(FnSpec *sp) {
         if (auto it = sigs.find(sp); it != sigs.end()) return it->second;
         vector<const tyg_type *> ps;
-        for (auto t : sp->argtypes) ps.push_back(AT(t));
+        for (auto t : sp->argtypes) {
+            // A by-value T[] is its image's address; a by-value T[>..] its
+            // header, then its stack (CodeGen::SigParams).
+            if (RzParam(t) && !IsGrow(t)) {
+                ps.push_back(tyg_type_ptr(m));
+                continue;
+            }
+            ps.push_back(AT(t));
+            if (RzParam(t)) ps.push_back(tyg_type_ptr(m));
+        }
         for (size_t i = 1; i < sp->rets.size(); i++) ps.push_back(tyg_type_ptr(m));
         if (!sp->sf->isextern && cg.sinfo[sp].needssp) ps.push_back(tyg_type_int(m, TYG_I64, 1));
         const tyg_type *ret = sp->rets.empty() ? nullptr : AT(sp->rets[0]);
@@ -463,6 +565,11 @@ struct TgFn {
     // instance does not change under it.
     vector<pair<VarDef *, tyg_local>> gaddrs;
     tyg_block gblk = 0, gstart = 0;
+    // By-value T[] parameters, whose locals hold their images' addresses;
+    // and by-value T[>..] ones, whose locals hold their headers, with the
+    // local holding each one's stack.
+    set<const VarDef *> indirect;
+    map<const VarDef *, tyg_local> rzstk;
 
     TgFn(TgModule &_M, FnSpec *_sp) : M(_M), cg(_M.cg), sp(_sp), m(_M.m) {}
 
@@ -475,10 +582,12 @@ struct TgFn {
         bool mem = false;
         TypeExpr *t = nullptr;
     };
-    // A place: memory holding a value of type t.
+    // A place: memory holding a value of type t, and for a resizable
+    // array the stack its elements grow on, where known (else 0).
     struct P {
         tyg_addr a;
         TypeExpr *t;
+        tyg_val stk = 0;
     };
 
     // ---- Blocks and positions ------------------------------------------------
@@ -535,11 +644,7 @@ struct TgFn {
     // wanted (reference transparency, §3.8), a scalar converted.
     V Fit(V x, TypeExpr *want, Line l) {
         if (!want || want->kind == TY_VOID || !x.t) return x;
-        while (IsPlainRef(x.t) && want->kind != TY_REF) {
-            auto sub = x.t->ref->sub;
-            P pl { tyg_at_val(x.v, 0), sub };
-            x = Load(pl, l);
-        }
+        while (IsPlainRef(x.t) && want->kind != TY_REF) x = Load(RefTarget(x), l);
         if (M.IsScalar(x.t) && M.IsScalar(want)) {
             if (x.t->kind == TY_REF || want->kind == TY_REF) {
                 if (x.t->kind != want->kind) No(l, "reference conversion");
@@ -584,12 +689,26 @@ struct TgFn {
 
     // ---- Places --------------------------------------------------------------
 
-    P Deref(P pl) {
-        while (IsPlainRef(pl.t)) {
-            auto ptr = tyg_load(p, TYG_I64, pl.a, 0);
-            pl = P { tyg_at_val(ptr, 0), pl.t->ref->sub };
+    // What the reference at pl refers to: a fat reference's header, with
+    // its stack.
+    P Step(const P &pl) {
+        auto ptr = tyg_load(p, TYG_I64, pl.a, 0);
+        P r { tyg_at_val(ptr, 0), pl.t->ref->sub };
+        if (cg.IsFatRef(pl.t)) {
+            auto a8 = pl.a;
+            a8.offset += 8;
+            r.stk = tyg_load(p, TYG_I64, a8, 0);
         }
+        return r;
+    }
+    P Deref(P pl) {
+        while (IsPlainRef(pl.t)) pl = Step(pl);
         return pl;
+    }
+    // What a reference value refers to.
+    P RefTarget(const V &x) {
+        if (x.mem) return Step(P { x.a, x.t });
+        return P { tyg_at_val(x.v, 0), x.t->ref->sub };
     }
 
     P Place(Node *n) {
@@ -599,8 +718,14 @@ struct TgFn {
             auto it = locals.find(vd);
             if (it == locals.end() && vd->isglobal) return GlobalPlace(vd, n->line);
             if (it == locals.end()) No(n->line, "variable from outside");
-            return P { tyg_at_local(it->second, 0), vd->type };
+            if (indirect.count(vd))
+                return P { tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(it->second, 0), 0), 0), vd->type };
+            P pl { tyg_at_local(it->second, 0), vd->type };
+            if (auto s = rzstk.find(vd); s != rzstk.end())
+                pl.stk = tyg_load(p, TYG_I64, tyg_at_local(s->second, 0), 0);
+            return pl;
         }
+
         if (auto d = Is<Dot>(n); d && d->IsField()) {
             auto base = Deref(Place(d->obj));
             if (base.t->kind != TY_STRUCT || !M.TypeOk(base.t)) No(n->line, "field of this type");
@@ -746,6 +871,19 @@ struct TgFn {
     V GenUnary(Unary *u) {
         auto et = u->exprtype;
         if (u->op == T_BITAND) {
+            if (et && et->kind == TY_REF && cg.IsFatRef(et)) {
+                // gs_rref: the header's address and its stack.
+                auto pl = Deref(Place(u->child));
+                if (!IsGrow(pl.t) || !pl.stk) No(u->line, "reference to an array of this kind");
+                auto tmp = tyg_local_new(p, 16, 8);
+                tyg_store(p, TYG_I64, tyg_at_local(tmp, 0), tyg_addr_of(p, pl.a), 0);
+                tyg_store(p, TYG_I64, tyg_at_local(tmp, 8), pl.stk, 0);
+                V x;
+                x.t = et;
+                x.mem = true;
+                x.a = tyg_at_local(tmp, 0);
+                return x;
+            }
             if (et && et->kind == TY_REF) {
                 if (!IsPlainRef(et)) No(u->line, "reference kind");
                 auto pl = Deref(Place(u->child));
@@ -1064,10 +1202,21 @@ struct TgFn {
             auto k = cg.ArrSize(pl.t->arr);
             return { tyg_addr_of(p, pl.a), tyg_iconst(p, TYG_I64, k), pl.t->arr->sub, k };
         }
-        if (pl.t->kind == TY_SLICE && M.TypeOk(pl.t)) {
+        if ((pl.t->kind == TY_SLICE && M.TypeOk(pl.t)) || (IsGrow(pl.t) && M.RzOk(pl.t))) {
+            // { data, len }, and gs_rhdr { base, len } alike.
             auto a8 = pl.a;
             a8.offset += 8;
-            return { tyg_load(p, TYG_I64, pl.a, 0), tyg_load(p, TYG_I64, a8, 0), pl.t->sub, -1 };
+            auto elem = pl.t->kind == TY_SLICE ? pl.t->sub : pl.t->arr->sub;
+            return { tyg_load(p, TYG_I64, pl.a, 0), tyg_load(p, TYG_I64, a8, 0), elem, -1 };
+        }
+        if (IsArrayKind(pl.t, A_VAR) && M.RzOk(pl.t)) {
+            // A T[] image: the length prefix, the elements behind it.
+            auto w = TgModule::LenWidth(pl.t);
+            auto s = w == 1 ? TYG_I8 : w == 2 ? TYG_I16 : w == 4 ? TYG_I32 : TYG_I64;
+            auto n = tyg_load(p, s, pl.a, 0);
+            if (s != TYG_I64) n = tyg_convert(p, TYG_ZEXT, TYG_I64, n);
+            auto base = tyg_addr_of(p, pl.a);
+            return { tyg_bin(p, TYG_ADD, base, tyg_iconst(p, TYG_I64, w)), n, pl.t->arr->sub, -1 };
         }
         No(l, "array of this kind");
     }
@@ -1113,10 +1262,10 @@ struct TgFn {
     V GenLen(Node *obj, Node *n) {
         auto ot = obj->exprtype;
         while (ot && IsPlainRef(ot)) ot = ot->ref->sub;
-        if (!ot || !M.TypeOk(ot) || (ot->kind != TY_ARRAY && ot->kind != TY_SLICE))
+        if (!ot || !(M.TypeOk(ot) || M.RzOk(ot)) || (ot->kind != TY_ARRAY && ot->kind != TY_SLICE))
             No(n->line, "len of this type");
         tyg_val len;
-        if (ot->kind == TY_ARRAY) {
+        if (ot->kind == TY_ARRAY && ot->arr->akind == A_FIXED) {
             if (!Is<Ident>(obj) && !Is<Dot>(obj)) Gen(obj);   // What it does, it does.
             len = tyg_iconst(p, TYG_I64, cg.ArrSize(ot->arr));
         } else {
@@ -1152,7 +1301,7 @@ struct TgFn {
         } else {
             auto x = Gen1(n);
             if (Ended()) return Dummy(t);
-            if (x.t && IsPlainRef(x.t)) pl = Deref(P { tyg_at_val(x.v, 0), x.t->ref->sub });
+            if (x.t && IsPlainRef(x.t)) pl = Deref(RefTarget(x));
             else if (x.t && x.t->kind == TY_ARRAY && x.mem) pl = P { x.a, x.t };
             else return Fit(x, t, n->line);
         }
@@ -1243,6 +1392,7 @@ struct TgFn {
     // ---- Calls -------------------------------------------------------------
 
     tyg_arg Arg(Node *n, TypeExpr *pt) {
+        if (!M.TypeOk(pt)) No(n->line, "argument of this type");
         tyg_arg a {};
         auto x = GenAs(n, pt);
         if (M.IsScalar(pt)) a.val = x.v;
@@ -1277,6 +1427,7 @@ struct TgFn {
     V GenCall(Call *c) {
         if (c->builtin == B_PRINT) return GenPrint(c);
         if (c->builtin == B_LEN && c->ArgNodes().size() == 1) return GenLen(c->ArgNodes()[0], c);
+        if (c->builtin == B_PUSH && c->ArgNodes().size() == 2) return GenPush(c);
         if (c->builtin >= 0) No(c->line, cat("builtin ", BuiltinByKind(c->builtin).name));
         if (c->fvbody || !c->dispatch.empty() || !c->fvremap.empty() || !c->spec)
             No(c->line, "call kind");
@@ -1327,6 +1478,33 @@ struct TgFn {
         }
         return x;
     }
+
+    // v.push(x) for a fixed element (EmitPush): the receiver, then the
+    // element, which may grow the array itself, then its slot claimed at
+    // the stack's top, where the elements end, and the count raised. Its
+    // value is the element's address.
+    V GenPush(Call *c) {
+        auto an = c->ArgNodes();
+        auto pl = Deref(Place(an[0]));
+        if (!IsGrow(pl.t) || !M.RzOk(pl.t) || !pl.stk) No(c->line, "push to an array of this kind");
+        auto et = pl.t->arr->sub;
+        auto x = GenAs(an[1], et);
+        if (Ended()) return Dummy(c->exprtype);
+        if (!M.IsScalar(et) && !x.mem) No(c->line, "aggregate value");
+        auto top = tyg_load(p, TYG_I64, tyg_at_val(pl.stk, 0), 0);
+        Store(P { tyg_at_val(top, 0), et }, x);
+        tyg_store(p, TYG_I64, tyg_at_val(pl.stk, 0),
+                  tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, cg.FixedSize(et))), 0);
+        auto la = pl.a;
+        la.offset += 8;
+        auto n = tyg_load(p, TYG_I64, la, 0);
+        tyg_store(p, TYG_I64, la, tyg_bin(p, TYG_ADD, n, tyg_iconst(p, TYG_I64, 1)), 0);
+        V r;
+        r.t = c->exprtype && c->exprtype->kind == TY_REF ? c->exprtype : nullptr;
+        if (r.t) r.v = top;
+        return r;
+    }
+    static bool IsGrow(TypeExpr *t) { return TgModule::IsGrow(t); }
 
     // A call whose every result is wanted: `let a, b = f()`, `return f()`.
     vector<V> GenCallAll(Node *n, size_t count) {
@@ -1400,6 +1578,14 @@ struct TgFn {
                 continue;
             }
             auto ot = cg.OperandT(t);
+            auto bt = t;
+            while (bt && IsPlainRef(bt)) bt = bt->ref->sub;
+            if (bt && ((bt->kind == TY_ARRAY && IsU8(bt->arr->sub)) || (bt->kind == TY_SLICE && IsU8(bt->sub)))) {
+                // A u8 array or slice prints as its bytes (SimpleText).
+                auto v = ViewOf(Place(a), a->line);
+                outs.push_back({ "gs_out_bytes", { v.elems, v.len }, { tyg_type_ptr(m), IT(TYG_I64) } });
+                continue;
+            }
             if (!ot || !M.IsScalar(ot) || ot->kind == TY_REF) No(a->line, "print of this type");
             if (ot->kind == TY_INT && ot->intstorage == IS_U64) {
                 outs.push_back({ "gs_out_uint", { GenAs(a, ot).v }, { IT(TYG_I64, false) } });
@@ -1578,7 +1764,7 @@ struct TgFn {
     }
 
     void Declare(VarDef *d, Line l) {
-        if (!M.TypeOk(d->type)) No(l, cat("variable type of ", d->name));
+        if (!M.TypeOk(d->type) || cg.PrefVar(d)) No(l, cat("variable type of ", d->name));
         auto loc = Temp(d->type);
         locals[d] = loc;
         tyg_debug_var(p, string(d->name).c_str(), M.DT(d->type), tyg_at_local(loc, 0),
@@ -1790,26 +1976,47 @@ struct TgFn {
         if (!p) No(sp->sf->line, cat("tyg_proc_begin: ", tyg_error(m) ? tyg_error(m) : "?"));
         auto file = M.File(sp->sf->line.fileidx);
         vector<const tyg_dtype *> pdt;
-        for (auto t : sp->argtypes) pdt.push_back(M.DT(t));
+        for (auto t : sp->argtypes) {
+            if (M.RzParam(t) && !IsGrow(t)) pdt.push_back(tyg_dt_pointer(m, M.DT(t)));
+            else pdt.push_back(M.DT(t));
+            if (M.RzParam(t) && IsGrow(t)) pdt.push_back(tyg_dt_pointer(m, M.StackDT()));
+        }
         auto fdt = tyg_dt_func(m, sp->rets.empty() ? tyg_dt_void(m) : M.DT(sp->rets[0]), pdt.data(),
                                (int)pdt.size(), 0);
         tyg_debug_proc(p, string(sp->sf->qname).c_str(), file, sp->sf->line.line, fdt);
         Loc(sp->sf->line);
+        int pi = 0;   // The C parameter: a by-value T[>..] takes two.
         for (size_t i = 0; i < sp->params.size(); i++) {
             auto vd = sp->params[i];
             auto t = sp->argtypes[i];
-            auto loc = Temp(t);
+            auto pv = tyg_param(p, pi++);
+            if (M.RzParam(t) && !IsGrow(t)) {
+                // A by-value T[]: its image's address, the image a copy the
+                // caller made.
+                auto loc = tyg_local_new(p, 8, 8);
+                locals[vd] = loc;
+                indirect.insert(vd);
+                tyg_store(p, TYG_I64, tyg_at_local(loc, 0), pv, 0);
+                tyg_debug_param(p, string(vd->name).c_str(), tyg_dt_pointer(m, M.DT(t)),
+                                tyg_at_local(loc, 0), M.File(vd->line.fileidx), vd->line.line);
+                continue;
+            }
+            auto loc = M.RzParam(t) ? tyg_local_new(p, 16, 8) : Temp(t);
             locals[vd] = loc;
-            auto pv = tyg_param(p, (int)i);
             if (M.IsScalar(t)) tyg_store(p, M.Scal(t), tyg_at_local(loc, 0), pv, 0);
-            else tyg_copy(p, tyg_at_local(loc, 0), tyg_at_val(pv, 0), M.Size(t));
+            else tyg_copy(p, tyg_at_local(loc, 0), tyg_at_val(pv, 0), M.RzParam(t) ? 16 : M.Size(t));
             tyg_debug_param(p, string(vd->name).c_str(), M.DT(t), tyg_at_local(loc, 0),
                             M.File(vd->line.fileidx), vd->line.line);
+            if (M.RzParam(t)) {
+                // A by-value T[>..]: its header, then its stack.
+                auto sl = tyg_local_new(p, 8, 8);
+                tyg_store(p, TYG_I64, tyg_at_local(sl, 0), tyg_param(p, pi++), 0);
+                rzstk[vd] = sl;
+            }
         }
         for (size_t i = 1; i < sp->rets.size(); i++) {
             auto loc = tyg_local_new(p, 8, 8);
-            tyg_store(p, TYG_I64, tyg_at_local(loc, 0),
-                      tyg_param(p, (int)(sp->argtypes.size() + i - 1)), 0);
+            tyg_store(p, TYG_I64, tyg_at_local(loc, 0), tyg_param(p, pi++), 0);
             outs.push_back(loc);
         }
         gblk = tyg_block_new(p);
