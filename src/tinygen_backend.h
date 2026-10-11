@@ -833,6 +833,8 @@ struct TgModule {
     // fixed elements (RzOk), or such structs; no relative references.
     bool VsOk(TypeExpr *t, int depth = 0) {
         if (!IsVs(t) || depth > 32 || cg.SI(t)->sclass != SC_VARIABLE) return false;
+        if (Reentered(t)) return true;   // Through an optional reference.
+        Open open { this, t };
         auto si = cg.SI(t);
         for (size_t i = 0; i < si->st->fields.size(); i++) {
             if (si->st->fields[i].ispad) continue;
@@ -851,6 +853,7 @@ struct TgModule {
         if (cg.IsFix(t)) return cg.FixedSize(t);
         if (IsVarint(t)) return 1;
         if (IsVarArr(t)) return PrefixBytes(t);
+        if (IsVm(t)) return TagSize(t);
         auto si = cg.SI(t);
         int64_t off = 0;
         for (size_t i = 0; i < si->st->fields.size(); i++) {
@@ -902,6 +905,8 @@ struct TgModule {
     bool AdtOk(TypeExpr *t, int depth) {
         if (t->kind == TY_ENUM && t->enu->varmode) return false;
         if (!cg.IsFix(t) || cg.IsLargeFixed(t)) return false;
+        if (Reentered(t)) return true;   // Through a reference or a slice.
+        Open open { this, t };
         auto ei = EI(t);
         auto ok = [&](int vi) {
             for (size_t i = 0; i < ei->en->variants[vi].fields.size(); i++)
@@ -918,6 +923,8 @@ struct TgModule {
         if (t->kind == TY_ENUM && t->enu->varmode) return VmOk(t, depth) ? "" : "variable-mode ADT";
         if (!cg.IsFix(t)) return VvOk(t, depth) ? "" : "variable-size ADT";
         if (cg.IsLargeFixed(t)) return "large fixed value";
+        if (Reentered(t)) return "";
+        Open open { this, t };
         auto ei = EI(t);
         for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
             if (t->kind == TY_VARIANT && (int)vi != VariantIdx(t)) continue;
@@ -1027,6 +1034,8 @@ struct TgModule {
     }
     bool VmOk(TypeExpr *t, int depth = 0) {
         if (!IsVm(t) || depth > 32) return false;
+        if (Reentered(t)) return true;   // Through an optional reference.
+        Open open { this, t };
         auto ei = cg.EIOf(t);
         for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
             if (!FieldsOk(ei->en->variants[vi].fields, ei->vftypes[vi], depth + 1)) return false;
@@ -1051,6 +1060,8 @@ struct TgModule {
     bool IsVv(TypeExpr *t) { return t && t->kind == TY_VARIANT && !cg.IsFix(t); }
     bool VvOk(TypeExpr *t, int depth = 0) {
         if (!IsVv(t) || depth > 32) return false;
+        if (Reentered(t)) return true;   // Through an optional reference.
+        Open open { this, t };
         auto ei = cg.EIVar(t);
         auto vi = ei->en->VariantIndex(t->var->variant);
         return FieldsOk(ei->en->variants[(size_t)vi].fields, ei->vftypes[(size_t)vi], depth + 1);
