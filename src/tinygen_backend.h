@@ -2162,6 +2162,17 @@ struct TgFn {
             return x;
         }
         if (LimAdapts(x, want)) return LimFrom(x, want, l);
+        if (want->kind == TY_ENUM && M.IsVm(want) && x.mem && M.VmOk(want) && x.t->kind != TY_REF &&
+            (x.t->kind == TY_VARIANT || (x.t->kind == TY_ENUM && !M.IsVm(x.t))) && M.EI(x.t) == M.EI(want)) {
+            // A variant, or a fixed-mode ADT, wanted as a variable-mode one:
+            // its image on a temporary's stack.
+            auto stk = Stk(AllocStk(false, l), l);
+            V r;
+            r.t = want;
+            r.mem = true;
+            r.a = tyg_at_val(VmFrom(stk, x.a, x.t, want, l), 0);
+            return r;
+        }
         if (x.t->kind == TY_VARIANT && want->kind == TY_ENUM && x.mem) return AdaptToAdt(x, want, l);
         if (x.t->kind == TY_ENUM && want->kind == TY_ENUM && x.mem && M.IsVm(x.t) && !M.IsVm(want) &&
             M.EI(x.t) == M.EI(want) && M.TypeOk(want)) {
@@ -4726,6 +4737,9 @@ struct TgFn {
         V r;
         r.t = c->exprtype && c->exprtype->kind == TY_REF ? c->exprtype : nullptr;
         if (r.t) r.v = top;
+        // The element itself, as a value, where one is wanted.
+        else if (c->exprtype && c->exprtype->kind != TY_VOID && M.TypeOk(et))
+            return Load(P { tyg_at_val(top, 0), et }, c->line);
         return r;
     }
 
@@ -6295,13 +6309,19 @@ struct TgFn {
             for (size_t i = 0; i < sp->argtypes.size(); i++)
                 if ((int)i != pos && cg.Mangle(sp->argtypes[i]) != cg.Mangle(sp0->argtypes[i]))
                     No(c->line, "dispatch with arguments of different types");
-            if (M.RzParam(sp->argtypes[(size_t)pos])) No(c->line, "dispatch to a case of this kind");
+            // A variable-size case takes its payload by value as an image:
+            // a copy of the variable-mode value's own (below).
+            auto cpt = sp->argtypes[(size_t)pos];
+            if (M.RzParam(cpt) && !(M.IsVv(cpt) && !M.Resz(cpt) && M.IsVm(adt)))
+                No(c->line, "dispatch to a case of this kind");
             for (size_t i = 0; i < sp->argtypes.size(); i++)
                 if (cg.IsPoolParam(sp, i)) No(c->line, "dispatch with a pool reference");
         }
         // The shared arguments, each kept in a local of its own: the arms
         // are blocks of their own.
         Scrut s {};
+        tyg_local copied = 0;
+        auto havecopy = false;
         vector<tyg_local> shared(an.size());
         vector<vector<tyg_arg>> valargs(an.size());   // By-value arrays', built once.
         for (size_t i = 0; i < an.size(); i++) {
@@ -6319,6 +6339,15 @@ struct TgFn {
             }
             if ((int)i == pos) {
                 s = AdtScrutinee(an[i], adt);
+                if (!Ended() && M.IsVm(adt) && std::any_of(c->dispatch.begin(), c->dispatch.end(),
+                                            [&](FnSpec *k) { return k->argtypes[(size_t)pos]->kind != TY_REF; })) {
+                    // The whole value copied before the later arguments
+                    // run (CodeGen::EmitDispatch's `copied`).
+                    auto stk = Stk(AllocStk(false, c->line), c->line);
+                    copied = tyg_local_new(p, 8, 8);
+                    tyg_store(p, TYG_I64, tyg_at_local(copied, 0), ImgCopy(stk, tyg_addr_of(p, s.v.a), adt), 0);
+                    havecopy = true;
+                }
                 continue;
             }
             auto pt = sp0->argtypes[i];
@@ -6363,9 +6392,17 @@ struct TgFn {
                 if ((int)i == pos && pt->kind == TY_REF && pt->ref->sub->kind == TY_VARIANT) {
                     a.val = tyg_bin(p, TYG_ADD, tyg_addr_of(p, s.v.a), tyg_iconst(p, TYG_I64, M.TagSize(adt)));
                 } else if ((int)i == pos) {
+                    if (M.IsVv(pt)) {
+                        a.val = tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, tyg_at_local(copied, 0), 0),
+                                        tyg_iconst(p, TYG_I64, M.TagSize(adt)));
+                        args.push_back(a);
+                        continue;
+                    }
                     if (pt->kind != TY_VARIANT) No(c->line, "dispatch to a case of this kind");
                     auto t = Temp(pt);
-                    CopyPayload(s, (int)vi, tyg_at_local(t, 0));
+                    auto cs = s;
+                    if (havecopy) cs.v.a = tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(copied, 0), 0), 0);
+                    CopyPayload(cs, (int)vi, tyg_at_local(t, 0));
                     if (cg.IsLargeFixed(pt)) a.val = tyg_addr_of(p, tyg_at_local(t, 0));
                     else a.mem = tyg_at_local(t, 0);
                 } else if (M.RzParam(pt)) {
@@ -6524,6 +6561,8 @@ struct TgFn {
         if (IsImg(t)) {
             if (!x) {
                 GenImg(val, dst, t, l);
+            } else if (M.IsVm(t) && !M.IsVm(x->t)) {
+                VmFrom(dst, x->a, x->t, t, l);   // A variant or a fixed ADT, adapted.
             } else if (M.IsVs(t) || M.IsVm(t)) {
                 VsCopy(dst, *x, t, l);
             } else {
@@ -7380,6 +7419,54 @@ struct TgFn {
         return ImgCopy(stk, tyg_addr_of(p, x.a), t);
     }
 
+    // A variant or a fixed-mode ADT of the variable-mode ADT t's variants,
+    // lying at `src`, adapted to t at the top of stk (CodeGen::
+    // GenVarEnumFromLoc): the tag, then the payload; its address.
+    tyg_val VmFrom(tyg_val stk, tyg_addr src, TypeExpr *srct, TypeExpr *t, Line l) {
+        auto start = tyg_local_new(p, 8, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(start, 0), Top(stk), 0);
+        auto at = [&] { return tyg_load(p, TYG_I64, tyg_at_local(start, 0), 0); };
+        {
+            if (M.EI(srct) != M.EI(t) || (srct->kind != TY_VARIANT && !(srct->kind == TY_ENUM && !srct->enu->varmode)))
+                No(l, cat("value of type ", M.NameWhy(t)));
+            auto base = at();
+            auto ts = M.TagSize(t);
+            SetTop(stk, tyg_bin(p, TYG_ADD, base, tyg_iconst(p, TYG_I64, ts)));
+            auto ei = M.EI(t);
+            auto copyfix = [&](int64_t sz, tyg_addr from) {
+                if (!sz) return;
+                auto top = Top(stk);
+                tyg_copy(p, tyg_at_val(top, 0), from, sz);
+                SetTop(stk, tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, sz)));
+            };
+            if (srct->kind == TY_VARIANT) {
+                StoreTag(tyg_at_val(base, 0), t, M.VariantIdx(srct));
+                if (cg.IsFix(srct)) copyfix(cg.FixedSize(srct), src);
+                else ImgCopy(stk, tyg_addr_of(p, src), srct);
+                return at();
+            }
+            auto tag = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(tag, 0), LoadTag(src, srct), 0);
+            tyg_store(p, M.TagScal(t), tyg_at_val(base, 0),
+                      tyg_convert(p, TYG_TRUNC, M.TagScal(t), tyg_load(p, TYG_I64, tyg_at_local(tag, 0), 0)), 0);
+            auto done = tyg_block_new(p);
+            for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
+                auto psz = cg.VariantLayout(ei, (int)vi).size;
+                auto hit = tyg_block_new(p), next = tyg_block_new(p);
+                tyg_branch(p, tyg_cmp(p, TYG_EQ, tyg_load(p, TYG_I64, tyg_at_local(tag, 0), 0), tyg_iconst(p, TYG_I64, (int64_t)vi)), hit, next);
+                tyg_block_set(p, hit);
+                auto from = src;
+                from.offset += ts;
+                copyfix(psz, from);
+                tyg_jump(p, done);
+                tyg_block_set(p, next);
+            }
+            tyg_jump(p, done);
+            tyg_block_set(p, done);
+            return at();
+        }
+    }
+
     // Builds n's value, of the variable-size struct t, at the top of stk
     // (CodeGen::GenConstruct); its address. A literal field by field, a
     // call returning one handed stk as its destination, anything else (a
@@ -7443,47 +7530,7 @@ struct TgFn {
         }
         auto pl = Deref(Place(n));
         if (Ended()) return at();
-        if (!cg.TEq(pl.t, t)) {
-            // A variant or a fixed-mode ADT of this one's variants, adapted
-            // (CodeGen::GenVarEnumFromLoc): the tag, then the payload.
-            if (M.EI(pl.t) != M.EI(t) || (pl.t->kind != TY_VARIANT && !(pl.t->kind == TY_ENUM && !pl.t->enu->varmode)))
-                No(l, cat("value of type ", M.NameWhy(t)));
-            auto base = at();
-            auto ts = M.TagSize(t);
-            SetTop(stk, tyg_bin(p, TYG_ADD, base, tyg_iconst(p, TYG_I64, ts)));
-            auto ei = M.EI(t);
-            auto copyfix = [&](int64_t sz, tyg_addr from) {
-                if (!sz) return;
-                auto top = Top(stk);
-                tyg_copy(p, tyg_at_val(top, 0), from, sz);
-                SetTop(stk, tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, sz)));
-            };
-            if (pl.t->kind == TY_VARIANT) {
-                StoreTag(tyg_at_val(base, 0), t, M.VariantIdx(pl.t));
-                if (cg.IsFix(pl.t)) copyfix(cg.FixedSize(pl.t), pl.a);
-                else ImgCopy(stk, tyg_addr_of(p, pl.a), pl.t);
-                return at();
-            }
-            auto tag = tyg_local_new(p, 8, 8);
-            tyg_store(p, TYG_I64, tyg_at_local(tag, 0), LoadTag(pl.a, pl.t), 0);
-            tyg_store(p, M.TagScal(t), tyg_at_val(base, 0),
-                      tyg_convert(p, TYG_TRUNC, M.TagScal(t), tyg_load(p, TYG_I64, tyg_at_local(tag, 0), 0)), 0);
-            auto done = tyg_block_new(p);
-            for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
-                auto psz = cg.VariantLayout(ei, (int)vi).size;
-                auto hit = tyg_block_new(p), next = tyg_block_new(p);
-                tyg_branch(p, tyg_cmp(p, TYG_EQ, tyg_load(p, TYG_I64, tyg_at_local(tag, 0), 0), tyg_iconst(p, TYG_I64, (int64_t)vi)), hit, next);
-                tyg_block_set(p, hit);
-                auto from = pl.a;
-                from.offset += ts;
-                copyfix(psz, from);
-                tyg_jump(p, done);
-                tyg_block_set(p, next);
-            }
-            tyg_jump(p, done);
-            tyg_block_set(p, done);
-            return at();
-        }
+        if (!cg.TEq(pl.t, t)) return VmFrom(stk, pl.a, pl.t, t, l);
         return ImgCopy(stk, tyg_addr_of(p, pl.a), t);
     }
 
