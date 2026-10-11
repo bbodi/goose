@@ -407,7 +407,9 @@ struct TgModule {
         return cg.IsFix(t->arr->sub) && TypeOk(t->arr->sub, depth + 1);
     }
     // A variable-size struct (VsOk) is an image too, read where it lies.
-    bool ImgOk(TypeExpr *t, int depth = 0) { return RzOk(t, depth) || VsOk(t, depth) || VarImgOk(t, depth); }
+    bool ImgOk(TypeExpr *t, int depth = 0) {
+        return RzOk(t, depth) || VsOk(t, depth) || VarImgOk(t, depth) || VmOk(t, depth) || VvOk(t, depth);
+    }
     // A T[] whose elements are images themselves (u8[][], an array of
     // strings): its length prefix, then the elements back to back, each
     // walked by its size; never indexed (the checker forbids it).
@@ -443,7 +445,9 @@ struct TgModule {
         }
     }
     // A by-value parameter of a type RzOk or VsOk holds.
-    bool RzParam(TypeExpr *t) { return (t->kind == TY_ARRAY && (RzOk(t) || VarImgOk(t))) || VsOk(t); }
+    bool RzParam(TypeExpr *t) {
+        return (t->kind == TY_ARRAY && (RzOk(t) || VarImgOk(t))) || VsOk(t) || VmOk(t) || VvOk(t);
+    }
     tyg_scalar Scal(TypeExpr *t) {
         switch (t->kind) {
             case TY_INT:
@@ -630,7 +634,7 @@ struct TgModule {
                 tyg_dt_record_complete(m, rec, cg.FixedSize(t), 1);
                 return rec;
             }
-            case TY_ENUM: case TY_VARIANT: return AdtDT(t, name);
+            case TY_ENUM: case TY_VARIANT: return IsVv(t) ? VvDT(t, name) : AdtDT(t, name);
             default: d = tyg_dt_void(m); break;
         }
         return dtypes[name] = d;
@@ -755,7 +759,7 @@ struct TgModule {
     // another representation.
     bool IsVs(TypeExpr *t) { return t && t->kind == TY_STRUCT && !cg.IsFix(t) && !cg.IsFrameObj(t); }
     // An image: a T[] or such a struct.
-    bool IsImg(TypeExpr *t) { return IsVarArr(t) || IsVs(t); }
+    bool IsImg(TypeExpr *t) { return IsVarArr(t) || IsVs(t) || IsVm(t) || IsVv(t); }
     // One this backend holds: its fields fixed values it holds, T[]s of
     // fixed elements (RzOk), or such structs; no relative references.
     bool VsOk(TypeExpr *t, int depth = 0) {
@@ -839,8 +843,8 @@ struct TgModule {
         return true;
     }
     string AdtBlocker(TypeExpr *t, int depth) {
-        if (t->kind == TY_ENUM && t->enu->varmode) return "variable-mode ADT";
-        if (!cg.IsFix(t)) return "variable-size ADT";
+        if (t->kind == TY_ENUM && t->enu->varmode) return VmOk(t, depth) ? "" : "variable-mode ADT";
+        if (!cg.IsFix(t)) return VvOk(t, depth) ? "" : "variable-size ADT";
         if (cg.IsLargeFixed(t)) return "large fixed value";
         auto ei = EI(t);
         for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
@@ -897,18 +901,83 @@ struct TgModule {
         for (size_t vi = 0; vi < en->variants.size(); vi++)
             tyg_dt_enumerator(m, tag, string(en->variants[vi].name).c_str(), (int64_t)vi);
         tyg_dt_member(m, rec, "tag", tag, 0);
-        auto psize = cg.FixedSize(t) - TagSize(t);
+        auto full = IsVm(t) ? VmMaxSize(t) : cg.FixedSize(t);
+        auto psize = full - TagSize(t);
         if (psize > 0) {
             auto u = tyg_dt_record(m, TYG_DT_UNION, nullptr, File(0), 0);
-            for (size_t vi = 0; vi < en->variants.size(); vi++)
-                if (cg.VariantLayout(ei, (int)vi).size)
-                    tyg_dt_member(m, u, string(en->variants[vi].name).c_str(),
-                                  DT(cg.VariantType(t, (int)vi)), 0);
+            for (size_t vi = 0; vi < en->variants.size(); vi++) {
+                auto vt = cg.VariantType(t, (int)vi);
+                if (!cg.IsFix(vt) || cg.VariantLayout(ei, (int)vi).size)
+                    tyg_dt_member(m, u, string(en->variants[vi].name).c_str(), DT(vt), 0);
+            }
             tyg_dt_record_complete(m, u, psize, 1);
             tyg_dt_member(m, rec, "u", u, TagSize(t));
         }
-        tyg_dt_record_complete(m, rec, cg.FixedSize(t), 1);
+        tyg_dt_record_complete(m, rec, full, 1);
         return rec;
+    }
+
+    // ---- Variable-mode ADTs -------------------------------------------------
+
+    // A variable-mode ADT (`Shape..`, §8.1) is a bytes value: its tag in
+    // its storage integer, then the variant's payload fields, packed, each
+    // value its own variant's size (CodeGen's GenStructLit for TY_ENUM).
+    // Held where every variant's payload is a fixed value of fields held.
+    static bool IsVm(TypeExpr *t) { return t && t->kind == TY_ENUM && t->enu->varmode; }
+    bool VmOk(TypeExpr *t, int depth = 0) {
+        if (!IsVm(t) || depth > 32) return false;
+        auto ei = cg.EIOf(t);
+        for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
+            if (!FieldsOk(ei->en->variants[vi].fields, ei->vftypes[vi], depth + 1)) return false;
+        return true;
+    }
+    // A run of fields this backend reads and builds: fixed ones it holds,
+    // T[]s and variable-size structs it holds as images.
+    bool FieldsOk(const vector<Field> &fields, const vector<TypeExpr *> &ftypes, int depth) {
+        for (size_t i = 0; i < fields.size(); i++) {
+            if (fields[i].ispad) continue;
+            auto ft = ftypes[i];
+            if (cg.IsFix(ft) ? !TypeOk(ft, depth + 1)
+                             : !((IsVarArr(ft) && (RzOk(ft, depth + 1) || VarImgOk(ft, depth + 1))) || VsOk(ft, depth + 1)))
+                return false;
+        }
+        return true;
+    }
+    // A variant type whose payload has a variable-size field (`Msg.Text`
+    // with a u8[]): an image of its fields, as a variable-size struct is.
+    bool IsVv(TypeExpr *t) { return t && t->kind == TY_VARIANT && !cg.IsFix(t); }
+    bool VvOk(TypeExpr *t, int depth = 0) {
+        if (!IsVv(t) || depth > 32) return false;
+        auto ei = cg.EIVar(t);
+        auto vi = ei->en->VariantIndex(t->var->variant);
+        return FieldsOk(ei->en->variants[(size_t)vi].fields, ei->vftypes[(size_t)vi], depth + 1);
+    }
+    const tyg_dtype *VvDT(TypeExpr *t, const string &name) {
+        auto ei = cg.EIVar(t);
+        auto vi = (size_t)ei->en->VariantIndex(t->var->variant);
+        auto rec = tyg_dt_record(m, TYG_DT_STRUCT, name.c_str(), File(0), 0);
+        dtypes[name] = rec;
+        int64_t off = 0;
+        for (size_t i = 0; i < ei->en->variants[vi].fields.size(); i++) {
+            auto &f = ei->en->variants[vi].fields[i];
+            if (f.ispad) { off += f.padsize > 0 ? f.padsize : 0; continue; }
+            auto ft = ei->vftypes[vi][i];
+            tyg_dt_member(m, rec, string(f.name).c_str(), DT(ft), off);
+            if (!cg.IsFix(ft)) { off += IsVarArr(ft) ? LenWidth(ft) : 0; break; }
+            off += cg.FixedSize(ft);
+        }
+        tyg_dt_record_complete(m, rec, off, 1);
+        return rec;
+    }
+    // The largest value: the tag and the largest payload.
+    int64_t VmMaxSize(TypeExpr *t) {
+        auto ei = cg.EIOf(t);
+        int64_t m = 0;
+        for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
+            auto vt = cg.VariantType(t, (int)vi);
+            if (cg.IsFix(vt)) m = std::max(m, cg.FixedSize(vt));
+        }
+        return TagSize(t) + m;
     }
 
     // ---- Optionals ---------------------------------------------------------
@@ -1134,14 +1203,17 @@ struct TgModule {
     // A result this backend holds: a fixed value, or a resizable array or
     // a T[] image of fixed elements, built at the caller's destination
     // stack.
-    bool RetOk(TypeExpr *t) { return TypeOk(t) || ((IsGrow(t) || IsVarArr(t)) && RzOk(t)) || VsOk(t); }
+    bool RetOk(TypeExpr *t) {
+        return TypeOk(t) || ((IsGrow(t) || IsVarArr(t)) && RzOk(t)) || VsOk(t) || VmOk(t) || VvOk(t);
+    }
     // A free variable of a nested function (§7.5), as SigParams passes it:
     // a fixed variable by its address, a T[] by its image's address, and
     // a resizable by its header's address and then its stack. Pools and
     // frame objects are not held.
     bool FvOk(const VarDef *fv) {
         if (!fv->type || fv->reusable || cg.PrefVar(fv)) return false;
-        return TypeOk(fv->type) || ((IsGrow(fv->type) || IsVarArr(fv->type)) && RzOk(fv->type)) || VsOk(fv->type);
+        return TypeOk(fv->type) || ((IsGrow(fv->type) || IsVarArr(fv->type)) && RzOk(fv->type)) || VsOk(fv->type) ||
+               VmOk(fv->type) || VvOk(fv->type);
     }
 
     tyg_sig *Sig(FnSpec *sp) {
@@ -1470,6 +1542,14 @@ struct TgFn {
     // elements (GenRz) behind a prefix patched once they are counted --
     // or the elements of `from`, or none. Its address.
     tyg_val GenImg(Node *n, tyg_val stk, TypeExpr *t, Line l, const View *from = nullptr) {
+        if (M.IsVm(t)) {
+            if (!n || from) No(l, cat("value of type ", M.NameWhy(t)));
+            return GenVm(n, stk, t, l);
+        }
+        if (M.IsVv(t)) {
+            if (!n || from) No(l, cat("value of type ", M.NameWhy(t)));
+            return GenVv(n, stk, t, l);
+        }
         if (M.IsVs(t)) {
             if (!n || from) No(l, cat("value of type ", M.NameWhy(t)));
             return GenVs(n, stk, t, l);
@@ -1672,6 +1752,12 @@ struct TgFn {
             auto base = Deref(Place(d->obj));
             if (M.VsOk(base.t)) return VsFieldPlace(base, d->fieldidx);
             if (M.FoOk(base.t)) return FoFieldPlace(base, d->fieldidx, n->line);
+            if (M.VvOk(base.t)) {
+                auto ei = cg.EIVar(base.t);
+                auto vi = (size_t)ei->en->VariantIndex(base.t->var->variant);
+                return P { tyg_at_val(VvField(base.t, tyg_addr_of(p, base.a), d->fieldidx), 0),
+                           ei->vftypes[vi][(size_t)d->fieldidx] };
+            }
             if (base.t->kind == TY_VARIANT && M.TypeOk(base.t)) return VariantField(base, d->fieldidx);
             if (base.t->kind != TY_STRUCT || !M.TypeOk(base.t)) No(n->line, "field of this type");
             auto si = cg.SI(base.t);
@@ -4025,6 +4111,18 @@ struct TgFn {
         tyg_local tag;
     };
     Scrut AdtScrutinee(Node *n, TypeExpr *adt) {
+        if (M.VmOk(adt)) {
+            // A variable-mode value is read where it lies: its tag first,
+            // its payload behind it, as a fixed-mode one's.
+            auto pl = Deref(Place(n));
+            Scrut s { V {}, adt, tyg_local_new(p, 8, 8) };
+            s.v.t = adt;
+            s.v.mem = true;
+            s.v.a = pl.a;
+            if (Ended()) s.v.a = tyg_at_local(Temp(M.ast.inttypes[IS_I64]), 0);
+            tyg_store(p, TYG_I64, tyg_at_local(s.tag, 0), LoadTag(s.v.a, adt), 0);
+            return s;
+        }
         if (!M.TypeOk(adt)) No(n->line, cat("match over type ", M.NameWhy(adt)));
         Scrut s { GenAs(n, adt), adt, tyg_local_new(p, 8, 8) };
         if (Ended()) s.v = MemTemp(adt, false);
@@ -4071,10 +4169,26 @@ struct TgFn {
             tyg_block_set(p, hit);
             tyg_scope_begin(p);
             if (a.binder) {
-                if (a.pat.byref) No(me->line, "match arm binding by reference");
-                Declare(a.binder, me->line);
-                CopyPayload(s, adt->enu->en->VariantIndex(a.variants[0]),
-                            tyg_at_local(locals[a.binder], 0));
+                auto vi = adt->enu->en->VariantIndex(a.variants[0]);
+                auto vt = cg.VariantType(adt, vi);
+                auto pay = s.v.a;
+                pay.offset += M.TagSize(adt);
+                if (a.pat.byref) {
+                    // Variable-mode payloads only (§8.1): its address.
+                    if (!M.IsVm(adt)) No(me->line, "match arm binding by reference");
+                    auto slot = tyg_local_new(p, 8, 8);
+                    tyg_store(p, TYG_I64, tyg_at_local(slot, 0), tyg_addr_of(p, pay), 0);
+                    locals[a.binder] = slot;
+                    if (!IsAddrRef(a.binder->type)) indirect.insert(a.binder);
+                } else if (!cg.IsFix(vt)) {
+                    // A variable payload, copied onto the binder's own stack.
+                    Declare(a.binder, me->line);
+                    auto stk = tyg_load(p, TYG_I64, tyg_at_local(rzstk[a.binder], 0), 0);
+                    tyg_store(p, TYG_I64, tyg_at_local(locals[a.binder], 0), ImgCopy(stk, tyg_addr_of(p, pay), vt), 0);
+                } else {
+                    Declare(a.binder, me->line);
+                    CopyPayload(s, vi, tyg_at_local(locals[a.binder], 0));
+                }
             }
             Loc(a.body->line);   // A breakpoint on the arm's line stops here, bound.
             auto v = GenArm(a.body, !valued);
@@ -4305,7 +4419,7 @@ struct TgFn {
                 SetTop(dst, tyg_load(p, TYG_I64, tyg_at_local(chans[i].top0, 0), 0));
                 if (xs.empty()) {
                     GenImg(vals[i], dst, rets[i], l);
-                } else if (M.IsVs(rets[i])) {
+                } else if (M.IsVs(rets[i]) || M.IsVm(rets[i])) {
                     VsCopy(dst, xs[i], rets[i], l);
                 } else {
                     auto v = ViewOf(P { xs[i].a, xs[i].t, xs[i].stk }, l);
@@ -4482,7 +4596,8 @@ struct TgFn {
                           M.File(d->line.fileidx), d->line.line);
             return;
         }
-        if (((IsVarArr(d->type) && M.RzOk(d->type)) || M.VsOk(d->type)) && !cg.PrefVar(d)) {
+        if (((IsVarArr(d->type) && M.RzOk(d->type)) || M.VsOk(d->type) || M.VmOk(d->type) || M.VvOk(d->type)) &&
+            !cg.PrefVar(d)) {
             // A T[] local: its image's address, the image on a stack of its
             // own (built by StmtVarDecl).
             auto stk = Stk(AllocStk(true, l), l);
@@ -4512,7 +4627,7 @@ struct TgFn {
             auto xs = GenCallAll(vd->inits[0], vd->defs.size());
             for (size_t i = 0; i < xs.size(); i++) {
                 auto d = vd->defs[i];
-                if (M.IsVs(d->type) && !Ended()) {
+                if ((M.IsVs(d->type) || M.IsVm(d->type)) && !Ended()) {
                     auto stk = tyg_load(p, TYG_I64, tyg_at_local(rzstk[d], 0), 0);
                     tyg_store(p, TYG_I64, tyg_at_local(locals[d], 0), VsCopy(stk, xs[i], d->type, vd->line), 0);
                     continue;
@@ -4843,6 +4958,33 @@ struct TgFn {
     // The bytes of the image of type t at `at` (CodeGen::SizeX).
     tyg_val ImgSize(TypeExpr *t, tyg_val at) {
         if (cg.IsFix(t)) return tyg_iconst(p, TYG_I64, cg.FixedSize(t));
+        if (M.IsVv(t)) return tyg_bin(p, TYG_SUB, VvField(t, at, -1), at);
+        if (M.IsVm(t)) {
+            // The tag, and its variant's payload: a variable one walked,
+            // only on its own tag's path.
+            auto ei = cg.EIOf(t);
+            auto ts = M.TagSize(t);
+            auto res = tyg_local_new(p, 8, 8);
+            auto tag = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(tag, 0), LoadTag(tyg_at_val(at, 0), t), 0);
+            auto done = tyg_block_new(p);
+            for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
+                auto vt = cg.VariantType(t, (int)vi);
+                auto hit = tyg_block_new(p), next = tyg_block_new(p);
+                tyg_branch(p, tyg_cmp(p, TYG_EQ, tyg_load(p, TYG_I64, tyg_at_local(tag, 0), 0),
+                                      tyg_iconst(p, TYG_I64, (int64_t)vi)), hit, next);
+                tyg_block_set(p, hit);
+                auto pay = tyg_bin(p, TYG_ADD, at, tyg_iconst(p, TYG_I64, ts));
+                auto ps = cg.IsFix(vt) ? tyg_iconst(p, TYG_I64, cg.FixedSize(vt)) : ImgSize(vt, pay);
+                tyg_store(p, TYG_I64, tyg_at_local(res, 0), tyg_bin(p, TYG_ADD, ps, tyg_iconst(p, TYG_I64, ts)), 0);
+                tyg_jump(p, done);
+                tyg_block_set(p, next);
+            }
+            tyg_store(p, TYG_I64, tyg_at_local(res, 0), tyg_iconst(p, TYG_I64, ts), 0);
+            tyg_jump(p, done);
+            tyg_block_set(p, done);
+            return tyg_load(p, TYG_I64, tyg_at_local(res, 0), 0);
+        }
         if (IsVarArr(t)) {
             auto v = ViewOf(P { tyg_at_val(at, 0), t }, Line {});
             if (!cg.IsFix(t->arr->sub)) return tyg_bin(p, TYG_SUB, RunEnd(v), at);
@@ -4856,13 +4998,23 @@ struct TgFn {
     // variable-size field intervenes, then a cursor past each one.
     tyg_val VsField(TypeExpr *t, tyg_val at, int fi) {
         auto si = cg.SI(t);
-        auto n = fi < 0 ? (int)si->st->fields.size() : fi;
+        return RunField(si->st->fields, si->ftypes, at, fi);
+    }
+    // A variable-size variant's field: its payload's run walked.
+    tyg_val VvField(TypeExpr *t, tyg_val at, int fi) {
+        auto ei = cg.EIVar(t);
+        auto vi = (size_t)ei->en->VariantIndex(t->var->variant);
+        return RunField(ei->en->variants[vi].fields, ei->vftypes[vi], at, fi);
+    }
+    // The same over any run of fields: a struct's, a variant's payload.
+    tyg_val RunField(const vector<Field> &fields, const vector<TypeExpr *> &ftypes, tyg_val at, int fi) {
+        auto n = fi < 0 ? (int)fields.size() : fi;
         int64_t off = 0;
         auto cur = at;
         for (int i = 0; i < n; i++) {
-            auto &f = si->st->fields[(size_t)i];
+            auto &f = fields[(size_t)i];
             if (f.ispad) { off += f.padsize > 0 ? f.padsize : 0; continue; }
-            auto ft = si->ftypes[(size_t)i];
+            auto ft = ftypes[(size_t)i];
             if (cg.IsFix(ft)) { off += cg.FixedSize(ft); continue; }
             if (off) cur = tyg_bin(p, TYG_ADD, cur, tyg_iconst(p, TYG_I64, off));
             off = 0;
@@ -4894,6 +5046,82 @@ struct TgFn {
     // (CodeGen::GenConstruct); its address. A literal field by field, a
     // call returning one handed stk as its destination, anything else (a
     // variable, a field, a pointee) copied whole.
+    // Builds n's value, of the variable-mode ADT t, at the top of stk; its
+    // address. A variant literal as its tag then its payload fields, a call
+    // returning one handed stk, anything else copied whole.
+    tyg_val GenVm(Node *n, tyg_val stk, TypeExpr *t, Line l) {
+        auto start = tyg_local_new(p, 8, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(start, 0), Top(stk), 0);
+        auto at = [&] { return tyg_load(p, TYG_I64, tyg_at_local(start, 0), 0); };
+        if (auto c = Is<Call>(n); c && c->builtin < 0 && c->spec && !c->spec->sf->isextern &&
+                                   !c->spec->rets.empty() && cg.Mangle(c->spec->rets[0]) == cg.Mangle(t)) {
+            imgdst = stk;
+            GenCall(c);
+            imgdst = 0;
+            return at();
+        }
+        if (auto sl = Is<StructLit>(n); sl && sl->variant && !cg.IsFix(cg.VariantType(t, cg.EIOf(t)->en->VariantIndex(sl->variant)))) {
+            // A variable payload: the tag, then its fields built in turn.
+            auto ei = cg.EIOf(t);
+            auto vi = (size_t)ei->en->VariantIndex(sl->variant);
+            auto base = at();
+            SetTop(stk, tyg_bin(p, TYG_ADD, base, tyg_iconst(p, TYG_I64, M.TagSize(t))));
+            StoreTag(tyg_at_val(base, 0), t, (int)vi);
+            RunLit(sl, stk, ei->en->variants[vi].fields, ei->vftypes[vi]);
+            return at();
+        }
+        if (auto sl = Is<StructLit>(n); sl && sl->variant) {
+            auto ei = cg.EIOf(t);
+            auto vi = ei->en->VariantIndex(sl->variant);
+            auto vt = cg.VariantType(t, vi);
+            auto ts = M.TagSize(t);
+            auto size = ts + cg.FixedSize(vt);
+            auto base = at();
+            SetTop(stk, tyg_bin(p, TYG_ADD, base, tyg_iconst(p, TYG_I64, size)));
+            tyg_zero(p, tyg_at_val(base, 0), size);
+            StoreTag(tyg_at_val(base, 0), t, vi);
+            auto &lay = cg.VariantLayout(ei, vi);
+            for (size_t i = 0; i < ei->en->variants[(size_t)vi].fields.size(); i++) {
+                if (ei->en->variants[(size_t)vi].fields[i].ispad) continue;
+                auto init = sl->InitFor((int)i);
+                if (!init) continue;
+                Into(P { tyg_at_val(at(), ts + lay.offs[i]), ei->vftypes[(size_t)vi][i] }, init);
+                if (Ended()) return at();
+            }
+            return at();
+        }
+        auto pl = Deref(Place(n));
+        if (Ended()) return at();
+        if (!cg.TEq(pl.t, t)) No(l, cat("value of type ", M.NameWhy(t)));
+        return ImgCopy(stk, tyg_addr_of(p, pl.a), t);
+    }
+
+    // A variable-size variant's value at the top of stk: a literal's fields
+    // in turn, a call's built there, anything else copied whole.
+    tyg_val GenVv(Node *n, tyg_val stk, TypeExpr *t, Line l) {
+        auto start = tyg_local_new(p, 8, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(start, 0), Top(stk), 0);
+        auto at = [&] { return tyg_load(p, TYG_I64, tyg_at_local(start, 0), 0); };
+        if (auto sl = Is<StructLit>(n); sl && cg.TEq(sl->exprtype, t)) {
+            auto ei = cg.EIVar(t);
+            auto vi = (size_t)ei->en->VariantIndex(t->var->variant);
+            RunLit(sl, stk, ei->en->variants[vi].fields, ei->vftypes[vi]);
+            return at();
+        }
+        if (auto c = Is<Call>(n); c && c->builtin < 0 && c->spec && !c->spec->sf->isextern &&
+                                   !c->spec->rets.empty() && cg.TEq(c->spec->rets[0], t)) {
+            imgdst = stk;
+            GenCall(c);
+            imgdst = 0;
+            return at();
+        }
+        auto pl = Deref(Place(n));
+        if (Ended()) return at();
+        if (!cg.TEq(pl.t, t)) No(l, cat("value of type ", M.NameWhy(pl.t), " as ", M.Name(t)));
+        ImgCopy(stk, tyg_addr_of(p, pl.a), t);
+        return at();
+    }
+
     tyg_val GenVs(Node *n, tyg_val stk, TypeExpr *t, Line l) {
         auto start = tyg_local_new(p, 8, 8);
         tyg_store(p, TYG_I64, tyg_at_local(start, 0), Top(stk), 0);
@@ -4921,18 +5149,21 @@ struct TgFn {
     // variable-size one built there; explicit padding zeroed.
     void VsLit(StructLit *sl, tyg_val stk, TypeExpr *t) {
         auto si = cg.SI(t);
+        RunLit(sl, stk, si->st->fields, si->ftypes);
+    }
+    void RunLit(StructLit *sl, tyg_val stk, const vector<Field> &fields, const vector<TypeExpr *> &ftypes) {
         auto zero = [&](int64_t n) {
             auto top = Top(stk);
             tyg_zero(p, tyg_at_val(top, 0), n);
             SetTop(stk, tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, n)));
         };
-        for (size_t i = 0; i < si->st->fields.size() && !Ended(); i++) {
-            auto &f = si->st->fields[i];
+        for (size_t i = 0; i < fields.size() && !Ended(); i++) {
+            auto &f = fields[i];
             if (f.ispad) {
                 if (f.padsize > 0) zero(f.padsize);
                 continue;
             }
-            auto ft = si->ftypes[i];
+            auto ft = ftypes[i];
             auto init = sl->InitFor((int)i);
             if (!cg.IsFix(ft)) {
                 if (!init) No(sl->line, "omitted variable-size field");
