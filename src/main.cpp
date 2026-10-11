@@ -39,6 +39,7 @@
 #include "runtime_inline.h"
 #include "jit.h"
 #include "progress.h"
+#include "tinygen_backend.h"
 #include "process.h"
 #include "buildfile.h"
 #include "toolchain.h"
@@ -626,6 +627,12 @@ int Main(int argc, char **argv) {
     // A build is for a deliverable: the inlining and the C compiler's
     // optimization both at their highest.
     auto optlevel = verb == "build" ? 2 : 1;
+    auto optgiven = false;
+    // --backend=tinygen: the specializations tinygen supports go to a
+    // native object of its own, with debug information that names the
+    // Goose source (docs/design/tinygen_backend.md).
+    string backendname = "c";
+    vector<string> tinygenskip;
     vector<string> cdefines, progargs, includenames, files;
     for (int i = firstarg; i < argc; i++) {
         string arg = argv[i];
@@ -691,9 +698,22 @@ int Main(int argc, char **argv) {
             }
             return 0;
         }
-        else if (arg == "-O0") optlevel = 0;
-        else if (arg == "-O1") optlevel = 1;
-        else if (arg == "-O2") optlevel = 2;
+        else if (arg == "-O0") optlevel = 0, optgiven = true;
+        else if (arg == "-O1") optlevel = 1, optgiven = true;
+        else if (arg == "-O2") optlevel = 2, optgiven = true;
+        else if (arg.rfind("--backend=", 0) == 0) backendname = arg.substr(10);
+        else if (arg == "--backend" && i + 1 < argc) backendname = argv[++i];
+        // Hidden: functions the tinygen backend leaves to C, by name, for
+        // testing calls between the two halves.
+        else if (arg.rfind("--tinygen-skip=", 0) == 0) {
+            auto names = arg.substr(15);
+            for (size_t b = 0; b <= names.size();) {
+                auto e = names.find(',', b);
+                if (e == string::npos) e = names.size();
+                if (e > b) tinygenskip.push_back(names.substr(b, e - b));
+                b = e + 1;
+            }
+        }
         else if (arg == "-o" && i + 1 < argc) outname = argv[++i];
         else if (arg == "--header" && i + 1 < argc) headername = argv[++i];
         else if (arg == "--include" && i + 1 < argc) includenames.push_back(argv[++i]);
@@ -719,6 +739,27 @@ int Main(int argc, char **argv) {
         else files.push_back(arg);
     }
     if (verbose || dryrun) ProgressPlain();
+    if (backendname != "c" && backendname != "tinygen") {
+        fprintf(stderr, "unknown backend: %s (c or tinygen)\n", backendname.c_str());
+        return 1;
+    }
+    auto tinygen = backendname == "tinygen";
+    if (tinygen) {
+        #if !GOOSE_HAVE_TINYGEN
+            fprintf(stderr, "--backend=tinygen: this compiler was built without tinygen "
+                            "(TINYGEN_DIR, CMakeLists.txt)\n");
+            return 1;
+        #endif
+        if (verb != "build") {
+            fprintf(stderr, "--backend=tinygen works with goose build only so far\n");
+            return 1;
+        }
+        // A debug build: no inlining unless asked for, so that every Goose
+        // function is a function in the debugger, and the C half compiled
+        // with debug information and no optimization (--debug adds the
+        // checks of GS_DEBUG on both halves).
+        if (!optgiven) optlevel = 0;
+    }
     if (verb == "toolchain") {
         try {
             auto tools = FindTools(ccrequest, refresh);
@@ -757,7 +798,7 @@ int Main(int argc, char **argv) {
                             "(-o out.c) writes the C for a C host\n");
             return 1;
         }
-        buildopts = BuildOptions { debug, verbose, dryrun, standalone, outname };
+        buildopts = BuildOptions { debug || tinygen, verbose, dryrun, standalone, outname };
         outname.clear();
     }
     if (files.size() > 1 && !multitest) {
@@ -830,6 +871,8 @@ int Main(int argc, char **argv) {
     vector<string> includes;
     // What a JIT run compiles and starts, once the compile produced it.
     string program;
+    // The tinygen backend's object, when it compiled anything.
+    string tgobject;
     // The program's Ast outlives the compile: a build and a JIT run read
     // its packages, for the native parts the program needs (native.h).
     unique_ptr<Ast> astp;
@@ -926,8 +969,40 @@ int Main(int argc, char **argv) {
         for (auto &rf : runtime_files)
             if (string_view(rf.name) == "runtime_ext.h") runtime_ext_text = rf.text;
         auto stackcfg = StackConfigOf(cdefines);
-        CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, stackcfg.maxstacks);
+        #if GOOSE_HAVE_TINYGEN
+            unique_ptr<TinyGenBackend> tgb;
+            if (tinygen && !nocgen) {
+                auto checks = std::find(cdefines.begin(), cdefines.end(), "GS_DEBUG=1") !=
+                              cdefines.end();
+                tgb = make_unique<TinyGenBackend>(ast, checks, filename, runtime_ext_text);
+                tgb->skip = tinygenskip;
+            }
+            CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, stackcfg.maxstacks,
+                       tgb.get());
+        #else
+            CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, stackcfg.maxstacks);
+        #endif
         if (stacks) cg.StackReport(msgs, stackcfg);
+        #if GOOSE_HAVE_TINYGEN
+            if (tgb) {
+                tgb->Compile(cg);
+                cg.result += tgb->Shims(cg);
+                fprintf(msgs, "tinygen: %d of %d function(s) compiled, %d left to C\n",
+                        (int)tgb->taken.size(), (int)cg.livespecs.size(), (int)tgb->left.size());
+                if (verbose)
+                    for (auto &[sp, why] : tgb->left)
+                        fprintf(msgs, "tinygen: %s (%s:%d) left to C: %s\n",
+                                cg.sinfo[sp].cname.c_str(),
+                                ast.sources[sp->sf->line.fileidx].first.c_str(),
+                                sp->sf->line.line, why.c_str());
+                if (!tgb->taken.empty() && !outfile.empty()) {
+                    tgobject = cat(DirOf(outfile), PathStem(outfile), ".tg.o");
+                    string err;
+                    if (!dryrun && !tgb->Write(tgobject, err))
+                        throw CompileError { cat("tinygen: cannot write ", tgobject, ": ", err) };
+                }
+            }
+        #endif
         // The packages whose native parts the program needs, which a JIT
         // run takes functions from and a build links: its own, when it has
         // one, and every package an extern fn it calls was declared in,
@@ -1031,6 +1106,7 @@ int Main(int argc, char **argv) {
                 if (FileExists(inc)) inc = AbsolutePath(inc);
         }
         program.clear();
+        tgobject.clear();
         astp.reset();
         nativepkgs.clear();
         try {
@@ -1061,7 +1137,9 @@ int Main(int argc, char **argv) {
                     rsps.push_back(nb.rsp);
                 }
                 return BuildExecutable(filename, outfile, builddir, tc, buildopts, DirOf(exe),
-                                       msgs, rsps, astp->packages[0].output);
+                                       msgs, rsps, astp->packages[0].output,
+                                       tgobject.empty() ? vector<string> {}
+                                                        : vector<string> { tgobject });
             }
             if (program.empty()) return code;
             // The native parts the program reaches hand the run their

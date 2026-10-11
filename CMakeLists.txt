@@ -61,6 +61,7 @@ add_executable(goose
     src/codegen_nodes.h
     src/runtime_inline.h
     src/jit.h
+    src/tinygen_backend.h
     src/runtime/runtime.h
     src/runtime/runtime_impl.h
     src/runtime/runtime_threads.h

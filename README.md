@@ -460,6 +460,14 @@ program and each of its workers can take and the cap that puts on
 `hardware_threads()`, and `-DGS_STACK_STATS=1` makes a program report its
 actual use as it ends.
 
+`goose build --backend=tinygen` (experimental, for debugging) compiles the
+functions it supports through [tinygen](docs/design/tinygen_backend.md), a
+code generator for debug builds, when the compiler was built with a tinygen
+checkout beside this one (`TINYGEN_DIR`): in the debugger they are Goose
+functions, with their `.goose` lines and their locals under their Goose names
+and types. The rest of the program goes through C as usual; `-v` says which
+functions did and why.
+
 A program with C of its own names it in a sidecar beside the source,
 `foo.build` beside `foo.goose`: `c_sources = ["impl.c"];`, with `c_include`,
 `c_defines`, `c_libs` and `_windows`, `_linux` or `_macos` variants of each

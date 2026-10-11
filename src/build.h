@@ -208,9 +208,11 @@ inline string RuntimeObject(const Builder &b) {
 // code.
 inline int BuildExecutable(const string &rootfile, const string &cfile, const string &builddir,
                            const Toolchain &tc, const BuildOptions &opts, const string &exedir,
-                           FILE *msgs, const vector<string> &nativersps, const string &output) {
+                           FILE *msgs, const vector<string> &nativersps, const string &output,
+                           const vector<string> &extraobjects = {}) {
     Builder b { tc, opts, msgs };
-    vector<string> objects;
+    // Objects made beside the C (the tinygen backend's), then the runtime.
+    vector<string> objects = extraobjects;
     if (!opts.standalone) {
         auto obj = RuntimeObject(b);
         if (obj.empty()) return 1;
