@@ -482,34 +482,21 @@ struct TgModule {
     // ---- Signatures --------------------------------------------------------
 
     // Whether a call to sp, or sp's own definition (`define`), has a C
-    // interface this backend can match: declared parameters and results it
-    // holds (the first result the C value, every other one written through
-    // an out-pointer, `T *gs_r<i>`, after the parameters: CodeGen::SigParams),
-    // no free variables, no `return from` channel. A definition may take gs_sp (which it never
-    // uses, building nothing on a data stack); a callee must not, since
-    // the stacks it is handed would need accounting (codegen_stacks.h).
-    // The specializations this module's procedures may call although the C
-    // gives them gs_sp: the ones this backend compiles too, which never use
-    // it (Choose), and are passed 0.
-    const set<FnSpec *> *ours = nullptr;
-
+    // interface this backend can match (CodeGen::SigParams): declared
+    // parameters it holds, then a channel per result -- the C return value
+    // for the first fixed one (cret), an out-pointer `T *gs_r<i>` for every
+    // other fixed one, and a destination stack and count out-parameter
+    // (`gs_stack *gs_dst<i>, int64_t *gs_rl<i>`) for a resizable one --
+    // then gs_sp, where the C gives it one. No free variables, no `return
+    // from` channel.
     bool SigOk(FnSpec *sp, bool define, string &why) {
+        (void)define;
         auto &si = cg.sinfo[sp];
         if (sp->sf->isextern) { why = "extern"; return false; }
         if (!si.freevars.empty()) { why = "free variables"; return false; }
         if (si.hasrf || cg.fromids.count(sp)) { why = "return from"; return false; }
-        if (si.needssp && !define && !(ours && ours->count(sp))) {
-            why = "calls a function using data stacks";
-            return false;
-        }
         for (auto r : sp->rets)
-            if (!TypeOk(r)) { why = cat("result type ", Name(r)); return false; }
-        // A result this backend holds is fixed and not large, so the C
-        // returns the first one (CodeGen::CollectSpecs).
-        if (!sp->rets.empty() && si.cret != 0) {
-            why = "results";
-            return false;
-        }
+            if (!RetOk(r)) { why = cat("result type ", Name(r)); return false; }
         for (size_t i = 0; i < sp->argtypes.size(); i++)
             if (cg.IsPoolParam(sp, i) || !(TypeOk(sp->argtypes[i]) || RzParam(sp->argtypes[i]))) {
                 why = cat("parameter type ", Name(sp->argtypes[i]));
@@ -517,9 +504,13 @@ struct TgModule {
             }
         return true;
     }
+    // A result this backend holds: a fixed value, or a resizable array of
+    // fixed elements, built at the caller's destination stack.
+    bool RetOk(TypeExpr *t) { return TypeOk(t) || (IsGrow(t) && RzOk(t)); }
 
     tyg_sig *Sig(FnSpec *sp) {
         if (auto it = sigs.find(sp); it != sigs.end()) return it->second;
+        auto &si = cg.sinfo[sp];
         vector<const tyg_type *> ps;
         for (auto t : sp->argtypes) {
             // A by-value T[] is its image's address; a by-value T[>..] its
@@ -531,9 +522,16 @@ struct TgModule {
             ps.push_back(AT(t));
             if (RzParam(t)) ps.push_back(tyg_type_ptr(m));
         }
-        for (size_t i = 1; i < sp->rets.size(); i++) ps.push_back(tyg_type_ptr(m));
-        if (!sp->sf->isextern && cg.sinfo[sp].needssp) ps.push_back(tyg_type_int(m, TYG_I64, 1));
-        const tyg_type *ret = sp->rets.empty() ? nullptr : AT(sp->rets[0]);
+        for (size_t i = 0; i < sp->rets.size(); i++) {
+            if (IsGrow(sp->rets[i])) {
+                ps.push_back(tyg_type_ptr(m));   // gs_dst<i>
+                ps.push_back(tyg_type_ptr(m));   // gs_rl<i>
+            } else if ((int)i != si.cret) {
+                ps.push_back(tyg_type_ptr(m));   // gs_r<i>
+            }
+        }
+        if (!sp->sf->isextern && si.needssp) ps.push_back(tyg_type_int(m, TYG_I64, 1));
+        const tyg_type *ret = si.cret < 0 ? nullptr : AT(sp->rets[si.cret]);
         return sigs[sp] = tyg_sig_new(m, ret, ps.data(), (int)ps.size(), 0);
     }
     tyg_sig *ExternSig(FnSpec *sp) {
@@ -555,14 +553,36 @@ struct TgFn {
     unordered_map<const VarDef *, tyg_local> locals;
     struct LoopTargets {
         tyg_block brk, cnt;
+        size_t depth;   // The stack scopes open outside the body (sscopes).
     };
     vector<LoopTargets> loops;
-    // The specializations taking gs_sp this body calls, which it may only
-    // while they are tinygen's too (TinyGenBackend::Choose).
-    set<FnSpec *> relied;
-    // The out-pointers of results after the first (rets[i] at outs[i - 1]),
-    // each kept in a local.
-    vector<tyg_local> outs;
+    // Each result's channel (CodeGen::SigParams), its parameters kept in
+    // locals: an out-pointer in `a` for a fixed result other than the C
+    // return value; a destination stack in `a` and the count's
+    // out-parameter in `b` for a resizable one.
+    struct Chan {
+        tyg_local a = 0, b = 0;
+    };
+    vector<Chan> chans;
+    // Data stacks (§6.2), as the C backend uses them: gs_sp in a local,
+    // the thread's stack block (gs_stks) read once per invocation (gblk);
+    // the body's own stacks are GS(gs_sp + k), k counted up as locals and
+    // temporaries take one (AllocStk) and down as their scopes end, and a
+    // callee is handed gs_sp + the indices in use. Every scope restores
+    // the tops of the stacks it took, on every way out of it, from marks
+    // saved as each was taken (CodeGen::CScope).
+    tyg_local spl = 0, stksl = 0;
+    int live = 0, maxown = 0;
+    vector<CodeGen::StackCall> stackcalls;
+    struct Mark {
+        int k;
+        tyg_local top;
+    };
+    struct SScope {
+        bool stmt;
+        vector<Mark> marks;
+    };
+    vector<SScope> sscopes;
     // The globals of the C half's instance this body names, each with the
     // local holding its address. The accessors that give them are called
     // once per invocation, in a block the entry block jumps to (gblk),
@@ -586,6 +606,7 @@ struct TgFn {
         tyg_addr a {};
         bool mem = false;
         TypeExpr *t = nullptr;
+        tyg_val stk = 0;   // A resizable's stack, its header at a.
     };
     // A place: memory holding a value of type t, and for a resizable
     // array the stack its elements grow on, where known (else 0).
@@ -617,6 +638,154 @@ struct TgFn {
         int64_t align = 1;
         while (align < 8 && align * 2 <= sz) align *= 2;
         return tyg_local_new(p, sz, align);
+    }
+
+    // ---- Data stacks ---------------------------------------------------------
+
+    tyg_val SpVal(Line l) {
+        if (!spl) No(l, "data stack without gs_sp");
+        return tyg_load(p, TYG_I64, tyg_at_local(spl, 0), 0);
+    }
+    // GS(gs_sp + k): the gs_stack (one pointer, its top) at that index.
+    tyg_val Stk(int k, Line l) {
+        auto sp0 = SpVal(l);
+        if (!stksl) {
+            stksl = tyg_local_new(p, 8, 8);
+            M.NeedShim("gs_tg_stks", "void *gs_tg_stks(void) { return gs_stks; }\n");
+        }
+        auto base = tyg_load(p, TYG_I64, tyg_at_local(stksl, 0), 0);
+        auto idx = tyg_bin(p, TYG_ADD, sp0, tyg_iconst(p, TYG_I64, k));
+        return tyg_bin(p, TYG_ADD, base, tyg_bin(p, TYG_MUL, idx, tyg_iconst(p, TYG_I64, 8)));
+    }
+    tyg_val Top(tyg_val stk) { return tyg_load(p, TYG_I64, tyg_at_val(stk, 0), 0); }
+    void SetTop(tyg_val stk, tyg_val top) { tyg_store(p, TYG_I64, tyg_at_val(stk, 0), top, 0); }
+
+    // The next free index, for a local (in the innermost scope that is not
+    // a statement's, AllocStk(forlocal) in the C) or a temporary (in the
+    // statement's), its top saved to restore.
+    int AllocStk(bool forlocal, Line l) {
+        auto k = live++;
+        maxown = std::max(maxown, live);
+        auto mark = tyg_local_new(p, 8, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(mark, 0), Top(Stk(k, l)), 0);
+        auto i = sscopes.size() - 1;
+        while (forlocal && i > 0 && sscopes[i].stmt) i--;
+        sscopes[i].marks.push_back({ k, mark });
+        return k;
+    }
+    void Restore(const SScope &sc) {
+        for (size_t i = sc.marks.size(); i-- > 0;)
+            SetTop(Stk(sc.marks[i].k, Line {}), tyg_load(p, TYG_I64, tyg_at_local(sc.marks[i].top, 0), 0));
+    }
+    // The restores of every scope from `depth` in, innermost first: a
+    // break's, a continue's, a return's (from 0).
+    void RestoreFrom(size_t depth) {
+        for (size_t i = sscopes.size(); i-- > depth;) Restore(sscopes[i]);
+    }
+    void OpenScope(bool stmt) { sscopes.push_back({ stmt, {} }); }
+    void CloseScope() {
+        auto sc = std::move(sscopes.back());
+        sscopes.pop_back();
+        if (!Ended()) Restore(sc);
+        live -= (int)sc.marks.size();
+    }
+
+    // A call handed gs_sp + the indices in use: none into the recursive
+    // cycle this function is in (§7.8; CodeGen::NoStackAcrossCycleCall),
+    // which the C backend's allocation guarantees and this one's may not.
+    tyg_val CalleeSp(FnSpec *callee, Line l) {
+        auto cycle = [](FnSpec *s) {
+            while (s->cyclelink) s = s->cyclelink;
+            return s;
+        };
+        if (live && sp->incycle && callee->incycle && cycle(sp) == cycle(callee))
+            No(l, "data stack held across a call into the recursive cycle");
+        stackcalls.push_back({ callee, live, l });
+        return tyg_bin(p, TYG_ADD, SpVal(l), tyg_iconst(p, TYG_I64, live));
+    }
+
+    // Appends x, of the element type et, at the top of stk to the
+    // resizable whose count is at len.
+    void PushRaw(tyg_val stk, tyg_addr len, TypeExpr *et, const V &x) {
+        auto top = Top(stk);
+        Store(P { tyg_at_val(top, 0), et }, x);
+        SetTop(stk, tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, cg.FixedSize(et))));
+        tyg_store(p, TYG_I64, len, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, len, 0), tyg_iconst(p, TYG_I64, 1)), 0);
+    }
+    // Copies n elements of et from elems to the top of stk, adding them to
+    // the count at len. The source may lie on stk itself, below its top.
+    void CopyRun(tyg_val stk, tyg_addr len, TypeExpr *et, tyg_val elems, tyg_val n) {
+        auto top = Top(stk);
+        auto bytes = tyg_bin(p, TYG_MUL, n, tyg_iconst(p, TYG_I64, cg.FixedSize(et)));
+        tyg_move_dyn(p, top, elems, bytes);
+        SetTop(stk, tyg_bin(p, TYG_ADD, top, bytes));
+        tyg_store(p, TYG_I64, len, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, len, 0), n), 0);
+    }
+
+    // Builds n's value, a resizable array of type t, at the top of stk,
+    // its header at hdr (CodeGen::GenConstruct): a literal's elements one
+    // by one, a call's at the destination it is handed, anything else (an
+    // array, a slice, copy(x)) as a copy of its elements.
+    void GenRz(Node *n, tyg_val stk, tyg_addr hdr, TypeExpr *t, Line l) {
+        auto et = t->arr->sub;
+        if (auto c = Is<Call>(n); c && c->builtin == B_COPY && c->ArgNodes().size() == 1)
+            n = c->ArgNodes()[0];
+        auto len = hdr;
+        len.offset += 8;
+        auto begin = [&] {
+            tyg_store(p, TYG_I64, hdr, Top(stk), 0);
+            tyg_store(p, TYG_I64, len, tyg_iconst(p, TYG_I64, 0), 0);
+        };
+        if (auto al = Is<ArrayLit>(n)) {
+            if (al->fillval || al->capexpr) No(l, "array literal of this kind");
+            begin();
+            for (auto e : al->elems) {
+                auto x = GenAs(e, et);
+                if (Ended()) return;
+                if (!M.IsScalar(et) && !x.mem) No(e->line, "aggregate value");
+                PushRaw(stk, len, et, x);
+            }
+            return;
+        }
+        if (auto c = Is<Call>(n); c && c->builtin < 0 && c->spec && !c->spec->sf->isextern &&
+                                   !c->spec->rets.empty() && IsGrow(c->spec->rets[0])) {
+            if (cg.Mangle(c->spec->rets[0]->arr->sub) != cg.Mangle(et)) No(l, "result of another element type");
+            RzDst d { stk, hdr };
+            rzdst = &d;
+            GenCall(c);
+            rzdst = nullptr;
+            return;
+        }
+        if (auto s = Is<StrLit>(n)) {
+            if (!IsU8(et)) No(l, "string of this type");
+            begin();
+            CopyRun(stk, len, et, tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)),
+                    tyg_iconst(p, TYG_I64, (int64_t)s->val.size()));
+            return;
+        }
+        auto pl = Place(n);
+        if (Ended()) return;
+        auto v = ViewOf(pl, l);
+        if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
+        begin();
+        CopyRun(stk, len, et, v.elems, v.len);
+    }
+    // Where GenCall builds a call's first result, a resizable, instead of
+    // a temporary of its own: a local's stack, a return destination.
+    struct RzDst {
+        tyg_val stk;
+        tyg_addr hdr;
+    };
+    const RzDst *rzdst = nullptr;
+
+    // A resizable temporary: a stack of the statement's, its header.
+    V RzTemp(TypeExpr *t, Line l) {
+        V x;
+        x.t = t;
+        x.mem = true;
+        x.stk = Stk(AllocStk(false, l), l);
+        x.a = tyg_at_local(tyg_local_new(p, 16, 8), 0);
+        return x;
     }
 
     // ---- Conversions -------------------------------------------------------
@@ -743,7 +912,7 @@ struct TgFn {
         if (auto ix = Is<Index>(n)) return IndexPlace(ix);
         // Any other value: in memory of its own.
         auto x = Gen(n);
-        if (x.mem) return P { x.a, x.t };
+        if (x.mem) return P { x.a, x.t, x.stk };
         if (!x.t || x.t->kind == TY_VOID) No(n->line, "place of no value");
         auto t = Temp(x.t);
         P pl { tyg_at_local(t, 0), x.t };
@@ -786,6 +955,21 @@ struct TgFn {
     }
     V GenAs(Node *n, TypeExpr *t) {
         if (t && t->kind == TY_SLICE) return GenSliceAs(n, t);
+        if (t && t->kind == TY_REF && cg.IsFatRef(t) && n->exprtype && IsGrow(n->exprtype)) {
+            // A resizable where a reference to one is wanted: gs_rref, its
+            // header's address and its stack.
+            auto pl = Deref(Place(n));
+            if (Ended()) return Dummy(t);
+            if (!pl.stk) No(n->line, "reference to an array of this kind");
+            auto tmp = tyg_local_new(p, 16, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(tmp, 0), tyg_addr_of(p, pl.a), 0);
+            tyg_store(p, TYG_I64, tyg_at_local(tmp, 8), pl.stk, 0);
+            V x;
+            x.t = t;
+            x.mem = true;
+            x.a = tyg_at_local(tmp, 0);
+            return x;
+        }
         return Fit(Gen(n), t, n->line);
     }
     tyg_val Truth(Node *n) {
@@ -975,7 +1159,9 @@ struct TgFn {
             if (op == T_ANDAND) tyg_branch(p, lb, rhs, done);
             else tyg_branch(p, lb, done, rhs);
             tyg_block_set(p, rhs);
+            OpenScope(true);   // Its temporaries exist only when it runs.
             auto r = Truth(b->right);
+            CloseScope();
             if (!Ended()) {
                 tyg_store(p, TYG_I8, tyg_at_local(t, 0), tyg_cmp(p, TYG_NE, r, tyg_iconst(p, TYG_I8, 0)), 0);
                 tyg_jump(p, done);
@@ -1409,13 +1595,14 @@ struct TgFn {
     // value, the others where the callee wrote them through out-pointers.
     vector<V> lastrets;
 
-    V Result(FnSpec *callee, tyg_sig *sig, tyg_callee ce, vector<tyg_arg> &args) {
+    // The call, and its C return value: rets[cret], none where cret < 0.
+    V Result(FnSpec *callee, int cret, tyg_sig *sig, tyg_callee ce, vector<tyg_arg> &args) {
         V x;
-        if (callee->rets.empty()) {
+        if (cret < 0) {
             tyg_call(p, sig, ce, args.data(), (int)args.size(), nullptr, nullptr);
             return x;
         }
-        auto rt = callee->rets[0];
+        auto rt = callee->rets[cret];
         x.t = rt;
         if (M.IsScalar(rt)) {
             x.v = tyg_call(p, sig, ce, args.data(), (int)args.size(), nullptr, nullptr);
@@ -1430,9 +1617,12 @@ struct TgFn {
     }
 
     V GenCall(Call *c) {
+        auto dst = rzdst;   // For this call only, not for its arguments'.
+        rzdst = nullptr;
         if (c->builtin == B_PRINT) return GenPrint(c);
         if (c->builtin == B_LEN && c->ArgNodes().size() == 1) return GenLen(c->ArgNodes()[0], c);
         if (c->builtin == B_PUSH && c->ArgNodes().size() == 2) return GenPush(c);
+        if (c->builtin == B_APPEND && c->ArgNodes().size() == 2) return GenAppend(c);
         if (c->builtin >= 0) No(c->line, cat("builtin ", BuiltinByKind(c->builtin).name));
         if (c->fvbody || !c->dispatch.empty() || !c->fvremap.empty() || !c->spec)
             No(c->line, "call kind");
@@ -1443,45 +1633,78 @@ struct TgFn {
         if (callee->sf->isextern) return GenExternCall(c, callee, an);
         string why;
         if (!M.SigOk(callee, false, why)) No(c->line, cat("call to ", callee->sf->name, ": ", why));
+        auto &ci = cg.sinfo[callee];
         vector<tyg_arg> args;
-        for (size_t i = 0; i < an.size(); i++) args.push_back(Arg(an[i], callee->argtypes[i]));
+        for (size_t i = 0; i < an.size(); i++) {
+            auto pt = callee->argtypes[i];
+            if (M.RzParam(pt)) {
+                // A by-value resizable: a copy of its own, on a stack of the
+                // statement's, as its header and its stack.
+                if (!IsGrow(pt)) No(an[i]->line, "by-value array argument");
+                auto x = RzTemp(pt, an[i]->line);
+                GenRz(an[i], x.stk, x.a, pt, an[i]->line);
+                tyg_arg h {}, k {};
+                h.mem = x.a;
+                k.val = x.stk;
+                args.push_back(h);
+                args.push_back(k);
+                continue;
+            }
+            args.push_back(Arg(an[i], pt));
+        }
         lastrets.clear();
         if (Ended()) {
             for (auto r : callee->rets) lastrets.push_back(Dummy(r));
             return Dummy(callee->rets.empty() ? nullptr : callee->rets[0]);
         }
-        // Results after the first land in temporaries, through out-pointers
-        // after the declared arguments (C.3).
-        vector<V> extra;
-        for (size_t i = 1; i < callee->rets.size(); i++) {
-            V r;
+        // A channel per result after the declared arguments (C.3): a
+        // resizable's destination stack -- a temporary's, or the one this
+        // call builds at -- and the count's address; a temporary's address
+        // for a fixed result the C does not return.
+        vector<V> rets(callee->rets.size());
+        for (size_t i = 0; i < callee->rets.size(); i++) {
+            auto &r = rets[i];
             r.t = callee->rets[i];
+            if (IsGrow(r.t)) {
+                if (i == 0 && dst) {
+                    r.mem = true;
+                    r.stk = dst->stk;
+                    r.a = dst->hdr;
+                } else {
+                    r = RzTemp(r.t, c->line);
+                }
+                auto len = r.a;
+                len.offset += 8;
+                tyg_store(p, TYG_I64, r.a, Top(r.stk), 0);
+                tyg_store(p, TYG_I64, len, tyg_iconst(p, TYG_I64, 0), 0);
+                tyg_arg s {}, n {};
+                s.val = r.stk;
+                n.val = tyg_addr_of(p, len);
+                args.push_back(s);
+                args.push_back(n);
+                continue;
+            }
+            if ((int)i == ci.cret) continue;
             auto t = Temp(r.t);
             r.a = tyg_at_local(t, 0);
             tyg_arg a {};
             a.val = tyg_addr_of(p, r.a);
             args.push_back(a);
-            if (M.IsScalar(r.t)) r.v = 0;
-            else r.mem = true;
-            extra.push_back(r);
+            if (!M.IsScalar(r.t)) r.mem = true;
         }
-        if (cg.sinfo[callee].needssp) {
-            relied.insert(callee);
-            tyg_arg sp0 {};
-            sp0.val = tyg_iconst(p, TYG_I64, 0);
-            args.push_back(sp0);
+        if (ci.needssp) {
+            tyg_arg s {};
+            s.val = CalleeSp(callee, c->line);
+            args.push_back(s);
         }
-        auto sym = M.Sym(cg.sinfo[callee].cname, TYG_SYM_FUNC | TYG_SYM_GLOBAL);
-        auto x = Result(callee, M.Sig(callee), tyg_direct(sym), args);
-        lastrets.push_back(x);
-        for (auto &r : extra) {
-            if (M.IsScalar(r.t)) {
-                lastrets.push_back(Load(P { r.a, r.t }, c->line));
-            } else {
-                lastrets.push_back(r);
-            }
+        auto sym = M.Sym(ci.cname, TYG_SYM_FUNC | TYG_SYM_GLOBAL);
+        auto x = Result(callee, ci.cret, M.Sig(callee), tyg_direct(sym), args);
+        for (size_t i = 0; i < rets.size(); i++) {
+            if ((int)i == ci.cret) lastrets.push_back(x);
+            else if (M.IsScalar(rets[i].t)) lastrets.push_back(Load(P { rets[i].a, rets[i].t }, c->line));
+            else lastrets.push_back(rets[i]);
         }
-        return x;
+        return lastrets.empty() ? V {} : lastrets[0];
     }
 
     // v.push(x) for a fixed element (EmitPush): the receiver, then the
@@ -1496,18 +1719,54 @@ struct TgFn {
         auto x = GenAs(an[1], et);
         if (Ended()) return Dummy(c->exprtype);
         if (!M.IsScalar(et) && !x.mem) No(c->line, "aggregate value");
-        auto top = tyg_load(p, TYG_I64, tyg_at_val(pl.stk, 0), 0);
-        Store(P { tyg_at_val(top, 0), et }, x);
-        tyg_store(p, TYG_I64, tyg_at_val(pl.stk, 0),
-                  tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, cg.FixedSize(et))), 0);
+        auto top = Top(pl.stk);
         auto la = pl.a;
         la.offset += 8;
-        auto n = tyg_load(p, TYG_I64, la, 0);
-        tyg_store(p, TYG_I64, la, tyg_bin(p, TYG_ADD, n, tyg_iconst(p, TYG_I64, 1)), 0);
+        PushRaw(pl.stk, la, et, x);
         V r;
         r.t = c->exprtype && c->exprtype->kind == TY_REF ? c->exprtype : nullptr;
         if (r.t) r.v = top;
         return r;
+    }
+
+    // v.append(x) (EmitAppend): a call's resizable result built straight
+    // at v's top, its count added; anything else holding elements (an
+    // array, a slice, a string literal, copy(x)) copied there.
+    V GenAppend(Call *c) {
+        auto an = c->ArgNodes();
+        auto pl = Deref(Place(an[0]));
+        if (!IsGrow(pl.t) || !M.RzOk(pl.t) || !pl.stk) No(c->line, "append to an array of this kind");
+        auto et = pl.t->arr->sub;
+        auto len = pl.a;
+        len.offset += 8;
+        auto src = an[1];
+        if (auto cc = Is<Call>(src); cc && cc->builtin == B_COPY && cc->ArgNodes().size() == 1)
+            src = cc->ArgNodes()[0];
+        auto st = src->exprtype;
+        if (Is<Call>(src) && st && IsGrow(st) && !Is<Call>(src)->spec) No(c->line, "append of this call");
+        if (auto cc = Is<Call>(src); cc && cc->builtin < 0 && st && IsGrow(st)) {
+            auto tmp = tyg_local_new(p, 16, 8);
+            GenRz(src, pl.stk, tyg_at_local(tmp, 0), st, c->line);
+            if (Ended()) return V {};
+            tyg_store(p, TYG_I64, len,
+                      tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, len, 0),
+                              tyg_load(p, TYG_I64, tyg_at_local(tmp, 8), 0)), 0);
+            return V {};
+        }
+        if (auto s = Is<StrLit>(src)) {
+            if (!IsU8(et)) No(c->line, "string of this type");
+            CopyRun(pl.stk, len, et, tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)),
+                    tyg_iconst(p, TYG_I64, (int64_t)s->val.size()));
+            return V {};
+        }
+        // A literal is a fixed array, all of it evaluated before any of it
+        // is copied, as in the C.
+        auto from = Place(src);
+        if (Ended()) return V {};
+        auto v = ViewOf(from, c->line);
+        if (cg.Mangle(v.elem) != cg.Mangle(et)) No(c->line, "append of another element type");
+        CopyRun(pl.stk, len, et, v.elems, v.len);
+        return V {};
     }
     static bool IsGrow(TypeExpr *t) { return TgModule::IsGrow(t); }
 
@@ -1560,7 +1819,7 @@ struct TgFn {
         if (!known) M.externs.push_back(callee);
         if (Ended()) return Dummy(callee->rets.empty() ? nullptr : callee->rets[0]);
         auto sym = M.Sym(cat("gs_tg_x_", callee->sf->cname), TYG_SYM_FUNC | TYG_SYM_GLOBAL);
-        return Result(callee, M.ExternSig(callee), tyg_direct(sym), args);
+        return Result(callee, callee->rets.empty() ? -1 : 0, M.ExternSig(callee), tyg_direct(sym), args);
     }
 
     // print(...) (§3.7): every argument is evaluated before any text is
@@ -1614,29 +1873,44 @@ struct TgFn {
     // ---- Control -----------------------------------------------------------
 
     // A block's value is its tail's (none in statement position).
-    V GenBlock(Block *b, bool discard) {
+    // A block's value is its tail's (none in statement position); a
+    // function body's tail with a result is returned (tailret).
+    V GenBlock(Block *b, bool discard, bool tailret = false) {
         tyg_scope_begin(p);
+        OpenScope(false);
         for (auto s : b->stmts) Stmt(s);
         V x;
         if (b->tail) {
-            if (discard) Stmt(b->tail);
-            else {
+            if (tailret) {
+                Open();
+                Loc(b->tail->line);
+                DoReturn({ b->tail }, b->tail->line);
+            } else if (discard) {
+                Stmt(b->tail);
+            } else {
                 Open();
                 Loc(b->tail->line);
                 x = Gen(b->tail);
+                if (x.t && IsGrow(x.t)) No(b->tail->line, "array value of a block");
             }
         }
+        CloseScope();
         tyg_scope_end(p);
         return x;
     }
 
+    // An arm runs or not: what it takes on a stack is its own.
     V GenArm(Node *n, bool discard) {
         if (auto b = Is<Block>(n)) return GenBlock(b, discard);
         if (discard) {
             Stmt(n);
             return V {};
         }
-        return Gen(n);
+        OpenScope(true);
+        auto x = Gen(n);
+        if (x.t && IsGrow(x.t)) No(n->line, "array value of an arm");
+        CloseScope();
+        return x;
     }
 
     V GenIf(IfExpr *i, bool discard) {
@@ -1666,9 +1940,15 @@ struct TgFn {
 
     // ---- Statements ----------------------------------------------------------
 
+    // A statement's temporaries' stacks are free again at its end.
     void Stmt(Node *n) {
         Open();
         Loc(n->line);
+        OpenScope(true);
+        Stmt1(n);
+        CloseScope();
+    }
+    void Stmt1(Node *n) {
         switch (n->nkind) {
             case NK_VarDecl: return StmtVarDecl(static_cast<VarDecl *>(n));
             case NK_Assign: return StmtAssign(static_cast<Assign *>(n));
@@ -1688,9 +1968,12 @@ struct TgFn {
                 tyg_jump(p, head);
                 tyg_block_set(p, head);
                 Loc(w->cond->line);
-                tyg_branch(p, Truth(w->cond), body, done);
+                OpenScope(true);
+                auto c = Truth(w->cond);
+                CloseScope();
+                tyg_branch(p, c, body, done);
                 tyg_block_set(p, body);
-                loops.push_back({ done, head });
+                loops.push_back({ done, head, sscopes.size() });
                 GenBlock(w->body, true);
                 loops.pop_back();
                 Jump(head);
@@ -1703,7 +1986,7 @@ struct TgFn {
                 auto body = tyg_block_new(p), done = tyg_block_new(p);
                 tyg_jump(p, body);
                 tyg_block_set(p, body);
-                loops.push_back({ done, body });
+                loops.push_back({ done, body, sscopes.size() });
                 GenBlock(lp->body, true);
                 loops.pop_back();
                 Jump(body);
@@ -1714,27 +1997,19 @@ struct TgFn {
             case NK_Return: {
                 auto r = static_cast<Return *>(n);
                 if (r->target != sp->sf) No(n->line, "return from");
-                if (sp->rets.size() > 1) return ReturnMany(r);
-                if (r->vals.empty() || sp->rets.empty()) {
-                    for (auto v : r->vals) Gen(v);
-                    if (!Ended()) tyg_ret(p, 0);
-                    return;
-                }
-                auto x = GenAs(r->vals[0], sp->rets[0]);
-                if (Ended()) return;
-                if (x.mem) tyg_ret_mem(p, x.a);
-                else tyg_ret(p, x.v);
-                return;
+                return DoReturn(r->vals, r->line);
             }
             case NK_Break: {
                 auto b = static_cast<Break *>(n);
                 if (b->val) No(n->line, "break with a value");
                 if (loops.empty()) No(n->line, "break target");
+                RestoreFrom(loops.back().depth);
                 tyg_jump(p, loops.back().brk);
                 return;
             }
             case NK_Continue:
                 if (loops.empty()) No(n->line, "continue target");
+                RestoreFrom(loops.back().depth);
                 tyg_jump(p, loops.back().cnt);
                 return;
             case NK_FnDecl: case NK_StructDecl: case NK_EnumDecl: case NK_AliasDecl: return;
@@ -1744,31 +2019,88 @@ struct TgFn {
         }
     }
 
-    // return a, b (each result in turn, the ones after the first written
-    // through their out-pointers as they are made, as the C does), or
-    // return f() forwarding all of a call's results (§7.1).
-    void ReturnMany(Return *r) {
+    // return, return x, return a, b (each result in turn, the ones the C
+    // does not return written through their channels as they are made, as
+    // the C does), or return f() forwarding all of a call's results (§7.1).
+    // A resizable result is built at its destination stack, its count
+    // written through its out-parameter. Then every scope's stacks are
+    // restored, and the C return value returned.
+    void DoReturn(const vector<Node *> &vals, Line l) {
         auto &rets = sp->rets;
-        vector<V> xs;
-        if (r->vals.size() == 1) xs = GenCallAll(r->vals[0], rets.size());
-        else if (r->vals.size() != rets.size()) No(r->line, "result count");
-        P first { tyg_at_local(Temp(rets[0]), 0), rets[0] };
-        for (size_t i = 0; i < rets.size(); i++) {
-            auto x = xs.empty() ? GenAs(r->vals[i], rets[i]) : Fit(xs[i], rets[i], r->line);
+        auto cret = cg.sinfo[sp].cret;
+        if (rets.empty()) {
+            for (auto v : vals) Gen(v);
             if (Ended()) return;
-            if (!M.IsScalar(rets[i]) && !x.mem) No(r->line, "aggregate value");
-            if (i == 0) {
+            RestoreFrom(0);
+            tyg_ret(p, 0);
+            return;
+        }
+        if (rets.size() == 1 && cret == 0) {
+            auto x = GenAs(vals.at(0), rets[0]);
+            if (Ended()) return;
+            if (!M.IsScalar(rets[0]) && !x.mem) No(l, "aggregate value");
+            RestoreFrom(0);
+            if (x.mem) tyg_ret_mem(p, x.a);
+            else tyg_ret(p, x.v);
+            return;
+        }
+        vector<V> xs;
+        if (vals.size() == 1 && rets.size() > 1) xs = GenCallAll(vals[0], rets.size());
+        else if (vals.size() != rets.size()) No(l, "result count");
+        P first {};
+        if (cret >= 0) first = P { tyg_at_local(Temp(rets[cret]), 0), rets[cret] };
+        for (size_t i = 0; i < rets.size(); i++) {
+            if (IsGrow(rets[i])) {
+                auto dst = tyg_load(p, TYG_I64, tyg_at_local(chans[i].a, 0), 0);
+                auto hdr = tyg_at_local(tyg_local_new(p, 16, 8), 0);
+                if (xs.empty()) {
+                    GenRz(vals[i], dst, hdr, rets[i], l);
+                } else {
+                    auto v = ViewOf(P { xs[i].a, xs[i].t, xs[i].stk }, l);
+                    tyg_store(p, TYG_I64, hdr, Top(dst), 0);
+                    auto len = hdr;
+                    len.offset += 8;
+                    tyg_store(p, TYG_I64, len, tyg_iconst(p, TYG_I64, 0), 0);
+                    CopyRun(dst, len, rets[i]->arr->sub, v.elems, v.len);
+                }
+                if (Ended()) return;
+                auto len = hdr;
+                len.offset += 8;
+                auto rl = tyg_load(p, TYG_I64, tyg_at_local(chans[i].b, 0), 0);
+                tyg_store(p, TYG_I64, tyg_at_val(rl, 0), tyg_load(p, TYG_I64, len, 0), 0);
+                continue;
+            }
+            auto x = xs.empty() ? GenAs(vals[i], rets[i]) : Fit(xs[i], rets[i], l);
+            if (Ended()) return;
+            if (!M.IsScalar(rets[i]) && !x.mem) No(l, "aggregate value");
+            if ((int)i == cret) {
                 Store(first, x);
                 continue;
             }
-            auto ptr = tyg_load(p, TYG_I64, tyg_at_local(outs[i - 1], 0), 0);
+            auto ptr = tyg_load(p, TYG_I64, tyg_at_local(chans[i].a, 0), 0);
             Store(P { tyg_at_val(ptr, 0), rets[i] }, x);
         }
-        if (M.IsScalar(rets[0])) tyg_ret(p, tyg_load(p, M.Scal(rets[0]), first.a, 0));
+        RestoreFrom(0);
+        if (cret < 0) tyg_ret(p, 0);
+        else if (M.IsScalar(rets[cret])) tyg_ret(p, tyg_load(p, M.Scal(rets[cret]), first.a, 0));
         else tyg_ret_mem(p, first.a);
     }
 
     void Declare(VarDef *d, Line l) {
+        if (IsGrow(d->type) && M.RzOk(d->type) && !cg.PrefVar(d)) {
+            // A resizable local: its header, and a stack of its own, empty.
+            auto stk = Stk(AllocStk(true, l), l);
+            auto hdr = tyg_local_new(p, 16, 8);
+            auto sl = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(sl, 0), stk, 0);
+            tyg_store(p, TYG_I64, tyg_at_local(hdr, 0), Top(stk), 0);
+            tyg_store(p, TYG_I64, tyg_at_local(hdr, 8), tyg_iconst(p, TYG_I64, 0), 0);
+            locals[d] = hdr;
+            rzstk[d] = sl;
+            tyg_debug_var(p, string(d->name).c_str(), M.DT(d->type), tyg_at_local(hdr, 0),
+                          M.File(d->line.fileidx), d->line.line);
+            return;
+        }
         if (!M.TypeOk(d->type) || cg.PrefVar(d)) No(l, cat("variable type of ", d->name, ": ", M.Name(d->type)));
         auto loc = Temp(d->type);
         locals[d] = loc;
@@ -1784,6 +2116,16 @@ struct TgFn {
             auto xs = GenCallAll(vd->inits[0], vd->defs.size());
             for (size_t i = 0; i < xs.size(); i++) {
                 auto d = vd->defs[i];
+                if (IsGrow(d->type) && !Ended()) {
+                    // A resizable result, copied from its temporary onto
+                    // the local's own stack.
+                    if (!IsGrow(xs[i].t) || cg.Mangle(xs[i].t->arr->sub) != cg.Mangle(d->type->arr->sub))
+                        No(vd->line, "array result of another type");
+                    auto v = ViewOf(P { xs[i].a, xs[i].t, xs[i].stk }, vd->line);
+                    auto stk = tyg_load(p, TYG_I64, tyg_at_local(rzstk[d], 0), 0);
+                    CopyRun(stk, tyg_at_local(locals[d], 8), d->type->arr->sub, v.elems, v.len);
+                    continue;
+                }
                 auto x = Fit(xs[i], d->type, vd->line);
                 if (!M.IsScalar(d->type) && !x.mem && !Ended()) No(vd->line, "aggregate value");
                 Store(P { tyg_at_local(locals[d], 0), d->type }, x);
@@ -1791,10 +2133,19 @@ struct TgFn {
             return;
         }
         if (!vd->inits.empty() && vd->inits.size() != vd->defs.size()) No(vd->line, "declaration kind");
+        // Every local first, so that a resizable one's stack lies under
+        // what its initializer takes for itself.
+        for (auto d : vd->defs) Declare(d, vd->line);
         for (size_t i = 0; i < vd->defs.size(); i++) {
             auto d = vd->defs[i];
-            Declare(d, vd->line);
             P pl { tyg_at_local(locals[d], 0), d->type };
+            if (IsGrow(d->type)) {
+                // Built in place, on its own stack.
+                if (!vd->inits.empty())
+                    GenRz(vd->inits[i], tyg_load(p, TYG_I64, tyg_at_local(rzstk[d], 0), 0), pl.a, d->type,
+                          vd->line);
+                continue;
+            }
             if (vd->inits.empty()) tyg_zero(p, pl.a, M.Size(d->type));
             else Into(pl, vd->inits[i]);
         }
@@ -1900,7 +2251,7 @@ struct TgFn {
             tyg_store(p, M.Scal(f->idxdef->type), tyg_at_local(locals[f->idxdef], 0),
                       Conv(tyg_load(p, TYG_I64, tyg_at_local(ix, 0), 0), M.ast.inttypes[IS_I64],
                            f->idxdef->type, f->line), 0);
-        loops.push_back({ done, step });
+        loops.push_back({ done, step, sscopes.size() });
         GenBlock(f->body, true);
         loops.pop_back();
         Jump(step);
@@ -1957,7 +2308,7 @@ struct TgFn {
         if (f->idxdef)
             tyg_store(p, M.Scal(f->idxdef->type), tyg_at_local(locals[f->idxdef], 0),
                       Conv(i, M.ast.inttypes[IS_I64], f->idxdef->type, f->line), 0);
-        loops.push_back({ done, step });
+        loops.push_back({ done, step, sscopes.size() });
         GenBlock(f->body, true);
         loops.pop_back();
         Jump(step);
@@ -1986,7 +2337,8 @@ struct TgFn {
             else pdt.push_back(M.DT(t));
             if (M.RzParam(t) && IsGrow(t)) pdt.push_back(tyg_dt_pointer(m, M.StackDT()));
         }
-        auto fdt = tyg_dt_func(m, sp->rets.empty() ? tyg_dt_void(m) : M.DT(sp->rets[0]), pdt.data(),
+        auto cret = cg.sinfo[sp].cret;
+        auto fdt = tyg_dt_func(m, cret < 0 ? tyg_dt_void(m) : M.DT(sp->rets[cret]), pdt.data(),
                                (int)pdt.size(), 0);
         tyg_debug_proc(p, string(sp->sf->qname).c_str(), file, sp->sf->line.line, fdt);
         Loc(sp->sf->line);
@@ -2019,33 +2371,43 @@ struct TgFn {
                 rzstk[vd] = sl;
             }
         }
-        for (size_t i = 1; i < sp->rets.size(); i++) {
+        auto param = [&] {
             auto loc = tyg_local_new(p, 8, 8);
             tyg_store(p, TYG_I64, tyg_at_local(loc, 0), tyg_param(p, pi++), 0);
-            outs.push_back(loc);
+            return loc;
+        };
+        chans.resize(sp->rets.size());
+        for (size_t i = 0; i < sp->rets.size(); i++) {
+            if (IsGrow(sp->rets[i])) {
+                chans[i].a = param();
+                chans[i].b = param();
+            } else if ((int)i != cret) {
+                chans[i].a = param();
+            }
         }
+        if (cg.sinfo[sp].needssp) spl = param();
         gblk = tyg_block_new(p);
         gstart = tyg_block_new(p);
         tyg_jump(p, gblk);
         tyg_block_set(p, gstart);
+        // The tail of a body with a result is returned as the C returns it
+        // (EmitSpec): unless it is an `if` without an `else`, or no value.
         auto body = sp->body;
-        auto x = GenBlock(body, sp->rets.empty());
+        auto tail = body->tail;
+        auto tailret = !sp->rets.empty() && tail && tail->exprtype && tail->exprtype->kind != TY_VOID &&
+                       !(Is<IfExpr>(tail) && !Is<IfExpr>(tail)->elseb) && !Is<Return>(tail) &&
+                       !Is<Break>(tail) && !Is<Continue>(tail);
+        GenBlock(body, true, tailret);
         if (!Ended()) {
-            if (sp->rets.empty()) {
-                tyg_ret(p, 0);
-            } else if (body->tail && x.t && sp->rets.size() == 1) {
-                x = Fit(x, sp->rets[0], body->line);
-                if (x.mem) tyg_ret_mem(p, x.a);
-                else tyg_ret(p, x.v);
-            } else {
-                // Control cannot reach the end of a function with a result
-                // (the checker's rule); the C emits GS_UNREACHABLE.
-                tyg_trap(p);
-            }
+            // Control cannot reach the end of a function with a result
+            // (the checker's rule); the C emits GS_UNREACHABLE.
+            if (sp->rets.empty()) tyg_ret(p, 0);
+            else tyg_trap(p);
         }
-        // The addresses of the globals the body names.
+        // The addresses of the globals the body names, and the stack block.
         tyg_block_set(p, gblk);
         Loc(sp->sf->line);
+        if (stksl) tyg_store(p, TYG_I64, tyg_at_local(stksl, 0), CallC("gs_tg_stks", {}, {}, tyg_type_ptr(m)), 0);
         for (auto &[d, loc] : gaddrs)
             tyg_store(p, TYG_I64, tyg_at_local(loc, 0), CallC(M.Accessor(d), {}, {}, tyg_type_ptr(m)), 0);
         tyg_jump(p, gstart);
@@ -2074,12 +2436,14 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     TinyGenBackend(Ast &_ast, bool _checks, const string &_source, string_view _ext)
         : ast(_ast), checks(_checks), source(_source), runtime_ext_text(_ext) {}
 
-    // Builds sp into the module, with the specializations in `ours`
-    // callable. A construct this backend does not support anywhere in the
-    // body abandons the procedure (tyg_proc_abort), and what it asked of the
-    // module for the C half (shims, trampolines) is taken back, so that the
-    // whole body goes to C. "" when it compiled, else why not.
-    string Build(FnSpec *sp, set<FnSpec *> &relied) {
+    // Builds sp into the module. A construct this backend does not
+    // support anywhere in the body abandons the procedure (tyg_proc_abort),
+    // and what it asked of the module for the C half (shims, trampolines) is
+    // taken back, so that the whole body goes to C. "" when it compiled,
+    // else why not. A body that compiled tells the C half's stack
+    // accounting (codegen_stacks.h) the stacks it owns and what it hands
+    // its callees, as one the C backend emits does.
+    string Build(CodeGen &cg, FnSpec *sp) {
         string why;
         if (sp->sf->issimd) return "simd function";
         if (!mod->SigOk(sp, true, why)) return cat("interface: ", why);
@@ -2093,50 +2457,33 @@ struct TinyGenBackend : CodeGen::SpecBackend {
             mod->externs.resize(nexterns);
             return u.line.line > 0 ? cat(u.why, " (line ", u.line.line, ")") : u.why;
         }
-        relied.insert(fn.relied.begin(), fn.relied.end());
+        cg.stackown[sp] = fn.maxown;
+        cg.stackcalls[sp] = fn.stackcalls;
         return "";
     }
 
-    // The specializations this backend takes: the largest set each of
-    // whose bodies compiles while calling into the set. Every candidate
-    // starts in it and is built straight into the module; one that does
-    // not compile leaves it. A body may call a specialization that takes
-    // gs_sp only while that one is in the set: where one that left was
-    // called so, the module is built again from scratch without it, until
-    // nothing that was called leaves.
+    // The specializations this backend takes: every one whose body
+    // compiles. Each is built straight into the module; one that does not
+    // compile is left to C. The two halves call each other with gs_sp as
+    // two C functions do, so what one takes does not depend on the other.
     set<FnSpec *> Choose(CodeGen &cg, const vector<FnSpec *> &specs) override {
         set<FnSpec *> ours;
-        map<FnSpec *, string> why;
+        mod = make_unique<TgModule>(ast, cg, checks, source);
+        if (!mod->m) {
+            for (auto sp : specs) left.emplace_back(sp, "tinygen has no module for this target");
+            mod.reset();
+            return {};
+        }
         for (auto sp : specs) {
-            if (std::find(skip.begin(), skip.end(), sp->sf->qname) != skip.end())
-                why[sp] = "--tinygen-skip";
-            else
+            string w = std::find(skip.begin(), skip.end(), sp->sf->qname) != skip.end()
+                           ? string("--tinygen-skip")
+                           : Build(cg, sp);
+            if (w.empty()) {
                 ours.insert(sp);
-        }
-        for (;;) {
-            mod = make_unique<TgModule>(ast, cg, checks, source);
-            if (!mod->m) {
-                for (auto sp : specs) left.emplace_back(sp, "tinygen has no module for this target");
-                mod.reset();
-                return {};
+                taken.push_back(sp);
+            } else {
+                left.emplace_back(sp, w);
             }
-            mod->ours = &ours;
-            set<FnSpec *> relied, gone;
-            for (auto sp : specs) {
-                if (!ours.count(sp)) continue;
-                auto w = Build(sp, relied);
-                if (w.empty()) continue;
-                why[sp] = w;
-                ours.erase(sp);
-                gone.insert(sp);
-            }
-            auto again = false;
-            for (auto sp : gone) again = again || relied.count(sp);
-            if (!again) break;
-        }
-        for (auto sp : specs) {
-            if (ours.count(sp)) taken.push_back(sp);
-            else left.emplace_back(sp, why[sp]);
         }
         return ours;
     }
@@ -2147,7 +2494,6 @@ struct TinyGenBackend : CodeGen::SpecBackend {
 
     void Compile(CodeGen &cg) {
         if (!mod) return;
-        mod->ours = &cg.foreign;
         declared.insert(cg.usedexterns.begin(), cg.usedexterns.end());
         for (auto sp : mod->externs)
             if (std::find(cg.usedexterns.begin(), cg.usedexterns.end(), sp) == cg.usedexterns.end())
