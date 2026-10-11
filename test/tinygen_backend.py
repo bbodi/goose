@@ -137,6 +137,21 @@ WHOLE_PROGRAM = {
     "tinygen_render", "tinygen_strings", "tinygen_control",
 }
 
+# ---- ADTs: fixed-mode values, variants, match and case-function dispatch,
+# whole and with the cases, the scrutinees' owners and main left to C in
+# turn; and a sample whose variable-mode ADTs stay in C.
+PROGRAMS += [
+    ("test/tinygen/tinygen_adts.goose", True, []),
+    ("test/tinygen/tinygen_adts.goose", True, ["--debug"]),
+    ("test/tinygen/tinygen_adts.goose", False, ["--tinygen-skip=main"]),
+    ("test/tinygen/tinygen_adts.goose", False,
+     ["--tinygen-skip=area,scale_area,name,tokval,widen,dirnum"]),
+    ("test/tinygen/tinygen_adts.goose", False,
+     ["--tinygen-skip=scaled,by_ref,grow,first_tok,turn,circle"]),
+    ("samples/05_shapes.goose", False, []),
+]
+WHOLE_PROGRAM |= {"tinygen_adts", "cnames"}   # cnames: its enum now held
+
 
 def expected(source):
     """The blessed stdout of a program, whether its run aborts, and the
@@ -211,6 +226,38 @@ def check_tinygen_backend(exe, base, ok, fail, say):
             continue
         ok(f"{label} ({done} of {total} functions{', whole program' if alone else ''})")
     check_lldb(exe, base, ok, fail, say)
+    check_lldb_adts(exe, base, ok, fail)
+
+
+def check_lldb_adts(exe, base, ok, fail):
+    """A fixed-mode ADT as its tag, by variant name, and its payloads;
+    a match arm's binder as its variant; a C-like enum's tag."""
+    lldb = shutil.which("lldb")
+    if not lldb:
+        return
+    source = HERE / "tinygen" / "tinygen_adts.goose"
+    out = base / f"lldb-adts{tc.EXE_SUFFIX}"
+    good, log, _, _ = build(exe, source, out, [])
+    if not good:
+        fail("tinygen lldb ADT build", log)
+        return
+    code, o, e = tc.run_capture([lldb, "-b", "-o", "b scaled", "-o", "run",
+                                 "-o", "frame variable s",
+                                 "-o", "b tinygen_adts.goose:49", "-o", "continue",
+                                 "-o", "frame variable r", "-o", "b turn", "-o", "continue",
+                                 "-o", "frame variable d", "-o", "kill", out])
+    text = o + e
+    wants = [
+        r"scaled_g\(s=.*at tinygen_adts\.goose:4[67]",
+        r"\(Shape\) s = \{\s*tag = Rect\s*u = \{.*Rect = \(w = 3, h = 4\)",
+        r"\(Shape\.Rect\) r = \(w = 3, h = 4\)",
+        r"\(Dir\) d = \(tag = West\)",
+    ]
+    missing = [w for w in wants if not re.search(w, text, re.S)]
+    if missing:
+        fail("tinygen ADT debug info under lldb", f"missing {missing}:\n{text}")
+        return
+    ok("tinygen debug info under lldb: an ADT, a match binder and a C-like enum")
 
 
 def check_lldb(exe, base, ok, fail, say):
