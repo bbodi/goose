@@ -126,6 +126,29 @@ target_link_libraries(goose PRIVATE libtcc)
 add_dependencies(goose tcc_runtime)
 target_compile_definitions(goose PRIVATE GOOSE_TCC_LIB_PATH="${TCC_STAGE}")
 
+# The tinygen backend (docs/design/tinygen_backend.md): tinygen is one C99
+# translation unit in a repository of its own, by default checked out beside
+# this one. Without it the compiler builds as before, and
+# `--backend=tinygen` says it was left out.
+set(TINYGEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../tinygen" CACHE PATH
+    "A tinygen checkout, for the tinygen backend; empty or missing builds without it")
+if(TINYGEN_DIR AND EXISTS "${TINYGEN_DIR}/src/tinygen.c" AND
+   EXISTS "${TINYGEN_DIR}/include/tinygen.h")
+    add_library(goose_tinygen STATIC "${TINYGEN_DIR}/src/tinygen.c")
+    target_include_directories(goose_tinygen PUBLIC "${TINYGEN_DIR}/include")
+    set_target_properties(goose_tinygen PROPERTIES C_STANDARD 99)
+    if(MSVC)
+        target_compile_options(goose_tinygen PRIVATE /W0)
+    else()
+        target_compile_options(goose_tinygen PRIVATE -w)
+    endif()
+    target_link_libraries(goose PRIVATE goose_tinygen)
+    target_compile_definitions(goose PRIVATE GOOSE_HAVE_TINYGEN=1)
+    message(STATUS "tinygen backend: ${TINYGEN_DIR}")
+else()
+    message(STATUS "tinygen backend: left out (no tinygen at TINYGEN_DIR='${TINYGEN_DIR}')")
+endif()
+
 # The blessed packages GOOSE_BUILTIN_LIBS names (src/blessed.txt; `all`, or
 # a list of their names), compiled into the compiler (cmake/package.cmake),
 # so that their programs run with nothing else installed. Empty by default:
