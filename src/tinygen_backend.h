@@ -1542,6 +1542,23 @@ struct TgFn {
     // elements (GenRz) behind a prefix patched once they are counted --
     // or the elements of `from`, or none. Its address.
     tyg_val GenImg(Node *n, tyg_val stk, TypeExpr *t, Line l, const View *from = nullptr) {
+        if (auto ie = n && !from ? Is<IfExpr>(n) : nullptr; ie && ie->elseb) {
+            // Each arm builds its value at the same top (CodeGen's
+            // GenConstruct of an if): the image starts where the top was.
+            auto start = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(start, 0), Top(stk), 0);
+            auto c = Truth(ie->cond);
+            auto tb = tyg_block_new(p), eb = tyg_block_new(p), done = tyg_block_new(p);
+            tyg_branch(p, c, tb, eb);
+            tyg_block_set(p, tb);
+            ImgArm(ie->thenb, stk, t, l);
+            Jump(done);
+            tyg_block_set(p, eb);
+            ImgArm(ie->elseb, stk, t, l);
+            Jump(done);
+            tyg_block_set(p, done);
+            return tyg_load(p, TYG_I64, tyg_at_local(start, 0), 0);
+        }
         if (M.IsVm(t)) {
             if (!n || from) No(l, cat("value of type ", M.NameWhy(t)));
             return GenVm(n, stk, t, l);
@@ -3876,6 +3893,29 @@ struct TgFn {
         return x;
     }
 
+    // An arm whose value is an image built at the top of stk: its
+    // statements, then its tail built there, in a scope of its own.
+    void ImgArm(Node *n, tyg_val stk, TypeExpr *t, Line l) {
+        if (auto b = Is<Block>(n)) {
+            tyg_scope_begin(p);
+            OpenScope(false);
+            for (auto st : b->stmts) Stmt(st);
+            if (b->tail && !Ended()) {
+                Open();
+                Loc(b->tail->line);
+                GenImg(b->tail, stk, t, l);
+            } else if (!b->tail && !Ended()) {
+                No(l, "arm without a value");
+            }
+            CloseScope();
+            tyg_scope_end(p);
+            return;
+        }
+        OpenScope(true);
+        GenImg(n, stk, t, l);
+        CloseScope();
+    }
+
     // An arm runs or not: what it takes on a stack is its own.
     V GenArm(Node *n, bool discard) {
         if (auto b = Is<Block>(n)) return GenBlock(b, discard);
@@ -4168,6 +4208,9 @@ struct TgFn {
             if (!wild) tyg_jump(p, next);
             tyg_block_set(p, hit);
             tyg_scope_begin(p);
+            // The arm's own stack scope: a binder's stack is taken and given
+            // back on this arm's path only.
+            OpenScope(false);
             if (a.binder) {
                 auto vi = adt->enu->en->VariantIndex(a.variants[0]);
                 auto vt = cg.VariantType(adt, vi);
@@ -4193,6 +4236,7 @@ struct TgFn {
             Loc(a.body->line);   // A breakpoint on the arm's line stops here, bound.
             auto v = GenArm(a.body, !valued);
             if (valued && !Ended() && v.t) Store(P { tyg_at_local(res, 0), et }, Fit(v, et, a.body->line));
+            CloseScope();
             tyg_scope_end(p);
             Jump(done);
             tyg_block_set(p, next);
