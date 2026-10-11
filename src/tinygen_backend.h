@@ -2149,7 +2149,8 @@ struct TgFn {
                 return x;
             }
             if (et && et->kind == TY_REF) {
-                if (!IsPlainRef(et) && !M.OptRef(et)) No(u->line, "reference kind");
+                if (!IsPlainRef(et) && !M.OptRef(et) && !(TgModule::IsRel(et) && M.RelOk(et, 1)))
+                    No(u->line, "reference kind");
                 auto pl = Deref(Place(u->child));
                 V x;
                 x.t = et;
