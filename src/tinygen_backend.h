@@ -2118,10 +2118,17 @@ struct TgFn {
     // wanted (reference transparency, §3.8), a scalar converted.
     V Fit(V x, TypeExpr *want, Line l) {
         if (!want || want->kind == TY_VOID || !x.t) return x;
-        while (IsAddrRef(x.t) && want->kind != TY_REF) x = Load(RefTarget(x), l);
+        // A relative reference too, as its slot's decoded address (RelLoad).
+        while ((IsAddrRef(x.t) || (TgModule::IsRel(x.t) && M.RelOk(x.t, 1) && !x.mem)) && want->kind != TY_REF)
+            x = Load(RefTarget(x), l);
         if (M.IsScalar(x.t) && M.IsScalar(want)) {
             if (x.t->kind == TY_REF || want->kind == TY_REF) {
-                if (x.t->kind != want->kind) No(l, "reference conversion");
+                if (x.t->kind != want->kind) {
+                    string a, b;
+                    x.t->Dump(a);
+                    want->Dump(b);
+                    No(l, cat("reference conversion from ", a, " to ", b));
+                }
                 x.t = want;
                 return x;
             }
