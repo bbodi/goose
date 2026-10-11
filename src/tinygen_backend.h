@@ -1152,6 +1152,7 @@ struct TgModule {
         if (TypeOk(d->type)) return true;
         return ((IsGrow(d->type) || IsVarArr(d->type)) && RzOk(d->type) && cg.gstks.count(d)) ||
                (VarImgOk(d->type) && cg.gstks.count(d)) ||
+               ((VsOk(d->type) || VmOk(d->type) || VvOk(d->type) || RcOk(d->type)) && cg.gstks.count(d)) ||
                (IsGrow(d->type) && VeOk(d->type) && cg.gstks.count(d)) || (FoOk(d->type) && cg.gstks.count(d));
     }
 
@@ -2139,8 +2140,8 @@ struct TgFn {
         if (s != TYG_NO_SYM) return P { tyg_at_sym(s, 0), d->type };
         // The shims now, so that an abandoned body takes them back.
         auto at = tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(M.Accessor(d)), 0), 0);
-        if (IsVarArr(d->type)) {
-            // A T[]: the instance holds its image's address.
+        if (IsImg(d->type)) {
+            // A T[], any image: the instance holds its address.
             return P { tyg_at_val(tyg_load(p, TYG_I64, tyg_at_val(at, 0), 0), 0), d->type };
         }
         P pl { tyg_at_val(at, 0), d->type };
@@ -6729,7 +6730,7 @@ struct TgFn {
                     GenFo(init, P { tyg_at_val(at, 0), d->type, stk }, init->line);
                     continue;
                 }
-                if (IsGrow(d->type) || IsVarArr(d->type)) {
+                if (IsGrow(d->type) || IsImg(d->type)) {
                     auto at = tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(M.Accessor(d)), 0), 0);
                     auto stk = tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(M.StackAccessor(d)), 0), 0);
                     M.NeedShim("gs_tg_stack_init");
@@ -7015,7 +7016,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                 auto name = cg.gnames[d].substr(7);   // "GS_GL->name"
                 if (TgModule::IsGrow(d->type)) {
                     gsyms[d] = def(name, 16, 8, d, mod->DT(d->type));
-                } else if (TgModule::IsVarArr(d->type)) {
+                } else if (mod->IsImg(d->type)) {
                     gsyms[d] = def(name, 8, 8, d, tyg_dt_pointer(m, mod->DT(d->type)));
                 } else {
                     auto sz = mod->Size(d->type);
