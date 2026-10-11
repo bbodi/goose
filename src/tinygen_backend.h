@@ -1319,6 +1319,9 @@ struct TgFn {
     // local holding each one's stack.
     set<const VarDef *> indirect;
     map<const VarDef *, tyg_local> rzstk;
+    // A reusable pool's freelist (§5.4): its header { base, len } and the
+    // slot holding its stack, by the pool's variable.
+    map<const VarDef *, pair<tyg_local, tyg_local>> poolfl;
 
     TgFn(TgModule &_M, FnSpec *_sp) : M(_M), cg(_M.cg), sp(_sp), m(_M.m) {}
 
@@ -2765,6 +2768,75 @@ struct TgFn {
         if (r.t) r.v = at;
         return r;
     }
+    // pool.alloc_index(x), pool.alloc_ref(x) and pool.free(i) on a reusable
+    // pool (CodeGen::EmitAlloc, B_FREE): a slot from the freelist, or a new
+    // one at the top that joins the array once its element is written.
+    V GenPool(Call *c) {
+        auto an = c->ArgNodes();
+        auto recv = an[0];
+        if (auto u = Is<Unary>(recv); u && u->op == T_BITAND) recv = u->child;
+        auto id = Is<Ident>(recv);
+        if (!id || !id->vdef || !poolfl.count(id->vdef)) No(c->line, "pool of this kind");
+        auto vd = id->vdef;
+        auto pl = VarPlace(vd, c->line);
+        auto fl = tyg_at_local(poolfl[vd].first, 0);
+        auto fllen = fl;
+        fllen.offset += 8;
+        auto flstk = tyg_load(p, TYG_I64, tyg_at_local(poolfl[vd].second, 0), 0);
+        auto len = pl.a;
+        len.offset += 8;
+        auto elem = pl.t->arr->sub;
+        auto esz = cg.FixedSize(elem);
+        if (c->builtin == B_FREE) {
+            auto i = Index64(an[1]);
+            if (Ended()) return V {};
+            BoundsCheck(i, tyg_load(p, TYG_I64, len, 0), c->line);
+            auto top = Top(flstk);
+            tyg_store(p, TYG_I64, tyg_at_val(top, 0), i, 0);
+            SetTop(flstk, tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, 8)));
+            tyg_store(p, TYG_I64, fllen, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, fllen, 0), tyg_iconst(p, TYG_I64, 1)), 0);
+            return V {};
+        }
+        // The value first, then the slot (the checker keeps the array from
+        // growing into a fresh one meanwhile).
+        auto x = GenAs(an[1], elem);
+        if (Ended()) return Dummy(c->exprtype);
+        if (!M.IsScalar(elem) && !x.mem) No(c->line, "aggregate value");
+        auto il = tyg_local_new(p, 8, 8);
+        auto pop = tyg_block_new(p), fresh = tyg_block_new(p), got = tyg_block_new(p);
+        tyg_branch(p, tyg_cmp(p, TYG_SGT, tyg_load(p, TYG_I64, fllen, 0), tyg_iconst(p, TYG_I64, 0)), pop, fresh);
+        tyg_block_set(p, pop);
+        tyg_store(p, TYG_I64, fllen, tyg_bin(p, TYG_SUB, tyg_load(p, TYG_I64, fllen, 0), tyg_iconst(p, TYG_I64, 1)), 0);
+        auto ftop = tyg_bin(p, TYG_SUB, Top(flstk), tyg_iconst(p, TYG_I64, 8));
+        SetTop(flstk, ftop);
+        tyg_store(p, TYG_I64, tyg_at_local(il, 0), tyg_load(p, TYG_I64, tyg_at_val(ftop, 0), 0), 0);
+        tyg_jump(p, got);
+        tyg_block_set(p, fresh);
+        tyg_store(p, TYG_I64, tyg_at_local(il, 0), tyg_load(p, TYG_I64, len, 0), 0);
+        tyg_jump(p, got);
+        tyg_block_set(p, got);
+        auto idx = [&] { return tyg_load(p, TYG_I64, tyg_at_local(il, 0), 0); };
+        auto base = tyg_load(p, TYG_I64, pl.a, 0);
+        auto e = tyg_bin(p, TYG_ADD, base, tyg_bin(p, TYG_MUL, idx(), tyg_iconst(p, TYG_I64, esz)));
+        Store(P { tyg_at_val(e, 0), elem }, x);
+        auto grow = tyg_block_new(p), done = tyg_block_new(p);
+        tyg_branch(p, tyg_cmp(p, TYG_EQ, idx(), tyg_load(p, TYG_I64, len, 0)), grow, done);
+        tyg_block_set(p, grow);
+        tyg_store(p, TYG_I64, len, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, len, 0), tyg_iconst(p, TYG_I64, 1)), 0);
+        SetTop(pl.stk, tyg_bin(p, TYG_ADD, Top(pl.stk), tyg_iconst(p, TYG_I64, esz)));
+        tyg_jump(p, done);
+        tyg_block_set(p, done);
+        V r;
+        r.t = c->exprtype;
+        if (c->builtin == B_ALLOC_INDEX) {
+            r.v = Conv(idx(), M.ast.inttypes[IS_I64], c->exprtype, c->line);
+        } else {
+            auto base2 = tyg_load(p, TYG_I64, pl.a, 0);
+            r.v = tyg_bin(p, TYG_ADD, base2, tyg_bin(p, TYG_MUL, idx(), tyg_iconst(p, TYG_I64, esz)));
+        }
+        return r;
+    }
+
     // v.append(x) (EmitAppend): the receiver, then the source's elements
     // (a string literal's bytes, or an array's, a slice's, a literal's,
     // evaluated whole), then the length read and the capacity checked,
@@ -2955,6 +3027,24 @@ struct TgFn {
             return V {};
         }
         if (c->builtin == B_FORMAT && c->ArgNodes().size() >= 1) return GenFormat(c);
+        if (c->builtin == B_INDEX_OF && c->ArgNodes().size() == 2) {
+            // The checker proved the reference is an element of this very
+            // array (§3.3): the distance in whole elements, unchecked.
+            auto an = c->ArgNodes();
+            auto v = ViewOf(Place(an[0]), c->line);
+            if (!cg.IsFix(v.elem)) No(c->line, "index_of of elements of variable size");
+            auto r = Gen(an[1]);
+            if (Ended()) return Dummy(c->exprtype);
+            auto d = tyg_bin(p, TYG_SUB, r.v, v.elems);
+            auto ix = tyg_bin(p, TYG_SDIV, d, tyg_iconst(p, TYG_I64, std::max<int64_t>(cg.FixedSize(v.elem), 1)));
+            V x;
+            x.t = c->exprtype;
+            x.v = Conv(ix, M.ast.inttypes[IS_I64], c->exprtype, c->line);
+            return x;
+        }
+        if ((c->builtin == B_ALLOC_INDEX || c->builtin == B_ALLOC_REF || c->builtin == B_FREE) &&
+            c->ArgNodes().size() == 2)
+            return GenPool(c);
         if (c->builtin == B_COPY && c->ArgNodes().size() == 1 && cg.IsFix(c->rettypes[0]) &&
             M.TypeOk(c->rettypes[0])) {
             // A fresh copy of a fixed value; at a slice destination, a view
@@ -4769,6 +4859,16 @@ struct TgFn {
             rzstk[d] = sl;
             tyg_debug_var(p, string(d->name).c_str(), M.DT(d->type), tyg_at_local(hdr, 0),
                           M.File(d->line.fileidx), d->line.line);
+            if (d->reusable) {
+                // Its freelist: free slot indices on a stack of their own.
+                auto flstk = Stk(AllocStk(true, l), l);
+                auto fl = tyg_local_new(p, 16, 8);
+                auto fsl = tyg_local_new(p, 8, 8);
+                tyg_store(p, TYG_I64, tyg_at_local(fsl, 0), flstk, 0);
+                tyg_store(p, TYG_I64, tyg_at_local(fl, 0), Top(flstk), 0);
+                tyg_store(p, TYG_I64, tyg_at_local(fl, 8), tyg_iconst(p, TYG_I64, 0), 0);
+                poolfl[d] = { fl, fsl };
+            }
             return;
         }
         if (M.FoOk(d->type) && !cg.PrefVar(d)) {
@@ -4811,7 +4911,10 @@ struct TgFn {
     }
 
     void StmtVarDecl(VarDecl *vd) {
-        if (vd->isglobal || vd->reusable) No(vd->line, "declaration kind");
+        if (vd->isglobal) No(vd->line, "declaration kind");
+        if (vd->reusable)
+            for (auto d : vd->defs)
+                if (!IsGrow(d->type) || !M.RzOk(d->type) || cg.PrefVar(d)) No(vd->line, "reusable pool of this kind");
         if (vd->defs.size() > 1 && vd->inits.size() == 1) {
             // let a, b = f(): the locals, then the call into them.
             for (auto d : vd->defs) Declare(d, vd->line);
