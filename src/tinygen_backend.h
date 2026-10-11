@@ -3545,6 +3545,209 @@ struct TgFn {
         if (r.t) r.v = at;
         return r;
     }
+    // A reusable pool's array, its freelist's header and the freelist's
+    // stack: a local's, or a global's through its accessors.
+    void PoolAt(VarDef *vd, Line l, P &pl, tyg_addr &fl, tyg_val &flstk) {
+        if (!vd || !(poolfl.count(vd) || (vd->isglobal && vd->reusable))) No(l, "pool of this kind");
+        pl = VarPlace(vd, l);
+        if (vd->isglobal) {
+            auto [h, st] = M.PoolAccessors(vd);
+            fl = tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(h), 0), 0), 0);
+            flstk = tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(st), 0), 0);
+        } else {
+            fl = tyg_at_local(poolfl[vd].first, 0);
+            flstk = tyg_load(p, TYG_I64, tyg_at_local(poolfl[vd].second, 0), 0);
+        }
+    }
+    // A slice pool (§5.4; CodeGen::EmitSlicePool): runs of elements of a
+    // reusable array, its freelist of (index, count) spans kept by the
+    // runtime's gs_spans_*.
+    V GenSlicePool(Call *c) {
+        auto an = c->ArgNodes();
+        auto recv = an[0];
+        if (auto u = Is<Unary>(recv); u && u->op == T_BITAND) recv = u->child;
+        auto id = Is<Ident>(recv);
+        P pl;
+        tyg_addr fl;
+        tyg_val flstk;
+        PoolAt(id ? id->vdef : nullptr, c->line, pl, fl, flstk);
+        if (!IsGrow(pl.t) || !M.RzOk(pl.t) || !pl.stk) No(c->line, "slice pool of this kind");
+        auto elem = pl.t->arr->sub;
+        auto esz = cg.FixedSize(elem);
+        auto len = pl.a;
+        len.offset += 8;
+        auto fllen = fl;
+        fllen.offset += 8;
+        auto i64 = [&](int64_t v) { return tyg_iconst(p, TYG_I64, v); };
+        auto ld = [&](tyg_local x) { return tyg_load(p, TYG_I64, tyg_at_local(x, 0), 0); };
+        auto st = [&](tyg_local x, tyg_val v) { tyg_store(p, TYG_I64, tyg_at_local(x, 0), v, 0); };
+        auto pt = tyg_type_ptr(m);
+        auto spanargs = [&]() -> vector<tyg_val> {
+            return { tyg_load(p, TYG_I64, fl, 0), tyg_addr_of(p, fllen), flstk };
+        };
+        auto elems = [&] { return tyg_load(p, TYG_I64, pl.a, 0); };
+        // A slice's index in the pool: 0 for an empty one; else, where the
+        // checker cannot root it here, checked to start a whole number of
+        // elements in and to end inside the length.
+        auto indexof = [&](tyg_val data, tyg_val n) {
+            auto il = tyg_local_new(p, 8, 8);
+            st(il, i64(0));
+            auto ne = tyg_block_new(p), done = tyg_block_new(p);
+            tyg_branch(p, tyg_cmp(p, TYG_NE, n, i64(0)), ne, done);
+            tyg_block_set(p, ne);
+            auto off = tyg_bin(p, TYG_SUB, data, elems());
+            if (c->poolcheck && esz) {
+                auto bad = tyg_bin(p, TYG_OR, tyg_cmp(p, TYG_NE, tyg_bin(p, TYG_UREM, off, i64(esz)), i64(0)),
+                                   tyg_cmp(p, TYG_UGE, tyg_bin(p, TYG_UDIV, off, i64(esz)), tyg_load(p, TYG_I64, len, 0)));
+                auto k = tyg_bin(p, TYG_UDIV, off, i64(esz));
+                bad = tyg_bin(p, TYG_OR, bad, tyg_cmp(p, TYG_UGT, n, tyg_bin(p, TYG_SUB, tyg_load(p, TYG_I64, len, 0), k)));
+                AbortUnless(tyg_cmp(p, TYG_EQ, bad, tyg_iconst(p, TYG_I8, 0)), "POOLSLICE", c->line);
+            }
+            st(il, tyg_bin(p, TYG_SDIV, off, i64(std::max<int64_t>(esz, 1))));
+            tyg_jump(p, done);
+            tyg_block_set(p, done);
+            return il;
+        };
+        auto slicelen = [&](Node *n) {
+            auto nl = tyg_local_new(p, 8, 8);
+            st(nl, Index64(n));
+            if (esz) AbortUnless(tyg_cmp(p, TYG_ULE, ld(nl), i64((int64_t)((2048ull << 20) / (uint64_t)esz))),
+                                 "SLICELEN", c->line);
+            else AbortUnless(tyg_cmp(p, TYG_SGE, ld(nl), i64(0)), "SLICELEN", c->line);
+            return nl;
+        };
+        auto slice = [&](Node *n, tyg_local &data, tyg_local &cnt) {
+            auto x = GenAs(n, M.ast.SliceOf(elem, n->line));
+            data = tyg_local_new(p, 8, 8);
+            cnt = tyg_local_new(p, 8, 8);
+            st(data, tyg_load(p, TYG_I64, x.a, 0));
+            auto a8 = x.a;
+            a8.offset += 8;
+            st(cnt, tyg_load(p, TYG_I64, a8, 0));
+        };
+        if (c->builtin == B_FREE_SLICE) {
+            tyg_local d, n;
+            slice(an[1], d, n);
+            if (Ended()) return V {};
+            auto il = indexof(ld(d), ld(n));
+            auto as = spanargs();
+            CallC("gs_spans_free", { pt, pt, pt, IT(TYG_I64), IT(TYG_I64) }, { as[0], as[1], as[2], ld(il), ld(n) }, nullptr);
+            return V {};
+        }
+        // Where a run of n goes: past the end while the freelist is empty.
+        auto place = [&](tyg_val n) {
+            auto r = tyg_local_new(p, 8, 8);
+            auto some = tyg_block_new(p), none = tyg_block_new(p), done = tyg_block_new(p);
+            tyg_branch(p, tyg_cmp(p, TYG_NE, tyg_load(p, TYG_I64, fllen, 0), i64(0)), some, none);
+            tyg_block_set(p, some);
+            auto as = spanargs();
+            st(r, CallC("gs_spans_alloc", { pt, pt, pt, IT(TYG_I64), IT(TYG_I64) },
+                        { as[0], as[1], as[2], tyg_load(p, TYG_I64, len, 0), n }, IT(TYG_I64)));
+            tyg_jump(p, done);
+            tyg_block_set(p, none);
+            st(r, tyg_load(p, TYG_I64, len, 0));
+            tyg_jump(p, done);
+            tyg_block_set(p, done);
+            return r;
+        };
+        auto extend = [&](tyg_val end) {
+            auto ext = tyg_bin(p, TYG_SUB, end, tyg_load(p, TYG_I64, len, 0));
+            auto grow = tyg_block_new(p), done = tyg_block_new(p);
+            auto el = tyg_local_new(p, 8, 8);
+            st(el, ext);
+            tyg_branch(p, tyg_cmp(p, TYG_SGT, ext, i64(0)), grow, done);
+            tyg_block_set(p, grow);
+            tyg_store(p, TYG_I64, len, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, len, 0), ld(el)), 0);
+            SetTop(pl.stk, tyg_bin(p, TYG_ADD, Top(pl.stk), tyg_bin(p, TYG_MUL, ld(el), i64(esz))));
+            tyg_jump(p, done);
+            tyg_block_set(p, done);
+        };
+        // Default values for count elements from first (EmitDefaultElems).
+        auto defaults = [&](tyg_val first, tyg_val count) {
+            if (!esz) return;
+            if (!cg.HasFieldDefaults(elem)) {
+                auto at = tyg_bin(p, TYG_ADD, elems(), tyg_bin(p, TYG_MUL, first, i64(esz)));
+                CallC("memset", { pt, IT(TYG_I32), IT(TYG_I64, false) },
+                      { at, tyg_iconst(p, TYG_I32, 0), tyg_bin(p, TYG_MUL, count, i64(esz)) }, pt);
+                return;
+            }
+            if (!c->defaultinit) No(c->line, "slice pool defaults");
+            auto fl0 = tyg_local_new(p, 8, 8), kl = tyg_local_new(p, 8, 8), cl = tyg_local_new(p, 8, 8);
+            st(fl0, first);
+            st(cl, count);
+            st(kl, i64(0));
+            auto head = tyg_block_new(p), body = tyg_block_new(p), done = tyg_block_new(p);
+            tyg_jump(p, head);
+            tyg_block_set(p, head);
+            tyg_branch(p, tyg_cmp(p, TYG_SLT, ld(kl), ld(cl)), body, done);
+            tyg_block_set(p, body);
+            auto at = tyg_bin(p, TYG_ADD, elems(), tyg_bin(p, TYG_MUL, tyg_bin(p, TYG_ADD, ld(fl0), ld(kl)), i64(esz)));
+            OpenScope(true);
+            Into(P { tyg_at_val(at, 0), elem }, c->defaultinit);
+            CloseScope();
+            st(kl, tyg_bin(p, TYG_ADD, ld(kl), i64(1)));
+            tyg_jump(p, head);
+            tyg_block_set(p, done);
+        };
+        tyg_local il, nl;
+        if (c->builtin == B_ALLOC_SLICE) {
+            nl = slicelen(an[1]);
+            if (Ended()) return Dummy(c->exprtype);
+            il = place(ld(nl));
+            extend(tyg_bin(p, TYG_ADD, ld(il), ld(nl)));
+            defaults(ld(il), ld(nl));
+        } else {
+            tyg_local d, ol;
+            slice(an[1], d, ol);
+            nl = slicelen(an[2]);
+            if (Ended()) return Dummy(c->exprtype);
+            il = indexof(ld(d), ld(ol));
+            auto shrink = tyg_block_new(p), growb = tyg_block_new(p), done = tyg_block_new(p);
+            tyg_branch(p, tyg_cmp(p, TYG_SLE, ld(nl), ld(ol)), shrink, growb);
+            tyg_block_set(p, shrink);
+            {
+                auto as = spanargs();
+                CallC("gs_spans_free", { pt, pt, pt, IT(TYG_I64), IT(TYG_I64) },
+                      { as[0], as[1], as[2], tyg_bin(p, TYG_ADD, ld(il), ld(nl)), tyg_bin(p, TYG_SUB, ld(ol), ld(nl)) },
+                      nullptr);
+            }
+            tyg_jump(p, done);
+            tyg_block_set(p, growb);
+            auto empty = tyg_block_new(p), notempty = tyg_block_new(p), moved = tyg_block_new(p), placed = tyg_block_new(p);
+            tyg_branch(p, tyg_cmp(p, TYG_EQ, ld(ol), i64(0)), empty, notempty);
+            tyg_block_set(p, empty);
+            st(il, ld(place(ld(nl))));
+            tyg_jump(p, placed);
+            tyg_block_set(p, notempty);
+            tyg_branch(p, tyg_cmp(p, TYG_NE, tyg_bin(p, TYG_ADD, ld(il), ld(ol)), tyg_load(p, TYG_I64, len, 0)),
+                       moved, placed);
+            tyg_block_set(p, moved);
+            {
+                auto as = spanargs();
+                auto ni = tyg_local_new(p, 8, 8);
+                st(ni, CallC("gs_spans_regrow", { pt, pt, pt, IT(TYG_I64), IT(TYG_I64), IT(TYG_I64), IT(TYG_I64) },
+                             { as[0], as[1], as[2], tyg_load(p, TYG_I64, len, 0), ld(il), ld(ol), ld(nl) }, IT(TYG_I64)));
+                auto mv = tyg_block_new(p), same = tyg_block_new(p);
+                tyg_branch(p, tyg_cmp(p, TYG_NE, ld(ni), ld(il)), mv, same);
+                tyg_block_set(p, mv);
+                tyg_move_dyn(p, tyg_bin(p, TYG_ADD, elems(), tyg_bin(p, TYG_MUL, ld(ni), i64(esz))),
+                             tyg_bin(p, TYG_ADD, elems(), tyg_bin(p, TYG_MUL, ld(il), i64(esz))),
+                             tyg_bin(p, TYG_MUL, ld(ol), i64(esz)));
+                tyg_jump(p, same);
+                tyg_block_set(p, same);
+                st(il, ld(ni));
+            }
+            tyg_jump(p, placed);
+            tyg_block_set(p, placed);
+            extend(tyg_bin(p, TYG_ADD, ld(il), ld(nl)));
+            defaults(tyg_bin(p, TYG_ADD, ld(il), ld(ol)), tyg_bin(p, TYG_SUB, ld(nl), ld(ol)));
+            tyg_jump(p, done);
+            tyg_block_set(p, done);
+        }
+        return SliceValue(M.ast.SliceOf(elem, c->line),
+                          tyg_bin(p, TYG_ADD, elems(), tyg_bin(p, TYG_MUL, ld(il), i64(esz))), ld(nl));
+    }
+
     // pool.alloc_index(x), pool.alloc_ref(x) and pool.free(i) on a reusable
     // pool (CodeGen::EmitAlloc, B_FREE): a slot from the freelist, or a new
     // one at the top that joins the array once its element is written.
@@ -3554,18 +3757,10 @@ struct TgFn {
         if (auto u = Is<Unary>(recv); u && u->op == T_BITAND) recv = u->child;
         auto id = Is<Ident>(recv);
         auto vd = id ? id->vdef : nullptr;
-        if (!vd || !(poolfl.count(vd) || (vd->isglobal && vd->reusable))) No(c->line, "pool of this kind");
-        auto pl = VarPlace(vd, c->line);
+        P pl;
         tyg_addr fl;
         tyg_val flstk;
-        if (vd->isglobal) {
-            auto [h, st] = M.PoolAccessors(vd);
-            fl = tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(h), 0), 0), 0);
-            flstk = tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(st), 0), 0);
-        } else {
-            fl = tyg_at_local(poolfl[vd].first, 0);
-            flstk = tyg_load(p, TYG_I64, tyg_at_local(poolfl[vd].second, 0), 0);
-        }
+        PoolAt(vd, c->line, pl, fl, flstk);
         auto fllen = fl;
         fllen.offset += 8;
         auto len = pl.a;
@@ -3837,6 +4032,8 @@ struct TgFn {
         if ((c->builtin == B_ALLOC_INDEX || c->builtin == B_ALLOC_REF || c->builtin == B_FREE) &&
             c->ArgNodes().size() == 2)
             return GenPool(c);
+        if (c->builtin == B_ALLOC_SLICE || c->builtin == B_REALLOC_SLICE || c->builtin == B_FREE_SLICE)
+            return GenSlicePool(c);
         if (c->builtin == B_COPY && c->ArgNodes().size() == 1 && !cg.IsFix(c->rettypes[0])) {
             // A copy of a variable-size value on a temporary's stack: an
             // image, a resizable, a frame object.
