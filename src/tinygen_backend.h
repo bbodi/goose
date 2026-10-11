@@ -2203,6 +2203,12 @@ struct TgFn {
             tyg_block_set(p, done);
             return r;
         }
+        if (want->kind == TY_SLICE && x.t->kind == TY_ARRAY && x.t->arr->akind == A_FIXED && x.mem &&
+            cg.Mangle(x.t->arr->sub) == cg.Mangle(want->sub)) {
+            // A fixed array where a slice is wanted: a view of where it lies.
+            auto v = ViewOf(P { x.a, x.t }, l);
+            return SliceValue(want, v.elems, v.len);
+        }
         if (OptFit(x, want)) return x;
         if (M.IsScalar(x.t) != M.IsScalar(want) || !cg.TEq(x.t, want)) {
             string a, b;
