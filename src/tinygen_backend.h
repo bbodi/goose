@@ -456,7 +456,8 @@ struct TgModule {
     }
     // A by-value parameter of a type RzOk or VsOk holds.
     bool RzParam(TypeExpr *t) {
-        return (t->kind == TY_ARRAY && (RzOk(t) || VarImgOk(t) || RcOk(t))) || VsOk(t) || VmOk(t) || VvOk(t);
+        return (t->kind == TY_ARRAY && (RzOk(t) || VarImgOk(t) || RcOk(t))) || VsOk(t) || VmOk(t) || VvOk(t) ||
+               FoOk(t);
     }
     tyg_scalar Scal(TypeExpr *t) {
         switch (t->kind) {
@@ -512,6 +513,7 @@ struct TgModule {
         if (IsRel(t)) return tyg_type_int(m, RelScal(t), 0);
         if (t->kind == TY_REF) return tyg_type_ptr(m);
         if (IsGrow(t)) return SliceAT();   // gs_rhdr { base, len }, as a slice.
+        if (t->kind == TY_STRUCT && cg.IsFrameObj(t)) return FoAT(t);
         if (t->kind == TY_INT) return tyg_type_int(m, Scal(t), IsSigned(t));
         if (t->kind == TY_BOOL) return tyg_type_int(m, TYG_I8, 0);
         if (t->kind == TY_FLT) return tyg_type_scalar(m, Scal(t));
@@ -534,6 +536,23 @@ struct TgModule {
         for (auto &f : Fields(t)) fs.push_back({ AT(f.t), f.off });
         return atypes[key] = tyg_type_record(m, cg.FixedSize(t), 1, fs.data(), (int)fs.size());
     }
+
+    // A frame object's C struct: its fixed fields, then the tail's header.
+    const tyg_type *FoAT(TypeExpr *t) {
+        auto key = cg.Mangle(t);
+        if (auto it = atypes.find(key); it != atypes.end()) return it->second;
+        auto si = cg.SI(t);
+        auto fl = FoLayout(t);
+        vector<tyg_field> fs;
+        for (int i = 0; i < fl.tailfi; i++) {
+            if (si->st->fields[(size_t)i].ispad) continue;
+            fs.push_back({ AT(si->ftypes[(size_t)i]), fl.offs[(size_t)i] });
+        }
+        fs.push_back({ SliceAT(), fl.tail });
+        return atypes[key] = tyg_type_record(m, fl.tail + 16, 1, fs.data(), (int)fs.size());
+    }
+    // A resizable value: a T[>..]'s header, or a frame object, with a stack.
+    bool Resz(TypeExpr *t) { return IsGrow(t) || (t && t->kind == TY_STRUCT && cg.IsFrameObj(t)); }
 
     // The u8 slice of the extern boundary, sl_u8: data and length.
     const tyg_type *sliceat = nullptr;
@@ -1271,7 +1290,10 @@ struct TgModule {
             if (!FvOk(fv)) { why = cat("free variable of type ", fv->type ? NameWhy(fv->type) : "?"); return false; }
         if (define && cg.fromids.count(sp))
             for (auto r : sp->rets)
-                if (!RetOk(r)) { why = cat("return from target with result type ", NameWhy(r)); return false; }
+                if (!RetOk(r) || cg.IsFrameObj(r)) {
+                    why = cat("return from target with result type ", NameWhy(r));
+                    return false;
+                }
         for (auto r : sp->rets)
             if (!RetOk(r)) { why = cat("result type ", NameWhy(r)); return false; }
         for (size_t i = 0; i < sp->argtypes.size(); i++)
@@ -1286,6 +1308,7 @@ struct TgModule {
     // stack.
     bool RetOk(TypeExpr *t) {
         return TypeOk(t) || ((IsGrow(t) || IsVarArr(t)) && RzOk(t)) || VsOk(t) || VmOk(t) || VvOk(t) || RcOk(t) ||
+               FoOk(t) ||
                VarImgOk(t) || VeOk(t);
     }
     // A free variable of a nested function (§7.5), as SigParams passes it:
@@ -1306,7 +1329,7 @@ struct TgModule {
         for (auto t : sp->argtypes) {
             // A by-value T[] is its image's address; a by-value T[>..] its
             // header, then its stack (CodeGen::SigParams).
-            if (RzParam(t) && !IsGrow(t)) {
+            if (RzParam(t) && !Resz(t)) {
                 ps.push_back(tyg_type_ptr(m));
                 continue;
             }
@@ -1318,7 +1341,7 @@ struct TgModule {
             if (IsGrow(fv->type)) ps.push_back(tyg_type_ptr(m));   // its stack
         }
         for (size_t i = 0; i < sp->rets.size(); i++) {
-            if (IsGrow(sp->rets[i])) {
+            if (Resz(sp->rets[i])) {
                 ps.push_back(tyg_type_ptr(m));   // gs_dst<i>
                 ps.push_back(tyg_type_ptr(m));   // gs_rl<i>
             } else if (IsImg(sp->rets[i])) {
@@ -3492,6 +3515,19 @@ struct TgFn {
             if (M.RzParam(pt)) {
                 // A by-value resizable: a copy of its own, on a stack of the
                 // statement's, as its header and its stack.
+                if (M.FoOk(pt)) {
+                    // A frame object: a copy of its own, its tail on a
+                    // stack of the statement's.
+                    P x { tyg_at_local(tyg_local_new(p, M.Size(pt), 8), 0), pt,
+                          Stk(AllocStk(false, an[i]->line), an[i]->line) };
+                    GenFo(an[i], x, an[i]->line);
+                    tyg_arg h {}, k {};
+                    h.mem = x.a;
+                    k.val = x.stk;
+                    args.push_back(h);
+                    args.push_back(k);
+                    continue;
+                }
                 if (!IsGrow(pt)) {
                     // A T[]: an image of its own, on a stack of the
                     // statement's, by its address.
@@ -3562,6 +3598,19 @@ struct TgFn {
                 tyg_arg s {};
                 s.val = stk;
                 args.push_back(s);
+                continue;
+            }
+            if (M.FoOk(r.t)) {
+                // A frame object: its struct in a temporary, its tail on
+                // a stack of the statement's.
+                r.mem = true;
+                r.a = tyg_at_local(tyg_local_new(p, M.Size(r.t), 8), 0);
+                r.stk = Stk(AllocStk(false, l), l);
+                tyg_arg s {}, n {};
+                s.val = r.stk;
+                n.val = tyg_addr_of(p, r.a);
+                args.push_back(s);
+                args.push_back(n);
                 continue;
             }
             if (IsGrow(r.t)) {
@@ -5107,6 +5156,12 @@ struct TgFn {
     // forwarded call's value): a T[]'s image, or a resizable's elements,
     // whose count is stored at len.
     void BuildAt(Node *val, V *x, tyg_val dst, TypeExpr *t, tyg_addr len, Line l) {
+        if (M.FoOk(t)) {
+            // A frame object: its struct at len, its tail on dst.
+            if (x) FoCopy(P { len, t, dst }, P { x->a, t, x->stk }, l);
+            else GenFo(val, P { len, t, dst }, l);
+            return;
+        }
         if (IsImg(t)) {
             if (!x) {
                 GenImg(val, dst, t, l);
@@ -5164,10 +5219,10 @@ struct TgFn {
         P first {};
         if (cret >= 0) first = P { tyg_at_local(Temp(rets[cret]), 0), rets[cret] };
         for (size_t i = 0; i < rets.size(); i++) {
-            if (IsImg(rets[i]) || IsGrow(rets[i])) {
+            if (IsImg(rets[i]) || M.Resz(rets[i])) {
                 auto dst = tyg_load(p, TYG_I64, tyg_at_local(chans[i].a, 0), 0);
                 SetTop(dst, tyg_load(p, TYG_I64, tyg_at_local(chans[i].top0, 0), 0));
-                auto rl = IsGrow(rets[i]) ? tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(chans[i].b, 0), 0), 0)
+                auto rl = M.Resz(rets[i]) ? tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(chans[i].b, 0), 0), 0)
                                           : tyg_addr {};
                 BuildAt(xs.empty() ? vals[i] : nullptr, xs.empty() ? nullptr : &xs[i], dst, rets[i], rl, l);
                 if (Ended()) return;
@@ -5728,6 +5783,19 @@ struct TgFn {
     // where they lie, the tail built in place (CodeGen's GenConstruct).
     void GenFo(Node *n, P pl, Line l) {
         auto sl = Is<StructLit>(n);
+        if (!sl && n->exprtype && cg.TEq(n->exprtype, pl.t)) {
+            // Any other one copied: a call's result, a variable.
+            P src;
+            if (Is<Call>(n)) {
+                auto x = Gen1(n);
+                src = P { x.a, x.t, x.stk };
+            } else {
+                src = Deref(Place(n));
+            }
+            if (Ended()) return;
+            FoCopy(pl, src, l);
+            return;
+        }
         if (!sl || !sl->sinst || sl->variant) No(l, cat("value of type ", M.NameWhy(pl.t)));
         auto si = cg.SI(pl.t);
         auto fl = M.FoLayout(pl.t);
@@ -5749,6 +5817,27 @@ struct TgFn {
             else tyg_zero(p, fp.a, M.Size(fp.t));
             if (Ended()) return;
         }
+    }
+
+    // The frame object at src copied to dst: its fixed fields, then its
+    // tail's elements onto dst's stack.
+    void FoCopy(const P &dst, const P &src, Line l) {
+        auto fl = M.FoLayout(dst.t);
+        if (!dst.stk || !src.stk) No(l, "frame object without its stack");
+        auto tl = FoFieldPlace(src, fl.tailfi, l);
+        auto v = ViewOf(tl, l);
+        // The tail's start and count first: the source may be anywhere.
+        auto el = tyg_local_new(p, 16, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(el, 0), v.elems, 0);
+        tyg_store(p, TYG_I64, tyg_at_local(el, 8), v.len, 0);
+        if (fl.tail) tyg_move(p, dst.a, src.a, fl.tail);
+        auto dt = FoFieldPlace(dst, fl.tailfi, l);
+        auto len = dt.a;
+        len.offset += 8;
+        tyg_store(p, TYG_I64, dt.a, Top(dst.stk), 0);
+        tyg_store(p, TYG_I64, len, tyg_iconst(p, TYG_I64, 0), 0);
+        CopyRun(dst.stk, len, dt.t->arr->sub, tyg_load(p, TYG_I64, tyg_at_local(el, 0), 0),
+                tyg_load(p, TYG_I64, tyg_at_local(el, 8), 0));
     }
 
     // ---- Variable-size structs -------------------------------------------------
@@ -6037,9 +6126,9 @@ struct TgFn {
         auto file = M.File(sp->sf->line.fileidx);
         vector<const tyg_dtype *> pdt;
         for (auto t : sp->argtypes) {
-            if (M.RzParam(t) && !IsGrow(t)) pdt.push_back(tyg_dt_pointer(m, M.DT(t)));
+            if (M.RzParam(t) && !M.Resz(t)) pdt.push_back(tyg_dt_pointer(m, M.DT(t)));
             else pdt.push_back(M.DT(t));
-            if (M.RzParam(t) && IsGrow(t)) pdt.push_back(tyg_dt_pointer(m, M.StackDT()));
+            if (M.RzParam(t) && M.Resz(t)) pdt.push_back(tyg_dt_pointer(m, M.StackDT()));
         }
         for (auto fv : cg.sinfo[sp].freevars) {
             pdt.push_back(tyg_dt_pointer(m, M.DT(fv->type)));
@@ -6055,7 +6144,7 @@ struct TgFn {
         // for the debugger as the parameters' do (tyg_debug_var_ref,
         // tyg_debug_param).
         int pi = 0;
-        for (auto t : sp->argtypes) pi += M.RzParam(t) && IsGrow(t) ? 2 : 1;
+        for (auto t : sp->argtypes) pi += M.RzParam(t) && M.Resz(t) ? 2 : 1;
         auto param = [&] {
             auto loc = tyg_local_new(p, 8, 8);
             tyg_store(p, TYG_I64, tyg_at_local(loc, 0), tyg_param(p, pi++), 0);
@@ -6080,7 +6169,7 @@ struct TgFn {
             auto vd = sp->params[i];
             auto t = sp->argtypes[i];
             auto pv = tyg_param(p, pi++);
-            if (M.RzParam(t) && !IsGrow(t)) {
+            if (M.RzParam(t) && !M.Resz(t)) {
                 // A by-value T[]: its image's address, the image a copy the
                 // caller made.
                 auto loc = tyg_local_new(p, 8, 8);
@@ -6091,10 +6180,11 @@ struct TgFn {
                                 tyg_at_local(loc, 0), M.File(vd->line.fileidx), vd->line.line);
                 continue;
             }
-            auto loc = M.RzParam(t) ? tyg_local_new(p, 16, 8) : Temp(t);
+            auto psize = M.RzParam(t) && IsGrow(t) ? 16 : M.Size(t);
+            auto loc = tyg_local_new(p, psize, 8);
             locals[vd] = loc;
             if (M.IsScalar(t)) tyg_store(p, M.Scal(t), tyg_at_local(loc, 0), pv, 0);
-            else tyg_copy(p, tyg_at_local(loc, 0), tyg_at_val(pv, 0), M.RzParam(t) ? 16 : M.Size(t));
+            else tyg_copy(p, tyg_at_local(loc, 0), tyg_at_val(pv, 0), psize);
             tyg_debug_param(p, string(vd->name).c_str(), M.DT(t), tyg_at_local(loc, 0),
                             M.File(vd->line.fileidx), vd->line.line);
             if (M.RzParam(t)) {
@@ -6107,7 +6197,7 @@ struct TgFn {
         pi = afterfv;
         chans.resize(sp->rets.size());
         for (size_t i = 0; i < sp->rets.size(); i++) {
-            if (IsGrow(sp->rets[i])) {
+            if (M.Resz(sp->rets[i])) {
                 chans[i].a = param();
                 chans[i].b = param();
             } else if (M.IsImg(sp->rets[i]) || (int)i != cret) {
@@ -6119,7 +6209,7 @@ struct TgFn {
         // there, also one nested in another return's value that has
         // started building (`return str("x", if c { return "y"; } ...)`).
         for (size_t i = 0; i < sp->rets.size(); i++) {
-            if (!IsGrow(sp->rets[i]) && !IsImg(sp->rets[i])) continue;
+            if (!M.Resz(sp->rets[i]) && !IsImg(sp->rets[i])) continue;
             chans[i].top0 = tyg_local_new(p, 8, 8);
             tyg_store(p, TYG_I64, tyg_at_local(chans[i].top0, 0),
                       Top(tyg_load(p, TYG_I64, tyg_at_local(chans[i].a, 0), 0)), 0);
