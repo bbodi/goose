@@ -5052,7 +5052,10 @@ struct TgFn {
     // A block's value is its tail's (none in statement position).
     // A block's value is its tail's (none in statement position); a
     // function body's tail with a result is returned (tailret).
+    TypeExpr *armwant = nullptr;   // What GenArm wants of a block arm's tail.
     V GenBlock(Block *b, bool discard, bool tailret = false) {
+        auto want = armwant;
+        armwant = nullptr;
         tyg_scope_begin(p);
         OpenScope(false);
         for (auto s : b->stmts) Stmt(s);
@@ -5067,7 +5070,7 @@ struct TgFn {
             } else {
                 Open();
                 Loc(b->tail->line);
-                x = Gen(b->tail);
+                x = want ? GenSliceAs(b->tail, want) : Gen(b->tail);
                 if (x.t && (IsGrow(x.t) || IsImg(x.t))) No(b->tail->line, "array value of a block");
             }
         }
@@ -5213,14 +5216,23 @@ struct TgFn {
     }
 
     // An arm runs or not: what it takes on a stack is its own.
-    V GenArm(Node *n, bool discard) {
-        if (auto b = Is<Block>(n)) return GenBlock(b, discard);
+    V GenArm(Node *n, bool discard, TypeExpr *want = nullptr) {
+        // A slice wanted: an array arm is a view of the array where it lies
+        // (§6.4), not of a copy.
+        if (want && want->kind != TY_SLICE) want = nullptr;
+        if (auto b = Is<Block>(n)) {
+            auto was = armwant;
+            armwant = discard ? nullptr : want;
+            auto x = GenBlock(b, discard);
+            armwant = was;
+            return x;
+        }
         if (discard) {
             Stmt(n);
             return V {};
         }
         OpenScope(true);
-        auto x = Gen(n);
+        auto x = want ? GenSliceAs(n, want) : Gen(n);
         if (x.t && (IsGrow(x.t) || IsImg(x.t))) No(n->line, "array value of an arm");
         CloseScope();
         return x;
@@ -5229,6 +5241,23 @@ struct TgFn {
     V GenIf(IfExpr *i, bool discard) {
         auto et = i->exprtype;
         auto valued = !discard && et && et->kind != TY_VOID;
+        if (valued && i->elseb && !M.TypeOk(et)) {
+            // An image or a resizable: each arm builds it on a temporary's
+            // stack (GenImg, GenRz).
+            if (IsImg(et) && M.ImgOk(et)) {
+                auto stk = Stk(AllocStk(false, i->line), i->line);
+                V x;
+                x.t = et;
+                x.mem = true;
+                x.a = tyg_at_val(GenImg(i, stk, et, i->line), 0);
+                return x;
+            }
+            if (IsGrow(et) && (M.RzOk(et) || M.VeOk(et))) {
+                auto x = RzTemp(et, i->line);
+                GenRz(i, x.stk, x.a, et, i->line);
+                return x;
+            }
+        }
         if (valued && !M.TypeOk(et)) No(i->line, "if value type");
         tyg_local res = 0;
         if (valued) res = Temp(et);
@@ -5237,7 +5266,7 @@ struct TgFn {
         tyg_branch(p, c, tb, i->elseb ? eb : done);
         tyg_block_set(p, tb);
         auto arm = [&](Node *n) {
-            auto x = GenArm(n, !valued);
+            auto x = GenArm(n, !valued, valued ? et : nullptr);
             if (valued && !Ended() && x.t) Store(P { tyg_at_local(res, 0), et }, Fit(x, et, n->line));
             Jump(done);
         };
@@ -5313,7 +5342,7 @@ struct TgFn {
         auto k = [&](int64_t v) { return tyg_iconst(p, TYG_I64, v); };
         auto done = tyg_block_new(p);
         auto arm = [&](Node *body) {
-            auto v = GenArm(body, !valued);
+            auto v = GenArm(body, !valued, valued ? et : nullptr);
             if (valued && !Ended() && v.t) Store(P { tyg_at_local(res, 0), et }, Fit(v, et, body->line));
             Jump(done);
         };
@@ -5539,7 +5568,7 @@ struct TgFn {
                 }
             }
             Loc(a.body->line);   // A breakpoint on the arm's line stops here, bound.
-            auto v = GenArm(a.body, !valued);
+            auto v = GenArm(a.body, !valued, valued ? et : nullptr);
             if (valued && !Ended() && v.t) Store(P { tyg_at_local(res, 0), et }, Fit(v, et, a.body->line));
             CloseScope();
             tyg_scope_end(p);
