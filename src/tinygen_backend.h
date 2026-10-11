@@ -1621,6 +1621,12 @@ struct TgFn {
             }
             return;
         }
+        if (auto c = Is<Call>(n); c && c->builtin == B_TO_BYTES && c->ArgNodes().size() == 1) {
+            if (!IsU8(et)) No(l, "to_bytes of this type");
+            begin();
+            ToBytesInto(stk, len, c->ArgNodes()[0], l);
+            return;
+        }
         if (auto c = Is<Call>(n); c && c->builtin == B_STR) {
             if (!IsU8(et)) No(l, "str of this type");
             begin();
@@ -1900,6 +1906,27 @@ struct TgFn {
         }
         PatchPrefix(at(), t, tyg_load(p, TYG_I64, tyg_at_local(cnt, 0), 0), stk);
         return at();
+    }
+
+    // to_bytes (CodeGen::EmitToBytes): the payload's byte count ULEB128,
+    // then its bytes, appended at the top of stk to the u8 count at len.
+    void ToBytesInto(tyg_val stk, tyg_addr len, Node *a, Line l) {
+        auto v = ViewOf(Place(a), l);
+        if (Ended()) return;
+        auto sl = tyg_local_new(p, 16, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(sl, 0), v.elems, 0);
+        tyg_store(p, TYG_I64, tyg_at_local(sl, 8),
+                  cg.IsFix(v.elem) ? tyg_bin(p, TYG_MUL, v.len, tyg_iconst(p, TYG_I64, cg.FixedSize(v.elem)))
+                                   : tyg_bin(p, TYG_SUB, RunEnd(v), v.elems), 0);
+        auto src = [&] { return tyg_load(p, TYG_I64, tyg_at_local(sl, 0), 0); };
+        auto sz = [&] { return tyg_load(p, TYG_I64, tyg_at_local(sl, 8), 0); };
+        auto top = Top(stk);
+        auto pn = UlebWrite(top, sz());
+        auto at = tyg_bin(p, TYG_ADD, top, pn);
+        tyg_move_dyn(p, at, src(), sz());
+        auto tot = tyg_bin(p, TYG_ADD, pn, sz());
+        SetTop(stk, tyg_bin(p, TYG_ADD, top, tot));
+        tyg_store(p, TYG_I64, len, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, len, 0), tot), 0);
     }
 
     // A resizable temporary: a stack of the statement's, its header.
@@ -3785,6 +3812,20 @@ struct TgFn {
             y.mem = true;
             y.a = tyg_at_local(tmp, 0);
             return y;
+        }
+        if (c->builtin == B_TO_BYTES && c->ArgNodes().size() == 2) {
+            // Appended to a u8 resizable.
+            auto out = Deref(Place(c->ArgNodes()[1]));
+            if (!IsGrow(out.t) || !IsU8(out.t->arr->sub) || !out.stk) No(c->line, "to_bytes into this kind");
+            auto len = out.a;
+            len.offset += 8;
+            ToBytesInto(out.stk, len, c->ArgNodes()[0], c->line);
+            return V {};
+        }
+        if (c->builtin == B_TO_BYTES && c->ArgNodes().size() == 1) {
+            auto x = RzTemp(cg.GrowU8(), c->line);
+            GenRz(c, x.stk, x.a, x.t, c->line);
+            return x;
         }
         if (c->builtin == B_BYTES_OF && c->ArgNodes().size() == 1) {
             // The element region of an array or slice as a u8[:]
