@@ -3525,37 +3525,7 @@ struct TgFn {
         for (size_t i = 0; i < an.size(); i++) {
             auto pt = callee->argtypes[i];
             if (M.RzParam(pt)) {
-                // A by-value resizable: a copy of its own, on a stack of the
-                // statement's, as its header and its stack.
-                if (M.FoOk(pt)) {
-                    // A frame object: a copy of its own, its tail on a
-                    // stack of the statement's.
-                    P x { tyg_at_local(tyg_local_new(p, M.Size(pt), 8), 0), pt,
-                          Stk(AllocStk(false, an[i]->line), an[i]->line) };
-                    GenFo(an[i], x, an[i]->line);
-                    tyg_arg h {}, k {};
-                    h.mem = x.a;
-                    k.val = x.stk;
-                    args.push_back(h);
-                    args.push_back(k);
-                    continue;
-                }
-                if (!IsGrow(pt)) {
-                    // A T[]: an image of its own, on a stack of the
-                    // statement's, by its address.
-                    auto stk = Stk(AllocStk(false, an[i]->line), an[i]->line);
-                    tyg_arg a {};
-                    a.val = GenImg(an[i], stk, pt, an[i]->line);
-                    args.push_back(a);
-                    continue;
-                }
-                auto x = RzTemp(pt, an[i]->line);
-                GenRz(an[i], x.stk, x.a, pt, an[i]->line);
-                tyg_arg h {}, k {};
-                h.mem = x.a;
-                k.val = x.stk;
-                args.push_back(h);
-                args.push_back(k);
+                ValArg(an[i], pt, args);
                 continue;
             }
             args.push_back(Arg(an[i], pt));
@@ -3653,6 +3623,42 @@ struct TgFn {
             if (!M.IsScalar(r.t)) r.mem = true;
         }
         return rets;
+    }
+
+    // A by-value array, image or frame object argument: a copy of its own,
+    // on a stack of the statement's, as the C passes it (SigParams).
+    void ValArg(Node *n, TypeExpr *pt, vector<tyg_arg> &args) {
+        // A by-value resizable: a copy of its own, on a stack of the
+        // statement's, as its header and its stack.
+        if (M.FoOk(pt)) {
+            // A frame object: a copy of its own, its tail on a
+            // stack of the statement's.
+            P x { tyg_at_local(tyg_local_new(p, M.Size(pt), 8), 0), pt,
+                  Stk(AllocStk(false, n->line), n->line) };
+            GenFo(n, x, n->line);
+            tyg_arg h {}, k {};
+            h.mem = x.a;
+            k.val = x.stk;
+            args.push_back(h);
+            args.push_back(k);
+            return;
+        }
+        if (!IsGrow(pt)) {
+            // A T[]: an image of its own, on a stack of the
+            // statement's, by its address.
+            auto stk = Stk(AllocStk(false, n->line), n->line);
+            tyg_arg a {};
+            a.val = GenImg(n, stk, pt, n->line);
+            args.push_back(a);
+            return;
+        }
+        auto x = RzTemp(pt, n->line);
+        GenRz(n, x.stk, x.a, pt, n->line);
+        tyg_arg h {}, k {};
+        h.mem = x.a;
+        k.val = x.stk;
+        args.push_back(h);
+        args.push_back(k);
     }
 
     void FvArgs(Call *c, CodeGen::SpecInfo &ci, vector<tyg_arg> &args) {
@@ -4266,7 +4272,7 @@ struct TgFn {
     // A call whose every result is wanted: `let a, b = f()`, `return f()`.
     vector<V> GenCallAll(Node *n, size_t count) {
         auto c = Is<Call>(n);
-        if (!c || c->builtin >= 0 || !c->spec || c->spec->sf->isextern) No(n->line, "multiple results of this kind");
+        if (!DestSpec(c)) No(n->line, "multiple results of this kind");
         GenCall(c);
         if (lastrets.size() != count) No(n->line, "result count");
         return lastrets;
@@ -4997,18 +5003,25 @@ struct TgFn {
             for (size_t i = 0; i < sp->rets.size(); i++)
                 if (cg.Mangle(sp->rets[i]) != cg.Mangle(sp0->rets[i])) No(c->line, "dispatch with results of different types");
             for (size_t i = 0; i < sp->argtypes.size(); i++)
-                if (M.RzParam(sp->argtypes[i])) No(c->line, "dispatch with an array by value");
+                if ((int)i != pos && cg.Mangle(sp->argtypes[i]) != cg.Mangle(sp0->argtypes[i]))
+                    No(c->line, "dispatch with arguments of different types");
+            if (M.RzParam(sp->argtypes[(size_t)pos])) No(c->line, "dispatch to a case of this kind");
         }
         // The shared arguments, each kept in a local of its own: the arms
         // are blocks of their own.
         Scrut s {};
         vector<tyg_local> shared(an.size());
+        vector<vector<tyg_arg>> valargs(an.size());   // By-value arrays', built once.
         for (size_t i = 0; i < an.size(); i++) {
             if ((int)i == pos) {
                 s = AdtScrutinee(an[i], adt);
                 continue;
             }
             auto pt = sp0->argtypes[i];
+            if (M.RzParam(pt)) {
+                ValArg(an[i], pt, valargs[i]);
+                continue;
+            }
             if (!M.TypeOk(pt)) No(an[i]->line, "argument of this type");
             auto x = GenAs(an[i], pt);
             shared[i] = Temp(pt);
@@ -5048,6 +5061,9 @@ struct TgFn {
                     auto t = Temp(pt);
                     CopyPayload(s, (int)vi, tyg_at_local(t, 0));
                     a.mem = tyg_at_local(t, 0);
+                } else if (M.RzParam(pt)) {
+                    args.insert(args.end(), valargs[i].begin(), valargs[i].end());
+                    continue;
                 } else if (M.IsScalar(pt)) {
                     a.val = tyg_load(p, M.Scal(pt), tyg_at_local(shared[i], 0), 0);
                 } else {
