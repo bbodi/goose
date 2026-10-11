@@ -263,6 +263,124 @@ struct TgModule {
         return dtypes[name] = d;
     }
 
+    // ---- Globals -----------------------------------------------------------
+
+    // A global this backend reaches: a fixed value it holds, not a pool's.
+    // Every global stays the C half's (gs_globals_t, initialized by
+    // gs_init_globals as for any build), and is reached through an
+    // accessor the C half exports, which returns its address in the
+    // running thread's instance (GS_GL; Global). A `let` of a const type
+    // with a compile-time initializer, which the C makes static data
+    // (CodeGen::EmitGlobalDecls), is static data in this object too, read
+    // where it lies (StaticGlobal).
+    bool GlobalOk(VarDef *d) {
+        return d->isglobal && !d->reusable && !cg.PrefVar(d) && cg.gnames.count(d) && TypeOk(d->type);
+    }
+
+    map<const VarDef *, string> accessors;
+    string Accessor(VarDef *d) {
+        auto it = accessors.find(d);
+        auto name = it != accessors.end() ? it->second
+                                          : (accessors[d] = cat("gs_tg_g", accessors.size()));
+        NeedShim(name, cat("void *", name, "(void) { return (void *)&(", cg.gnames[d], "); }\n"));
+        return name;
+    }
+
+    // The static copy of a global the C makes static data, with its debug
+    // entry under its Goose name; TYG_NO_SYM for any other global, or one
+    // whose initializer this backend does not lay out.
+    map<const VarDef *, tyg_sym> gdata;
+    tyg_sym StaticGlobal(VarDef *d) {
+        if (auto it = gdata.find(d); it != gdata.end()) return it->second;
+        auto init = cg.gstatic.find(d);
+        vector<uint8_t> bytes((size_t)max<int64_t>(Size(d->type), 1), 0);
+        if (init == cg.gstatic.end() || !StaticBytes(init->second, d->type, bytes, 0))
+            return gdata[d] = TYG_NO_SYM;
+        auto sym = tyg_symbol(m, cat("gs_tg_d", gdata.size()).c_str(), 0);
+        int64_t align = 1;
+        while (align < 8 && align * 2 <= (int64_t)bytes.size()) align *= 2;
+        tyg_data(m, sym, TYG_SECTION_RODATA, bytes.data(), (int64_t)bytes.size(), align);
+        tyg_debug_global(m, string(d->name).c_str(), DT(d->type), sym, File(d->line.fileidx),
+                         d->line.line);
+        return gdata[d] = sym;
+    }
+
+    // n's value of type t as the bytes at `off`: what CodeGen::StaticInitX
+    // spells as a C initializer, laid out as the packed C type holds it.
+    bool StaticBytes(Node *n, TypeExpr *t, vector<uint8_t> &out, int64_t off) {
+        if (!n || !t) return false;
+        auto put = [&](const void *v, int64_t size) {
+            if (off + size > (int64_t)out.size()) return false;
+            memcpy(out.data() + off, v, (size_t)size);
+            return true;
+        };
+        if (auto id = Is<Ident>(n)) {
+            auto it = id->vdef ? cg.gstatic.find(id->vdef) : cg.gstatic.end();
+            if (it == cg.gstatic.end() ||
+                !(cg.TEq(id->vdef->type, t) || (t->kind == TY_INT && id->vdef->type->kind == TY_INT)))
+                return false;
+            return StaticBytes(it->second, t, out, off);
+        }
+        switch (t->kind) {
+            case TY_INT: {
+                auto i = Is<IntLit>(n);
+                if (!i || t->intstorage == IS_VARINT) return false;
+                auto v = (uint64_t)i->val;   // Little-endian: the low bytes.
+                return put(&v, ScalSize(Scal(t)));
+            }
+            case TY_FLT: {
+                auto f = Is<FltLit>(n);
+                if (!f) return false;
+                if (Scal(t) == TYG_F32) {
+                    auto v = (float)f->val;
+                    return put(&v, 4);
+                }
+                auto v = (double)f->val;
+                return put(&v, 8);
+            }
+            case TY_BOOL: {
+                auto b = Is<BoolLit>(n);
+                if (!b) return false;
+                uint8_t v = b->val ? 1 : 0;
+                return put(&v, 1);
+            }
+            case TY_STRUCT: {
+                auto sl = Is<StructLit>(n);
+                auto si = cg.SI(t);
+                if (!sl || sl->sinst != si) return false;
+                auto &lay = cg.StructLayout(si);
+                for (size_t fi = 0; fi < si->st->fields.size(); fi++) {
+                    if (si->st->fields[fi].ispad) continue;
+                    if (!StaticBytes(sl->InitFor((int)fi), si->ftypes[fi], out, off + lay.offs[fi]))
+                        return false;
+                }
+                return true;
+            }
+            case TY_ARRAY: {
+                if (t->arr->akind != A_FIXED) return false;
+                auto k = cg.ArrSize(t->arr);
+                auto et = t->arr->sub;
+                auto esz = cg.FixedSize(et);
+                if (auto str = Is<StrLit>(n)) {
+                    if (!IsU8(et) || (int64_t)str->val.size() != k) return false;
+                    return put(str->val.data(), k);
+                }
+                auto al = Is<ArrayLit>(n);
+                if (!al) return false;
+                if (al->fillval) {
+                    for (int64_t e = 0; e < k; e++)
+                        if (!StaticBytes(al->fillval, et, out, off + e * esz)) return false;
+                    return true;
+                }
+                if ((int64_t)al->elems.size() != k) return false;
+                for (int64_t e = 0; e < k; e++)
+                    if (!StaticBytes(al->elems[(size_t)e], et, out, off + e * esz)) return false;
+                return true;
+            }
+            default: return false;
+        }
+    }
+
     // ---- Signatures --------------------------------------------------------
 
     // Whether a call to sp, or sp's own definition (`define`), has a C
@@ -338,6 +456,13 @@ struct TgFn {
     // The out-pointers of results after the first (rets[i] at outs[i - 1]),
     // each kept in a local.
     vector<tyg_local> outs;
+    // The globals of the C half's instance this body names, each with the
+    // local holding its address. The accessors that give them are called
+    // once per invocation, in a block the entry block jumps to (gblk),
+    // filled once the body is done: a body runs on one thread, whose
+    // instance does not change under it.
+    vector<pair<VarDef *, tyg_local>> gaddrs;
+    tyg_block gblk = 0, gstart = 0;
 
     TgFn(TgModule &_M, FnSpec *_sp) : M(_M), cg(_M.cg), sp(_sp), m(_M.m) {}
 
@@ -472,8 +597,8 @@ struct TgFn {
             auto vd = id->vdef;
             if (!vd) No(n->line, "function as a value");
             auto it = locals.find(vd);
-            if (it == locals.end())
-                No(n->line, vd->isglobal ? "global variable" : "variable from outside");
+            if (it == locals.end() && vd->isglobal) return GlobalPlace(vd, n->line);
+            if (it == locals.end()) No(n->line, "variable from outside");
             return P { tyg_at_local(it->second, 0), vd->type };
         }
         if (auto d = Is<Dot>(n); d && d->IsField()) {
@@ -494,6 +619,25 @@ struct TgFn {
         P pl { tyg_at_local(t, 0), x.t };
         Store(pl, x);
         return pl;
+    }
+
+    P GlobalPlace(VarDef *d, Line l) {
+        if (!M.GlobalOk(d)) No(l, "global of this kind");
+        auto s = M.StaticGlobal(d);
+        if (s != TYG_NO_SYM) return P { tyg_at_sym(s, 0), d->type };
+        tyg_local loc = 0;
+        auto found = false;
+        for (auto &[g, at] : gaddrs)
+            if (g == d) {
+                loc = at;
+                found = true;
+            }
+        if (!found) {
+            M.Accessor(d);   // The shim, now, so that an abandoned body takes it back.
+            loc = tyg_local_new(p, 8, 8);
+            gaddrs.emplace_back(d, loc);
+        }
+        return P { tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(loc, 0), 0), 0), d->type };
     }
 
     // Builds n's value at the place.
@@ -1668,6 +1812,10 @@ struct TgFn {
                       tyg_param(p, (int)(sp->argtypes.size() + i - 1)), 0);
             outs.push_back(loc);
         }
+        gblk = tyg_block_new(p);
+        gstart = tyg_block_new(p);
+        tyg_jump(p, gblk);
+        tyg_block_set(p, gstart);
         auto body = sp->body;
         auto x = GenBlock(body, sp->rets.empty());
         if (!Ended()) {
@@ -1683,6 +1831,12 @@ struct TgFn {
                 tyg_trap(p);
             }
         }
+        // The addresses of the globals the body names.
+        tyg_block_set(p, gblk);
+        Loc(sp->sf->line);
+        for (auto &[d, loc] : gaddrs)
+            tyg_store(p, TYG_I64, tyg_at_local(loc, 0), CallC(M.Accessor(d), {}, {}, tyg_type_ptr(m)), 0);
+        tyg_jump(p, gstart);
         if (tyg_proc_end(p) != 0) {
             p = nullptr;
             No(sp->sf->line, cat("tinygen: ", tyg_error(m) ? tyg_error(m) : "?"));

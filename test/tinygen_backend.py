@@ -45,6 +45,11 @@ PROGRAMS = [
     ("test/tinygen/tinygen_results.goose", False, ["--tinygen-skip=main"]),
     ("test/tinygen/tinygen_results.goose", False,
      ["--tinygen-skip=divmod,minmax,split,corners,widen"]),
+    ("test/tinygen/tinygen_globals.goose", True, []),
+    ("test/tinygen/tinygen_globals.goose", True, ["--debug"]),
+    ("test/tinygen/tinygen_globals.goose", False, ["--tinygen-skip=main"]),
+    ("test/tinygen/tinygen_globals.goose", False,
+     ["--tinygen-skip=start_seed,divmod,bump,next,move_to,sum_primes"]),
     ("test/codegen/loop_invariant_divisors.goose", False, []),
     ("test/codegen/cnames.goose", False, []),
     ("test/codegen/wider_slot_operations.goose", False, []),
@@ -173,6 +178,25 @@ def check_lldb_arrays(exe, base, lldb, ok, fail):
         fail("tinygen array debug info under lldb", f"missing {missing}:\n{text}")
         return
     ok("tinygen debug info under lldb: a slice and a fixed array")
+    check_lldb_globals(exe, base, lldb, ok, fail)
+
+
+def check_lldb_globals(exe, base, lldb, ok, fail):
+    """The static data tinygen holds a copy of, by its Goose name and type."""
+    source = HERE / "tinygen" / "tinygen_globals.goose"
+    out = base / f"lldb-globals{tc.EXE_SUFFIX}"
+    good, log, _, _ = build(exe, source, out, [])
+    if not good:
+        fail("tinygen lldb globals build", log)
+        return
+    code, o, e = tc.run_capture([lldb, "-b", "-o", "b sum_primes", "-o", "run",
+                                 "-o", "target variable PRIMES", "-o", "kill", out])
+    text = o + e
+    want = r"\(i32\[6\]\) PRIMES = \(\[0\] = 2, \[1\] = 3, \[2\] = 5"
+    if not re.search(want, text):
+        fail("tinygen global debug info under lldb", f"missing {want}:\n{text}")
+        return
+    ok("tinygen debug info under lldb: a global")
 
 
 if __name__ == "__main__":
