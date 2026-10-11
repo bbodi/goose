@@ -1,0 +1,1 @@
+c_sources = ["tinygen_extern_impl.c"];

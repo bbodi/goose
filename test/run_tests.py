@@ -1916,6 +1916,16 @@ def main():
     if cc:
         r.show_task(native_toolchain)
 
+    def tinygen_backend():
+        from tinygen_backend import check_tinygen_backend
+        try:
+            check_tinygen_backend(exe, gendir, r.ok, r.fail, r.say)
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+            r.fail("tinygen backend", str(e))
+    if cc:
+        r.section("tinygen backend")
+        r.show_task(tinygen_backend)
+
     show_goose_in_goose()
 
     # --- JIT: the same programs, compiled and run inside the compiler --------
