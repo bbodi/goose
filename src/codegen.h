@@ -1262,6 +1262,12 @@ struct CodeGen {
     static const char *FnAttrs(FnSpec *sp) {
         return sp->outofline ? "GS_NOINLINE " : sp->cinline ? "GS_INLINE " : "";
     }
+    // A specialization's storage class and attributes. With another backend
+    // beside this one (SpecBackend) every specialization has external
+    // linkage, since the other object calls the C ones and the C calls its
+    // own, and none is inline: an inline definition with external linkage
+    // defines no symbol in C.
+    string FnLinkage(FnSpec *sp) { return backend ? string() : cat("static ", FnAttrs(sp)); }
     const VarDef *NamedResult(Block *fnbody, SFunction *target, size_t nrets, size_t resultidx);
     const VarDef *OpenIbNrvo(InlineBlock *ib, const Dst &d);
     void PlanTopClasses(FnSpec *sp);
@@ -1311,9 +1317,22 @@ struct CodeGen {
     // Extern-support C and user headers are inputs to this emission, not
     // process state that the driver must install before constructing us.
     // A function the extern support declares gets no prototype here.
+    // Another backend that compiles some specializations itself, to an
+    // object of its own linked beside this C (tinygen_backend.h). It chooses
+    // among the live specializations once their call interfaces are known;
+    // the ones it takes get a prototype here and no body.
+    struct SpecBackend {
+        virtual ~SpecBackend() {}
+        virtual set<FnSpec *> Choose(CodeGen &cg, const vector<FnSpec *> &specs) = 0;
+    };
+    SpecBackend *backend = nullptr;
+    set<FnSpec *> foreign;   // The specializations the other backend defines.
+
     CodeGen(Ast &_ast, string_view runtime_ext_text, const vector<string> &headers,
-            bool _norfcheck = false, bool _library = false, int64_t _maxstacks = 0)
-        : ast(_ast), library(_library), norfcheck(_norfcheck), maxstacks(_maxstacks) {
+            bool _norfcheck = false, bool _library = false, int64_t _maxstacks = 0,
+            SpecBackend *_backend = nullptr)
+        : ast(_ast), library(_library), norfcheck(_norfcheck), maxstacks(_maxstacks),
+          backend(_backend) {
         for (auto t : ast.alltypes)
             if (t->kind == TY_REF && t->ref->pool) poolglobals.insert(t->ref->pool);
         ComputeRelRootMax();
@@ -1324,11 +1343,13 @@ struct CodeGen {
         // state every propagating function's ordinary exit leaves behind.
         if (!fromids.empty()) data += "static GS_TLS int32_t gs_rf;\n";
         EmitGlobalDecls();
+        if (backend) foreign = backend->Choose(*this, livespecs);
         // Prototypes for every live specialization, then their bodies.
         for (auto sp : livespecs)
-            Append(protos, "static ", FnAttrs(sp), SigRet(sp), " ", sinfo[sp].cname, "(",
+            Append(protos, FnLinkage(sp), SigRet(sp), " ", sinfo[sp].cname, "(",
                    SigParams(sp, false), ");\n");
-        for (auto sp : livespecs) EmitSpec(sp);
+        for (auto sp : livespecs)
+            if (!foreign.count(sp)) EmitSpec(sp);
         EmitGlobalInit();
         // Element-run twins requested by call sites, the globals'
         // initializers included (may request more).
