@@ -3457,7 +3457,15 @@ struct TgFn {
             tyg_block_set(p, ok);
         };
         if (!cg.IsFix(t)) {
-            if (!EqBitwise(t)) No(l, cat("comparison of type ", M.NameWhy(t)));
+            if (!EqBitwise(t)) {
+                // Floats or pads among its bytes: walked field by field,
+                // over a cursor in each (CodeGen::EmitEqWalk).
+                auto ca = tyg_local_new(p, 8, 8), cb = tyg_local_new(p, 8, 8);
+                tyg_store(p, TYG_I64, tyg_at_local(ca, 0), tyg_addr_of(p, a.a), 0);
+                tyg_store(p, TYG_I64, tyg_at_local(cb, 0), tyg_addr_of(p, b.a), 0);
+                EqWalk(t, ca, cb, fail, l);
+                return;
+            }
             auto pa = tyg_addr_of(p, a.a), pb = tyg_addr_of(p, b.a);
             auto na = ImgSize(t, pa);
             next(tyg_cmp(p, TYG_EQ, na, ImgSize(t, pb)));
@@ -3535,6 +3543,128 @@ struct TgFn {
             return;
         }
         No(l, cat("comparison of type ", M.NameWhy(t)));
+    }
+    // The bytes value at each cursor compared with the other's, both
+    // cursors left behind it (CodeGen::EmitEqWalk): fixed parts by value,
+    // a varint by its canonical bytes, an array by its length and then
+    // its elements, a struct by its fields in order, an ADT by its tag and
+    // then its variant's payload.
+    void EqWalk(TypeExpr *t, tyg_local ca, tyg_local cb, tyg_block fail, Line l) {
+        auto A = [&] { return tyg_load(p, TYG_I64, tyg_at_local(ca, 0), 0); };
+        auto B = [&] { return tyg_load(p, TYG_I64, tyg_at_local(cb, 0), 0); };
+        auto adv = [&](tyg_val n) {
+            tyg_store(p, TYG_I64, tyg_at_local(ca, 0), tyg_bin(p, TYG_ADD, A(), n), 0);
+            tyg_store(p, TYG_I64, tyg_at_local(cb, 0), tyg_bin(p, TYG_ADD, B(), n), 0);
+        };
+        auto next = [&](tyg_val same) {
+            auto ok = tyg_block_new(p);
+            tyg_branch(p, same, ok, fail);
+            tyg_block_set(p, ok);
+        };
+        auto i64 = [&](int64_t v) { return tyg_iconst(p, TYG_I64, v); };
+        if (cg.IsFix(t)) {
+            if (!M.TypeOk(t)) No(l, cat("comparison of type ", M.NameWhy(t)));
+            EqJump(P { tyg_at_val(A(), 0), t }, P { tyg_at_val(B(), 0), t }, fail, l);
+            adv(i64(cg.FixedSize(t)));
+            return;
+        }
+        switch (t->kind) {
+            case TY_INT: case TY_REF: {
+                if (!TgModule::IsVarint(t) && !TgModule::IsVr(t)) No(l, cat("comparison of type ", M.NameWhy(t)));
+                auto na = tyg_local_new(p, 8, 8);
+                tyg_store(p, TYG_I64, tyg_at_local(na, 0), UlebSize(A()), 0);
+                auto n = [&] { return tyg_load(p, TYG_I64, tyg_at_local(na, 0), 0); };
+                next(tyg_cmp(p, TYG_EQ, UlebSize(B()), n()));
+                auto d = CallC("memcmp", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64, false) }, { A(), B(), n() }, IT(TYG_I32));
+                next(tyg_cmp(p, TYG_EQ, d, tyg_iconst(p, TYG_I32, 0)));
+                adv(n());
+                return;
+            }
+            case TY_ARRAY: {
+                auto sub = t->arr->sub;
+                auto lena = tyg_local_new(p, 8, 8), lenb = tyg_local_new(p, 8, 8);
+                auto capa = tyg_local_new(p, 8, 8), capb = tyg_local_new(p, 8, 8);
+                auto rc = TgModule::IsLim(t);
+                // The length (and a limited array's capacity) at a cursor, which moves past them.
+                auto head = [&](tyg_local c, tyg_local len, tyg_local cap) {
+                    auto at = [&] { return tyg_load(p, TYG_I64, tyg_at_local(c, 0), 0); };
+                    auto put = [&](tyg_local l2, tyg_val v) { tyg_store(p, TYG_I64, tyg_at_local(l2, 0), v, 0); };
+                    if (t->arr->akind == A_VAR) {
+                        auto w = TgModule::LenWidth(t);
+                        if (w == 0) {
+                            put(len, UlebRead(at()));
+                            tyg_store(p, TYG_I64, tyg_at_local(c, 0), tyg_bin(p, TYG_ADD, at(), UlebSize(at())), 0);
+                        } else {
+                            auto sc = w == 1 ? TYG_I8 : w == 2 ? TYG_I16 : w == 4 ? TYG_I32 : TYG_I64;
+                            auto n = tyg_load(p, sc, tyg_at_val(at(), 0), 0);
+                            if (sc != TYG_I64) n = tyg_convert(p, TgModule::SignedLen(t) ? TYG_SEXT : TYG_ZEXT, TYG_I64, n);
+                            put(len, n);
+                            tyg_store(p, TYG_I64, tyg_at_local(c, 0), tyg_bin(p, TYG_ADD, at(), i64(w)), 0);
+                        }
+                    } else if (rc) {
+                        put(cap, tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, TYG_I32, tyg_at_val(at(), 0), 0)));
+                        put(len, tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, TYG_I32, tyg_at_val(at(), 4), 0)));
+                        tyg_store(p, TYG_I64, tyg_at_local(c, 0), tyg_bin(p, TYG_ADD, at(), i64(8)), 0);
+                    } else {
+                        No(l, cat("comparison of type ", M.NameWhy(t)));
+                    }
+                };
+                head(ca, lena, capa);
+                head(cb, lenb, capb);
+                auto la = [&] { return tyg_load(p, TYG_I64, tyg_at_local(lena, 0), 0); };
+                auto lb = [&] { return tyg_load(p, TYG_I64, tyg_at_local(lenb, 0), 0); };
+                next(tyg_cmp(p, TYG_EQ, la(), lb()));
+                auto il = tyg_local_new(p, 8, 8);
+                tyg_store(p, TYG_I64, tyg_at_local(il, 0), i64(0), 0);
+                auto hd = tyg_block_new(p), body = tyg_block_new(p), done = tyg_block_new(p);
+                tyg_jump(p, hd);
+                tyg_block_set(p, hd);
+                tyg_branch(p, tyg_cmp(p, TYG_SLT, tyg_load(p, TYG_I64, tyg_at_local(il, 0), 0), la()), body, done);
+                tyg_block_set(p, body);
+                EqWalk(sub, ca, cb, fail, l);
+                tyg_store(p, TYG_I64, tyg_at_local(il, 0),
+                          tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, tyg_at_local(il, 0), 0), i64(1)), 0);
+                tyg_jump(p, hd);
+                tyg_block_set(p, done);
+                if (rc) {
+                    // Each side's unused slots.
+                    auto esz = cg.FixedSize(sub);
+                    auto ld = [&](tyg_local c, tyg_local cap, tyg_local len) {
+                        auto gap = tyg_bin(p, TYG_MUL, tyg_bin(p, TYG_SUB, tyg_load(p, TYG_I64, tyg_at_local(cap, 0), 0),
+                                                               tyg_load(p, TYG_I64, tyg_at_local(len, 0), 0)), i64(esz));
+                        tyg_store(p, TYG_I64, tyg_at_local(c, 0), tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, tyg_at_local(c, 0), 0), gap), 0);
+                    };
+                    ld(ca, capa, lena);
+                    ld(cb, capb, lenb);
+                }
+                return;
+            }
+            case TY_STRUCT: case TY_VARIANT:
+                cg.EachField(t, [&](TypeExpr *ft) { EqWalk(ft, ca, cb, fail, l); });
+                return;
+            case TY_ENUM: {
+                auto ei = cg.EIOf(t);
+                auto ts = M.TagSize(t);
+                auto ta = LoadTag(tyg_at_val(A(), 0), t);
+                next(tyg_cmp(p, TYG_EQ, ta, LoadTag(tyg_at_val(B(), 0), t)));
+                auto tag = tyg_local_new(p, 8, 8);
+                tyg_store(p, TYG_I64, tyg_at_local(tag, 0), LoadTag(tyg_at_val(A(), 0), t), 0);
+                adv(i64(ts));
+                auto done = tyg_block_new(p);
+                for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
+                    auto hit = tyg_block_new(p), miss = tyg_block_new(p);
+                    tyg_branch(p, tyg_cmp(p, TYG_EQ, tyg_load(p, TYG_I64, tyg_at_local(tag, 0), 0), i64((int64_t)vi)), hit, miss);
+                    tyg_block_set(p, hit);
+                    EqWalk(cg.VariantType(t, (int)vi), ca, cb, fail, l);
+                    tyg_jump(p, done);
+                    tyg_block_set(p, miss);
+                }
+                tyg_jump(p, done);
+                tyg_block_set(p, done);
+                return;
+            }
+            default: No(l, cat("comparison of type ", M.NameWhy(t)));
+        }
     }
     // The first n elements of two views, n their (equal) count.
     void EqElems(const View &va, const View &vb, tyg_block fail, Line l) {
