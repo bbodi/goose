@@ -5322,6 +5322,18 @@ struct TgFn {
         vector<tyg_local> shared(an.size());
         vector<vector<tyg_arg>> valargs(an.size());   // By-value arrays', built once.
         for (size_t i = 0; i < an.size(); i++) {
+            if ((int)i == pos && sp0->argtypes[i]->kind == TY_REF) {
+                // Cases taking the variant by reference: the value where it
+                // lies, its payload handed by address.
+                auto pl = Deref(Place(an[i]));
+                s = Scrut { V {}, adt, tyg_local_new(p, 8, 8) };
+                s.v.t = adt;
+                s.v.mem = true;
+                s.v.a = pl.a;
+                if (Ended()) s.v.a = tyg_at_local(Temp(M.ast.inttypes[IS_I64]), 0);
+                tyg_store(p, TYG_I64, tyg_at_local(s.tag, 0), LoadTag(s.v.a, adt), 0);
+                continue;
+            }
             if ((int)i == pos) {
                 s = AdtScrutinee(an[i], adt);
                 continue;
@@ -5365,7 +5377,9 @@ struct TgFn {
             for (size_t i = 0; i < an.size(); i++) {
                 auto pt = sp->argtypes[i];
                 tyg_arg a {};
-                if ((int)i == pos) {
+                if ((int)i == pos && pt->kind == TY_REF && pt->ref->sub->kind == TY_VARIANT) {
+                    a.val = tyg_bin(p, TYG_ADD, tyg_addr_of(p, s.v.a), tyg_iconst(p, TYG_I64, M.TagSize(adt)));
+                } else if ((int)i == pos) {
                     if (pt->kind != TY_VARIANT) No(c->line, "dispatch to a case of this kind");
                     auto t = Temp(pt);
                     CopyPayload(s, (int)vi, tyg_at_local(t, 0));
