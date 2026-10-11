@@ -1324,6 +1324,7 @@ struct TgModule {
         TypeExpr *elem = nullptr;    // The tail's element type, null without one.
         int tailfi = -1;
         bool img = false;            // A variable-size field: an image, walked by its size (VvOk).
+        bool fo = false;             // The tail is a frame object, its fields bytes ahead of its elements.
         bool ok = true;
     };
     RbShape RbShapeOf(EnumInst *ei, int vi) {
@@ -1339,8 +1340,14 @@ struct TgModule {
             }
             auto ft = ei->vftypes[(size_t)vi][i];
             if (cg.IsResz(ft)) {
-                if ((int)i != LastRealField(fs) || !IsGrow(ft)) sh.ok = false;
-                else sh.elem = ft->arr->sub, sh.tailfi = (int)i;
+                if ((int)i != LastRealField(fs)) sh.ok = false;
+                else if (IsGrow(ft)) sh.elem = ft->arr->sub, sh.tailfi = (int)i;
+                else if (cg.IsFrameObj(ft)) {
+                    // A frame object (C.2) as bytes (CodeGen::FoBytes): its fixed
+                    // fields, then its innermost tail's elements.
+                    sh.elem = cg.FoTailArr(ft)->arr->sub, sh.tailfi = (int)i, sh.fo = true;
+                    off += cg.FoBytesPrefix(ft);
+                } else sh.ok = false;
                 break;
             }
             if (!cg.IsFix(ft)) {   // A variable-size field: a size to walk, no offset.
@@ -1367,7 +1374,7 @@ struct TgModule {
             if (fs[i].ispad) continue;
             auto ft = ei->vftypes[(size_t)vi][i];
             if ((int)i == sh.tailfi) {
-                if (!RzOk(ft, depth + 1)) return false;
+                if (sh.fo ? !(FoOk(ft, depth + 1) && RzOk(cg.FoTailArr(ft), depth + 1)) : !RzOk(ft, depth + 1)) return false;
                 continue;
             }
             if (!cg.IsFix(ft) || !TypeOk(ft, depth + 1)) return false;
@@ -2218,6 +2225,12 @@ struct TgFn {
                 }
                 auto ft = ei->vftypes[(size_t)vi][i];
                 auto init = sl->InitFor((int)i);
+                if ((int)i == sh.tailfi && sh.fo) {
+                    if (!init || Is<SelfRef>(init)) No(l, "resizable ADT without its frame object");
+                    GenFoBytes(init, stk, ft, len, l);
+                    if (Ended()) return;
+                    continue;
+                }
                 if ((int)i == sh.tailfi) {
                     if (!init) continue;
                     if (Is<SelfRef>(init)) No(l, "self reference in a resizable ADT");
@@ -2436,6 +2449,7 @@ struct TgFn {
         tyg_store(p, TYG_I64, tyg_at_local(th, 8), tyg_load(p, TYG_I64, hl, 0), 0);
         P r { tyg_at_local(th, 0), ft, base.stk };
         r.tmphdr = true;
+        r.ohdr = base.tmphdr ? base.ohdr : base.a;   // The struct's own header, whose count it is.
         return r;
     }
     // A field of a resizable variant's payload, where it lies.
@@ -6525,7 +6539,12 @@ struct TgFn {
                 first = false;
                 auto ft = ei->vftypes[(size_t)vi][i];
                 auto at = tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, pl.a, 0), tyg_iconst(p, TYG_I64, pay + sh.offs[i]));
-                if ((int)i == sh.tailfi) {
+                if ((int)i == sh.tailfi && sh.fo) {
+                    P fp { tyg_at_val(at, 0), ft };
+                    fp.bfo = true;
+                    fp.ohdr = pl.a;
+                    RenderInto(stk, len, fp, true, l, depth + 1);
+                } else if ((int)i == sh.tailfi) {
                     auto th = tyg_local_new(p, 16, 8);
                     tyg_store(p, TYG_I64, tyg_at_local(th, 0), at, 0);
                     tyg_store(p, TYG_I64, tyg_at_local(th, 8), tyg_load(p, TYG_I64, hl, 0), 0);
@@ -6830,7 +6849,9 @@ struct TgFn {
     // result, and whether the bytes were one.
     vector<V> GenFromBytes(Call *c) {
         auto t = c->rettypes.empty() ? nullptr : c->rettypes[0];
-        if (!t || !IsGrow(t) || !(M.RzOk(t) || M.VeOk(t))) No(c->line, "from_bytes of this type");
+        // A T[] image result (a statement's own stack) as well as a resizable.
+        auto isimg = t && IsVarArr(t) && M.RzOk(t);
+        if (!t || !((IsGrow(t) && (M.RzOk(t) || M.VeOk(t))) || isimg)) No(c->line, "from_bytes of this type");
         auto et = t->arr->sub;
         auto plain = cg.IsFix(et) && !cg.NeedsVerifyWalk(et) && cg.FixedSize(et) > 0;
         auto esz = plain ? cg.FixedSize(et) : 0;
@@ -6850,7 +6871,14 @@ struct TgFn {
         auto i64 = [&](int64_t x) { return tyg_iconst(p, TYG_I64, x); };
         auto ld = [&](tyg_local l) { return tyg_load(p, TYG_I64, tyg_at_local(l, 0), 0); };
         auto st = [&](tyg_local l, tyg_val x) { tyg_store(p, TYG_I64, tyg_at_local(l, 0), x, 0); };
-        auto r = RzTemp(t, c->line);
+        V r;
+        if (isimg) {
+            r.t = t;
+            r.mem = true;
+            r.stk = Stk(AllocStk(false, c->line), c->line);
+        } else {
+            r = RzTemp(t, c->line);
+        }
         auto rlen = r.a;
         rlen.offset += 8;
         auto src = tyg_local_new(p, 8, 8), len = tyg_local_new(p, 8, 8), pay = tyg_local_new(p, 8, 8),
@@ -6916,6 +6944,34 @@ struct TgFn {
             st(okl, tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_cmp(p, TYG_SGE, n, i64(0))));
             tyg_jump(p, ran);
             tyg_block_set(p, ran);
+        }
+        if (isimg) {
+            // The prefix reserved, the payload behind it, the count patched
+            // in (CodeGen::OpenRzDest, EmitPrefixPatch).
+            auto start = tyg_local_new(p, 8, 8);
+            st(start, Top(r.stk));
+            SetTop(r.stk, tyg_bin(p, TYG_ADD, ld(start), i64(TgModule::PrefixBytes(t))));
+            auto copy = tyg_block_new(p), out = tyg_block_new(p);
+            tyg_branch(p, tyg_cmp(p, TYG_NE, ld(okl), i64(0)), copy, out);
+            tyg_block_set(p, copy);
+            auto top = Top(r.stk);
+            tyg_move_dyn(p, top, ld(pay), ld(pn));
+            SetTop(r.stk, tyg_bin(p, TYG_ADD, top, ld(pn)));
+            tyg_jump(p, out);
+            tyg_block_set(p, out);
+            // The count: the verifier's, or none for a rejected image.
+            auto zero = tyg_block_new(p), keep = tyg_block_new(p);
+            tyg_branch(p, tyg_cmp(p, TYG_NE, ld(okl), i64(0)), keep, zero);
+            tyg_block_set(p, zero);
+            st(cnt, i64(0));
+            tyg_jump(p, keep);
+            tyg_block_set(p, keep);
+            PatchPrefix(ld(start), t, ld(cnt), r.stk);
+            r.a = tyg_at_val(ld(start), 0);
+            V ok;
+            ok.t = M.ast.booltype;
+            ok.v = tyg_convert(p, TYG_TRUNC, TYG_I8, ld(okl));
+            return { r, ok };
         }
         tyg_store(p, TYG_I64, r.a, Top(r.stk), 0);
         tyg_store(p, TYG_I64, rlen, i64(0), 0);
@@ -8907,6 +8963,20 @@ struct TgFn {
             GenFo(a->rhs, pl, a->line);
             return;
         }
+        if (a->op == T_ASSIGN && pl.tmphdr && pl.stk && M.RbOk(pl.t)) {
+            // The tail of a resizable struct, a resizable ADT (Assign::CgStmt):
+            // the stack's top back to where the tail starts, the new one built
+            // there, its count the struct's.
+            SetTop(pl.stk, tyg_load(p, TYG_I64, pl.a, 0));
+            GenRb(a->rhs, pl.stk, pl.a, pl.t, a->line);
+            if (Ended()) return;
+            auto tl = pl.a;
+            tl.offset += 8;
+            auto ol = pl.ohdr;
+            ol.offset += 8;
+            tyg_store(p, TYG_I64, ol, tyg_load(p, TYG_I64, tl, 0), 0);
+            return;
+        }
         if (a->op == T_ASSIGN && pl.tmphdr) No(a->line, "assignment to the tail of a resizable struct");
         if (a->op == T_ASSIGN && M.RsOk(pl.t)) {
             // A whole resizable struct: rebuilt from the start of its image.
@@ -9199,7 +9269,7 @@ struct TgFn {
     // A fixed field at its offset in the C struct; the tail, a resizable
     // whose header is the struct's last member, on the frame object's stack.
     P FoFieldPlace(const P &base, int fi, Line l, bool read = false) {
-        if (base.bfo) return BfoFieldPlace(base, fi, l);
+        if (base.bfo) return BfoFieldPlace(base, fi, l, read);
         auto fl = M.FoLayout(base.t);
         auto si = cg.SI(base.t);
         auto a = base.a;
@@ -9322,7 +9392,7 @@ struct TgFn {
     // Field fi of the frame object at base.a laid out as bytes
     // (CodeGen::FoBytes): its fixed fields packed in order, an explicit pad
     // taking its bytes and a bare one none, the tail where they end.
-    P BfoFieldPlace(const P &base, int fi, Line l) {
+    P BfoFieldPlace(const P &base, int fi, Line l, bool read = false) {
         auto si = cg.SI(base.t);
         auto fl = M.FoLayout(base.t);
         auto &fields = si->st->fields;
@@ -9344,7 +9414,7 @@ struct TgFn {
             r.ohdr = base.ohdr;
             return r;
         }
-        if (!base.stk) No(l, "frame object without its stack");
+        if (!base.stk && !read) No(l, "frame object without its stack");
         P r { base.ohdr, ft, base.stk };
         r.rbase = tyg_addr_of(p, a);
         return r;
