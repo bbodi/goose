@@ -119,8 +119,12 @@ function counts as owning none.
 any other, their C parts are linked as before, and their extern fns go
 through the trampolines.
 
-**Globals** stay in `gs_globals_t` in the C half; a function naming one is
-left to C in the first stage.
+**Globals** stay in `gs_globals_t` in the C half, initialized by
+`gs_init_globals` before `main` as in any build (an initializer calling a
+tinygen function calls it from there). tinygen code reaches one through an
+accessor the C half exports (`void *gs_tg_g0(void) { return &GS_GL->x_g; }`),
+so a worker thread reads its own instance through the thread-local `gs_gl`
+without tinygen touching thread-local storage (gap 6). See the second stage.
 
 ## Building tinygen into goose
 
@@ -136,7 +140,7 @@ at a pinned tag like the blessed packages, once its API settles.
 ## What the first stage supports
 
 Specializations whose interface is plain: parameters and a result of the types
-below (no free variables, no `return from`, no multiple results, no pool
+below (no free variables, no `return from`, no pool
 parameters, no large fixed values), and whose bodies use only:
 
 * **types**: every integer type but `varint`, `f32`, `f64`, `bool`, plain
@@ -208,6 +212,32 @@ with its `data` pointer and `len` (`(i64[:]) s = { data = 0x... len = 5 }`;
 by themselves: that needs an array type whose count is the `len` member,
 which tinygen lacks (gap 3).
 
+**Multiple results** (§7.1): the C convention is `CodeGen::SigParams`'s. A
+result the backend holds is fixed and not large, so `CollectSpecs` makes
+the first one the C return value (`cret == 0`), and every later one is an
+out-pointer `T *gs_r<i>` after the declared parameters (and before `gs_sp`).
+A call passes the addresses of temporaries; `let a, b = f()` declares the
+locals and stores each result into its own, adapted to its type (`Fit`);
+`return a, b` evaluates the results in order, writing each later one
+through its out-pointer as it is made, as the C does; `return f()` forwards
+every result of the call, adapting each. An ordinary value use of such a
+call takes the first, a call statement discards them all. Extern fns with
+more than one result stay in C.
+
+**Globals**: a fixed global of a type the backend holds (not a pool's,
+not `reusable`) is read and written in place. The accessors a body needs
+are called once per invocation, in a block the entry block jumps to and
+that is filled once the body is done (a body runs on one thread, whose
+instance does not change under it); each address is kept in a local. A
+`let` of a const type with a compile-time initializer, which the C makes
+`static const` data, is static data in the object too: the backend lays out
+the bytes of what `StaticInitX` would spell (`tyg_data`, read-only, no
+pointers since such initializers hold none, so no `tyg_data_reloc`), reads
+it where it lies, and describes it with `tyg_debug_global` under its Goose
+name and type (`target variable PRIMES` gives `(i32[6]) PRIMES = ([0] = 2,
+...)`). The other globals are described only by the C half, as members of
+`gs_globals_main` under their C names (gap 7).
+
 Not yet: static-capacity limited arrays `T[..k]` (a length beside the slots,
 built by copy from other arrays, §4.2), slices of variable-size elements,
 slices of string literals and `u8[]` values, element-wise operators on
@@ -224,34 +254,45 @@ backend compiles:
 |---|---|---|
 | first (scalars, structs, control flow) | 542 of 3811 (14%) | 0 of 172 |
 | second, so far (fixed arrays, slices) | 952 of 3811 (25%) | 1 of 172 |
+| second, so far (+ multiple results, globals) | 1099 of 3811 (29%) | 1 of 172 |
 
 (The first stage's own write-up counted 394 of 3331 over 284 programs, an
-older sweep; both rows above come from the same one.) What still sends a
-function to C, by count: a parameter or result of a type the backend does not
-hold (mostly `u8[]` strings and resizable arrays, 870), a local of such a type
-(357), multiple results (352), free variables of nested functions (329), a
-global (179), calls through function values and dispatch (169), `return
-from` (158), and calls to functions using data stacks (87). Goose-in-Goose
-passes strings and resizable arrays nearly everywhere, which is stage 3.
+older sweep; the rows above come from the same one.) The step that added
+multiple results and globals took fewer functions than the counts promised:
+the "multiple results" reason (352) also counted every function whose single
+result the C does not return as its value (a `u8[]` string, a resizable
+array), and most globals named are strings, resizable arrays or SIMD
+vectors. What still sends a function to C, by count (the check order now
+reports a result's type before its position): a parameter of a type the
+backend does not hold (mostly `u8[]` strings and resizable arrays, 748), a
+local of such a type (371), a result of such a type (414), free variables of
+nested functions (358 with the calls to such functions), calls through
+function values and dispatch (169), `return from` (167), builtins other
+than `print` and `len` (108), calls to functions using data stacks (95), and
+globals of the types above (51). Goose-in-Goose passes strings and resizable
+arrays nearly everywhere, which is stage 3.
 
 ## Testing
 
 `test/tinygen/` holds fixtures the backend covers whole: scalars,
 structs, extern calls with C of their own (a sidecar), a division by zero
 that must abort with the Goose line, arrays and slices (ending in a failed
-bounds check), and a slice whose bounds fail. They are ordinary fixtures, run by the
+bounds check), a slice whose bounds fail, multiple results, and globals
+(mutable ones, static data, and one whose initializer calls a function). They are ordinary fixtures, run by the
 main suite through both C backends against `test/expected/`.
 `test/tinygen_backend.py` (the "tinygen backend" section of `run_tests.py`)
 builds them with `--backend=tinygen`, requires every function to go through
 tinygen, builds the structs fixture three more times with chosen functions
 left to C (`--tinygen-skip=a,b`, hidden) so that by-value and by-reference
-structs cross the two halves in both directions, and the arrays fixture twice
-more so that arrays and slices do, builds a few existing
+structs cross the two halves in both directions, and the arrays, results
+and globals fixtures twice more so that arrays and slices, out-pointers and
+globals do, builds a few existing
 fixtures and a sample that the stage covers in part, and compares every run
 with the same expected output. Where `lldb` is installed it runs one program
 under it and requires a breakpoint by Goose function name, Goose lines in the
 frame and its caller, and a parameter and a local with Goose types; and one
-more for a slice parameter's `data` and `len` and a fixed array's elements.
+more for a slice parameter's `data` and `len` and a fixed array's elements,
+and one for a static global by its Goose name.
 
 ## What tinygen lacks for Goose
 
@@ -297,10 +338,20 @@ Recorded here rather than changed in tinygen, which other work is changing:
    unchecked, and the Windows x64 rules differ again. This needs a test on
    those targets before the backend is enabled there.
 6. **Thread-locals on Mach-O.** The runtime keeps `gs_gl` and `gs_rf` in
-   thread-local storage. Reaching them from tinygen code (a later stage:
-   globals, `return from`) needs `TYG_SYM_TLS` access on every target;
+   thread-local storage. Globals sidestep it (the C half's accessors read
+   `gs_gl`); reaching `gs_rf` from tinygen code for `return from` would
+   need `TYG_SYM_TLS` access on every target, or accessors of its own;
    tinygen's recent work names ELF thread-locals, and Mach-O's TLV access
    should be checked.
+
+7. **Debug info for a member of a data symbol.** `tyg_debug_global` takes a
+   symbol, and the variable is at its start. A global that lives in the C
+   half's instance block (`gs_globals_main`, or a worker's through
+   `gs_gl`) is at an offset in a struct, and with threads at a thread-local
+   address: describing it under its Goose name needs a symbol and offset
+   (or a DWARF location expression: the TLS block, a load, an offset),
+   which tinygen's debug calls cannot express. Until then lldb shows such
+   a global as `gs_globals_main.counter_g`.
 
 ## Plan
 
@@ -311,11 +362,9 @@ Recorded here rather than changed in tinygen, which other work is changing:
 2. **Fixed arrays and slices**: done so far: `T[k]` values and fields,
    slices of fixed elements as parameters, results and values, indexing
    with bounds checks (`gs_idxfail`, honoring `Index::nobc`), slicing,
-   `len`, `for` over arrays and slices, string literals as slices. Next, in
-   order of what the coverage count says they unlock: multiple results
-   (out-pointers, 352 functions), globals through an exported accessor for
-   `gs_globals_t` (or `gs_globals_main` made external, 179), static-capacity
-   `T[..k]`, fixed-mode enums and `match`, optional references and null
+   `len`, `for` over arrays and slices, string literals as slices;
+   multiple results (out-pointers); globals (C accessors, static data).
+   Next: static-capacity `T[..k]`, fixed-mode enums and `match`, optional references and null
    tests, `block`/`break` with values, and `InlineBlock`, so that `-O1` and
    `-O2` builds stay in tinygen.
 3. **Data stacks**: resizable and variable-size values, `gs_sp` and the stack
