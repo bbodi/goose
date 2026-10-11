@@ -2654,6 +2654,14 @@ struct TgFn {
         auto pl = Place(a->lval);
         if (a->pointee) pl = Deref(pl);
         if (a->op == T_DOTASSIGN) No(a->line, "rebind");
+        if (a->op == T_ASSIGN && IsGrow(pl.t)) {
+            // A whole resizable (Assign::CgStmt): its stack's top back to
+            // where its elements start, then the new ones built there.
+            if (!M.RzOk(pl.t) || !pl.stk) No(a->line, "assignment to an array of this kind");
+            SetTop(pl.stk, tyg_load(p, TYG_I64, pl.a, 0));
+            GenRz(a->rhs, pl.stk, pl.a, pl.t, a->line);
+            return;
+        }
         if (a->op == T_ASSIGN) {
             // The destination's address is taken before the value runs (it
             // is a local slot or an address in a register), as the C does.
