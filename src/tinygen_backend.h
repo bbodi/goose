@@ -4399,6 +4399,20 @@ struct TgFn {
             x.v = CallC("gs_hardware_threads", {}, {}, IT(TYG_I64));
             return x;
         }
+        if ((c->builtin == B_EMBED_FILE || c->builtin == B_EMBED_SHADER) && c->shaderblob &&
+            c->rettypes.size() == 1) {
+            // A read-only view of static data (CodeGen's B_EMBED_FILE): the
+            // blob's bytes in the object, the slice's data and length.
+            auto &blob = *c->shaderblob;
+            auto t = Temp(c->rettypes[0]);
+            tyg_store(p, TYG_I64, tyg_at_local(t, 0), tyg_addr_of(p, tyg_at_sym(M.Bytes(blob), 0)), 0);
+            tyg_store(p, TYG_I64, tyg_at_local(t, 8), tyg_iconst(p, TYG_I64, (int64_t)blob.size()), 0);
+            V x;
+            x.t = c->rettypes[0];
+            x.mem = true;
+            x.a = tyg_at_local(t, 0);
+            return x;
+        }
         if (c->builtin >= 0) No(c->line, cat("builtin ", BuiltinByKind(c->builtin).name));
         if (c->fvbody) return GenFvCall(c);
         if (!c->dispatch.empty()) return GenDispatch(c, idst, dst);
