@@ -1134,6 +1134,27 @@ struct TgModule {
         return walk(t, 0);
     }
 
+    // The render procedures of types that reach themselves, one per type
+    // (CodeGen::RenderFn): named by the type's mangled name, queued as they
+    // are asked for and built once the function asking is done, as only one
+    // procedure is built at a time (TinyGenBackend::BuildRenders).
+    map<string, string> renderfns;
+    vector<pair<string, TypeExpr *>> renderq;
+    string RenderFn(TypeExpr *t) {
+        auto k = cg.Mangle(t);
+        auto it = renderfns.find(k);
+        if (it != renderfns.end()) return it->second;
+        auto name = cat("gs_tg_render_", k);
+        renderfns[k] = name;
+        renderq.emplace_back(name, t);
+        return name;
+    }
+    // Whether a render procedure can take the type: a fixed struct whose
+    // parts are all held (TypeOk), handed the address of its value.
+    bool RenderFnOk(TypeExpr *t) {
+        return t->kind == TY_STRUCT && cg.IsFix(t) && !VsOk(t) && !FoOk(t) && TypeOk(t);
+    }
+
     // ---- Globals -----------------------------------------------------------
 
     // A global this backend reaches: a fixed value it holds, not a pool's.
@@ -4584,6 +4605,7 @@ struct TgFn {
     // The call whose user format overloads the value being rendered uses
     // (CodeGen::FmtContext), or none.
     Call *fmtc = nullptr;
+    TypeExpr *inlinet = nullptr;   // The type a render procedure's body renders inline.
 
     // A type's name as text renders it: the checked type the C renders is
     // the value's, which a `const` variable's place does not drop.
@@ -4780,6 +4802,21 @@ struct TgFn {
         if (M.OptRef(t)) {
             RenderOpt(stk, len, pl, nested, l, depth);
             return;
+        }
+        // A struct that reaches itself is rendered by a procedure of its
+        // own, which calls itself for the next level (CodeGen::EmitRenderCall).
+        // It runs no overloads: the checker leaves none in such a type
+        // (CheckPrintable's OverloadedPart). The procedure's own body
+        // renders the first level here (inlinet).
+        if (t->kind == TY_STRUCT && M.Recursive(t)) {
+            if (inlinet && cg.TEq(inlinet, t)) {
+                inlinet = nullptr;
+            } else {
+                if (pl.stk || pl.enc || !M.RenderFnOk(t)) No(l, cat("text of type ", M.Name(t), " [recursive]"));
+                auto ptr = tyg_type_ptr(m);
+                CallC(M.RenderFn(t), { ptr, ptr, ptr }, { stk, tyg_addr_of(p, len), tyg_addr_of(p, pl.a) }, nullptr);
+                return;
+            }
         }
         switch (t->kind) {
             case TY_VARIANT:
@@ -5302,10 +5339,9 @@ struct TgFn {
         return x;
     }
     // An optional's text (CodeGen::RenderLoc): `null`, or its pointee's.
-    // A pointee that reaches its own type (a list) is rendered by the C
-    // half's recursive render functions; its function stays in C.
+    // A pointee that reaches its own type (a list) is rendered by a render
+    // procedure (RenderInto).
     void RenderOpt(tyg_val stk, tyg_addr len, const P &pl, bool nested, Line l, int depth) {
-        if (M.Recursive(pl.t->ref->sub)) No(l, cat("text of type ", M.Name(pl.t), " [recursive]"));
         auto none = tyg_block_new(p), some = tyg_block_new(p), done = tyg_block_new(p);
         tyg_branch(p, tyg_cmp(p, TYG_EQ, tyg_load(p, TYG_I64, pl.a, 0), tyg_iconst(p, TYG_I64, 0)), none, some);
         tyg_block_set(p, none);
@@ -7273,6 +7309,23 @@ struct TgFn {
         Finish(sp->sf->line);
     }
 
+    // The render procedure of t (CodeGen::EmitRenderFn): void(stk, &len,
+    // &value), the value rendered as a nested part of a larger one.
+    void EmitRender(const string &name, TypeExpr *t) {
+        auto ptr = tyg_type_ptr(m);
+        const tyg_type *pts[3] = { ptr, ptr, ptr };
+        p = tyg_proc_begin(m, M.Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL), tyg_sig_new(m, nullptr, pts, 3, 0));
+        if (!p) No(Line {}, cat("tyg_proc_begin: ", tyg_error(m) ? tyg_error(m) : "?"));
+        inlinet = t;
+        RenderInto(tyg_param(p, 0), tyg_at_val(tyg_param(p, 1), 0), P { tyg_at_val(tyg_param(p, 2), 0), t }, true, Line {});
+        if (!Ended()) tyg_ret(p, 0);
+        if (tyg_proc_end(p) != 0) {
+            p = nullptr;
+            No(Line {}, cat("tinygen: ", tyg_error(m) ? tyg_error(m) : "?"));
+        }
+        p = nullptr;
+    }
+
     // The entry's block (gblk): the addresses of the globals the body
     // names, and the stack block, then on to the body (gstart).
     void Finish(Line line) {
@@ -7436,7 +7489,24 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                 left.emplace_back(sp, w);
             }
         }
+        BuildRenders();
         return ours;
+    }
+
+    // The render procedures the functions asked for (TgModule::RenderFn),
+    // each possibly asking for others.
+    void BuildRenders() {
+        for (size_t i = 0; mod && i < mod->renderq.size(); i++) {
+            auto [name, t] = mod->renderq[i];
+            TgFn fn(*mod, nullptr);
+            try {
+                fn.EmitRender(name, t);
+            } catch (TgUnsupported &u) {
+                if (fn.p) tyg_proc_abort(fn.p);
+                throw CompileError { cat("tinygen: ", name, ": ", u.why) };
+            }
+        }
+        if (mod) mod->renderq.clear();
     }
 
     // After CodeGen has made the C half: the extern fns the object calls
@@ -7504,6 +7574,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         // A gs_init_globals built but not used stays in the object,
         // unreferenced, with what it asked of the C half.
         if (!cg.noglobalinit && !BuildInit(cg, why)) return false;
+        BuildRenders();
         for (auto &sh : mod->shims)
             if (TgFixedShim(sh.first).empty() && !OwnAccessor(sh.first)) {
                 initsym = TYG_NO_SYM;
