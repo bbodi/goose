@@ -2,7 +2,7 @@
 // which live on dedicated stacks of their own in the C half's instance
 // (gs_globals_t), reached through accessors it exports: read, indexed,
 // iterated, pushed to, appended to, popped, passed on by reference and by
-// value, and written in place.
+// value, written in place, and assigned anew.
 
 struct P2 { x: i32, y: i32 }
 
@@ -57,4 +57,21 @@ fn main() {
     shout();
     print(BUF);
     print(LOG[1]);
+    var r: i64[>..] = [];
+    print(reassign(r));
+    print(sum(r));
+    print(sum(LOG));
+    print(TEXT);
+}
+
+// Whole resizables assigned anew: a local, a global, through a reference.
+fn reassign(v: i64[>..]&) -> i64 {
+    var w: i64[>..] = [1, 2, 3];
+    w = [7, 8];
+    w.push(9);
+    v = copy(w);
+    v.push(10);
+    LOG = [5, 6, 7];
+    TEXT = "fresh";
+    return w.len * 100 + v.len * 10 + LOG.len;
 }

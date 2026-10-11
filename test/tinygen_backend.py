@@ -93,7 +93,7 @@ PROGRAMS = [
     ("test/tinygen/tinygen_gstacks.goose", True, ["--debug"]),
     ("test/tinygen/tinygen_gstacks.goose", False, ["--tinygen-skip=main"]),
     ("test/tinygen/tinygen_gstacks.goose", False,
-     ["--tinygen-skip=record,sum,copied,add_point,name_len,shout"]),
+     ["--tinygen-skip=record,sum,copied,add_point,name_len,shout,reassign"]),
     ("test/codegen/loop_invariant_divisors.goose", False, []),
     ("test/codegen/cnames.goose", False, []),
     ("test/codegen/wider_slot_operations.goose", False, []),
