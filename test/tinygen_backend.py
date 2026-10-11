@@ -218,6 +218,7 @@ PROGRAMS += [
      ["--tinygen-skip=or_zero,sum,longer,same,total,walk,look,find,positive,counted"]),
 ]
 WHOLE_PROGRAM |= {"tinygen_optionals"}
+WHOLE_PROGRAM |= {"tinygen_extern", "21_raytrace"}   # libm and package externs called directly
 
 
 def expected(source):

@@ -5569,10 +5569,15 @@ struct TgFn {
         string why;
         if (!M.SigOk(w, false, why)) No(c->line, cat("thread program: ", why));
         if (!cg.sinfo[w].freevars.empty()) No(c->line, "thread program with free variables");
-        if (!cg.ThreadGlobals(w).empty()) No(c->line, "thread program with globals");
+        // The globals the worker names, copied as the C packs them: each
+        // as [int64 size][bytes]. Fixed values only; a resizable's or a
+        // T[]'s image is the C half's to build.
+        for (auto d : cg.ThreadGlobals(w))
+            if (!M.GlobalOk(d) || !M.TypeOk(d->type) || !cg.IsFix(d->type) || d->reusable)
+                No(c->line, cat("thread program with a global of type ", M.NameWhy(d->type)));
         for (size_t i = 0; i < w->argtypes.size(); i++) {
             auto pt = w->argtypes[i];
-            if (cg.IsPoolParam(w, i) || M.RzParam(pt) || !M.TypeOk(pt) || !cg.FixedSize(pt))
+            if (cg.IsPoolParam(w, i) || (M.RzParam(pt) ? M.Resz(pt) || !QueueOk(pt) : !M.TypeOk(pt) || !cg.FixedSize(pt)))
                 No(c->line, cat("thread argument of type ", M.NameWhy(pt)));
         }
         cg.usesthreads = true;
@@ -5581,10 +5586,24 @@ struct TgFn {
         auto base = Top(stk);
         for (size_t i = 0; i < w->argtypes.size(); i++) {
             auto pt = w->argtypes[i];
+            if (M.RzParam(pt)) {
+                // An image, built at the top: the packet holds it whole.
+                GenImg(an[1 + i], stk, pt, c->line);
+                if (Ended()) return Dummy(M.ast.inttypes[IS_I64]);
+                continue;
+            }
             auto top = Top(stk);
             Into(P { tyg_at_val(top, 0), pt }, an[1 + i]);
             if (Ended()) return Dummy(M.ast.inttypes[IS_I64]);
             SetTop(stk, tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, cg.FixedSize(pt))));
+        }
+        for (auto d : cg.ThreadGlobals(w)) {
+            auto top = Top(stk);
+            auto size = cg.FixedSize(d->type);
+            tyg_store(p, TYG_I64, tyg_at_val(top, 0), tyg_iconst(p, TYG_I64, size), 0);
+            auto at = tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, 8));
+            if (size) tyg_copy(p, tyg_at_val(at, 0), VarPlace(d, c->line).a, size);
+            SetTop(stk, tyg_bin(p, TYG_ADD, at, tyg_iconst(p, TYG_I64, size)));
         }
         M.NeedShim("gs_tg_thread_spawn");
         V x;
@@ -8147,6 +8166,8 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                 initsym = TYG_NO_SYM;
                 return why = cat("C half's ", sh.first), false;
             }
+        for (auto &[acc, sp] : mod->thunkacc)
+            for (auto d : cg.ThreadGlobals(sp)) mod->Accessor(d);
         EmitGlobalStorage(cg);
         EmitExports(cg);
         ForwardExterns();
@@ -8239,15 +8260,38 @@ struct TinyGenBackend : CodeGen::SpecBackend {
             call(tyg_sig_new(m, nullptr, i64s, 1, 0), mod->Sym("gs_tg_stack_block", TYG_SYM_FUNC | TYG_SYM_GLOBAL),
                  { n });
             vector<tyg_arg> args;
+            TgFn fn(*mod, nullptr);   // For the sizes of image arguments.
+            fn.p = p;
             for (auto t : sp->argtypes) {
                 auto at = tyg_load(p, TYG_I64, tyg_at_local(cur, 0), 0);
                 tyg_arg a {};
-                if (cg.IsLargeFixed(t)) a.val = at;   // The packet is the worker's own copy.
-                else if (mod->IsScalar(t)) a.val = tyg_load(p, mod->Scal(t), tyg_at_val(at, 0), 0);
-                else a.mem = tyg_at_val(at, 0);
+                tyg_val size;
+                if (mod->RzParam(t)) {
+                    a.val = at;   // An image, by its address; the packet is the worker's own copy.
+                    size = fn.ImgSize(t, at);
+                } else {
+                    size = tyg_iconst(p, TYG_I64, cg.FixedSize(t));
+                    if (cg.IsLargeFixed(t)) a.val = at;
+                    else if (mod->IsScalar(t)) a.val = tyg_load(p, mod->Scal(t), tyg_at_val(at, 0), 0);
+                    else a.mem = tyg_at_val(at, 0);
+                }
                 args.push_back(a);
+                tyg_store(p, TYG_I64, tyg_at_local(cur, 0), tyg_bin(p, TYG_ADD, at, size), 0);
+            }
+            // The worker's globals, each [int64 size][bytes], into this
+            // thread's own instance of them.
+            for (auto d : cg.ThreadGlobals(sp)) {
+                auto size = cg.FixedSize(d->type);
+                auto at = tyg_load(p, TYG_I64, tyg_at_local(cur, 0), 0);
+                if (size) {
+                    auto dst = tyg_call(p, tyg_sig_new(m, ptr, nullptr, 0, 0),
+                                        tyg_direct(mod->Sym(mod->accessors.at(d), TYG_SYM_FUNC | TYG_SYM_GLOBAL)),
+                                        nullptr, 0, nullptr, nullptr);
+                    tyg_copy(p, tyg_at_val(dst, 0),
+                             tyg_at_val(tyg_bin(p, TYG_ADD, at, tyg_iconst(p, TYG_I64, 8)), 0), size);
+                }
                 tyg_store(p, TYG_I64, tyg_at_local(cur, 0),
-                          tyg_bin(p, TYG_ADD, at, tyg_iconst(p, TYG_I64, cg.FixedSize(t))), 0);
+                          tyg_bin(p, TYG_ADD, at, tyg_iconst(p, TYG_I64, 8 + size)), 0);
             }
             if (ki.needssp) {
                 tyg_arg a {};
@@ -8419,9 +8463,13 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         auto m = mod->m;
         map<const VarDef *, tyg_sym> gsyms, ssyms;
         map<const VarDef *, pair<tyg_sym, tyg_sym>> flsyms;
+        // Each thread program has an instance of the globals it names
+        // (§11.2): thread-local storage, which a thread's thunk fills.
+        auto tls = false;
+        for (auto &[acc, sp] : mod->thunkacc) tls = tls || !cg.ThreadGlobals(sp).empty();
         auto def = [&](const string &name, int64_t size, int64_t align, VarDef *d, const tyg_dtype *dt) {
-            auto sym = tyg_symbol(m, cat("gs_g_", name).c_str(), 0);
-            tyg_data(m, sym, TYG_SECTION_BSS, nullptr, std::max<int64_t>(size, 1), align);
+            auto sym = tyg_symbol(m, cat("gs_g_", name).c_str(), tls ? TYG_SYM_TLS : 0);
+            tyg_data(m, sym, tls ? TYG_SECTION_TBSS : TYG_SECTION_BSS, nullptr, std::max<int64_t>(size, 1), align);
             if (dt) tyg_debug_global(m, string(d->name).c_str(), dt, sym, mod->File(d->line.fileidx), d->line.line);
             return sym;
         };
