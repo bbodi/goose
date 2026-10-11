@@ -39,10 +39,12 @@ fn same(a: u8[]&, b: const u8[:]) -> bool { a == b }
 
 fn differ(a: const u8[:], b: const u8[:]) -> bool { a != b }
 
+fn width(s: const u8[:]) -> i64 { s.len }
+
 fn listing(k: i64) -> u8[>..] {
     var out: u8[>..] = "[";
     for i in 0..k { format(out, i, ","); }
-    format(out, "] ", 1.5 as f32, " ", 18446744073709551615 as u64, " ", -7 as i8);
+    format(out, "] ", width(str("ab", 12)), " ", 1.5 as f32, " ", 18446744073709551615 as u64, " ", -7 as i8);
     out
 }
 
