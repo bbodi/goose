@@ -490,13 +490,15 @@ struct TgModule {
     // other fixed one, a destination stack and count out-parameter
     // (`gs_stack *gs_dst<i>, int64_t *gs_rl<i>`) for a resizable one, and
     // a destination stack alone for a T[] image (built there whole) --
-    // then gs_sp, where the C gives it one. No free variables, no `return
-    // from` channel.
+    // then gs_sp, where the C gives it one. Free variables of a type it
+    // holds (FvOk) come after the declared parameters; no `return from`
+    // channel.
     bool SigOk(FnSpec *sp, bool define, string &why) {
         (void)define;
         auto &si = cg.sinfo[sp];
         if (sp->sf->isextern) { why = "extern"; return false; }
-        if (!si.freevars.empty()) { why = "free variables"; return false; }
+        for (auto fv : si.freevars)
+            if (!FvOk(fv)) { why = cat("free variable of type ", fv->type ? Name(fv->type) : "?"); return false; }
         if (si.hasrf || cg.fromids.count(sp)) { why = "return from"; return false; }
         for (auto r : sp->rets)
             if (!RetOk(r)) { why = cat("result type ", Name(r)); return false; }
@@ -511,6 +513,14 @@ struct TgModule {
     // a T[] image of fixed elements, built at the caller's destination
     // stack.
     bool RetOk(TypeExpr *t) { return TypeOk(t) || ((IsGrow(t) || IsVarArr(t)) && RzOk(t)); }
+    // A free variable of a nested function (§7.5), as SigParams passes it:
+    // a fixed variable by its address, a T[] by its image's address, and
+    // a resizable by its header's address and then its stack. Pools and
+    // frame objects are not held.
+    bool FvOk(const VarDef *fv) {
+        if (!fv->type || fv->reusable || cg.PrefVar(fv)) return false;
+        return TypeOk(fv->type) || ((IsGrow(fv->type) || IsVarArr(fv->type)) && RzOk(fv->type));
+    }
 
     tyg_sig *Sig(FnSpec *sp) {
         if (auto it = sigs.find(sp); it != sigs.end()) return it->second;
@@ -525,6 +535,10 @@ struct TgModule {
             }
             ps.push_back(AT(t));
             if (RzParam(t)) ps.push_back(tyg_type_ptr(m));
+        }
+        for (auto fv : si.freevars) {
+            ps.push_back(tyg_type_ptr(m));
+            if (IsGrow(fv->type)) ps.push_back(tyg_type_ptr(m));   // its stack
         }
         for (size_t i = 0; i < sp->rets.size(); i++) {
             if (IsGrow(sp->rets[i])) {
@@ -973,17 +987,8 @@ struct TgFn {
 
     P Place(Node *n) {
         if (auto id = Is<Ident>(n)) {
-            auto vd = id->vdef;
-            if (!vd) No(n->line, "function as a value");
-            auto it = locals.find(vd);
-            if (it == locals.end() && vd->isglobal) return GlobalPlace(vd, n->line);
-            if (it == locals.end()) No(n->line, "variable from outside");
-            if (indirect.count(vd))
-                return P { tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(it->second, 0), 0), 0), vd->type };
-            P pl { tyg_at_local(it->second, 0), vd->type };
-            if (auto s = rzstk.find(vd); s != rzstk.end())
-                pl.stk = tyg_load(p, TYG_I64, tyg_at_local(s->second, 0), 0);
-            return pl;
+            if (!id->vdef) No(n->line, "function as a value");
+            return VarPlace(id->vdef, n->line);
         }
 
         if (auto d = Is<Dot>(n); d && d->IsField()) {
@@ -1008,6 +1013,25 @@ struct TgFn {
         auto t = Temp(x.t);
         P pl { tyg_at_local(t, 0), x.t };
         Store(pl, x);
+        return pl;
+    }
+
+    // A variable: a local or parameter of this frame, one it was handed
+    // (a free variable, read through its address), or a global.
+    P VarPlace(VarDef *vd, Line l) {
+        auto it = locals.find(vd);
+        if (it == locals.end() && vd->isglobal) return GlobalPlace(vd, l);
+        if (it == locals.end()) No(l, "variable from outside");
+        if (indirect.count(vd)) {
+            P pl { tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(it->second, 0), 0), 0), vd->type };
+            // A captured resizable: its header's address, its stack.
+            if (auto s = rzstk.find(vd); s != rzstk.end() && IsGrow(vd->type))
+                pl.stk = tyg_load(p, TYG_I64, tyg_at_local(s->second, 0), 0);
+            return pl;
+        }
+        P pl { tyg_at_local(it->second, 0), vd->type };
+        if (auto s = rzstk.find(vd); s != rzstk.end())
+            pl.stk = tyg_load(p, TYG_I64, tyg_at_local(s->second, 0), 0);
         return pl;
     }
 
@@ -1783,8 +1807,7 @@ struct TgFn {
         }
         if (c->builtin == B_FORMAT && c->ArgNodes().size() >= 1) return GenFormat(c);
         if (c->builtin >= 0) No(c->line, cat("builtin ", BuiltinByKind(c->builtin).name));
-        if (c->fvbody || !c->dispatch.empty() || !c->fvremap.empty() || !c->spec)
-            No(c->line, "call kind");
+        if (c->fvbody || !c->dispatch.empty() || !c->spec) No(c->line, "call kind");
         auto callee = c->spec;
         auto an = c->ArgNodes();
         if (an.size() < callee->argtypes.size()) No(c->line, "argument count");
@@ -1818,6 +1841,22 @@ struct TgFn {
                 continue;
             }
             args.push_back(Arg(an[i], pt));
+        }
+        // The callee's free variables (CodeGen::EmitFvArg): what this call
+        // passes for each (Call::FreeVarArg), a variable of this frame or
+        // one this function was handed, by its address.
+        for (auto fv : ci.freevars) {
+            auto v = c->FreeVarArg(fv);
+            auto pl = VarPlace(v, c->line);
+            tyg_arg a {};
+            a.val = tyg_addr_of(p, pl.a);
+            args.push_back(a);
+            if (IsGrow(v->type)) {
+                if (!pl.stk) No(c->line, "free variable without its stack");
+                tyg_arg k {};
+                k.val = pl.stk;
+                args.push_back(k);
+            }
         }
         lastrets.clear();
         if (Ended()) {
@@ -2744,6 +2783,10 @@ struct TgFn {
             else pdt.push_back(M.DT(t));
             if (M.RzParam(t) && IsGrow(t)) pdt.push_back(tyg_dt_pointer(m, M.StackDT()));
         }
+        for (auto fv : cg.sinfo[sp].freevars) {
+            pdt.push_back(tyg_dt_pointer(m, M.DT(fv->type)));
+            if (IsGrow(fv->type)) pdt.push_back(tyg_dt_pointer(m, M.StackDT()));
+        }
         auto cret = cg.sinfo[sp].cret;
         auto fdt = tyg_dt_func(m, cret < 0 ? tyg_dt_void(m) : M.DT(sp->rets[cret]), pdt.data(),
                                (int)pdt.size(), 0);
@@ -2783,6 +2826,18 @@ struct TgFn {
             tyg_store(p, TYG_I64, tyg_at_local(loc, 0), tyg_param(p, pi++), 0);
             return loc;
         };
+        // Free variables (§7.5), each the address of the variable in the
+        // frame it lives in (a T[]'s image, a resizable's header, with its
+        // stack), read through as a by-value T[] parameter is. The debugger
+        // sees each as a pointer under the variable's name, as the C has it.
+        for (auto fv : cg.sinfo[sp].freevars) {
+            auto loc = param();
+            locals[fv] = loc;
+            indirect.insert(fv);
+            tyg_debug_param(p, string(fv->name).c_str(), tyg_dt_pointer(m, M.DT(fv->type)),
+                            tyg_at_local(loc, 0), M.File(fv->line.fileidx), fv->line.line);
+            if (IsGrow(fv->type)) rzstk[fv] = param();
+        }
         chans.resize(sp->rets.size());
         for (size_t i = 0; i < sp->rets.size(); i++) {
             if (IsGrow(sp->rets[i])) {
