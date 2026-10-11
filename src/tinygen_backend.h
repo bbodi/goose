@@ -2942,6 +2942,7 @@ struct TgFn {
     // A resizable result is built at its destination stack, its count
     // written through its out-parameter. Then every scope's stacks are
     // restored, and the C return value returned.
+    int retopen = 0;   // Returns building their results (DoReturn).
     void DoReturn(const vector<Node *> &vals, Line l) {
         auto &rets = sp->rets;
         auto cret = cg.sinfo[sp].cret;
@@ -2961,6 +2962,18 @@ struct TgFn {
             else tyg_ret(p, x.v);
             return;
         }
+        // A return inside a value one is building at the destination
+        // (`return str("x", if c { return "y"; } else { n })`) would leave
+        // what was built in front of its own value; the C moves it down
+        // (ExitStart, LandValue). Such a function stays in C.
+        auto stacked = false;
+        for (auto r : rets) stacked = stacked || IsGrow(r) || IsVarArr(r);
+        if (stacked && retopen) No(l, "return inside a result under construction");
+        struct Opened {
+            int &n, by;
+            Opened(int &k, int b) : n(k), by(b) { n += by; }
+            ~Opened() { n -= by; }
+        } opened(retopen, stacked ? 1 : 0);
         vector<V> xs;
         if (vals.size() == 1 && rets.size() > 1) xs = GenCallAll(vals[0], rets.size());
         else if (vals.size() != rets.size()) No(l, "result count");
