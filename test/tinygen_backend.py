@@ -138,6 +138,23 @@ WHOLE_PROGRAM = {
 }
 
 
+# Limited arrays T[..k]: the fixture whole, plain and --debug, then with
+# the functions taking, returning and growing them left to C in turn, so
+# that by-value and by-reference limited arrays (and structs holding one)
+# cross the two halves both ways.
+PROGRAMS += [
+    ("test/tinygen/tinygen_limited.goose", True, []),
+    ("test/tinygen/tinygen_limited.goose", True, ["--debug"]),
+    ("test/tinygen/tinygen_limited.goose", False, ["--tinygen-skip=main"]),
+    ("test/tinygen/tinygen_limited.goose", False, ["--tinygen-skip=grow,halves,bag"]),
+    ("test/tinygen/tinygen_limited.goose", False,
+     ["--tinygen-skip=digits,sum,shrink,named"]),
+    # A return nested in another return's T[] value as it is built.
+    ("test/codegen/exit_value_destination.goose", False, []),
+]
+WHOLE_PROGRAM |= {"tinygen_limited"}
+
+
 def expected(source):
     """The blessed stdout of a program, whether its run aborts, and the
     markers its stderr must hold."""
@@ -211,6 +228,35 @@ def check_tinygen_backend(exe, base, ok, fail, say):
             continue
         ok(f"{label} ({done} of {total} functions{', whole program' if alone else ''})")
     check_lldb(exe, base, ok, fail, say)
+    check_lldb_limited(exe, base, ok, fail)
+
+
+def check_lldb_limited(exe, base, ok, fail):
+    """A limited array local, and one in a struct field, as the C half's
+    layout under their Goose types: the length and every slot."""
+    lldb = shutil.which("lldb")
+    if not lldb:
+        return
+    source = HERE / "tinygen" / "tinygen_limited.goose"
+    out = base / f"lldb-limited{tc.EXE_SUFFIX}"
+    good, log, _, _ = build(exe, source, out, [])
+    if not good:
+        fail("tinygen lldb limited build", log)
+        return
+    code, o, e = tc.run_capture([lldb, "-b", "-o", "b tinygen_limited.goose:84",
+                                 "-o", "b tinygen_limited.goose:89", "-o", "run",
+                                 "-o", "frame variable a", "-o", "continue",
+                                 "-o", "frame variable n", "-o", "kill", out])
+    text = o + e
+    wants = [
+        r"\(i64\[\.\.8\]\) a = \{\s*len = '\\x05'\s*e = \(\[0\] = 9, \[1\] = 8, .*\[4\] = 5, \[5\] = 0",
+        r"\(Name\) n = \{\s*tag = 7\s*text = \(len = '\\x04', e = \"tiny\"\)",
+    ]
+    missing = [w for w in wants if not re.search(w, text)]
+    if missing:
+        fail("tinygen limited-array debug info under lldb", f"missing {missing}:\n{text}")
+        return
+    ok("tinygen debug info under lldb: limited arrays, alone and in a struct")
 
 
 def check_lldb(exe, base, ok, fail, say):
