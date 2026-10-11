@@ -4691,6 +4691,14 @@ struct TgFn {
         auto an = c->ArgNodes();
         auto pl = Deref(Place(an[0]));
         if (TgModule::IsLim(pl.t)) return LimShrink(c, pl);
+        if (IsGrow(pl.t) && M.VeOk(pl.t) && pl.stk && c->builtin == B_CLEAR) {
+            // Elements of variable size: none, their bytes given back.
+            auto len = pl.a;
+            len.offset += 8;
+            tyg_store(p, TYG_I64, len, tyg_iconst(p, TYG_I64, 0), 0);
+            SetTop(pl.stk, tyg_load(p, TYG_I64, pl.a, 0));
+            return V {};
+        }
         if (!IsGrow(pl.t) || !M.RzOk(pl.t) || !pl.stk)
             No(c->line, cat(BuiltinByKind(c->builtin).name, " of an array of this kind"));
         auto et = pl.t->arr->sub;
