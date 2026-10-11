@@ -2473,14 +2473,15 @@ struct TgFn {
         auto pc = Is<Call>(n);
         return pc && (pc->builtin == B_POP || pc->builtin == B_DEFAULT);
     }
-    static bool IsToBytes1(Node *n) {
+    static bool BytesBuiltin(Node *n) {
         auto c = Is<Call>(n);
-        return c && c->builtin == B_TO_BYTES && c->ArgNodes().size() == 1;
+        return c && ((c->builtin == B_TO_BYTES && c->ArgNodes().size() == 1) || c->builtin == B_FROM_BYTES);
     }
     P ElemsSource(Node *n, Line l) {
-        // to_bytes is typed as the array it is adapted to, but a u8
-        // resizable is what it builds (CodeGen::EmitToBytes).
-        if (FixedTyped(n) || IsToBytes1(n)) {
+        // to_bytes and from_bytes are typed as the array they are adapted
+        // to, but what they build is their own array (CodeGen::EmitToBytes,
+        // EmitFromBytes).
+        if (FixedTyped(n) || BytesBuiltin(n)) {
             auto x = Gen1(n);
             if (Ended()) return P {};
             if (!x.mem) No(l, "popped value in no memory");
@@ -2676,7 +2677,7 @@ struct TgFn {
                                                          tyg_bin(p, TYG_MUL, cap, tyg_iconst(p, TYG_I64, esz)))));
             return;
         }
-        if (n && !from && !al && !Is<StrLit>(n) && !LimCallResult(n) && !FixedTyped(n) && !IsToBytes1(n) && !IsStrCall(n) &&
+        if (n && !from && !al && !Is<StrLit>(n) && !LimCallResult(n) && !FixedTyped(n) && !BytesBuiltin(n) && !IsStrCall(n) &&
             n->exprtype &&
             cg.TEq(n->exprtype, t)) {
             auto src = Deref(Place(n));
@@ -5546,6 +5547,11 @@ struct TgFn {
             len.offset += 8;
             ToBytesInto(out.stk, len, c->ArgNodes()[0], c->line);
             return V {};
+        }
+        if (c->builtin == B_FROM_BYTES) {
+            // Its array alone, where the flag is not wanted.
+            lastrets = GenFromBytes(c);
+            return lastrets[0];
         }
         if (c->builtin == B_TO_BYTES && c->ArgNodes().size() == 1) {
             auto x = RzTemp(cg.GrowU8(), c->line);
