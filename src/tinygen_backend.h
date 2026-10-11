@@ -266,9 +266,10 @@ struct TgModule {
     // ---- Signatures --------------------------------------------------------
 
     // Whether a call to sp, or sp's own definition (`define`), has a C
-    // interface this backend can match: declared parameters it holds, at
-    // most one result returned as the C value, no free variables, no
-    // `return from` channel. A definition may take gs_sp (which it never
+    // interface this backend can match: declared parameters and results it
+    // holds (the first result the C value, every other one written through
+    // an out-pointer, `T *gs_r<i>`, after the parameters: CodeGen::SigParams),
+    // no free variables, no `return from` channel. A definition may take gs_sp (which it never
     // uses, building nothing on a data stack); a callee must not, since
     // the stacks it is handed would need accounting (codegen_stacks.h).
     // The specializations this module's procedures may call although the C
@@ -285,7 +286,9 @@ struct TgModule {
             why = "calls a function using data stacks";
             return false;
         }
-        if (sp->rets.size() > 1 || (sp->rets.size() == 1 && si.cret != 0)) {
+        // A result this backend holds is fixed and not large, so the C
+        // returns the first one (CodeGen::CollectSpecs).
+        if (!sp->rets.empty() && si.cret != 0) {
             why = "results";
             return false;
         }
@@ -303,6 +306,7 @@ struct TgModule {
         if (auto it = sigs.find(sp); it != sigs.end()) return it->second;
         vector<const tyg_type *> ps;
         for (auto t : sp->argtypes) ps.push_back(AT(t));
+        for (size_t i = 1; i < sp->rets.size(); i++) ps.push_back(tyg_type_ptr(m));
         if (!sp->sf->isextern && cg.sinfo[sp].needssp) ps.push_back(tyg_type_int(m, TYG_I64, 1));
         const tyg_type *ret = sp->rets.empty() ? nullptr : AT(sp->rets[0]);
         return sigs[sp] = tyg_sig_new(m, ret, ps.data(), (int)ps.size(), 0);
@@ -331,6 +335,9 @@ struct TgFn {
     // The specializations taking gs_sp this body calls, which it may only
     // while they are tinygen's too (TinyGenBackend::Choose).
     set<FnSpec *> relied;
+    // The out-pointers of results after the first (rets[i] at outs[i - 1]),
+    // each kept in a local.
+    vector<tyg_local> outs;
 
     TgFn(TgModule &_M, FnSpec *_sp) : M(_M), cg(_M.cg), sp(_sp), m(_M.m) {}
 
@@ -1099,6 +1106,10 @@ struct TgFn {
         return a;
     }
 
+    // Every result of the latest call (GenCall): the first as the call's
+    // value, the others where the callee wrote them through out-pointers.
+    vector<V> lastrets;
+
     V Result(FnSpec *callee, tyg_sig *sig, tyg_callee ce, vector<tyg_arg> &args) {
         V x;
         if (callee->rets.empty()) {
@@ -1134,7 +1145,26 @@ struct TgFn {
         if (!M.SigOk(callee, false, why)) No(c->line, cat("call to ", callee->sf->name, ": ", why));
         vector<tyg_arg> args;
         for (size_t i = 0; i < an.size(); i++) args.push_back(Arg(an[i], callee->argtypes[i]));
-        if (Ended()) return Dummy(callee->rets.empty() ? nullptr : callee->rets[0]);
+        lastrets.clear();
+        if (Ended()) {
+            for (auto r : callee->rets) lastrets.push_back(Dummy(r));
+            return Dummy(callee->rets.empty() ? nullptr : callee->rets[0]);
+        }
+        // Results after the first land in temporaries, through out-pointers
+        // after the declared arguments (C.3).
+        vector<V> extra;
+        for (size_t i = 1; i < callee->rets.size(); i++) {
+            V r;
+            r.t = callee->rets[i];
+            auto t = Temp(r.t);
+            r.a = tyg_at_local(t, 0);
+            tyg_arg a {};
+            a.val = tyg_addr_of(p, r.a);
+            args.push_back(a);
+            if (M.IsScalar(r.t)) r.v = 0;
+            else r.mem = true;
+            extra.push_back(r);
+        }
         if (cg.sinfo[callee].needssp) {
             relied.insert(callee);
             tyg_arg sp0 {};
@@ -1142,7 +1172,25 @@ struct TgFn {
             args.push_back(sp0);
         }
         auto sym = M.Sym(cg.sinfo[callee].cname, TYG_SYM_FUNC | TYG_SYM_GLOBAL);
-        return Result(callee, M.Sig(callee), tyg_direct(sym), args);
+        auto x = Result(callee, M.Sig(callee), tyg_direct(sym), args);
+        lastrets.push_back(x);
+        for (auto &r : extra) {
+            if (M.IsScalar(r.t)) {
+                lastrets.push_back(Load(P { r.a, r.t }, c->line));
+            } else {
+                lastrets.push_back(r);
+            }
+        }
+        return x;
+    }
+
+    // A call whose every result is wanted: `let a, b = f()`, `return f()`.
+    vector<V> GenCallAll(Node *n, size_t count) {
+        auto c = Is<Call>(n);
+        if (!c || c->builtin >= 0 || !c->spec || c->spec->sf->isextern) No(n->line, "multiple results of this kind");
+        GenCall(c);
+        if (lastrets.size() != count) No(n->line, "result count");
+        return lastrets;
     }
 
     // An extern fn, through a trampoline the C half defines: the C function
@@ -1150,6 +1198,7 @@ struct TgFn {
     // support, or a macro.
     V GenExternCall(Call *c, FnSpec *callee, vector<Node *> &an) {
         if (callee->rets.size() > 1) No(c->line, "extern results");
+        lastrets.clear();
         for (auto r : callee->rets) if (!M.TypeOk(r)) No(c->line, "extern result type");
         vector<tyg_arg> args;
         for (size_t i = 0; i < an.size(); i++) {
@@ -1330,7 +1379,7 @@ struct TgFn {
             case NK_Return: {
                 auto r = static_cast<Return *>(n);
                 if (r->target != sp->sf) No(n->line, "return from");
-                if (r->vals.size() > 1) No(n->line, "multiple results");
+                if (sp->rets.size() > 1) return ReturnMany(r);
                 if (r->vals.empty() || sp->rets.empty()) {
                     for (auto v : r->vals) Gen(v);
                     if (!Ended()) tyg_ret(p, 0);
@@ -1360,6 +1409,30 @@ struct TgFn {
         }
     }
 
+    // return a, b (each result in turn, the ones after the first written
+    // through their out-pointers as they are made, as the C does), or
+    // return f() forwarding all of a call's results (§7.1).
+    void ReturnMany(Return *r) {
+        auto &rets = sp->rets;
+        vector<V> xs;
+        if (r->vals.size() == 1) xs = GenCallAll(r->vals[0], rets.size());
+        else if (r->vals.size() != rets.size()) No(r->line, "result count");
+        P first { tyg_at_local(Temp(rets[0]), 0), rets[0] };
+        for (size_t i = 0; i < rets.size(); i++) {
+            auto x = xs.empty() ? GenAs(r->vals[i], rets[i]) : Fit(xs[i], rets[i], r->line);
+            if (Ended()) return;
+            if (!M.IsScalar(rets[i]) && !x.mem) No(r->line, "aggregate value");
+            if (i == 0) {
+                Store(first, x);
+                continue;
+            }
+            auto ptr = tyg_load(p, TYG_I64, tyg_at_local(outs[i - 1], 0), 0);
+            Store(P { tyg_at_val(ptr, 0), rets[i] }, x);
+        }
+        if (M.IsScalar(rets[0])) tyg_ret(p, tyg_load(p, M.Scal(rets[0]), first.a, 0));
+        else tyg_ret_mem(p, first.a);
+    }
+
     void Declare(VarDef *d, Line l) {
         if (!M.TypeOk(d->type)) No(l, cat("variable type of ", d->name));
         auto loc = Temp(d->type);
@@ -1369,13 +1442,27 @@ struct TgFn {
     }
 
     void StmtVarDecl(VarDecl *vd) {
-        if (vd->isglobal || vd->reusable || vd->defs.size() != 1 || vd->inits.size() > 1)
-            No(vd->line, "declaration kind");
-        auto d = vd->defs[0];
-        Declare(d, vd->line);
-        P pl { tyg_at_local(locals[d], 0), d->type };
-        if (vd->inits.empty()) tyg_zero(p, pl.a, M.Size(d->type));
-        else Into(pl, vd->inits[0]);
+        if (vd->isglobal || vd->reusable) No(vd->line, "declaration kind");
+        if (vd->defs.size() > 1 && vd->inits.size() == 1) {
+            // let a, b = f(): the locals, then the call into them.
+            for (auto d : vd->defs) Declare(d, vd->line);
+            auto xs = GenCallAll(vd->inits[0], vd->defs.size());
+            for (size_t i = 0; i < xs.size(); i++) {
+                auto d = vd->defs[i];
+                auto x = Fit(xs[i], d->type, vd->line);
+                if (!M.IsScalar(d->type) && !x.mem && !Ended()) No(vd->line, "aggregate value");
+                Store(P { tyg_at_local(locals[d], 0), d->type }, x);
+            }
+            return;
+        }
+        if (!vd->inits.empty() && vd->inits.size() != vd->defs.size()) No(vd->line, "declaration kind");
+        for (size_t i = 0; i < vd->defs.size(); i++) {
+            auto d = vd->defs[i];
+            Declare(d, vd->line);
+            P pl { tyg_at_local(locals[d], 0), d->type };
+            if (vd->inits.empty()) tyg_zero(p, pl.a, M.Size(d->type));
+            else Into(pl, vd->inits[i]);
+        }
     }
 
     void StmtAssign(Assign *a) {
@@ -1575,12 +1662,18 @@ struct TgFn {
             tyg_debug_param(p, string(vd->name).c_str(), M.DT(t), tyg_at_local(loc, 0),
                             M.File(vd->line.fileidx), vd->line.line);
         }
+        for (size_t i = 1; i < sp->rets.size(); i++) {
+            auto loc = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(loc, 0),
+                      tyg_param(p, (int)(sp->argtypes.size() + i - 1)), 0);
+            outs.push_back(loc);
+        }
         auto body = sp->body;
         auto x = GenBlock(body, sp->rets.empty());
         if (!Ended()) {
             if (sp->rets.empty()) {
                 tyg_ret(p, 0);
-            } else if (body->tail && x.t) {
+            } else if (body->tail && x.t && sp->rets.size() == 1) {
                 x = Fit(x, sp->rets[0], body->line);
                 if (x.mem) tyg_ret_mem(p, x.a);
                 else tyg_ret(p, x.v);

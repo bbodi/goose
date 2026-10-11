@@ -4,10 +4,10 @@
 Each program is built with the specializations tinygen supports in an object
 of its own and the rest in the C, and run; its output must be the blessed
 one the C backends are held to. The test/tinygen/ fixtures must go through
-tinygen whole (every function compiled by it), and one of them is also
-built with chosen functions left to C, so that calls cross between the two
-halves in both directions (structs, and arrays and slices); the other programs are ones the first stage
-covers in part. Where lldb is installed, one program is run under it to see
+tinygen whole (every function compiled by it), and some are also built
+with chosen functions left to C, so that calls cross between the two
+halves in both directions (structs, arrays and slices, multiple results);
+the other programs are ones the backend covers in part. Where lldb is installed, one program is run under it to see
 that the debugger finds a Goose function by name and shows its Goose source
 line, its parameters and its locals with their Goose types.
 
@@ -40,6 +40,11 @@ PROGRAMS = [
     ("test/tinygen/tinygen_arrays.goose", False,
      ["--tinygen-skip=sum,weighted,bump,first_last,reverse,perimeter,count_bytes,at"]),
     ("test/tinygen/tinygen_slicefail.goose", True, []),
+    ("test/tinygen/tinygen_results.goose", True, []),
+    ("test/tinygen/tinygen_results.goose", True, ["--debug"]),
+    ("test/tinygen/tinygen_results.goose", False, ["--tinygen-skip=main"]),
+    ("test/tinygen/tinygen_results.goose", False,
+     ["--tinygen-skip=divmod,minmax,split,corners,widen"]),
     ("test/codegen/loop_invariant_divisors.goose", False, []),
     ("test/codegen/cnames.goose", False, []),
     ("test/codegen/wider_slot_operations.goose", False, []),
