@@ -289,11 +289,12 @@ struct TgModule {
                 if (IsRel(t)) return !IsVr(t) && RelOk(t, depth);   // The varint width is an image (ImgOk).
                 return (IsPlainRef(t) || OptRef(t)) &&
                        ((cg.IsFix(t->ref->sub) && TypeOk(t->ref->sub, depth + 1)) || IsVarint(t->ref->sub) ||
-                        ImgOk(t->ref->sub, depth + 1) ||
+                        ImgOk(t->ref->sub, depth + 1) || ZeroOk(t->ref->sub, depth + 1) ||
                         (IsPlainRef(t) && (FoOk(t->ref->sub, depth + 1) || VeOk(t->ref->sub, depth + 1))));
             case TY_ARRAY:
                 // T[k]: k elements, packed; a static-capacity T[..k], a
                 // length beside them (LimOk).
+                if (ZeroArr(t)) return depth == 0 && ZeroOk(t, depth);
                 if (t->arr->akind == A_LIMITED) return LimOk(t, depth);
                 return t->arr->akind == A_FIXED && cg.IsFix(t) &&
                        cg.ArrSize(t->arr) > 0 && TypeOk(t->arr->sub, depth + 1);
@@ -304,7 +305,7 @@ struct TgModule {
             case TY_STRUCT: {
                 if (!cg.IsFix(t)) return false;
                 auto si = cg.SI(t);
-                if (!si || EmptyLayout(si->st->fields)) return false;
+                if (!si) return false;
                 if (Reentered(t)) return true;   // Through an optional (OptRef).
                 Open open { this, t };
                 for (size_t i = 0; i < si->st->fields.size(); i++) {
@@ -337,7 +338,6 @@ struct TgModule {
                 switch (t->arr->akind) {
                     case A_LIMITED:
                         if (cg.ArrSize(t->arr) < 0) return RcOk(t, depth) ? "" : "runtime-capacity limited array";
-                        if (cg.ArrSize(t->arr) == 0) return "limited array of capacity 0";
                         break;
                     case A_FIXED:
                         break;
@@ -367,7 +367,7 @@ struct TgModule {
                     return "variable-size struct";
                 }
                 auto si = cg.SI(t);
-                if (!si || EmptyLayout(si->st->fields)) return "empty struct";
+                if (!si) return "empty struct";
                 if (Reentered(t)) return "";
                 Open open { this, t };
                 for (size_t i = 0; i < si->st->fields.size(); i++) {
@@ -487,6 +487,7 @@ struct TgModule {
         if (IsScalar(t)) return ScalSize(Scal(t));
         // A payload-less variant as a value of its own: the gs_empty byte.
         if (t->kind == TY_VARIANT && !cg.FixedSize(t)) return 1;
+        if (ZeroArr(t)) return cg.FixedSize(t) + cg.FixedSize(t->arr->sub);
         if (FoOk(t)) return FoLayout(t).tail + FoTailSize(t);
         return cg.FixedSize(t);
     }
@@ -531,8 +532,8 @@ struct TgModule {
         }
         if (t->kind == TY_ARRAY) {
             // The C half's struct { T e[k]; }, packed.
-            tyg_field f { tyg_type_array(m, AT(t->arr->sub), cg.ArrSize(t->arr)), 0 };
-            return atypes[key] = tyg_type_record(m, cg.FixedSize(t), 1, &f, 1);
+            tyg_field f { tyg_type_array(m, AT(t->arr->sub), std::max<int64_t>(cg.ArrSize(t->arr), 1)), 0 };
+            return atypes[key] = tyg_type_record(m, Size(t), 1, &f, 1);
         }
         vector<tyg_field> fs;
         for (auto &f : Fields(t)) fs.push_back({ AT(f.t), f.off });
@@ -630,7 +631,7 @@ struct TgModule {
             }
             case TY_ARRAY: {
                 if (t->arr->akind == A_FIXED) {
-                    d = tyg_dt_array(m, DT(t->arr->sub), cg.ArrSize(t->arr));
+                    d = tyg_dt_array(m, DT(t->arr->sub), std::max<int64_t>(cg.ArrSize(t->arr), 1));
                     break;
                 }
                 auto rec = tyg_dt_record(m, TYG_DT_STRUCT, name.c_str(), File(0), 0);
@@ -696,6 +697,17 @@ struct TgModule {
     }
     // A limited array this backend holds, of either kind.
     bool LimHeld(TypeExpr *t) { return TypeOk(t) || RcOk(t); }
+    // A T[0] or T[..0] (§3.4): C gives the one element its struct needs, so
+    // as a value of its own it is a slot's worth bigger than its layout, and
+    // only that (a parameter, a result, a local, a global, behind a
+    // reference) is held: a field or an element's layout has no such slot.
+    bool ZeroArr(TypeExpr *t) {
+        return t && t->kind == TY_ARRAY && (t->arr->akind == A_FIXED || cg.IsStaticLimited(t)) &&
+               cg.ArrSize(t->arr) == 0;
+    }
+    bool ZeroOk(TypeExpr *t, int depth) {
+        return ZeroArr(t) && cg.IsFix(t) && depth <= 32 && TypeOk(t->arr->sub, depth + 1);
+    }
     bool LimOk(TypeExpr *t, int depth) {
         return cg.IsStaticLimited(t) && cg.ArrSize(t->arr) > 0 &&
                TypeOk(t->arr->sub, depth + 1);
@@ -717,8 +729,8 @@ struct TgModule {
         if (auto it = atypes.find(key); it != atypes.end()) return it->second;
         auto w = LimWidth(t);
         tyg_field fs[2] = { { tyg_type_int(m, LimLenScal(t), 0), 0 },
-                            { tyg_type_array(m, AT(t->arr->sub), cg.ArrSize(t->arr)), w } };
-        return atypes[key] = tyg_type_record(m, cg.FixedSize(t), 1, fs, 2);
+                            { tyg_type_array(m, AT(t->arr->sub), std::max<int64_t>(cg.ArrSize(t->arr), 1)), w } };
+        return atypes[key] = tyg_type_record(m, Size(t), 1, fs, 2);
     }
     // For the debugger: the C half's layout under the Goose type's name,
     // `len` and the slots `e` (all k of them: tinygen has no array whose
@@ -734,8 +746,8 @@ struct TgModule {
         auto w = LimWidth(t);
         auto lt = ast.inttypes[w == 1 ? IS_U8 : w == 2 ? IS_U16 : w == 4 ? IS_U32 : IS_U64];
         tyg_dt_member(m, rec, "len", DT(lt), 0);
-        tyg_dt_member(m, rec, "e", tyg_dt_array(m, DT(t->arr->sub), cg.ArrSize(t->arr)), w);
-        tyg_dt_record_complete(m, rec, cg.FixedSize(t), 1);
+        tyg_dt_member(m, rec, "e", tyg_dt_array(m, DT(t->arr->sub), std::max<int64_t>(cg.ArrSize(t->arr), 1)), w);
+        tyg_dt_record_complete(m, rec, Size(t), 1);
         return rec;
     }
 
@@ -1654,6 +1666,17 @@ struct TgFn {
         tyg_store(p, TYG_I64, len, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, len, 0), n), 0);
     }
 
+    // CopyRun of a view's elements, which may be images: their bytes as
+    // one run (to RunEnd), their count added to the one at len.
+    void CopyView(tyg_val stk, tyg_addr len, TypeExpr *et, const View &v) {
+        if (cg.IsFix(et)) return CopyRun(stk, len, et, v.elems, v.len);
+        auto bytes = tyg_bin(p, TYG_SUB, RunEnd(v), v.elems);
+        auto top = Top(stk);
+        tyg_move_dyn(p, top, v.elems, bytes);
+        SetTop(stk, tyg_bin(p, TYG_ADD, top, bytes));
+        tyg_store(p, TYG_I64, len, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, len, 0), v.len), 0);
+    }
+
     // Builds n's value, a resizable array of type t, at the top of stk,
     // its header at hdr (CodeGen::GenConstruct): a literal's elements one
     // by one, a call's at the destination it is handed, anything else (an
@@ -1689,6 +1712,34 @@ struct TgFn {
                 if (Ended()) return;
                 tyg_store(p, TYG_I64, len, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, len, 0), tyg_iconst(p, TYG_I64, 1)), 0);
             }
+            return;
+        }
+        if (auto al = Is<ArrayLit>(n); al && al->fillval && !al->capexpr && cg.IsFix(et)) {
+            // [v; k] (CodeGen::GenArrayLit): v built once, then copied k
+            // times behind the top; k is a constant (§4.2).
+            auto fc = Is<IntLit>(al->fillcount);
+            if (!fc || fc->val < 0) No(l, "fill count");
+            auto esz = cg.FixedSize(et);
+            auto one = Temp(et);
+            Into(P { tyg_at_local(one, 0), et }, al->fillval);
+            if (Ended()) return;
+            begin();
+            auto top = Top(stk);
+            auto i = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(i, 0), tyg_iconst(p, TYG_I64, 0), 0);
+            auto head = tyg_block_new(p), body = tyg_block_new(p), done = tyg_block_new(p);
+            tyg_jump(p, head);
+            tyg_block_set(p, head);
+            auto iv = [&] { return tyg_load(p, TYG_I64, tyg_at_local(i, 0), 0); };
+            tyg_branch(p, tyg_cmp(p, TYG_SLT, iv(), tyg_iconst(p, TYG_I64, fc->val)), body, done);
+            tyg_block_set(p, body);
+            auto at = tyg_bin(p, TYG_ADD, top, tyg_bin(p, TYG_MUL, iv(), tyg_iconst(p, TYG_I64, esz)));
+            tyg_copy(p, tyg_at_val(at, 0), tyg_at_local(one, 0), esz);
+            tyg_store(p, TYG_I64, tyg_at_local(i, 0), tyg_bin(p, TYG_ADD, iv(), tyg_iconst(p, TYG_I64, 1)), 0);
+            tyg_jump(p, head);
+            tyg_block_set(p, done);
+            SetTop(stk, tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, fc->val * esz)));
+            tyg_store(p, TYG_I64, len, tyg_iconst(p, TYG_I64, fc->val), 0);
             return;
         }
         if (auto al = Is<ArrayLit>(n)) {
@@ -1736,7 +1787,7 @@ struct TgFn {
         auto v = ViewOf(pl, l);
         if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
         begin();
-        CopyRun(stk, len, et, v.elems, v.len);
+        CopyView(stk, len, et, v);
     }
     // The function a call to it builds its first result at a destination
     // for (CodeGen's in-place construction): its own, or a dispatch's
@@ -1936,7 +1987,7 @@ struct TgFn {
         tyg_store(p, TYG_I64, len, tyg_iconst(p, TYG_I64, 0), 0);
         if (from) {
             if (cg.Mangle(from->elem) != cg.Mangle(et)) No(l, "array of another element type");
-            CopyRun(stk, len, et, from->elems, from->len);
+            CopyView(stk, len, et, *from);
         } else if (al || Is<StrLit>(n)) {
             GenRz(n, stk, hdr, t, l);
         } else if (n) {
@@ -1944,7 +1995,7 @@ struct TgFn {
             auto v = ViewOf(LimCallResult(n) ? LimCallPlace(n) : Place(n), l);
             if (Ended()) return;
             if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
-            CopyRun(stk, len, et, v.elems, v.len);
+            CopyView(stk, len, et, v);
         }
         if (Ended()) return;
         auto cnt = tyg_load(p, TYG_I64, len, 0);
@@ -2528,8 +2579,17 @@ struct TgFn {
                 // A string literal as a u8[:] (its bytes, read-only).
                 auto t = n->exprtype;
                 if (TgModule::IsLim(t)) return LimStr(static_cast<StrLit *>(n));
-                if (!t || t->kind != TY_SLICE || !IsU8(t->sub)) No(n->line, "string of this type");
                 auto &val = static_cast<StrLit *>(n)->val;
+                if (t && t->kind == TY_ARRAY && t->arr->akind == A_FIXED && IsU8(t->arr->sub) &&
+                    M.TypeOk(t) && (int64_t)val.size() == cg.FixedSize(t)) {
+                    // A u8[k] of exactly its bytes (§4.2): they, where they lie.
+                    V x;
+                    x.t = t;
+                    x.mem = true;
+                    x.a = tyg_at_sym(M.Bytes(val), 0);
+                    return x;
+                }
+                if (!t || t->kind != TY_SLICE || !IsU8(t->sub)) No(n->line, "string of this type");
                 auto tmp = tyg_local_new(p, 16, 8);
                 tyg_store(p, TYG_I64, tyg_at_local(tmp, 0),
                           tyg_addr_of(p, tyg_at_sym(M.Bytes(val), 0)), 0);
@@ -4317,6 +4377,13 @@ struct TgFn {
             x.a = pl.a;
             return x;
         }
+        if (c->builtin == B_HARDWARE_THREADS) {
+            // The runtime's count, capped by the thread limit.
+            V x;
+            x.t = c->exprtype;
+            x.v = CallC("gs_hardware_threads", {}, {}, IT(TYG_I64));
+            return x;
+        }
         if (c->builtin >= 0) No(c->line, cat("builtin ", BuiltinByKind(c->builtin).name));
         if (c->fvbody) return GenFvCall(c);
         if (!c->dispatch.empty()) return GenDispatch(c, idst, dst);
@@ -4692,7 +4759,7 @@ struct TgFn {
         if (Ended()) return;
         auto v = ViewOf(from, l);
         if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "append of another element type");
-        CopyRun(pl.stk, len, et, v.elems, v.len);
+        CopyView(pl.stk, len, et, v);
         return;
     }
     static bool IsGrow(TypeExpr *t) { return TgModule::IsGrow(t); }
@@ -5201,6 +5268,14 @@ struct TgFn {
     V GenStr(Call *c) {
         auto t = c->exprtype;
         auto slice = t && t->kind == TY_SLICE && IsU8(t->sub);
+        if (t && TgModule::IsLim(t) && M.LimHeld(t) && IsU8(t->arr->sub)) {
+            // Typed as a static-capacity u8[..k]: the text rendered as a
+            // resizable's, then copied under the capacity check.
+            auto r = RzTemp(cg.GrowU8(), c->line);
+            GenRz(c, r.stk, r.a, r.t, c->line);
+            if (Ended()) return Dummy(t);
+            return LimFrom(r, t, c->line);
+        }
         if (!slice && (!t || !IsGrow(t) || !IsU8(t->arr->sub))) No(c->line, cat("str of type ", t ? M.Name(t) : "?"));
         auto x = RzTemp(slice ? cg.GrowU8() : t, c->line);
         GenRz(c, x.stk, x.a, x.t, c->line);
@@ -5242,8 +5317,124 @@ struct TgFn {
     }
 
     // A call whose every result is wanted: `let a, b = f()`, `return f()`.
+    // gs_uleb_check: the ULEB128 at `at`, bounded by `end`, shortest and
+    // within 64 bits. Its byte count into k, 0 where it is none, and its
+    // value into v.
+    struct Uleb {
+        tyg_local k, v;
+    };
+    Uleb UlebCheck(tyg_val at, tyg_val end) {
+        Uleb r { tyg_local_new(p, 8, 8), tyg_local_new(p, 8, 8) };
+        auto sh = tyg_local_new(p, 8, 8), q = tyg_local_new(p, 8, 8);
+        auto i64 = [&](int64_t x) { return tyg_iconst(p, TYG_I64, x); };
+        auto ld = [&](tyg_local l) { return tyg_load(p, TYG_I64, tyg_at_local(l, 0), 0); };
+        auto st = [&](tyg_local l, tyg_val x) { tyg_store(p, TYG_I64, tyg_at_local(l, 0), x, 0); };
+        st(r.v, i64(0));
+        st(sh, i64(0));
+        st(q, at);
+        auto head = tyg_block_new(p), rd = tyg_block_new(p), top = tyg_block_new(p), chk = tyg_block_new(p),
+             body = tyg_block_new(p), more = tyg_block_new(p), last = tyg_block_new(p), chk2 = tyg_block_new(p),
+             ok = tyg_block_new(p), fail = tyg_block_new(p), done = tyg_block_new(p);
+        tyg_jump(p, head);
+        tyg_block_set(p, head);
+        tyg_branch(p, tyg_cmp(p, TYG_ULT, ld(q), end), rd, fail);
+        tyg_block_set(p, rd);
+        auto qa = ld(q);
+        auto b = tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, TYG_I8, tyg_at_val(qa, 0), 0));
+        auto shv = ld(sh);
+        st(q, tyg_bin(p, TYG_ADD, qa, i64(1)));
+        tyg_branch(p, tyg_cmp(p, TYG_SGT, shv, i64(63)), fail, top);
+        tyg_block_set(p, top);
+        tyg_branch(p, tyg_cmp(p, TYG_EQ, shv, i64(63)), chk, body);
+        tyg_block_set(p, chk);
+        tyg_branch(p, tyg_cmp(p, TYG_NE, tyg_bin(p, TYG_AND, b, i64(0x7e)), i64(0)), fail, body);
+        tyg_block_set(p, body);
+        st(r.v, tyg_bin(p, TYG_OR, ld(r.v), tyg_bin(p, TYG_SHL, tyg_bin(p, TYG_AND, b, i64(0x7f)), shv)));
+        tyg_branch(p, tyg_cmp(p, TYG_NE, tyg_bin(p, TYG_AND, b, i64(0x80)), i64(0)), more, last);
+        tyg_block_set(p, more);
+        st(sh, tyg_bin(p, TYG_ADD, shv, i64(7)));
+        tyg_jump(p, head);
+        tyg_block_set(p, last);
+        // A redundant high zero group is no shortest form.
+        tyg_branch(p, tyg_cmp(p, TYG_NE, shv, i64(0)), chk2, ok);
+        tyg_block_set(p, chk2);
+        tyg_branch(p, tyg_cmp(p, TYG_EQ, b, i64(0)), fail, ok);
+        tyg_block_set(p, ok);
+        st(r.k, tyg_bin(p, TYG_SUB, ld(q), at));
+        tyg_jump(p, done);
+        tyg_block_set(p, fail);
+        st(r.k, i64(0));
+        tyg_jump(p, done);
+        tyg_block_set(p, done);
+        return r;
+    }
+    // from_bytes<T[>..]>(bytes) (CodeGen::EmitFromBytes): the framing
+    // prefix has to count exactly the rest of the slice, and the payload
+    // has to be whole elements; then it is copied as the array's elements.
+    // Only elements whose bytes need no walk (VerifyFn: no bool, enum,
+    // limited array or reference in them) are verified here. The array
+    // result, and whether the bytes were one.
+    vector<V> GenFromBytes(Call *c) {
+        auto t = c->rettypes.empty() ? nullptr : c->rettypes[0];
+        if (!t || !IsGrow(t) || !M.RzOk(t)) No(c->line, "from_bytes of this type");
+        auto et = t->arr->sub;
+        if (!cg.IsFix(et) || cg.NeedsVerifyWalk(et) || cg.FixedSize(et) <= 0) No(c->line, "from_bytes of this type");
+        auto esz = cg.FixedSize(et);
+        auto an = c->ArgNodes();
+        auto v = ViewOf(Place(an[0]), c->line);
+        if (Ended()) return { Dummy(t), Dummy(M.ast.booltype) };
+        if (!IsU8(v.elem)) No(c->line, "from_bytes of this source");
+        auto i64 = [&](int64_t x) { return tyg_iconst(p, TYG_I64, x); };
+        auto ld = [&](tyg_local l) { return tyg_load(p, TYG_I64, tyg_at_local(l, 0), 0); };
+        auto st = [&](tyg_local l, tyg_val x) { tyg_store(p, TYG_I64, tyg_at_local(l, 0), x, 0); };
+        auto r = RzTemp(t, c->line);
+        auto rlen = r.a;
+        rlen.offset += 8;
+        auto src = tyg_local_new(p, 8, 8), len = tyg_local_new(p, 8, 8), pay = tyg_local_new(p, 8, 8),
+             pn = tyg_local_new(p, 8, 8), okl = tyg_local_new(p, 8, 8), cnt = tyg_local_new(p, 8, 8);
+        st(src, v.elems);
+        st(len, v.len);
+        st(pay, ld(src));
+        st(pn, i64(0));
+        st(okl, i64(0));
+        st(cnt, i64(0));
+        auto uc = UlebCheck(ld(src), tyg_bin(p, TYG_ADD, ld(src), ld(len)));
+        auto c1 = tyg_block_new(p), c2 = tyg_block_new(p), good = tyg_block_new(p), whole = tyg_block_new(p),
+             framed = tyg_block_new(p);
+        tyg_branch(p, tyg_cmp(p, TYG_NE, ld(uc.k), i64(0)), c1, framed);
+        tyg_block_set(p, c1);
+        tyg_branch(p, tyg_cmp(p, TYG_SGE, ld(uc.v), i64(0)), c2, framed);
+        tyg_block_set(p, c2);
+        tyg_branch(p, tyg_cmp(p, TYG_EQ, ld(uc.v), tyg_bin(p, TYG_SUB, ld(len), ld(uc.k))), good, framed);
+        tyg_block_set(p, good);
+        st(pay, tyg_bin(p, TYG_ADD, ld(src), ld(uc.k)));
+        st(pn, ld(uc.v));
+        // Whole elements: their count, else not an image.
+        tyg_branch(p, tyg_cmp(p, TYG_EQ, tyg_bin(p, TYG_SREM, ld(pn), i64(esz)), i64(0)), whole, framed);
+        tyg_block_set(p, whole);
+        st(okl, i64(1));
+        st(cnt, tyg_bin(p, TYG_SDIV, ld(pn), i64(esz)));
+        tyg_jump(p, framed);
+        tyg_block_set(p, framed);
+        tyg_store(p, TYG_I64, r.a, Top(r.stk), 0);
+        tyg_store(p, TYG_I64, rlen, i64(0), 0);
+        auto copy = tyg_block_new(p), out = tyg_block_new(p);
+        tyg_branch(p, tyg_cmp(p, TYG_NE, ld(okl), i64(0)), copy, out);
+        tyg_block_set(p, copy);
+        auto top = Top(r.stk);
+        tyg_move_dyn(p, top, ld(pay), ld(pn));
+        SetTop(r.stk, tyg_bin(p, TYG_ADD, top, ld(pn)));
+        tyg_store(p, TYG_I64, rlen, ld(cnt), 0);
+        tyg_jump(p, out);
+        tyg_block_set(p, out);
+        V ok;
+        ok.t = M.ast.booltype;
+        ok.v = tyg_convert(p, TYG_TRUNC, TYG_I8, ld(okl));
+        return { r, ok };
+    }
     vector<V> GenCallAll(Node *n, size_t count) {
         auto c = Is<Call>(n);
+        if (c && c->builtin == B_FROM_BYTES && count == 2) return GenFromBytes(c);
         if (!DestSpec(c)) No(n->line, "multiple results of this kind");
         GenCall(c);
         if (lastrets.size() != count) No(n->line, "result count");
@@ -6243,7 +6434,7 @@ struct TgFn {
             auto v = ViewOf(P { x->a, x->t, x->stk }, l);
             tyg_store(p, TYG_I64, hdr, Top(dst), 0);
             tyg_store(p, TYG_I64, hlen, tyg_iconst(p, TYG_I64, 0), 0);
-            CopyRun(dst, hlen, t->arr->sub, v.elems, v.len);
+            CopyView(dst, hlen, t->arr->sub, v);
         }
         if (Ended()) return;
         tyg_store(p, TYG_I64, len, tyg_load(p, TYG_I64, hlen, 0), 0);
@@ -6552,7 +6743,7 @@ struct TgFn {
                         No(vd->line, "array result of another type");
                     auto v = ViewOf(P { xs[i].a, xs[i].t, xs[i].stk }, vd->line);
                     auto stk = tyg_load(p, TYG_I64, tyg_at_local(rzstk[d], 0), 0);
-                    CopyRun(stk, tyg_at_local(locals[d], 8), d->type->arr->sub, v.elems, v.len);
+                    CopyView(stk, tyg_at_local(locals[d], 8), d->type->arr->sub, v);
                     continue;
                 }
                 auto x = Fit(xs[i], d->type, vd->line);
