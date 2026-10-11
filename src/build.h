@@ -139,7 +139,7 @@ struct Builder {
         return Run(argv, what, logfile);
     }
 
-    // Compiles `src` and links it with `objects` and the response files
+    // Compiles `src` ("" for none: a link alone) and links it with `objects` and the response files
     // `rsps` into `exe`, with `builddir` taking the intermediates.
     bool Link(const string &src, const vector<string> &objects, const vector<string> &rsps,
               const string &exe, const string &builddir, const string &logfile) const {
@@ -149,11 +149,11 @@ struct Builder {
             argv.push_back(cat("/Fe:", exe));
             argv.push_back(cat("/Fo:", builddir, "\\"));
             if (opts.debug) argv.push_back(cat("/Fd:", builddir, "\\", PathStem(exe), ".pdb"));
-            argv.push_back(src);
+            if (!src.empty()) argv.push_back(src);
             for (auto &o : objects) argv.push_back(o);
             for (auto &r : rsps) argv.push_back(cat("@", r));
         } else {
-            argv.push_back(src);
+            if (!src.empty()) argv.push_back(src);
             for (auto &o : objects) argv.push_back(o);
             argv.push_back("-o");
             argv.push_back(exe);
@@ -164,19 +164,22 @@ struct Builder {
     }
 };
 
-// The runtime object for this toolchain and configuration, compiled from
-// `goose --emit-runtime`'s C on first use: GOOSE_HOME/build/runtime/<runtime
-// hash>/<toolchain id>-<config>/goose_runtime.o. "" when it could not be
-// built, after the builder said why.
-inline string RuntimeObject(const Builder &b) {
+// An object compiled once per runtime, toolchain and configuration from
+// the C `source` gives on first use, and shared by every build after:
+// GOOSE_HOME/build/runtime/<runtime hash>/<toolchain id>-<config>/<name>.o,
+// its compiler's output in `logname`. "" when it could not be built, after
+// the builder said why.
+inline string CachedObject(const Builder &b, const string &name, const std::function<string()> &source,
+                           const string &what, const string &logname) {
     auto dir = cat(GooseHome(), "/build/runtime/", RuntimeVersion(), "/", b.tc.id, "-",
                    b.opts.debug ? "debug" : "release");
-    auto obj = cat(dir, "/goose_runtime.", b.tc.style == "msvc" ? "obj" : "o");
+    auto ext = b.tc.style == "msvc" ? "obj" : "o";
+    auto obj = cat(dir, "/", name, ".", ext);
     if (PathExists(obj) && !b.opts.dryrun) return obj;
-    auto src = cat(dir, "/goose_runtime.c");
-    auto log = cat(dir, "/cc.log");
+    auto src = cat(dir, "/", name, ".c");
+    auto log = cat(dir, "/", logname);
     if (b.opts.dryrun) {
-        b.CompileObject(src, obj, "compiling the runtime", log);
+        b.CompileObject(src, obj, what, log);
         return obj;
     }
     std::error_code ec;
@@ -184,35 +187,51 @@ inline string RuntimeObject(const Builder &b) {
     if (ec) throw CompileError { cat("cannot create ", dir, ": ", ec.message()) };
     // Every first build shares these paths. Wait before writing the source
     // or invoking the compiler, then recheck what the previous builder left.
-    FileLock lock(cat(dir, "/build.lock"), "waiting for another goose compiling the runtime");
+    FileLock lock(cat(dir, "/build.lock"), cat("waiting for another goose ", what));
     if (PathExists(obj)) return obj;
-    ProgressStep step(cat("compiling the runtime for ", b.tc.desc), true);
-    if (!WriteFileMakingDirs(src, RuntimeObjectSource()))
+    ProgressStep step(cat(what, " for ", b.tc.desc), true);
+    if (!WriteFileMakingDirs(src, source()))
         throw CompileError { cat("cannot write ", src) };
     // A failed or interrupted compiler may leave a partial object. Only a
     // successful compile publishes the name readers use, by atomic rename.
-    auto tmp = cat(dir, "/goose_runtime.tmp.", b.tc.style == "msvc" ? "obj" : "o");
+    auto tmp = cat(dir, "/", name, ".tmp.", ext);
     filesystem::remove(filesystem::path(tmp), ec);
     if (ec) throw CompileError { cat("cannot remove ", tmp, ": ", ec.message()) };
-    if (!b.CompileObject(src, tmp, "compiling the runtime", log)) return "";
+    if (!b.CompileObject(src, tmp, what, log)) return "";
     ec = RenamePath(tmp, obj);
     if (ec) throw CompileError { cat("cannot publish ", obj, ": ", ec.message()) };
     return obj;
+}
+
+// The runtime object for this toolchain and configuration, compiled from
+// `goose --emit-runtime`'s C on first use (goose_runtime.o).
+inline string RuntimeObject(const Builder &b) {
+    return CachedObject(b, "goose_runtime", RuntimeObjectSource, "compiling the runtime", "cc.log");
 }
 
 // What `goose build` does once the compiler has written the program's C to
 // `cfile` in `builddir`: finds the runtime object for the toolchain `tc`,
 // which built the native parts whose response files are `nativersps`
 // (native.h and builtin.h, found by the caller), and links the executable,
-// named by -o, the program's sidecar (`output`) or the root file. The exit
+// named by -o, the program's sidecar (`output`) or the root file. A whole
+// program the tinygen backend wrote (`cfile` "") links its object with the
+// support object `tgsupport` names (TinygenSupportSource), cached as the
+// runtime object is, so that no C of the program's is compiled. The exit
 // code.
 inline int BuildExecutable(const string &rootfile, const string &cfile, const string &builddir,
                            const Toolchain &tc, const BuildOptions &opts, const string &exedir,
                            FILE *msgs, const vector<string> &nativersps, const string &output,
-                           const vector<string> &extraobjects = {}) {
+                           const vector<string> &extraobjects = {},
+                           const pair<string, std::function<string()>> &tgsupport = {}) {
     Builder b { tc, opts, msgs };
     // Objects made beside the C (the tinygen backend's), then the runtime.
     vector<string> objects = extraobjects;
+    if (tgsupport.second) {
+        auto obj = CachedObject(b, tgsupport.first, tgsupport.second,
+                                "compiling the tinygen support", cat(tgsupport.first, ".log"));
+        if (obj.empty()) return 1;
+        objects.push_back(obj);
+    }
     if (!opts.standalone) {
         auto obj = RuntimeObject(b);
         if (obj.empty()) return 1;
