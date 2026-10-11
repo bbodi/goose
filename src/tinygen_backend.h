@@ -3831,6 +3831,35 @@ struct TgFn {
         if ((c->builtin == B_ALLOC_INDEX || c->builtin == B_ALLOC_REF || c->builtin == B_FREE) &&
             c->ArgNodes().size() == 2)
             return GenPool(c);
+        if (c->builtin == B_COPY && c->ArgNodes().size() == 1 && !cg.IsFix(c->rettypes[0])) {
+            // A copy of a variable-size value on a temporary's stack: an
+            // image, a resizable, a frame object.
+            auto rt = c->rettypes[0];
+            V x;
+            if (IsImg(rt) && M.ImgOk(rt)) {
+                auto stk = Stk(AllocStk(false, c->line), c->line);
+                x.t = rt;
+                x.mem = true;
+                x.a = tyg_at_val(GenImg(c->ArgNodes()[0], stk, rt, c->line), 0);
+            } else if (IsGrow(rt) && (M.RzOk(rt) || M.VeOk(rt))) {
+                x = RzTemp(rt, c->line);
+                GenRz(c, x.stk, x.a, rt, c->line);
+            } else if (M.FoOk(rt)) {
+                x.t = rt;
+                x.mem = true;
+                x.a = tyg_at_local(tyg_local_new(p, M.Size(rt), 8), 0);
+                x.stk = Stk(AllocStk(false, c->line), c->line);
+                GenFo(c->ArgNodes()[0], P { x.a, rt, x.stk }, c->line);
+            } else {
+                No(c->line, cat("copy of type ", M.NameWhy(rt)));
+            }
+            if (Ended()) return Dummy(c->exprtype);
+            if (c->exprtype && c->exprtype->kind == TY_SLICE) {
+                auto v = ViewOf(P { x.a, x.t, x.stk }, c->line);
+                return SliceValue(c->exprtype, v.elems, v.len);
+            }
+            return x;
+        }
         if (c->builtin == B_COPY && c->ArgNodes().size() == 1 && cg.IsFix(c->rettypes[0]) &&
             M.TypeOk(c->rettypes[0])) {
             // A fresh copy of a fixed value; at a slice destination, a view
