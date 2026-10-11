@@ -2504,9 +2504,9 @@ struct TgFn {
             return SelfRelLit(init) && cg.TEq(init->exprtype, ft);
         };
         if (auto sl = Is<StructLit>(n)) {
-            auto si = cg.SI(sl->exprtype);
-            for (size_t i = 0; i < si->st->fields.size(); i++)
-                if (!si->st->fields[i].ispad && stores(si->ftypes[i], sl->InitFor((int)i))) return true;
+            auto sh = LitShape(sl);
+            for (size_t i = 0; i < sh.fields->size(); i++)
+                if (!(*sh.fields)[i].ispad && stores((*sh.ftypes)[i], sl->InitFor((int)i))) return true;
             return false;
         }
         auto al = Is<ArrayLit>(n);
@@ -2517,10 +2517,34 @@ struct TgFn {
         return false;
     }
     // A struct or array literal SelfRelInto can build.
+    // The fields of a struct, variant or fixed-mode ADT literal, their
+    // types and offsets from the value's start (a tag first, for the ADT).
+    struct LitSh {
+        const vector<Field> *fields;
+        const vector<TypeExpr *> *ftypes;
+        vector<int64_t> offs;
+    };
+    LitSh LitShape(StructLit *sl) {
+        auto t = sl->exprtype;
+        if (t->kind == TY_STRUCT) {
+            auto si = cg.SI(t);
+            return { &si->st->fields, &si->ftypes, cg.StructLayout(si).offs };
+        }
+        auto ei = M.EI(t);
+        auto vi = t->kind == TY_VARIANT ? M.VariantIdx(t) : ei->en->VariantIndex(sl->variant);
+        auto offs = cg.VariantLayout(ei, vi).offs;
+        if (t->kind == TY_ENUM)
+            for (auto &o : offs) o += M.TagSize(t);
+        return { &ei->en->variants[(size_t)vi].fields, &ei->vftypes[(size_t)vi], offs };
+    }
     bool SelfRelLitOk(Node *n) {
-        if (auto sl = Is<StructLit>(n))
-            return sl->sinst && !sl->variant && sl->exprtype && sl->exprtype->kind == TY_STRUCT &&
-                   M.TypeOk(sl->exprtype);
+        if (auto sl = Is<StructLit>(n)) {
+            auto t = sl->exprtype;
+            if (!t || !M.TypeOk(t)) return false;
+            if (t->kind == TY_STRUCT) return sl->sinst && !sl->variant;
+            if (t->kind == TY_VARIANT) return true;
+            return t->kind == TY_ENUM && !t->enu->varmode && sl->variant;
+        }
         auto al = Is<ArrayLit>(n);
         return al && !al->capexpr && al->exprtype && al->exprtype->kind == TY_ARRAY &&
                al->exprtype->arr->akind == A_FIXED && M.TypeOk(al->exprtype);
@@ -2555,15 +2579,15 @@ struct TgFn {
             tyg_val &at, was;
             ~Back() { at = was; }
         } back { selfbase, outer };
-        auto si = cg.SI(t);
-        auto &lay = cg.StructLayout(si);
-        for (size_t i = 0; i < si->st->fields.size() && !Ended(); i++) {
-            if (si->st->fields[i].ispad) continue;
+        auto sh = LitShape(sl);
+        if (t->kind == TY_ENUM) StoreTag(pl.a, t, M.EI(t)->en->VariantIndex(sl->variant));
+        for (size_t i = 0; i < sh.fields->size() && !Ended(); i++) {
+            if ((*sh.fields)[i].ispad) continue;
             auto init = sl->InitFor((int)i);
             if (!init) continue;
             auto a = pl.a;
-            a.offset += lay.offs[i];
-            Into(P { a, si->ftypes[i] }, init);
+            a.offset += sh.offs[i];
+            Into(P { a, (*sh.ftypes)[i] }, init);
         }
     }
     // A fill [v; k] of a value linking to itself (CodeGen::FreezeFill): the
@@ -2606,12 +2630,11 @@ struct TgFn {
             }
             leaves.push_back(lf);
         };
-        if (auto sl = Is<StructLit>(al->fillval); sl && SelfRelLitOk(sl)) {
-            auto si = cg.SI(sl->exprtype);
-            auto &lay = cg.StructLayout(si);
-            for (size_t i = 0; i < si->st->fields.size() && !Ended(); i++) {
-                if (si->st->fields[i].ispad) continue;
-                if (auto init = sl->InitFor((int)i)) capture(init, si->ftypes[i], lay.offs[i]);
+        if (auto sl = Is<StructLit>(al->fillval); sl && SelfRelLitOk(sl) && sl->exprtype->kind == TY_STRUCT) {
+            auto sh = LitShape(sl);
+            for (size_t i = 0; i < sh.fields->size() && !Ended(); i++) {
+                if ((*sh.fields)[i].ispad) continue;
+                if (auto init = sl->InitFor((int)i)) capture(init, (*sh.ftypes)[i], sh.offs[i]);
             }
         } else {
             capture(al->fillval, et, 0);
