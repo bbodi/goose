@@ -1600,6 +1600,16 @@ struct TgFn {
             BuildFv(c, l, [&](Node *v) { GenRz(v, stk, hdr, t, l); });
             return;
         }
+        if (auto al = Is<ArrayLit>(n); al && !cg.IsFix(et) && !al->fillval && !al->capexpr) {
+            // Image elements, each built behind the last.
+            begin();
+            for (auto e : al->elems) {
+                GenImg(e, stk, et, l);
+                if (Ended()) return;
+                tyg_store(p, TYG_I64, len, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, len, 0), tyg_iconst(p, TYG_I64, 1)), 0);
+            }
+            return;
+        }
         if (auto al = Is<ArrayLit>(n)) {
             if (al->fillval || al->capexpr) No(l, "array literal of this kind");
             begin();
@@ -1875,8 +1885,10 @@ struct TgFn {
                           tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, tyg_at_local(cnt, 0), 0), tyg_iconst(p, TYG_I64, 1)), 0);
             }
         } else {
+            if (auto c = n ? Is<Call>(n) : nullptr; c && c->builtin == B_COPY && c->ArgNodes().size() == 1)
+                n = c->ArgNodes()[0];
             if (from) v = *from;
-            else if (n) v = ViewOf(Place(n), l);
+            else if (n) v = ViewOf(LimCallResult(n) ? LimCallPlace(n) : Place(n), l);
             else No(l, "array of images without a value");
             if (Ended()) return at();
             if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
