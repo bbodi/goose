@@ -6790,7 +6790,9 @@ struct TgFn {
     // result, and whether the bytes were one.
     vector<V> GenFromBytes(Call *c) {
         auto t = c->rettypes.empty() ? nullptr : c->rettypes[0];
-        if (!t || !IsGrow(t) || !(M.RzOk(t) || M.VeOk(t))) No(c->line, "from_bytes of this type");
+        // A T[] image result (a statement's own stack) as well as a resizable.
+        auto isimg = t && IsVarArr(t) && M.RzOk(t);
+        if (!t || !((IsGrow(t) && (M.RzOk(t) || M.VeOk(t))) || isimg)) No(c->line, "from_bytes of this type");
         auto et = t->arr->sub;
         auto plain = cg.IsFix(et) && !cg.NeedsVerifyWalk(et) && cg.FixedSize(et) > 0;
         auto esz = plain ? cg.FixedSize(et) : 0;
@@ -6810,7 +6812,14 @@ struct TgFn {
         auto i64 = [&](int64_t x) { return tyg_iconst(p, TYG_I64, x); };
         auto ld = [&](tyg_local l) { return tyg_load(p, TYG_I64, tyg_at_local(l, 0), 0); };
         auto st = [&](tyg_local l, tyg_val x) { tyg_store(p, TYG_I64, tyg_at_local(l, 0), x, 0); };
-        auto r = RzTemp(t, c->line);
+        V r;
+        if (isimg) {
+            r.t = t;
+            r.mem = true;
+            r.stk = Stk(AllocStk(false, c->line), c->line);
+        } else {
+            r = RzTemp(t, c->line);
+        }
         auto rlen = r.a;
         rlen.offset += 8;
         auto src = tyg_local_new(p, 8, 8), len = tyg_local_new(p, 8, 8), pay = tyg_local_new(p, 8, 8),
@@ -6876,6 +6885,34 @@ struct TgFn {
             st(okl, tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_cmp(p, TYG_SGE, n, i64(0))));
             tyg_jump(p, ran);
             tyg_block_set(p, ran);
+        }
+        if (isimg) {
+            // The prefix reserved, the payload behind it, the count patched
+            // in (CodeGen::OpenRzDest, EmitPrefixPatch).
+            auto start = tyg_local_new(p, 8, 8);
+            st(start, Top(r.stk));
+            SetTop(r.stk, tyg_bin(p, TYG_ADD, ld(start), i64(TgModule::PrefixBytes(t))));
+            auto copy = tyg_block_new(p), out = tyg_block_new(p);
+            tyg_branch(p, tyg_cmp(p, TYG_NE, ld(okl), i64(0)), copy, out);
+            tyg_block_set(p, copy);
+            auto top = Top(r.stk);
+            tyg_move_dyn(p, top, ld(pay), ld(pn));
+            SetTop(r.stk, tyg_bin(p, TYG_ADD, top, ld(pn)));
+            tyg_jump(p, out);
+            tyg_block_set(p, out);
+            // The count: the verifier's, or none for a rejected image.
+            auto zero = tyg_block_new(p), keep = tyg_block_new(p);
+            tyg_branch(p, tyg_cmp(p, TYG_NE, ld(okl), i64(0)), keep, zero);
+            tyg_block_set(p, zero);
+            st(cnt, i64(0));
+            tyg_jump(p, keep);
+            tyg_block_set(p, keep);
+            PatchPrefix(ld(start), t, ld(cnt), r.stk);
+            r.a = tyg_at_val(ld(start), 0);
+            V ok;
+            ok.t = M.ast.booltype;
+            ok.v = tyg_convert(p, TYG_TRUNC, TYG_I8, ld(okl));
+            return { r, ok };
         }
         tyg_store(p, TYG_I64, r.a, Top(r.stk), 0);
         tyg_store(p, TYG_I64, rlen, i64(0), 0);
