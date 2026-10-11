@@ -6373,8 +6373,17 @@ struct TgFn {
         auto plain = cg.IsFix(et) && !cg.NeedsVerifyWalk(et) && cg.FixedSize(et) > 0;
         auto esz = plain ? cg.FixedSize(et) : 0;
         auto an = c->ArgNodes();
-        auto v = ViewOf(Place(an[0]), c->line);
+        P src0;
+        if (Is<Call>(an[0]) && an[0]->exprtype && an[0]->exprtype->kind == TY_SLICE) {
+            // A call's array result handed as the slice: viewed where it lies.
+            auto x = Gen1(an[0]);
+            if (!Ended() && (!x.mem || !x.t || x.t->kind != TY_ARRAY)) No(c->line, "from_bytes of this source");
+            src0 = P { x.a, x.t, x.stk };
+        } else {
+            src0 = Place(an[0]);
+        }
         if (Ended()) return { Dummy(t), Dummy(M.ast.booltype) };
+        auto v = ViewOf(src0, c->line);
         if (!IsU8(v.elem)) No(c->line, "from_bytes of this source");
         auto i64 = [&](int64_t x) { return tyg_iconst(p, TYG_I64, x); };
         auto ld = [&](tyg_local l) { return tyg_load(p, TYG_I64, tyg_at_local(l, 0), 0); };
