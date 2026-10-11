@@ -1853,7 +1853,20 @@ struct TgFn {
         tyg_store(p, TYG_I64, tyg_at_local(cnt, 0), tyg_iconst(p, TYG_I64, 0), 0);
         View v {};
         auto al = n ? Is<ArrayLit>(n) : nullptr;
-        if (al && !al->fillval && !al->capexpr) {
+        if (al && al->fillval && !al->capexpr) {
+            // [v; k]: v built once, then copied behind itself.
+            auto fc = Is<IntLit>(al->fillcount);
+            if (!fc || fc->val < 0 || fc->val > 64) No(l, "fill count");
+            if (fc->val > 0) {
+                auto first = GenImg(al->fillval, stk, et, l);
+                if (Ended()) return at();
+                auto fl = tyg_local_new(p, 8, 8);
+                tyg_store(p, TYG_I64, tyg_at_local(fl, 0), first, 0);
+                for (int64_t i = 1; i < fc->val; i++)
+                    ImgCopy(stk, tyg_load(p, TYG_I64, tyg_at_local(fl, 0), 0), et);
+            }
+            tyg_store(p, TYG_I64, tyg_at_local(cnt, 0), tyg_iconst(p, TYG_I64, fc->val), 0);
+        } else if (al && !al->fillval && !al->capexpr) {
             for (auto e : al->elems) {
                 GenImg(e, stk, et, l);
                 if (Ended()) return at();
@@ -3192,6 +3205,8 @@ struct TgFn {
         // is a view all the same, which that array is built from.
         if (t && t->kind == TY_ARRAY && t->arr->akind != A_FIXED) t = M.ast.SliceOf(t->arr->sub, se->line);
         if (!t || t->kind != TY_SLICE || cg.Mangle(t->sub) != cg.Mangle(v.elem)) No(se->line, "slice to this type");
+        // Variable elements: whole-array slices only (the checker's rule).
+        if (!cg.IsFix(v.elem)) return SliceValue(t, v.elems, v.len);
         return SliceValue(t, ElemAddr(v, lo), tyg_bin(p, TYG_SUB, hi, lo));
     }
 
@@ -3199,8 +3214,22 @@ struct TgFn {
     V GenArrayLit(ArrayLit *al) {
         auto t = al->exprtype;
         if (TgModule::IsLim(t)) return LimLit(al);
+        if (t && IsImg(t) && M.ImgOk(t)) {
+            // An image: built at the top of a temporary's stack.
+            auto stk = Stk(AllocStk(false, al->line), al->line);
+            V x;
+            x.t = t;
+            x.mem = true;
+            x.a = tyg_at_val(GenImg(al, stk, t, al->line), 0);
+            return x;
+        }
+        if (t && IsGrow(t) && (M.RzOk(t) || M.VeOk(t))) {
+            auto x = RzTemp(t, al->line);
+            GenRz(al, x.stk, x.a, t, al->line);
+            return x;
+        }
         if (!t || t->kind != TY_ARRAY || t->arr->akind != A_FIXED || !M.TypeOk(t) || al->capexpr)
-            No(al->line, "array literal of this type");
+            No(al->line, cat("array literal of type ", t ? M.NameWhy(t) : "?"));
         auto k = cg.ArrSize(t->arr);
         auto et = t->arr->sub;
         auto esz = cg.FixedSize(et);
