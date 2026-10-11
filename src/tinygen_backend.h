@@ -295,14 +295,14 @@ struct TgModule {
                 // T[k]: k elements, packed; a static-capacity T[..k], a
                 // length beside them (LimOk).
                 if (t->arr->akind == A_LIMITED) return LimOk(t, depth);
-                return t->arr->akind == A_FIXED && cg.IsFix(t) && !cg.IsLargeFixed(t) &&
+                return t->arr->akind == A_FIXED && cg.IsFix(t) &&
                        cg.ArrSize(t->arr) > 0 && TypeOk(t->arr->sub, depth + 1);
             case TY_SLICE:
                 // { data, len }, over fixed elements (C.3), or over images
                 // walked by their sizes.
                 return cg.IsFix(t->sub) ? TypeOk(t->sub, depth + 1) : ImgOk(t->sub, depth + 1) || IsVarint(t->sub);
             case TY_STRUCT: {
-                if (!cg.IsFix(t) || cg.IsLargeFixed(t)) return false;
+                if (!cg.IsFix(t)) return false;
                 auto si = cg.SI(t);
                 if (!si || EmptyLayout(si->st->fields)) return false;
                 if (Reentered(t)) return true;   // Through an optional (OptRef).
@@ -337,11 +337,9 @@ struct TgModule {
                 switch (t->arr->akind) {
                     case A_LIMITED:
                         if (cg.ArrSize(t->arr) < 0) return RcOk(t, depth) ? "" : "runtime-capacity limited array";
-                        if (cg.IsLargeFixed(t)) return "large fixed value";
                         if (cg.ArrSize(t->arr) == 0) return "limited array of capacity 0";
                         break;
                     case A_FIXED:
-                        if (cg.IsFix(t) && cg.IsLargeFixed(t)) return "large fixed value";
                         break;
                     case A_VAR:
                         break;
@@ -368,7 +366,6 @@ struct TgModule {
                     }
                     return "variable-size struct";
                 }
-                if (cg.IsLargeFixed(t)) return "large fixed value";
                 auto si = cg.SI(t);
                 if (!si || EmptyLayout(si->st->fields)) return "empty struct";
                 if (Reentered(t)) return "";
@@ -699,7 +696,7 @@ struct TgModule {
     // A limited array this backend holds, of either kind.
     bool LimHeld(TypeExpr *t) { return TypeOk(t) || RcOk(t); }
     bool LimOk(TypeExpr *t, int depth) {
-        return cg.IsStaticLimited(t) && !cg.IsLargeFixed(t) && cg.ArrSize(t->arr) > 0 &&
+        return cg.IsStaticLimited(t) && cg.ArrSize(t->arr) > 0 &&
                TypeOk(t->arr->sub, depth + 1);
     }
     // The length field's bytes: where the slots start.
@@ -901,7 +898,7 @@ struct TgModule {
     // A fixed-mode ADT or a fixed variant whose payload fields it holds.
     bool AdtOk(TypeExpr *t, int depth) {
         if (t->kind == TY_ENUM && t->enu->varmode) return false;
-        if (!cg.IsFix(t) || cg.IsLargeFixed(t)) return false;
+        if (!cg.IsFix(t)) return false;
         auto ei = EI(t);
         auto ok = [&](int vi) {
             for (size_t i = 0; i < ei->en->variants[vi].fields.size(); i++)
@@ -917,7 +914,6 @@ struct TgModule {
     string AdtBlocker(TypeExpr *t, int depth) {
         if (t->kind == TY_ENUM && t->enu->varmode) return VmOk(t, depth) ? "" : "variable-mode ADT";
         if (!cg.IsFix(t)) return VvOk(t, depth) ? "" : "variable-size ADT";
-        if (cg.IsLargeFixed(t)) return "large fixed value";
         auto ei = EI(t);
         for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
             if (t->kind == TY_VARIANT && (int)vi != VariantIdx(t)) continue;
@@ -1360,7 +1356,8 @@ struct TgModule {
                 ps.push_back(tyg_type_ptr(m));
                 continue;
             }
-            ps.push_back(AT(t));
+            // A large fixed value is its copy's address (SigParams).
+            ps.push_back(cg.IsLargeFixed(t) ? tyg_type_ptr(m) : AT(t));
             if (RzParam(t)) ps.push_back(tyg_type_ptr(m));
         }
         for (auto fv : si.freevars) {
@@ -3980,6 +3977,19 @@ struct TgFn {
         return a;
     }
 
+    // A large fixed value by value: the address of a copy of its own
+    // (CodeGen::SigParams), which the callee reads through.
+    tyg_arg LargeArg(Node *n, TypeExpr *pt) {
+        if (!M.TypeOk(pt)) No(n->line, "argument of this type");
+        tyg_arg a {};
+        auto x = GenAs(n, pt);
+        if (Ended()) return a;
+        auto cp = Temp(pt);
+        tyg_copy(p, tyg_at_local(cp, 0), x.a, M.Size(pt));
+        a.val = tyg_addr_of(p, tyg_at_local(cp, 0));
+        return a;
+    }
+
     // Every result of the latest call (GenCall): the first as the call's
     // value, the others where the callee wrote them through out-pointers.
     vector<V> lastrets;
@@ -4219,7 +4229,7 @@ struct TgFn {
                 ValArg(an[i], pt, args);
                 continue;
             }
-            args.push_back(Arg(an[i], pt));
+            args.push_back(cg.IsLargeFixed(pt) ? LargeArg(an[i], pt) : Arg(an[i], pt));
         }
         // The callee's free variables (CodeGen::EmitFvArg): what this call
         // passes for each (Call::FreeVarArg), a variable of this frame or
@@ -4602,7 +4612,6 @@ struct TgFn {
         auto &ci = cg.sinfo[sp];
         if (!ci.freevars.empty()) No(l, "format overload with free variables");
         auto pt = sp->argtypes[1];
-        if (cg.IsLargeFixed(pt)) No(l, "format overload of a large value");
         auto hdr = len;
         hdr.offset -= 8;
         auto r = tyg_local_new(p, 16, 8);
@@ -4635,6 +4644,11 @@ struct TgFn {
             v.val = Load(P { pl.a, pt }, l).v;
         } else if (M.RzParam(pt)) {
             No(l, "format overload taking a variable-size value");
+        } else if (cg.IsLargeFixed(pt)) {
+            // The address of a copy of its own (SigParams).
+            auto cp = Temp(pt);
+            tyg_copy(p, tyg_at_local(cp, 0), pl.a, M.Size(pt));
+            v.val = tyg_addr_of(p, tyg_at_local(cp, 0));
         } else {
             v.mem = pl.a;
         }
@@ -5946,12 +5960,15 @@ struct TgFn {
                     if (pt->kind != TY_VARIANT) No(c->line, "dispatch to a case of this kind");
                     auto t = Temp(pt);
                     CopyPayload(s, (int)vi, tyg_at_local(t, 0));
-                    a.mem = tyg_at_local(t, 0);
+                    if (cg.IsLargeFixed(pt)) a.val = tyg_addr_of(p, tyg_at_local(t, 0));
+                    else a.mem = tyg_at_local(t, 0);
                 } else if (M.RzParam(pt)) {
                     args.insert(args.end(), valargs[i].begin(), valargs[i].end());
                     continue;
                 } else if (M.IsScalar(pt)) {
                     a.val = tyg_load(p, M.Scal(pt), tyg_at_local(shared[i], 0), 0);
+                } else if (cg.IsLargeFixed(pt)) {
+                    a.val = tyg_addr_of(p, tyg_at_local(shared[i], 0));
                 } else {
                     a.mem = tyg_at_local(shared[i], 0);
                 }
@@ -7123,6 +7140,7 @@ struct TgFn {
                 continue;
             }
             if (M.RzParam(t) && !M.Resz(t)) pdt.push_back(tyg_dt_pointer(m, M.DT(t)));
+            else if (cg.IsLargeFixed(t)) pdt.push_back(tyg_dt_pointer(m, M.DT(t)));
             else pdt.push_back(M.DT(t));
             if (M.RzParam(t) && M.Resz(t)) pdt.push_back(tyg_dt_pointer(m, M.StackDT()));
         }
@@ -7195,6 +7213,16 @@ struct TgFn {
             if (M.RzParam(t) && !M.Resz(t)) {
                 // A by-value T[]: its image's address, the image a copy the
                 // caller made.
+                auto loc = tyg_local_new(p, 8, 8);
+                locals[vd] = loc;
+                indirect.insert(vd);
+                tyg_store(p, TYG_I64, tyg_at_local(loc, 0), pv, 0);
+                tyg_debug_param(p, string(vd->name).c_str(), tyg_dt_pointer(m, M.DT(t)),
+                                tyg_at_local(loc, 0), M.File(vd->line.fileidx), vd->line.line);
+                continue;
+            }
+            if (cg.IsLargeFixed(t)) {
+                // The caller's copy, read through its address.
                 auto loc = tyg_local_new(p, 8, 8);
                 locals[vd] = loc;
                 indirect.insert(vd);
