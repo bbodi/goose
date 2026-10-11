@@ -6186,7 +6186,7 @@ struct TgFn {
                 No(c->line, cat("thread program with a global of type ", M.NameWhy(d->type)));
         for (size_t i = 0; i < w->argtypes.size(); i++) {
             auto pt = w->argtypes[i];
-            if (cg.IsPoolParam(w, i) || (M.RzParam(pt) ? M.Resz(pt) || !QueueOk(pt) : !M.TypeOk(pt) || !cg.FixedSize(pt)))
+            if (cg.IsPoolParam(w, i) || (M.RzParam(pt) ? !QueueOk(pt) : !M.TypeOk(pt)))
                 No(c->line, cat("thread argument of type ", M.NameWhy(pt)));
         }
         cg.usesthreads = true;
@@ -6195,6 +6195,18 @@ struct TgFn {
         auto base = Top(stk);
         for (size_t i = 0; i < w->argtypes.size(); i++) {
             auto pt = w->argtypes[i];
+            if (M.Resz(pt)) {
+                // [int64 size][flat image]: the worker's thunk rebuilds the
+                // header on a stack of its own (CodeGen::EmitThreadSpawn).
+                auto src = RzValue(an[1 + i], pt, c->line);
+                if (Ended()) return Dummy(M.ast.inttypes[IS_I64]);
+                auto szp = Top(stk);
+                SetTop(stk, tyg_bin(p, TYG_ADD, szp, tyg_iconst(p, TYG_I64, 8)));
+                RzImage(stk, src, pt);
+                tyg_store(p, TYG_I64, tyg_at_val(szp, 0),
+                          tyg_bin(p, TYG_SUB, Top(stk), tyg_bin(p, TYG_ADD, szp, tyg_iconst(p, TYG_I64, 8))), 0);
+                continue;
+            }
             if (M.RzParam(pt)) {
                 // An image, built at the top: the packet holds it whole.
                 GenImg(an[1 + i], stk, pt, c->line);
@@ -9829,6 +9841,44 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                 auto at = tyg_load(p, TYG_I64, tyg_at_local(cur, 0), 0);
                 tyg_arg a {};
                 tyg_val size;
+                if (mod->Resz(t)) {
+                    // [int64 size][count][fixed fields][elements]: a header
+                    // (or the frame object) and a stack of the thunk's own,
+                    // as CodeGen::EmitThreadThunk makes them.
+                    auto fo = mod->FoOk(t);
+                    auto pre = fo ? mod->FoHdrOff(t) : 0;
+                    auto obj = tyg_at_local(tyg_local_new(p, fo ? mod->Size(t) : 16, 8), 0);
+                    auto stkl = tyg_local_new(p, 8, 8);
+                    mod->NeedShim("gs_tg_stack_init");
+                    {
+                        tyg_arg sa {};
+                        sa.val = tyg_addr_of(p, tyg_at_local(stkl, 0));
+                        const tyg_type *sps[] = { ptr };
+                        tyg_call(p, tyg_sig_new(m, nullptr, sps, 1, 0),
+                                 tyg_direct(mod->Sym("gs_tg_stack_init", TYG_SYM_FUNC | TYG_SYM_GLOBAL)), &sa, 1,
+                                 nullptr, nullptr);
+                    }
+                    tyg_zero(p, obj, fo ? mod->Size(t) : 16);
+                    auto hdr = obj;
+                    hdr.offset += pre;
+                    auto hlen = hdr;
+                    hlen.offset += 8;
+                    auto sz = tyg_load(p, TYG_I64, tyg_at_val(at, 0), 0);
+                    auto top = tyg_load(p, TYG_I64, tyg_at_local(stkl, 0), 0);
+                    tyg_store(p, TYG_I64, hdr, top, 0);
+                    tyg_store(p, TYG_I64, hlen, tyg_load(p, TYG_I64, tyg_at_val(at, 8), 0), 0);
+                    if (pre) tyg_copy(p, obj, tyg_at_val(at, 16), pre);
+                    auto n = tyg_bin(p, TYG_SUB, sz, tyg_iconst(p, TYG_I64, 8 + pre));
+                    tyg_move_dyn(p, top, tyg_bin(p, TYG_ADD, at, tyg_iconst(p, TYG_I64, 16 + pre)), n);
+                    tyg_store(p, TYG_I64, tyg_at_local(stkl, 0), tyg_bin(p, TYG_ADD, top, n), 0);
+                    a.mem = obj;
+                    args.push_back(a);
+                    tyg_arg k {};
+                    k.val = tyg_addr_of(p, tyg_at_local(stkl, 0));
+                    args.push_back(k);
+                    tyg_store(p, TYG_I64, tyg_at_local(cur, 0), tyg_bin(p, TYG_ADD, at, tyg_bin(p, TYG_ADD, sz, tyg_iconst(p, TYG_I64, 8))), 0);
+                    continue;
+                }
                 if (mod->RzParam(t)) {
                     a.val = at;   // An image, by its address; the packet is the worker's own copy.
                     size = fn.ImgSize(t, at);
