@@ -272,6 +272,7 @@ backend compiles:
 | third, so far (+ zero `default<T>()`, globals in whole programs) | 2253 of 3811 (59%) | 172 of 172 |
 | third, so far (+ composites rendered by `print` and `str`) | 2276 of 3811 (60%) | 172 of 172 |
 | third, so far (+ `.=`, `block`, `loop` values, integer `match`) | 2334 of 3811 (61%) | 172 of 172 |
+| third, so far (+ optionals) | 2434 of 3811 (64%) | 172 of 172 |
 
 (The first stage's own write-up counted 394 of 3331 over 284 programs, an
 older sweep; the rows above come from the same one.) The step that added
@@ -796,6 +797,58 @@ tinygen puts it in a block that is never placed. Its expressions get a
 dummy value and its stores of a missing value are skipped, so functions
 such as `deep_fail_g` and `earlyblocks_g` no longer fall back with
 tinygen's `invalid value`.
+
+### Optionals
+
+`T?` (§3.8) as the C backend has it, so that either half calls the other
+with optionals in any position: the address a `T&` would be, `NULL`
+for null, and for a resizable array the fat reference `gs_rref` with a
+null `hdr` (`NullLit::CgX`, `GenTruth`). An optional of anything the
+backend holds behind a plain reference is held too
+(`TgModule::OptRef`), as a parameter, a result (the C return value or
+an out-pointer, as any address), a local, a struct field, an element, a
+free variable, a global (null in the zero-filled storage of a whole
+program) and a `return from` value. A struct reaching itself through an
+optional link (`struct Link { val: i64, next: Link? }`) is held: the
+type checks treat a struct met again on the way as held if the rest is.
+
+* **made**: `null` (zero, or a zeroed `gs_rref`), `default<T?>()`, an
+  omitted optional field of a literal (zeroed), and any reference or
+  variable where the checker adapts it (`&x`, `var o: i64? = n`).
+* **tested**: `if`, `while`, `guard`, `assert`, `&&`/`||`, `!`, and
+  `== null`/`!= null` compare the address held by the variable itself,
+  whether or not it is narrowed there, as the C reads `VarLoc`; another
+  expression's value otherwise. `.==`/`.!=` compare two addresses (a
+  fat reference's `hdr`), of plain references too.
+* **narrowed**: a path through an optional (`o.x`, `o += 1`, `o.push`,
+  `for x in o`) or a value read through one steps through it like a
+  plain reference (`TgFn::Deref`, `Fit`): the checker lets one through
+  only where it is narrowed, and an lvalue path's type does not say
+  that, so the backend does not ask.
+* **rebound**: `.=` stores the new address, or null, in the slot.
+* **printed**: `null`, or the pointee rendered as `CodeGen::RenderLoc`
+  does. A pointee whose type reaches itself (a list) is rendered by the
+  C half's recursive render functions; such a `print` or `str` keeps
+  its function in C (`text of type Link? [recursive]`).
+
+Relative optionals (`T&<u32 in pool>?`) stay in C with the relative
+references. The debug info gives a `T?` as a typedef under its Goose
+name over the C half's pointer (`(Link?) n = 0x...`, `p *n` shows the
+`Link`), a fat one as the record `i64[>..]?` of `hdr` and `stk`. No
+tinygen gap was met.
+
+Over the sweep, per-function coverage goes from 2343 of 3811 (after
+the unreachable-code fix above) to 2434 (64%), and the whole path from
+71 programs to 85: 14 programs that only optionals kept mixed (the
+ranking's 23 were optimistic; the other 9 meet limited arrays, ADTs,
+variable-size structs, varints or format overloads next).
+Goose-in-Goose stays whole, self-compiling byte for byte, plain and
+`--debug`. The sweep's run pairs match as before; the one program
+whose output differs, `codegen/exit_value_destination` (a `return
+from` with a `u8[]` result printed wrong), differs the same way
+without this change. What optionals still send to C: relative optionals
+(79 functions in 11 programs) and the text of recursive types (2
+functions, 1 program). The fixture is `tinygen_optionals`.
 
 ## Testing
 
