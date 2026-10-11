@@ -214,11 +214,25 @@ slices of string literals and `u8[]` values, element-wise operators on
 arrays, array comparisons, and the leading-check hoisting the C backend does
 (an optimization only).
 
-Coverage today is narrow by design: most of the test suite's functions use
-arrays, strings or data stacks, and stay in C: 0 of the 172 specializations
-of `test/goose_in_goose/`, and 394 of the 3331 of the samples and the
-`codegen/`, `typing/` and `optimizer/` fixtures, all 284 of which print the
-same with the backend as through C at `-O0`.
+Coverage, measured over the samples and the `codegen/`, `typing/` and
+`optimizer/` fixtures (291 programs; every one built with `goose build -O0`
+and with `--backend=tinygen`, each with and without `--debug`, and all 582
+pairs print the same and exit alike), counting the specializations the
+backend compiles:
+
+| Stage | Specializations through tinygen | `test/goose_in_goose/` |
+|---|---|---|
+| first (scalars, structs, control flow) | 542 of 3811 (14%) | 0 of 172 |
+| second, so far (fixed arrays, slices) | 952 of 3811 (25%) | 1 of 172 |
+
+(The first stage's own write-up counted 394 of 3331 over 284 programs, an
+older sweep; both rows above come from the same one.) What still sends a
+function to C, by count: a parameter or result of a type the backend does not
+hold (mostly `u8[]` strings and resizable arrays, 870), a local of such a type
+(357), multiple results (352), free variables of nested functions (329), a
+global (179), calls through function values and dispatch (169), `return
+from` (158), and calls to functions using data stacks (87). Goose-in-Goose
+passes strings and resizable arrays nearly everywhere, which is stage 3.
 
 ## Testing
 
@@ -294,15 +308,16 @@ Recorded here rather than changed in tinygen, which other work is changing:
    directions, extern fns, `print`, debug info; per-function fallback; macOS
    arm64 (tinygen's host target is used, so Linux arm64/x64 should work as
    well, untested).
-2. **Fixed arrays and slices**: `T[k]` and static-capacity `T[..k]` values
-   and fields, indexing with bounds checks (`gs_idxfail`, honoring
-   `Index::nobc`), slices as parameters (their `data`/`len` members, C.3) and
-   values, `for` over arrays and slices, string literals as slices, fixed-mode
-   enums and `match`, optional references and null tests, multiple results
-   (out-pointers), `block`/`break` with values. Globals through an exported
-   accessor for `gs_globals_t` (or `gs_globals_main` made external).
-   `InlineBlock`, so that `-O1` and `-O2` builds stay in tinygen. This is where
-   real programs' coverage starts.
+2. **Fixed arrays and slices**: done so far: `T[k]` values and fields,
+   slices of fixed elements as parameters, results and values, indexing
+   with bounds checks (`gs_idxfail`, honoring `Index::nobc`), slicing,
+   `len`, `for` over arrays and slices, string literals as slices. Next, in
+   order of what the coverage count says they unlock: multiple results
+   (out-pointers, 352 functions), globals through an exported accessor for
+   `gs_globals_t` (or `gs_globals_main` made external, 179), static-capacity
+   `T[..k]`, fixed-mode enums and `match`, optional references and null
+   tests, `block`/`break` with values, and `InlineBlock`, so that `-O1` and
+   `-O2` builds stay in tinygen.
 3. **Data stacks**: resizable and variable-size values, `gs_sp` and the stack
    accounting (`CodeGen` exposing `NoteStackCall`/`stackown` to the second
    backend), `push`/`append`/`str`/`format`, rendering composites through the
