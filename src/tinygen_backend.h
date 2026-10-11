@@ -1535,6 +1535,15 @@ struct TgFn {
             tyg_store(p, TYG_I64, hdr, Top(stk), 0);
             tyg_store(p, TYG_I64, len, tyg_iconst(p, TYG_I64, 0), 0);
         };
+        if (auto ie = Is<IfExpr>(n); ie && ie->elseb) {
+            // Each arm builds the array at the same top.
+            BuildIf(ie, l, [&](Node *v) { GenRz(v, stk, hdr, t, l); });
+            return;
+        }
+        if (auto b = Is<Block>(n); b && b->tail) {
+            BuildArm(b, l, [&](Node *v) { GenRz(v, stk, hdr, t, l); });
+            return;
+        }
         if (auto al = Is<ArrayLit>(n)) {
             if (al->fillval || al->capexpr) No(l, "array literal of this kind");
             begin();
@@ -1628,16 +1637,13 @@ struct TgFn {
             // GenConstruct of an if): the image starts where the top was.
             auto start = tyg_local_new(p, 8, 8);
             tyg_store(p, TYG_I64, tyg_at_local(start, 0), Top(stk), 0);
-            auto c = Truth(ie->cond);
-            auto tb = tyg_block_new(p), eb = tyg_block_new(p), done = tyg_block_new(p);
-            tyg_branch(p, c, tb, eb);
-            tyg_block_set(p, tb);
-            ImgArm(ie->thenb, stk, t, l);
-            Jump(done);
-            tyg_block_set(p, eb);
-            ImgArm(ie->elseb, stk, t, l);
-            Jump(done);
-            tyg_block_set(p, done);
+            BuildIf(ie, l, [&](Node *v) { GenImg(v, stk, t, l); });
+            return tyg_load(p, TYG_I64, tyg_at_local(start, 0), 0);
+        }
+        if (auto b = n && !from ? Is<Block>(n) : nullptr; b && b->tail) {
+            auto start = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(start, 0), Top(stk), 0);
+            BuildArm(b, l, [&](Node *v) { GenImg(v, stk, t, l); });
             return tyg_load(p, TYG_I64, tyg_at_local(start, 0), 0);
         }
         if (M.IsVm(t)) {
@@ -3617,37 +3623,45 @@ struct TgFn {
         auto pl = Deref(Place(an[0]));
         if (TgModule::IsLim(pl.t)) return LimAppend(c, pl);
         if (!IsGrow(pl.t) || !M.RzOk(pl.t) || !pl.stk) No(c->line, "append to an array of this kind");
+        AppendSrc(pl, an[1], c->line);
+        return V {};
+    }
+    // The elements of src added to the resizable at pl.
+    void AppendSrc(const P &pl, Node *src, Line l) {
         auto et = pl.t->arr->sub;
         auto len = pl.a;
         len.offset += 8;
-        auto src = an[1];
+        if (auto ie = Is<IfExpr>(src); ie && ie->elseb) {
+            BuildIf(ie, l, [&](Node *v) { AppendSrc(pl, v, l); });
+            return;
+        }
         if (auto cc = Is<Call>(src); cc && cc->builtin == B_COPY && cc->ArgNodes().size() == 1)
             src = cc->ArgNodes()[0];
         auto st = src->exprtype;
-        if (Is<Call>(src) && st && IsGrow(st) && !Is<Call>(src)->spec) No(c->line, "append of this call");
+        if (Is<Call>(src) && st && IsGrow(st) && !Is<Call>(src)->spec) No(l, "append of this call");
         if (auto cc = Is<Call>(src); cc && cc->builtin < 0 && st && IsGrow(st)) {
             auto tmp = tyg_local_new(p, 16, 8);
-            GenRz(src, pl.stk, tyg_at_local(tmp, 0), st, c->line);
-            if (Ended()) return V {};
+            GenRz(src, pl.stk, tyg_at_local(tmp, 0), st, l);
+            if (Ended()) return;
             tyg_store(p, TYG_I64, len,
                       tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, len, 0),
                               tyg_load(p, TYG_I64, tyg_at_local(tmp, 8), 0)), 0);
-            return V {};
+            return;
         }
         if (auto s = Is<StrLit>(src)) {
-            if (!IsU8(et)) No(c->line, "string of this type");
+            if (!IsU8(et)) No(l, "string of this type");
             CopyRun(pl.stk, len, et, tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)),
                     tyg_iconst(p, TYG_I64, (int64_t)s->val.size()));
-            return V {};
+            return;
         }
         // A literal is a fixed array, all of it evaluated before any of it
         // is copied, as in the C.
         auto from = Place(src);
-        if (Ended()) return V {};
-        auto v = ViewOf(from, c->line);
-        if (cg.Mangle(v.elem) != cg.Mangle(et)) No(c->line, "append of another element type");
+        if (Ended()) return;
+        auto v = ViewOf(from, l);
+        if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "append of another element type");
         CopyRun(pl.stk, len, et, v.elems, v.len);
-        return V {};
+        return;
     }
     static bool IsGrow(TypeExpr *t) { return TgModule::IsGrow(t); }
 
@@ -4422,6 +4436,10 @@ struct TgFn {
     // An arm whose value is an image built at the top of stk: its
     // statements, then its tail built there, in a scope of its own.
     void ImgArm(Node *n, tyg_val stk, TypeExpr *t, Line l) {
+        BuildArm(n, l, [&](Node *v) { GenImg(v, stk, t, l); });
+    }
+    // The same for any value built in place by `build`.
+    template <class F> void BuildArm(Node *n, Line l, F build) {
         if (auto b = Is<Block>(n)) {
             tyg_scope_begin(p);
             OpenScope(false);
@@ -4429,7 +4447,7 @@ struct TgFn {
             if (b->tail && !Ended()) {
                 Open();
                 Loc(b->tail->line);
-                GenImg(b->tail, stk, t, l);
+                build(b->tail);
             } else if (!b->tail && !Ended()) {
                 No(l, "arm without a value");
             }
@@ -4438,8 +4456,21 @@ struct TgFn {
             return;
         }
         OpenScope(true);
-        GenImg(n, stk, t, l);
+        build(n);
         CloseScope();
+    }
+    // An if with an else whose arms each build a value in place.
+    template <class F> void BuildIf(IfExpr *ie, Line l, F build) {
+        auto c = Truth(ie->cond);
+        auto tb = tyg_block_new(p), eb = tyg_block_new(p), done = tyg_block_new(p);
+        tyg_branch(p, c, tb, eb);
+        tyg_block_set(p, tb);
+        BuildArm(ie->thenb, l, build);
+        Jump(done);
+        tyg_block_set(p, eb);
+        BuildArm(ie->elseb, l, build);
+        Jump(done);
+        tyg_block_set(p, done);
     }
 
     // An arm runs or not: what it takes on a stack is its own.
