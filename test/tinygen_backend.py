@@ -139,7 +139,7 @@ WHOLE_PROGRAM = {
 
 # ---- ADTs: fixed-mode values, variants, match and case-function dispatch,
 # whole and with the cases, the scrutinees' owners and main left to C in
-# turn; and a sample whose variable-mode ADTs stay in C.
+# turn; and a sample of variable-mode ADTs.
 PROGRAMS += [
     ("test/tinygen/tinygen_adts.goose", True, []),
     ("test/tinygen/tinygen_adts.goose", True, ["--debug"]),
@@ -151,7 +151,7 @@ PROGRAMS += [
     ("samples/05_shapes.goose", False, []),
 ]
 WHOLE_PROGRAM |= {"tinygen_adts", "cnames"}   # cnames: its enum now held
-WHOLE_PROGRAM |= {"wider_slot_operations"}   # its varint references now held
+WHOLE_PROGRAM |= {"wider_slot_operations", "05_shapes"}   # varint references, ADT rendering now held
 
 
 # Limited arrays T[..k]: the fixture whole, plain and --debug, then with

@@ -1982,6 +1982,35 @@ struct TgFn {
         }
         if (LimAdapts(x, want)) return LimFrom(x, want, l);
         if (x.t->kind == TY_VARIANT && want->kind == TY_ENUM && x.mem) return AdaptToAdt(x, want, l);
+        if (x.t->kind == TY_ENUM && want->kind == TY_ENUM && x.mem && M.IsVm(x.t) && !M.IsVm(want) &&
+            M.EI(x.t) == M.EI(want) && M.TypeOk(want)) {
+            // A variable-mode value read as fixed-mode (CodeGen::AdaptToFixed):
+            // its tag, then the variant's payload copied.
+            auto r = MemTemp(want, true);
+            auto ei = cg.EIOf(want);
+            auto tag = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(tag, 0), LoadTag(x.a, x.t), 0);
+            tyg_store(p, M.TagScal(want), r.a,
+                      tyg_convert(p, TYG_TRUNC, M.TagScal(want), tyg_load(p, TYG_I64, tyg_at_local(tag, 0), 0)), 0);
+            auto done = tyg_block_new(p);
+            for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
+                auto psz = cg.VariantLayout(ei, (int)vi).size;
+                if (!psz) continue;
+                auto hit = tyg_block_new(p), next = tyg_block_new(p);
+                tyg_branch(p, tyg_cmp(p, TYG_EQ, tyg_load(p, TYG_I64, tyg_at_local(tag, 0), 0),
+                                      tyg_iconst(p, TYG_I64, (int64_t)vi)), hit, next);
+                tyg_block_set(p, hit);
+                auto to = r.a, from = x.a;
+                to.offset += M.TagSize(want);
+                from.offset += M.TagSize(x.t);
+                tyg_copy(p, to, from, psz);
+                tyg_jump(p, done);
+                tyg_block_set(p, next);
+            }
+            tyg_jump(p, done);
+            tyg_block_set(p, done);
+            return r;
+        }
         if (OptFit(x, want)) return x;
         if (M.IsScalar(x.t) != M.IsScalar(want) || !cg.TEq(x.t, want)) {
             string a, b;
@@ -3017,6 +3046,15 @@ struct TgFn {
 
     V GenStructLit(StructLit *sl) {
         auto t = sl->exprtype;
+        if (IsImg(t) && M.ImgOk(t)) {
+            // An image: built at the top of a temporary's stack.
+            auto stk = Stk(AllocStk(false, sl->line), sl->line);
+            V x;
+            x.t = t;
+            x.mem = true;
+            x.a = tyg_at_val(GenImg(sl, stk, t, sl->line), 0);
+            return x;
+        }
         if (t->kind == TY_VARIANT || t->kind == TY_ENUM) return GenVariantLit(sl);
         if (!sl->sinst || sl->variant || t->kind != TY_STRUCT || !M.TypeOk(t))
             No(sl->line, "literal of this type");
@@ -3836,9 +3874,9 @@ struct TgFn {
             while (rt && IsAddrRef(rt)) rt = rt->ref->sub;
             if (!rt || (rt->kind != TY_ARRAY && rt->kind != TY_SLICE)) No(c->line, "bytes_of of this type");
             auto elem = rt->kind == TY_SLICE ? rt->sub : rt->arr->sub;
-            if (!cg.IsFix(elem)) No(c->line, "bytes_of of variable-size elements");
             auto v = ViewOf(Place(a), c->line);
             if (Ended()) return Dummy(c->exprtype);
+            if (!cg.IsFix(elem)) return SliceValue(c->exprtype, v.elems, tyg_bin(p, TYG_SUB, RunEnd(v), v.elems));
             auto n = tyg_bin(p, TYG_MUL, v.len, tyg_iconst(p, TYG_I64, cg.FixedSize(elem)));
             return SliceValue(c->exprtype, v.elems, n);
         }
@@ -5339,6 +5377,15 @@ struct TgFn {
     // A payload-less variant constant (Dot::CgX).
     V GenVariantConst(Dot *d) {
         auto t = d->exprtype;
+        if (M.VmOk(t)) {
+            // A variable-mode value: its image on a temporary's stack.
+            auto stk = Stk(AllocStk(false, d->line), d->line);
+            V x;
+            x.t = t;
+            x.mem = true;
+            x.a = tyg_at_val(GenImg(d, stk, t, d->line), 0);
+            return x;
+        }
         if (!M.TypeOk(t)) No(d->line, cat("variant constant of type ", M.NameWhy(t)));
         auto x = MemTemp(t, true);
         if (t->kind == TY_ENUM) StoreTag(x.a, t, d->einst->en->VariantIndex(d->variantconst));
