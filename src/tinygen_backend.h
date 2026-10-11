@@ -404,14 +404,14 @@ struct TgModule {
             why = "calls a function using data stacks";
             return false;
         }
+        for (auto r : sp->rets)
+            if (!TypeOk(r)) { why = "result type"; return false; }
         // A result this backend holds is fixed and not large, so the C
         // returns the first one (CodeGen::CollectSpecs).
         if (!sp->rets.empty() && si.cret != 0) {
             why = "results";
             return false;
         }
-        for (auto r : sp->rets)
-            if (!TypeOk(r)) { why = "result type"; return false; }
         for (size_t i = 0; i < sp->argtypes.size(); i++)
             if (cg.IsPoolParam(sp, i) || !TypeOk(sp->argtypes[i])) {
                 why = "parameter type";
