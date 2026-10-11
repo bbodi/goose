@@ -6,7 +6,7 @@ of its own and the rest in the C, and run; its output must be the blessed
 one the C backends are held to. The test/tinygen/ fixtures must go through
 tinygen whole (every function compiled by it), and one of them is also
 built with chosen functions left to C, so that calls cross between the two
-halves in both directions; the other programs are ones the first stage
+halves in both directions (structs, and arrays and slices); the other programs are ones the first stage
 covers in part. Where lldb is installed, one program is run under it to see
 that the debugger finds a Goose function by name and shows its Goose source
 line, its parameters and its locals with their Goose types.
@@ -34,6 +34,12 @@ PROGRAMS = [
     ("test/tinygen/tinygen_extern.goose", True, []),
     ("test/tinygen/tinygen_divzero.goose", True, []),
     ("test/tinygen/tinygen_divzero.goose", True, ["--debug"]),
+    ("test/tinygen/tinygen_arrays.goose", True, []),
+    ("test/tinygen/tinygen_arrays.goose", True, ["--debug"]),
+    ("test/tinygen/tinygen_arrays.goose", False, ["--tinygen-skip=main"]),
+    ("test/tinygen/tinygen_arrays.goose", False,
+     ["--tinygen-skip=sum,weighted,bump,first_last,reverse,perimeter,count_bytes,at"]),
+    ("test/tinygen/tinygen_slicefail.goose", True, []),
     ("test/codegen/loop_invariant_divisors.goose", False, []),
     ("test/codegen/cnames.goose", False, []),
     ("test/codegen/wider_slot_operations.goose", False, []),
@@ -136,6 +142,32 @@ def check_lldb(exe, base, ok, fail, say):
         fail("tinygen debug info under lldb", f"missing {missing}:\n{text}")
         return
     ok("tinygen debug info under lldb: Goose function, lines, parameters and locals")
+    check_lldb_arrays(exe, base, lldb, ok, fail)
+
+
+def check_lldb_arrays(exe, base, lldb, ok, fail):
+    """A slice parameter as its data and length, a fixed array local with
+    its elements, by their Goose types."""
+    source = HERE / "tinygen" / "tinygen_arrays.goose"
+    out = base / f"lldb-arrays{tc.EXE_SUFFIX}"
+    good, log, _, _ = build(exe, source, out, [])
+    if not good:
+        fail("tinygen lldb arrays build", log)
+        return
+    code, o, e = tc.run_capture([lldb, "-b", "-o", "b weighted", "-o", "run",
+                                 "-o", "frame variable", "-o", "up", "-o", "frame variable a",
+                                 "-o", "kill", out])
+    text = o + e
+    wants = [
+        r"weighted_g\(s=.*at tinygen_arrays\.goose:1[45]",
+        r"\(i64\[:\]\) s = \{\s*data = 0x[0-9a-f]+\s*len = 5",
+        r"\(i64\[5\]\) a = \(\[0\] = 3, \[1\] = 1, \[2\] = 4, \[3\] = 1, \[4\] = 5\)",
+    ]
+    missing = [w for w in wants if not re.search(w, text)]
+    if missing:
+        fail("tinygen array debug info under lldb", f"missing {missing}:\n{text}")
+        return
+    ok("tinygen debug info under lldb: a slice and a fixed array")
 
 
 if __name__ == "__main__":

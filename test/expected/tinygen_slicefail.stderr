@@ -1,0 +1,2 @@
+goose runtime error: slice bounds out of range
+tinygen_slicefail.goose:4)

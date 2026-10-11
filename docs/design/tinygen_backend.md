@@ -181,6 +181,38 @@ functions with inlined bodies then go to C) and compiles the C half `-O0 -g`
 (`BuildOptions::debug`) without defining `GS_DEBUG`; `--debug` adds that.
 It works with `goose build`; `goose run` keeps the in-process TinyCC path.
 
+## What the second stage adds: fixed arrays and slices
+
+* **types**: fixed arrays `T[k]` (k > 0) of any type above, and slices
+  `T[:]` of fixed elements, as locals, fields, elements, parameters and
+  results. For the ABI a `T[k]` is the C half's `struct { T e[k]; }`, packed:
+  a record holding one `tyg_type_array`; a slice is `{ data, len }`, a pointer
+  and an `int64_t` (C.3).
+* **expressions**: indexing, as a value and as a place, with GS_IDX's bounds
+  check calling `gs_idxfail` (the runtime object's, so the message is the C
+  backend's) unless BCE elided it (`Index::nobc`) or the index is a constant
+  within a fixed array; slicing `a[lo..hi]` (`^k` from the end) with
+  `GS_E_SLICE`'s check through a shim; `.len`; array literals `[a, b, c]`
+  and `[v; k]`; a whole array where a slice is wanted (§3.10), viewed where it
+  lies; a string literal as a `u8[:]`.
+* **statements**: `for x in a`, `for &x in a` and `for x, i in a` over a
+  fixed array or a slice. As in the C, the length is read again at the top
+  of every iteration and the elements where the path leads then; an
+  iterated expression that is not a check-free path runs once.
+
+The debug info gives a fixed array as `tyg_dt_array` (lldb: `(i64[5]) a =
+([0] = 3, [1] = 1, ...)`) and a slice as a record named by its Goose type
+with its `data` pointer and `len` (`(i64[:]) s = { data = 0x... len = 5 }`;
+`parray 5 s.data` shows the elements). A debugger cannot show the elements
+by themselves: that needs an array type whose count is the `len` member,
+which tinygen lacks (gap 3).
+
+Not yet: static-capacity limited arrays `T[..k]` (a length beside the slots,
+built by copy from other arrays, §4.2), slices of variable-size elements,
+slices of string literals and `u8[]` values, element-wise operators on
+arrays, array comparisons, and the leading-check hoisting the C backend does
+(an optimization only).
+
 Coverage today is narrow by design: most of the test suite's functions use
 arrays, strings or data stacks, and stay in C: 0 of the 172 specializations
 of `test/goose_in_goose/`, and 394 of the 3331 of the samples and the
@@ -189,19 +221,22 @@ same with the backend as through C at `-O0`.
 
 ## Testing
 
-`test/tinygen/` holds fixtures the first stage covers whole: scalars,
-structs, extern calls with C of their own (a sidecar), and a division by zero
-that must abort with the Goose line. They are ordinary fixtures, run by the
+`test/tinygen/` holds fixtures the backend covers whole: scalars,
+structs, extern calls with C of their own (a sidecar), a division by zero
+that must abort with the Goose line, arrays and slices (ending in a failed
+bounds check), and a slice whose bounds fail. They are ordinary fixtures, run by the
 main suite through both C backends against `test/expected/`.
 `test/tinygen_backend.py` (the "tinygen backend" section of `run_tests.py`)
 builds them with `--backend=tinygen`, requires every function to go through
 tinygen, builds the structs fixture three more times with chosen functions
 left to C (`--tinygen-skip=a,b`, hidden) so that by-value and by-reference
-structs cross the two halves in both directions, builds a few existing
+structs cross the two halves in both directions, and the arrays fixture twice
+more so that arrays and slices do, builds a few existing
 fixtures and a sample that the stage covers in part, and compares every run
 with the same expected output. Where `lldb` is installed it runs one program
 under it and requires a breakpoint by Goose function name, Goose lines in the
-frame and its caller, and a parameter and a local with Goose types.
+frame and its caller, and a parameter and a local with Goose types; and one
+more for a slice parameter's `data` and `len` and a fixed array's elements.
 
 ## What tinygen lacks for Goose
 
@@ -219,7 +254,10 @@ Recorded here rather than changed in tinygen, which other work is changing:
    stack; a debugger shows them well only with an array type whose count is
    another member (DWARF `DW_AT_count` as a location expression, CodeView's
    equivalent through natvis). tinygen's `tyg_dt_array` takes a constant
-   count or none.
+   count or none, so the backend describes a slice as a plain record of
+   `data` and `len` (see the second stage); a `tyg_dt_array` whose count is
+   a member of the enclosing record (or a location expression) would let
+   lldb and gdb show its elements directly.
 4. **The source language, and lldb's formatters.** tinygen now names the
    unit's language (`tyg_module_language`); the backend says C11, as the C
    half's unit does. Tried under lldb (Xcode's, macOS arm64) with C99, C11,

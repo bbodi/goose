@@ -112,6 +112,14 @@ struct TgModule {
             case TY_FLT: case TY_BOOL: return true;
             case TY_REF:
                 return IsPlainRef(t) && cg.IsFix(t->ref->sub) && TypeOk(t->ref->sub, depth + 1);
+            case TY_ARRAY:
+                // T[k]: k elements, packed. A static-capacity T[..k] (a
+                // length beside them) is not held yet.
+                return t->arr->akind == A_FIXED && cg.IsFix(t) && !cg.IsLargeFixed(t) &&
+                       cg.ArrSize(t->arr) > 0 && TypeOk(t->arr->sub, depth + 1);
+            case TY_SLICE:
+                // { data, len }, over fixed elements (C.3).
+                return cg.IsFix(t->sub) && TypeOk(t->sub, depth + 1);
             case TY_STRUCT: {
                 if (!cg.IsFix(t) || cg.IsLargeFixed(t)) return false;
                 auto si = cg.SI(t);
@@ -176,17 +184,25 @@ struct TgModule {
         if (t->kind == TY_INT) return tyg_type_int(m, Scal(t), IsSigned(t));
         if (t->kind == TY_BOOL) return tyg_type_int(m, TYG_I8, 0);
         if (t->kind == TY_FLT) return tyg_type_scalar(m, Scal(t));
+        if (t->kind == TY_SLICE) return SliceAT();
         auto key = cg.Mangle(t);
         if (auto it = atypes.find(key); it != atypes.end()) return it->second;
+        if (t->kind == TY_ARRAY) {
+            // The C half's struct { T e[k]; }, packed.
+            tyg_field f { tyg_type_array(m, AT(t->arr->sub), cg.ArrSize(t->arr)), 0 };
+            return atypes[key] = tyg_type_record(m, cg.FixedSize(t), 1, &f, 1);
+        }
         vector<tyg_field> fs;
         for (auto &f : Fields(t)) fs.push_back({ AT(f.t), f.off });
         return atypes[key] = tyg_type_record(m, cg.FixedSize(t), 1, fs.data(), (int)fs.size());
     }
 
     // The u8 slice of the extern boundary, sl_u8: data and length.
+    const tyg_type *sliceat = nullptr;
     const tyg_type *SliceAT() {
+        if (sliceat) return sliceat;
         tyg_field fs[2] = { { tyg_type_ptr(m), 0 }, { tyg_type_int(m, TYG_I64, 1), 8 } };
-        return tyg_type_record(m, 16, 1, fs, 2);
+        return sliceat = tyg_type_record(m, 16, 1, fs, 2);
     }
 
     // The type the debugger sees, under its Goose name.
@@ -221,6 +237,17 @@ struct TgModule {
                 break;
             case TY_BOOL: d = scalar("_Bool", TYG_DT_BOOL); break;
             case TY_REF: d = tyg_dt_pointer(m, DT(t->ref->sub)); break;
+            case TY_ARRAY: d = tyg_dt_array(m, DT(t->arr->sub), cg.ArrSize(t->arr)); break;
+            case TY_SLICE: {
+                // A record of its two members: tinygen has no array type
+                // whose count is another member (the design doc's gaps).
+                auto rec = tyg_dt_record(m, TYG_DT_STRUCT, name.c_str(), File(0), 0);
+                dtypes[name] = rec;
+                tyg_dt_member(m, rec, "data", tyg_dt_pointer(m, DT(t->sub)), 0);
+                tyg_dt_member(m, rec, "len", DT(ast.inttypes[IS_I64]), 8);
+                tyg_dt_record_complete(m, rec, 16, 1);
+                return rec;
+            }
             case TY_STRUCT: {
                 auto si = cg.SI(t);
                 auto rec = tyg_dt_record(m, TYG_DT_STRUCT, name.c_str(), File(si->st->line.fileidx),
@@ -391,8 +418,12 @@ struct TgFn {
             x.t = want;
             return x;
         }
-        if (M.IsScalar(x.t) != M.IsScalar(want) || !cg.TEq(x.t, want))
-            No(l, "value conversion");
+        if (M.IsScalar(x.t) != M.IsScalar(want) || !cg.TEq(x.t, want)) {
+            string a, b;
+            x.t->Dump(a);
+            want->Dump(b);
+            No(l, cat("value conversion from ", a, " to ", b));
+        }
         return x;
     }
 
@@ -447,6 +478,7 @@ struct TgFn {
             a.offset += lay.offs[d->fieldidx];
             return P { a, si->ftypes[d->fieldidx] };
         }
+        if (auto ix = Is<Index>(n)) return IndexPlace(ix);
         // Any other value: in memory of its own.
         auto x = Gen(n);
         if (x.mem) return P { x.a, x.t };
@@ -459,7 +491,7 @@ struct TgFn {
 
     // Builds n's value at the place.
     void Into(const P &pl, Node *n) {
-        auto x = Fit(Gen(n), pl.t, n->line);
+        auto x = GenAs(n, pl.t);
         if (M.IsScalar(pl.t) || x.mem) Store(pl, x);
         else if (!Ended()) No(n->line, "aggregate value");
     }
@@ -471,7 +503,10 @@ struct TgFn {
         if (Ended() || !x.t || !n->exprtype || n->exprtype->kind == TY_VOID) return x;
         return Fit(x, n->exprtype, n->line);
     }
-    V GenAs(Node *n, TypeExpr *t) { return Fit(Gen(n), t, n->line); }
+    V GenAs(Node *n, TypeExpr *t) {
+        if (t && t->kind == TY_SLICE) return GenSliceAs(n, t);
+        return Fit(Gen(n), t, n->line);
+    }
     tyg_val Truth(Node *n) {
         auto x = GenAs(n, M.ast.booltype);
         return x.v;
@@ -520,8 +555,27 @@ struct TgFn {
             }
             case NK_Dot: {
                 auto d = static_cast<Dot *>(n);
+                if (d->member == B_LEN) return GenLen(d->obj, n);
                 if (!d->IsField()) No(n->line, "property or variant constant");
                 return Load(Place(n), n->line);
+            }
+            case NK_Index: return Load(Place(n), n->line);
+            case NK_ArrayLit: return GenArrayLit(static_cast<ArrayLit *>(n));
+            case NK_SliceExpr: return GenSlice(static_cast<SliceExpr *>(n));
+            case NK_StrLit: {
+                // A string literal as a u8[:] (its bytes, read-only).
+                auto t = n->exprtype;
+                if (!t || t->kind != TY_SLICE || !IsU8(t->sub)) No(n->line, "string of this type");
+                auto &val = static_cast<StrLit *>(n)->val;
+                auto tmp = tyg_local_new(p, 16, 8);
+                tyg_store(p, TYG_I64, tyg_at_local(tmp, 0),
+                          tyg_addr_of(p, tyg_at_sym(M.Bytes(val), 0)), 0);
+                tyg_store(p, TYG_I64, tyg_at_local(tmp, 8), tyg_iconst(p, TYG_I64, (int64_t)val.size()), 0);
+                V x;
+                x.t = t;
+                x.mem = true;
+                x.a = tyg_at_local(tmp, 0);
+                return x;
             }
             case NK_Unary: return GenUnary(static_cast<Unary *>(n));
             case NK_Binary: return GenBinary(static_cast<Binary *>(n));
@@ -843,6 +897,198 @@ struct TgFn {
         return x;
     }
 
+    // ---- Arrays and slices -------------------------------------------------
+
+    // The elements of an array or slice in memory at pl (references read
+    // through) and their count: a fixed array's lie in place, a slice's
+    // where its data member points.
+    struct View {
+        tyg_val elems, len;
+        TypeExpr *elem;
+        int64_t k;   // A fixed array's length, else -1.
+    };
+    View ViewOf(P pl, Line l) {
+        pl = Deref(pl);
+        if (pl.t->kind == TY_ARRAY && pl.t->arr->akind == A_FIXED && M.TypeOk(pl.t)) {
+            auto k = cg.ArrSize(pl.t->arr);
+            return { tyg_addr_of(p, pl.a), tyg_iconst(p, TYG_I64, k), pl.t->arr->sub, k };
+        }
+        if (pl.t->kind == TY_SLICE && M.TypeOk(pl.t)) {
+            auto a8 = pl.a;
+            a8.offset += 8;
+            return { tyg_load(p, TYG_I64, pl.a, 0), tyg_load(p, TYG_I64, a8, 0), pl.t->sub, -1 };
+        }
+        No(l, "array of this kind");
+    }
+    tyg_val ElemAddr(const View &v, tyg_val i) {
+        auto esz = cg.FixedSize(v.elem);
+        auto off = tyg_bin(p, TYG_MUL, i, tyg_iconst(p, TYG_I64, esz));
+        return tyg_bin(p, TYG_ADD, v.elems, off);
+    }
+
+    // An index as the i64 the checks and the address arithmetic take.
+    tyg_val Index64(Node *n) {
+        auto it = cg.OperandT(n->exprtype);
+        if (!it || it->kind != TY_INT || it->intstorage == IS_VARINT) No(n->line, "index type");
+        return Conv(GenAs(n, it).v, it, M.ast.inttypes[IS_I64], n->line);
+    }
+
+    // GS_IDX: i in [0, n), or gs_idxfail with the Goose file and line,
+    // which says what the C backend's says.
+    void BoundsCheck(tyg_val i, tyg_val n, Line l) {
+        auto ok = tyg_block_new(p), bad = tyg_block_new(p);
+        tyg_branch(p, tyg_cmp(p, TYG_ULT, i, n), ok, bad);
+        tyg_block_set(p, bad);
+        CallC("gs_idxfail", { IT(TYG_I64), IT(TYG_I64), tyg_type_ptr(m), IT(TYG_I32) },
+              { i, n, FileArg(l), LineArg(l) }, nullptr);
+        tyg_unreachable(p);
+        tyg_block_set(p, ok);
+    }
+
+    // a[i] (CodeGen::IndexLoc): the array's place, then the index, then the
+    // check, which BCE (Index::nobc) or a constant within a fixed array's
+    // length elides.
+    P IndexPlace(Index *ix) {
+        auto base = Deref(Place(ix->obj));
+        auto il = Is<IntLit>(ix->idx);
+        auto i = Index64(ix->idx);
+        auto v = ViewOf(base, ix->line);
+        auto known = il && v.k >= 0 && il->val >= 0 && il->val < v.k;
+        if (!ix->nobc && !known) BoundsCheck(i, v.len, ix->line);
+        return P { tyg_at_val(ElemAddr(v, i), 0), v.elem };
+    }
+
+    // .len and len(): a fixed array's is its type's; a slice's is read.
+    V GenLen(Node *obj, Node *n) {
+        auto ot = obj->exprtype;
+        while (ot && IsPlainRef(ot)) ot = ot->ref->sub;
+        if (!ot || !M.TypeOk(ot) || (ot->kind != TY_ARRAY && ot->kind != TY_SLICE))
+            No(n->line, "len of this type");
+        tyg_val len;
+        if (ot->kind == TY_ARRAY) {
+            if (!Is<Ident>(obj) && !Is<Dot>(obj)) Gen(obj);   // What it does, it does.
+            len = tyg_iconst(p, TYG_I64, cg.ArrSize(ot->arr));
+        } else {
+            len = ViewOf(Place(obj), n->line).len;
+        }
+        V x;
+        x.t = M.ast.inttypes[IS_I64];
+        x.v = len;
+        return x;
+    }
+
+    // A slice { data, len } in a temporary.
+    V SliceValue(TypeExpr *t, tyg_val data, tyg_val len) {
+        auto tmp = tyg_local_new(p, 16, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(tmp, 0), data, 0);
+        tyg_store(p, TYG_I64, tyg_at_local(tmp, 8), len, 0);
+        V x;
+        x.t = t;
+        x.mem = true;
+        x.a = tyg_at_local(tmp, 0);
+        return x;
+    }
+
+    // A value at a slice destination: a whole array there is a view of the
+    // array where it lies (§3.10), or in a temporary of its own if it is a
+    // value. The checker may have typed the node as the slice already.
+    V GenSliceAs(Node *n, TypeExpr *t) {
+        if (!M.TypeOk(t)) No(n->line, "slice type");
+        auto d = Is<Dot>(n);
+        P pl;
+        if (Is<Ident>(n) || Is<Index>(n) || (d && d->IsField())) {
+            pl = Deref(Place(n));
+        } else {
+            auto x = Gen1(n);
+            if (Ended()) return Dummy(t);
+            if (x.t && IsPlainRef(x.t)) pl = Deref(P { tyg_at_val(x.v, 0), x.t->ref->sub });
+            else if (x.t && x.t->kind == TY_ARRAY && x.mem) pl = P { x.a, x.t };
+            else return Fit(x, t, n->line);
+        }
+        if (pl.t->kind != TY_ARRAY) return Fit(Load(pl, n->line), t, n->line);
+        auto v = ViewOf(pl, n->line);
+        if (cg.Mangle(v.elem) != cg.Mangle(t->sub)) No(n->line, "slice of another element type");
+        return SliceValue(t, v.elems, v.len);
+    }
+
+    // a[lo:hi] (CodeGen::GenSlice): the view, then the bounds (^k counts
+    // from the end), checked as the C checks them unless BCE proved them.
+    V GenSlice(SliceExpr *se) {
+        auto v = ViewOf(Place(se->obj), se->line);
+        auto bound = [&](Node *b, bool fromend, tyg_val dflt) {
+            if (!b) return dflt;
+            auto x = Index64(b);
+            return fromend ? tyg_bin(p, TYG_SUB, v.len, x) : x;
+        };
+        auto lo = bound(se->lo, se->lo_from_end, tyg_iconst(p, TYG_I64, 0));
+        auto hi = bound(se->hi, se->hi_from_end, v.len);
+        if (!se->nobc) {
+            auto ok = tyg_block_new(p), bad = tyg_block_new(p), c2 = tyg_block_new(p),
+                 c3 = tyg_block_new(p);
+            tyg_branch(p, tyg_cmp(p, TYG_SLT, lo, tyg_iconst(p, TYG_I64, 0)), bad, c2);
+            tyg_block_set(p, c2);
+            tyg_branch(p, tyg_cmp(p, TYG_SLT, hi, lo), bad, c3);
+            tyg_block_set(p, c3);
+            tyg_branch(p, tyg_cmp(p, TYG_SGT, hi, v.len), bad, ok);
+            tyg_block_set(p, bad);
+            M.NeedShim("gs_tg_slicefail",
+                       "void gs_tg_slicefail(const char *f, int l) { gs_abort(GS_E_SLICE, f, l); }\n");
+            CallC("gs_tg_slicefail", { tyg_type_ptr(m), IT(TYG_I32) },
+                  { FileArg(se->line), LineArg(se->line) }, nullptr);
+            tyg_unreachable(p);
+            tyg_block_set(p, ok);
+        }
+        auto t = se->exprtype;
+        if (!t || t->kind != TY_SLICE || cg.Mangle(t->sub) != cg.Mangle(v.elem)) No(se->line, "slice to this type");
+        return SliceValue(t, ElemAddr(v, lo), tyg_bin(p, TYG_SUB, hi, lo));
+    }
+
+    // [a, b, c] and [v; k] as a fixed array.
+    V GenArrayLit(ArrayLit *al) {
+        auto t = al->exprtype;
+        if (!t || t->kind != TY_ARRAY || t->arr->akind != A_FIXED || !M.TypeOk(t) || al->capexpr)
+            No(al->line, "array literal of this type");
+        auto k = cg.ArrSize(t->arr);
+        auto et = t->arr->sub;
+        auto esz = cg.FixedSize(et);
+        auto tmp = Temp(t);
+        tyg_zero(p, tyg_at_local(tmp, 0), M.Size(t));
+        if (al->fillval) {
+            auto il = Is<IntLit>(al->fillcount);
+            if (!il || il->val != k) No(al->line, "fill count");
+            // The value once, then copied into every slot.
+            auto one = Temp(et);
+            Into(P { tyg_at_local(one, 0), et }, al->fillval);
+            if (k <= 16) {
+                for (int64_t i = 0; i < k; i++)
+                    tyg_copy(p, tyg_at_local(tmp, i * esz), tyg_at_local(one, 0), esz);
+            } else {
+                auto ctr = tyg_local_new(p, 8, 8);
+                tyg_store(p, TYG_I64, tyg_at_local(ctr, 0), tyg_iconst(p, TYG_I64, 0), 0);
+                auto head = tyg_block_new(p), body = tyg_block_new(p), done = tyg_block_new(p);
+                tyg_jump(p, head);
+                tyg_block_set(p, head);
+                auto c = tyg_load(p, TYG_I64, tyg_at_local(ctr, 0), 0);
+                tyg_branch(p, tyg_cmp(p, TYG_SLT, c, tyg_iconst(p, TYG_I64, k)), body, done);
+                tyg_block_set(p, body);
+                View v { tyg_addr_of(p, tyg_at_local(tmp, 0)), 0, et, k };
+                tyg_copy(p, tyg_at_val(ElemAddr(v, c), 0), tyg_at_local(one, 0), esz);
+                tyg_store(p, TYG_I64, tyg_at_local(ctr, 0), tyg_bin(p, TYG_ADD, c, tyg_iconst(p, TYG_I64, 1)), 0);
+                tyg_jump(p, head);
+                tyg_block_set(p, done);
+            }
+        } else {
+            if ((int64_t)al->elems.size() > k) No(al->line, "array literal length");
+            for (size_t i = 0; i < al->elems.size(); i++)
+                Into(P { tyg_at_local(tmp, (int64_t)i * esz), et }, al->elems[i]);
+        }
+        V x;
+        x.t = t;
+        x.mem = true;
+        x.a = tyg_at_local(tmp, 0);
+        return x;
+    }
+
     // ---- Calls -------------------------------------------------------------
 
     tyg_arg Arg(Node *n, TypeExpr *pt) {
@@ -875,6 +1121,7 @@ struct TgFn {
 
     V GenCall(Call *c) {
         if (c->builtin == B_PRINT) return GenPrint(c);
+        if (c->builtin == B_LEN && c->ArgNodes().size() == 1) return GenLen(c->ArgNodes()[0], c);
         if (c->builtin >= 0) No(c->line, cat("builtin ", BuiltinByKind(c->builtin).name));
         if (c->fvbody || !c->dispatch.empty() || !c->fvremap.empty() || !c->spec)
             No(c->line, "call kind");
@@ -1131,7 +1378,7 @@ struct TgFn {
         if (a->op == T_ASSIGN) {
             // The destination's address is taken before the value runs (it
             // is a local slot or an address in a register), as the C does.
-            auto x = Fit(Gen(a->rhs), pl.t, a->line);
+            auto x = GenAs(a->rhs, pl.t);
             if (!M.IsScalar(pl.t) && !x.mem && !Ended()) No(a->line, "aggregate value");
             Store(pl, x);
             return;
@@ -1188,7 +1435,8 @@ struct TgFn {
     // A counted loop over a range or a count (§6.5): the counter runs at the
     // range's own type, the binding is a copy of it at its own.
     void StmtFor(ForLoop *f) {
-        if (f->iterkind != IK_RANGE && f->iterkind != IK_COUNT) No(f->line, "for over an array");
+        if (f->iterkind == IK_ARRAY || f->iterkind == IK_SLICE) return StmtForEach(f);
+        if (f->iterkind != IK_RANGE && f->iterkind != IK_COUNT) No(f->line, "for kind");
         auto r = Is<RangeExpr>(f->iter);
         auto ct = r ? r->exprtype : f->iter->exprtype;
         if (!ct || ct->kind != TY_INT || ct->intstorage == IS_VARINT) No(f->line, "range type");
@@ -1235,6 +1483,59 @@ struct TgFn {
             auto i2 = tyg_load(p, TYG_I64, tyg_at_local(ix, 0), 0);
             tyg_store(p, TYG_I64, tyg_at_local(ix, 0), tyg_bin(p, TYG_ADD, i2, tyg_iconst(p, TYG_I64, 1)), 0);
         }
+        tyg_jump(p, head);
+        tyg_block_set(p, done);
+        tyg_scope_end(p);
+    }
+
+    // for x in a / for &x in a / for x, i in a over a fixed array or a
+    // slice (ForLoop::CgStmt): the length is read again at the top of every
+    // iteration, and the elements where the path to them leads then (a
+    // body may re-point a slice on it, §6.5); an iterated expression that
+    // is not such a path runs once, into a temporary. The binding is the
+    // element's address where the checker typed it as a reference to the
+    // element, else a copy of the element.
+    void StmtForEach(ForLoop *f) {
+        P once {};
+        auto path = CheckFreePath(f->iter);
+        if (!path) once = Place(f->iter);
+        auto at = [&]() { return path ? Place(f->iter) : once; };
+        auto gi = tyg_local_new(p, 8, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(gi, 0), tyg_iconst(p, TYG_I64, 0), 0);
+        tyg_scope_begin(p);
+        if (f->vdef) Declare(f->vdef, f->line);
+        if (f->idxdef) Declare(f->idxdef, f->line);
+        auto head = tyg_block_new(p), body = tyg_block_new(p), step = tyg_block_new(p),
+             done = tyg_block_new(p);
+        tyg_jump(p, head);
+        tyg_block_set(p, head);
+        Loc(f->line);
+        auto v = ViewOf(at(), f->line);
+        auto i = tyg_load(p, TYG_I64, tyg_at_local(gi, 0), 0);
+        tyg_branch(p, tyg_cmp(p, TYG_SLT, i, v.len), body, done);
+        tyg_block_set(p, body);
+        auto ea = ElemAddr(v, i);
+        if (f->vdef) {
+            auto vt = f->vdef->type;
+            P dst { tyg_at_local(locals[f->vdef], 0), vt };
+            if (vt->kind == TY_REF && v.elem->kind != TY_REF) {
+                if (!IsPlainRef(vt)) No(f->line, "binding kind");
+                tyg_store(p, TYG_I64, dst.a, ea, 0);
+            } else {
+                Store(dst, Fit(Load(P { tyg_at_val(ea, 0), v.elem }, f->line), vt, f->line));
+            }
+        }
+        if (f->idxdef)
+            tyg_store(p, M.Scal(f->idxdef->type), tyg_at_local(locals[f->idxdef], 0),
+                      Conv(i, M.ast.inttypes[IS_I64], f->idxdef->type, f->line), 0);
+        loops.push_back({ done, step });
+        GenBlock(f->body, true);
+        loops.pop_back();
+        Jump(step);
+        tyg_block_set(p, step);
+        Loc(f->line);
+        auto i2 = tyg_load(p, TYG_I64, tyg_at_local(gi, 0), 0);
+        tyg_store(p, TYG_I64, tyg_at_local(gi, 0), tyg_bin(p, TYG_ADD, i2, tyg_iconst(p, TYG_I64, 1)), 0);
         tyg_jump(p, head);
         tyg_block_set(p, done);
         tyg_scope_end(p);
