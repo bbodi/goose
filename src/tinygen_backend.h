@@ -3098,7 +3098,16 @@ struct TgFn {
     void StmtAssign(Assign *a) {
         auto pl = Place(a->lval);
         if (a->pointee) pl = Deref(pl);
-        if (a->op == T_DOTASSIGN) No(a->line, "rebind");
+        if (a->op == T_DOTASSIGN) {
+            // A reference re-pointed (CodeGen::GenRebind): the slot holding
+            // it takes the new address. Optional and relative references,
+            // and pooled ones, are not held.
+            if (!IsPlainRef(pl.t) || !M.TypeOk(pl.t)) No(a->line, cat("rebind of type ", M.NameWhy(pl.t)));
+            auto x = GenAs(a->rhs, pl.t);
+            if (!M.IsScalar(pl.t) && !x.mem && !Ended()) No(a->line, "aggregate value");
+            Store(pl, x);
+            return;
+        }
         if (a->op == T_ASSIGN && IsGrow(pl.t)) {
             // A whole resizable (Assign::CgStmt): its stack's top back to
             // where its elements start, then the new ones built there.
