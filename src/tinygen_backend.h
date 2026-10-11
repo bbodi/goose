@@ -283,7 +283,10 @@ struct TgModule {
                 // resizable array it reads in place (RzOk): a fat reference
                 // { hdr, stk } for a resizable one (gs_rref).
                 // An optional one is the same address, null where empty.
-                if (IsRel(t)) return depth > 0 && RelOk(t, depth);
+                // A relative reference outside a slot (a local, a parameter,
+                // a global) holds the offset too: of the `in pool` form, or
+                // a self-relative one only null reaches (§3.9).
+                if (IsRel(t)) return RelOk(t, depth);
                 return (IsPlainRef(t) || OptRef(t)) &&
                        ((cg.IsFix(t->ref->sub) && TypeOk(t->ref->sub, depth + 1)) || IsVarint(t->ref->sub) ||
                         ImgOk(t->ref->sub, depth + 1) ||
@@ -1323,6 +1326,7 @@ struct TgModule {
     // a T[] image of fixed elements, built at the caller's destination
     // stack.
     bool RetOk(TypeExpr *t) {
+        if (IsRel(t)) return false;
         return TypeOk(t) || ((IsGrow(t) || IsVarArr(t)) && RzOk(t)) || VsOk(t) || VmOk(t) || VvOk(t) || RcOk(t) ||
                FoOk(t) ||
                VarImgOk(t) || VeOk(t);
@@ -3962,6 +3966,15 @@ struct TgFn {
         if (!M.TypeOk(pt)) No(n->line, "argument of this type");
         tyg_arg a {};
         auto x = GenAs(n, pt);
+        if (TgModule::IsRel(pt)) {
+            // A relative parameter takes the offset (CodeGen::EmitArg),
+            // the same in the callee's copy for the `in pool` form.
+            if (Ended()) return a;
+            auto slot = Temp(pt);
+            Store(P { tyg_at_local(slot, 0), pt }, x);
+            a.val = tyg_load(p, M.RelScal(pt), tyg_at_local(slot, 0), 0);
+            return a;
+        }
         if (M.IsScalar(pt)) a.val = x.v;
         else a.mem = x.a;
         return a;
