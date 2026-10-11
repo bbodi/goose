@@ -804,7 +804,8 @@ struct TgModule {
             auto ft = si->ftypes[i];
             if (IsVarint(ft)) continue;
             if (cg.IsFix(ft) ? !TypeOk(ft, depth + 1)
-                             : !((IsVarArr(ft) && (RzOk(ft, depth + 1) || VarImgOk(ft, depth + 1))) || VsOk(ft, depth + 1)))
+                             : !((IsVarArr(ft) && (RzOk(ft, depth + 1) || VarImgOk(ft, depth + 1))) ||
+                                 VsOk(ft, depth + 1) || VmOk(ft, depth + 1)))
                 return false;
         }
         return true;
@@ -972,8 +973,15 @@ struct TgModule {
         auto w = t->ref->lenstorage;
         if (w != IS_U8 && w != IS_U16 && w != IS_U32 && w != IS_U64) return false;
         auto sub = t->ref->sub;
-        return cg.IsFix(sub) && TypeOk(sub, depth + 1);
+        if (cg.IsFix(sub)) return TypeOk(sub, depth + 1);
+        // An image it points at, which may hold such links to its own type.
+        if (relimg.count(sub)) return true;
+        relimg.insert(sub);
+        auto ok = ImgOk(sub, depth + 1);
+        relimg.erase(sub);
+        return ok;
     }
+    set<TypeExpr *> relimg;
     tyg_scalar RelScal(TypeExpr *t) {
         switch (t->ref->lenstorage) {
             case IS_U8: return TYG_I8;
@@ -997,7 +1005,8 @@ struct TgModule {
             auto ft = ftypes[i];
             if (IsVarint(ft)) continue;
             if (cg.IsFix(ft) ? !TypeOk(ft, depth + 1)
-                             : !((IsVarArr(ft) && (RzOk(ft, depth + 1) || VarImgOk(ft, depth + 1))) || VsOk(ft, depth + 1)))
+                             : !((IsVarArr(ft) && (RzOk(ft, depth + 1) || VarImgOk(ft, depth + 1))) ||
+                                 VsOk(ft, depth + 1) || VmOk(ft, depth + 1)))
                 return false;
         }
         return true;
@@ -1110,7 +1119,8 @@ struct TgModule {
         if (!d->isglobal || cg.PrefVar(d) || !cg.gnames.count(d)) return false;
         if (d->reusable) return IsGrow(d->type) && RzOk(d->type) && cg.gstks.count(d) && cg.gpools.count(d);
         if (TypeOk(d->type)) return true;
-        return (IsGrow(d->type) || IsVarArr(d->type)) && RzOk(d->type) && cg.gstks.count(d);
+        return ((IsGrow(d->type) || IsVarArr(d->type)) && RzOk(d->type) && cg.gstks.count(d)) ||
+               (IsGrow(d->type) && VeOk(d->type) && cg.gstks.count(d));
     }
 
     map<const VarDef *, string> accessors;
@@ -5860,6 +5870,19 @@ struct TgFn {
                 Into(P { tyg_at_val(at(), ts + lay.offs[i]), ei->vftypes[(size_t)vi][i] }, init);
                 if (Ended()) return at();
             }
+            return at();
+        }
+        if (auto d = Is<Dot>(n); d && d->variantconst) {
+            // A variant without fields: its tag, its payload's zero bytes.
+            auto ei = cg.EIOf(t);
+            auto vi = ei->en->VariantIndex(d->variantconst);
+            auto vt = cg.VariantType(t, vi);
+            if (!cg.IsFix(vt)) No(l, cat("variant constant of type ", M.NameWhy(t)));
+            auto size = M.TagSize(t) + cg.FixedSize(vt);
+            auto base = at();
+            SetTop(stk, tyg_bin(p, TYG_ADD, base, tyg_iconst(p, TYG_I64, size)));
+            tyg_zero(p, tyg_at_val(base, 0), size);
+            StoreTag(tyg_at_val(base, 0), t, vi);
             return at();
         }
         auto pl = Deref(Place(n));
