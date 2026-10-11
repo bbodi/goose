@@ -194,7 +194,8 @@ It works with `goose build`; `goose run` keeps the in-process TinyCC path.
   within a fixed array; slicing `a[lo..hi]` (`^k` from the end) with
   `GS_E_SLICE`'s check through a shim; `.len`; array literals `[a, b, c]`
   and `[v; k]`; a whole array where a slice is wanted (§3.10), viewed where it
-  lies; a string literal as a `u8[:]`.
+  lies; a string literal as a `u8[:]`. Slices of fixed elements also go to extern fns
+  (an array, a part of one), not only string literals.
 * **statements**: `for x in a`, `for &x in a` and `for x, i in a` over a
   fixed array or a slice. As in the C, the length is read again at the top
   of every iteration and the elements where the path leads then; an

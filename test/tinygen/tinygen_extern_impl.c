@@ -5,6 +5,7 @@
 #pragma pack(push, 1)
 typedef struct { int32_t a; double b; } Pair;
 typedef struct { const uint8_t *data; int64_t len; } Bytes;
+typedef struct { const int64_t *data; int64_t len; } Ints;
 #pragma pack(pop)
 
 uint32_t tg_checksum(Bytes s) {
@@ -21,4 +22,10 @@ Pair tg_pair_scale(Pair p, int32_t k) {
 void tg_pair_fill(Pair *out, int64_t n) {
     out->a = (int32_t)(n * 2);
     out->b = (double)n / 8;
+}
+
+int64_t tg_sum(Ints s) {
+    int64_t t = 0;
+    for (int64_t i = 0; i < s.len; i++) t += s.data[i];
+    return t;
 }

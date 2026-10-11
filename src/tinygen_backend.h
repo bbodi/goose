@@ -1156,6 +1156,10 @@ struct TgFn {
             auto pt = callee->argtypes[i];
             if (pt->kind == TY_SLICE) {
                 auto s = Is<StrLit>(an[i]);
+                if (!s && M.TypeOk(pt)) {
+                    args.push_back(Arg(an[i], pt));
+                    continue;
+                }
                 if (!s || !IsU8(pt->sub)) No(c->line, "slice argument");
                 auto t = tyg_local_new(p, 16, 8);
                 tyg_store(p, TYG_I64, tyg_at_local(t, 0),
@@ -1173,8 +1177,11 @@ struct TgFn {
         // their declarations.
         for (auto t : callee->argtypes) cg.CT(t);
         for (auto t : callee->rets) cg.CT(t);
-        if (std::find(M.externs.begin(), M.externs.end(), callee) == M.externs.end())
-            M.externs.push_back(callee);
+        // One trampoline per C name: a call may have a specialization of
+        // its own of the same extern.
+        auto known = false;
+        for (auto e : M.externs) known = known || e->sf->cname == callee->sf->cname;
+        if (!known) M.externs.push_back(callee);
         if (Ended()) return Dummy(callee->rets.empty() ? nullptr : callee->rets[0]);
         auto sym = M.Sym(cat("gs_tg_x_", callee->sf->cname), TYG_SYM_FUNC | TYG_SYM_GLOBAL);
         return Result(callee, M.ExternSig(callee), tyg_direct(sym), args);
