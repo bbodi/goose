@@ -1332,7 +1332,8 @@ struct TgModule {
     // a resizable by its header's address and then its stack. Pools and
     // frame objects are not held.
     bool FvOk(const VarDef *fv) {
-        if (!fv->type || fv->reusable || cg.PrefVar(fv)) return false;
+        if (!fv->type || cg.PrefVar(fv)) return false;
+        if (fv->reusable) return IsGrow(fv->type) && RzOk(fv->type);   // A gs_pref.
         return TypeOk(fv->type) || ((IsGrow(fv->type) || IsVarArr(fv->type)) && RzOk(fv->type)) || VsOk(fv->type) ||
                RcOk(fv->type) ||
                VmOk(fv->type) || VvOk(fv->type) || VarImgOk(fv->type) || VeOk(fv->type);
@@ -1359,6 +1360,10 @@ struct TgModule {
             if (RzParam(t)) ps.push_back(tyg_type_ptr(m));
         }
         for (auto fv : si.freevars) {
+            if (fv->reusable) {
+                for (int k = 0; k < 4; k++) ps.push_back(tyg_type_ptr(m));   // gs_pref's members
+                continue;
+            }
             ps.push_back(tyg_type_ptr(m));
             if (IsGrow(fv->type)) ps.push_back(tyg_type_ptr(m));   // its stack
         }
@@ -3559,7 +3564,8 @@ struct TgFn {
     void PoolAt(VarDef *vd, Line l, P &pl, tyg_addr &fl, tyg_val &flstk) {
         if (vd && prefs.count(vd)) {
             auto loc = prefs[vd];
-            pl = Deref(VarPlace(vd, l));
+            pl = VarPlace(vd, l);
+            if (IsAddrRef(pl.t)) pl = Deref(pl);
             fl = tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(loc, 16), 0), 0);
             flstk = tyg_load(p, TYG_I64, tyg_at_local(loc, 24), 0);
             return;
@@ -4356,6 +4362,20 @@ struct TgFn {
     void FvArgs(Call *c, CodeGen::SpecInfo &ci, vector<tyg_arg> &args) {
         for (auto fv : ci.freevars) {
             auto v = c->FreeVarArg(fv);
+            if (fv->reusable) {
+                // A pool, as gs_pref's members (CodeGen::SigParams).
+                P pl;
+                tyg_addr fl;
+                tyg_val flstk;
+                PoolAt(const_cast<VarDef *>(v), c->line, pl, fl, flstk);
+                if (!pl.stk) No(c->line, "pool without its stack");
+                for (auto x : { tyg_addr_of(p, pl.a), pl.stk, tyg_addr_of(p, fl), flstk }) {
+                    tyg_arg a {};
+                    a.val = x;
+                    args.push_back(a);
+                }
+                continue;
+            }
             auto pl = VarPlace(v, c->line);
             tyg_arg a {};
             a.val = tyg_addr_of(p, pl.a);
@@ -7096,6 +7116,10 @@ struct TgFn {
         for (auto fv : cg.sinfo[sp].freevars) {
             pdt.push_back(tyg_dt_pointer(m, M.DT(fv->type)));
             if (IsGrow(fv->type)) pdt.push_back(tyg_dt_pointer(m, M.StackDT()));
+            if (fv->reusable) {
+                pdt.push_back(tyg_dt_pointer(m, M.DT(fv->type)));
+                pdt.push_back(tyg_dt_pointer(m, M.StackDT()));
+            }
         }
         auto cret = cg.sinfo[sp].cret;
         auto fdt = tyg_dt_func(m, cret < 0 ? tyg_dt_void(m) : M.DT(sp->rets[cret]), pdt.data(),
@@ -7128,6 +7152,15 @@ struct TgFn {
             tyg_debug_var_ref(p, string(fv->name).c_str(), M.DT(fv->type), tyg_at_local(loc, 0),
                               M.File(fv->line.fileidx), fv->line.line);
             if (IsGrow(fv->type)) rzstk[fv] = param();
+            if (fv->reusable) {
+                // A pool, as gs_pref: its freelist's header and stack too.
+                auto pr = tyg_local_new(p, 32, 8);
+                tyg_store(p, TYG_I64, tyg_at_local(pr, 0), tyg_load(p, TYG_I64, tyg_at_local(loc, 0), 0), 0);
+                tyg_store(p, TYG_I64, tyg_at_local(pr, 8), tyg_load(p, TYG_I64, tyg_at_local(rzstk[fv], 0), 0), 0);
+                tyg_store(p, TYG_I64, tyg_at_local(pr, 16), tyg_param(p, pi++), 0);
+                tyg_store(p, TYG_I64, tyg_at_local(pr, 24), tyg_param(p, pi++), 0);
+                prefs[fv] = pr;
+            }
         }
         int afterfv = pi;
         pi = 0;
