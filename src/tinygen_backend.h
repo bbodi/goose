@@ -1749,6 +1749,18 @@ struct TgFn {
             auto fc = Is<IntLit>(al->fillcount);
             if (!fc || fc->val < 0) No(l, "fill count");
             auto esz = cg.FixedSize(et);
+            if (SelfRelLit(al->fillval) || (TgModule::IsRel(et) && !et->ref->pool && !Is<NullLit>(al->fillval))) {
+                // Each slot built where it lies, its links measured from it.
+                auto leaves = FillCapture(al);
+                if (Ended()) return;
+                begin();
+                auto top = Top(stk);
+                tyg_zero(p, tyg_at_val(top, 0), std::max<int64_t>(fc->val * esz, 1));
+                FillStore(leaves, top, fc->val, al);
+                SetTop(stk, tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, fc->val * esz)));
+                tyg_store(p, TYG_I64, len, tyg_iconst(p, TYG_I64, fc->val), 0);
+                return;
+            }
             auto one = Temp(et);
             Into(P { tyg_at_local(one, 0), et }, al->fillval);
             if (Ended()) return;
@@ -2054,14 +2066,29 @@ struct TgFn {
         if (al && al->fillval && !al->capexpr) {
             // [v; k]: v built once, then copied behind itself.
             auto fc = Is<IntLit>(al->fillcount);
-            if (!fc || fc->val < 0 || fc->val > 64) No(l, "fill count");
-            if (fc->val > 0) {
-                auto first = GenImg(al->fillval, stk, et, l);
-                if (Ended()) return at();
+            if (!fc || fc->val < 0) No(l, "fill count");
+            // The value is built once even for none (CodeGen::FreezeFill),
+            // then copied behind itself in a loop.
+            auto saved = Top(stk);
+            auto first = GenImg(al->fillval, stk, et, l);
+            if (Ended()) return at();
+            if (fc->val == 0) {
+                SetTop(stk, saved);
+            } else if (fc->val > 1) {
                 auto fl = tyg_local_new(p, 8, 8);
                 tyg_store(p, TYG_I64, tyg_at_local(fl, 0), first, 0);
-                for (int64_t i = 1; i < fc->val; i++)
-                    ImgCopy(stk, tyg_load(p, TYG_I64, tyg_at_local(fl, 0), 0), et);
+                auto ctr = tyg_local_new(p, 8, 8);
+                tyg_store(p, TYG_I64, tyg_at_local(ctr, 0), tyg_iconst(p, TYG_I64, 1), 0);
+                auto head = tyg_block_new(p), body = tyg_block_new(p), done = tyg_block_new(p);
+                tyg_jump(p, head);
+                tyg_block_set(p, head);
+                auto c = tyg_load(p, TYG_I64, tyg_at_local(ctr, 0), 0);
+                tyg_branch(p, tyg_cmp(p, TYG_SLT, c, tyg_iconst(p, TYG_I64, fc->val)), body, done);
+                tyg_block_set(p, body);
+                ImgCopy(stk, tyg_load(p, TYG_I64, tyg_at_local(fl, 0), 0), et);
+                tyg_store(p, TYG_I64, tyg_at_local(ctr, 0), tyg_bin(p, TYG_ADD, c, tyg_iconst(p, TYG_I64, 1)), 0);
+                tyg_jump(p, head);
+                tyg_block_set(p, done);
             }
             tyg_store(p, TYG_I64, tyg_at_local(cnt, 0), tyg_iconst(p, TYG_I64, fc->val), 0);
         } else if (al && !al->fillval && !al->capexpr) {
@@ -2465,35 +2492,63 @@ struct TgFn {
     }
 
     // Builds n's value at the place.
-    // A literal of a fixed struct with a non-null self-relative link: the
-    // C builds it where it lies, whose slots the offsets measure from.
+    // A literal of a fixed struct or array with a non-null self-relative
+    // link stored in it at any depth: the C builds it where it lies
+    // (CodeGen::FixedLitAtLv), whose slots the offsets measure from.
     bool SelfRelLit(Node *n) {
-        auto sl = Is<StructLit>(n);
-        if (!sl || !sl->sinst || sl->variant || !sl->exprtype || sl->exprtype->kind != TY_STRUCT ||
-            !M.TypeOk(sl->exprtype))
+        if (!SelfRelLitOk(n)) return false;
+        auto stores = [&](TypeExpr *ft, Node *init) {
+            if (!init) return false;
+            // An `in pool` link is the pool's offset, but its `self` is the slot's.
+            if (TgModule::IsRel(ft)) return ft->ref->pool ? Is<SelfRef>(init) != nullptr : !Is<NullLit>(init);
+            return SelfRelLit(init) && cg.TEq(init->exprtype, ft);
+        };
+        if (auto sl = Is<StructLit>(n)) {
+            auto si = cg.SI(sl->exprtype);
+            for (size_t i = 0; i < si->st->fields.size(); i++)
+                if (!si->st->fields[i].ispad && stores(si->ftypes[i], sl->InitFor((int)i))) return true;
             return false;
-        auto si = cg.SI(sl->exprtype);
-        for (size_t i = 0; i < si->st->fields.size(); i++) {
-            if (si->st->fields[i].ispad) continue;
-            auto ft = si->ftypes[i];
-            auto init = sl->InitFor((int)i);
-            if (init && TgModule::IsRel(ft) && !ft->ref->pool && !Is<NullLit>(init)) return true;
         }
+        auto al = Is<ArrayLit>(n);
+        auto et = al->exprtype->arr->sub;
+        if (al->fillval) return stores(et, al->fillval);
+        for (auto e : al->elems)
+            if (stores(et, e)) return true;
         return false;
     }
-    // A struct literal SelfRelInto can build.
+    // A struct or array literal SelfRelInto can build.
     bool SelfRelLitOk(Node *n) {
-        auto sl = Is<StructLit>(n);
-        return sl && sl->sinst && !sl->variant && sl->exprtype && sl->exprtype->kind == TY_STRUCT &&
-               M.TypeOk(sl->exprtype);
+        if (auto sl = Is<StructLit>(n))
+            return sl->sinst && !sl->variant && sl->exprtype && sl->exprtype->kind == TY_STRUCT &&
+                   M.TypeOk(sl->exprtype);
+        auto al = Is<ArrayLit>(n);
+        return al && !al->capexpr && al->exprtype && al->exprtype->kind == TY_ARRAY &&
+               al->exprtype->arr->akind == A_FIXED && M.TypeOk(al->exprtype);
     }
     // The value a literal being built in place starts at, which `self` in
     // its fields refers to (§3.9), or 0.
     tyg_val selfbase = 0;
     // Such a literal built at pl: zero bytes, then its fields where they lie.
-    void SelfRelInto(const P &pl, StructLit *sl) {
-        auto t = sl->exprtype;
+    void SelfRelInto(const P &pl, Node *lit) {
+        auto t = lit->exprtype;
         tyg_zero(p, pl.a, M.Size(t));
+        if (auto al = Is<ArrayLit>(lit)) {
+            auto et = t->arr->sub;
+            auto esz = cg.FixedSize(et);
+            if (al->fillval) {
+                auto leaves = FillCapture(al);
+                if (Ended()) return;
+                FillStore(leaves, tyg_addr_of(p, pl.a), cg.ArrSize(t->arr), al);
+                return;
+            }
+            for (size_t i = 0; i < al->elems.size() && !Ended(); i++) {
+                auto a = pl.a;
+                a.offset += (int64_t)i * esz;
+                Into(P { a, et }, al->elems[i]);
+            }
+            return;
+        }
+        auto sl = Is<StructLit>(lit);
         auto outer = selfbase;
         selfbase = tyg_addr_of(p, pl.a);
         struct Back {
@@ -2511,9 +2566,111 @@ struct TgFn {
             Into(P { a, si->ftypes[i] }, init);
         }
     }
+    // A fill [v; k] of a value linking to itself (CodeGen::FreezeFill): the
+    // leaves of v evaluated once, in order; then each slot built in place,
+    // its links measured from it (FillStore).
+    struct FillLeaf {
+        TypeExpr *ft;
+        int64_t off;
+        bool self;
+        tyg_local tmp;
+        shared_ptr<vector<FillLeaf>> sub;   // An inner fill: its leaves,
+        ArrayLit *inner = nullptr;          // repeated for the inner literal.
+    };
+    vector<FillLeaf> FillCapture(ArrayLit *al) {
+        vector<FillLeaf> leaves;
+        if (!al->fillval) return leaves;
+        auto et = al->exprtype->arr->sub;
+        auto capture = [&](Node *init, TypeExpr *ft, int64_t off) {
+            if (Is<SelfRef>(init)) {
+                leaves.push_back({ ft, off, true, 0 });
+                return;
+            }
+            if (auto il = Is<ArrayLit>(init); il && il->fillval && SelfRelLit(init) && SelfRelLitOk(init) &&
+                                               Is<IntLit>(il->fillcount)) {
+                FillLeaf lf { ft, off, false, 0 };
+                lf.sub = make_shared<vector<FillLeaf>>(FillCapture(il));
+                lf.inner = il;
+                leaves.push_back(lf);
+                return;
+            }
+            if (SelfRelLit(init)) No(init->line, "fill of a value linking to itself");
+            auto x = GenAs(init, ft);
+            if (Ended()) return;
+            FillLeaf lf { ft, off, false, tyg_local_new(p, std::max<int64_t>(M.Size(ft), 8), 8) };
+            if (M.IsScalar(ft) || TgModule::IsRel(ft)) {
+                tyg_store(p, TgModule::IsRel(ft) ? TYG_I64 : M.Scal(ft), tyg_at_local(lf.tmp, 0), x.v, 0);
+            } else {
+                if (!x.mem) No(init->line, "aggregate value");
+                tyg_copy(p, tyg_at_local(lf.tmp, 0), x.a, M.Size(ft));
+            }
+            leaves.push_back(lf);
+        };
+        if (auto sl = Is<StructLit>(al->fillval); sl && SelfRelLitOk(sl)) {
+            auto si = cg.SI(sl->exprtype);
+            auto &lay = cg.StructLayout(si);
+            for (size_t i = 0; i < si->st->fields.size() && !Ended(); i++) {
+                if (si->st->fields[i].ispad) continue;
+                if (auto init = sl->InitFor((int)i)) capture(init, si->ftypes[i], lay.offs[i]);
+            }
+        } else {
+            capture(al->fillval, et, 0);
+        }
+        return leaves;
+    }
+    // The elements a literal has: its elements', or its fill's count.
+    int64_t LitCount(ArrayLit *al) { return al->fillval ? Is<IntLit>(al->fillcount)->val : (int64_t)al->elems.size(); }
+    // A literal's run of k elements built where it stays, at the address in
+    // base: zeroed, then each element in place (its fill's leaves, if any,
+    // captured already).
+    void LitRunAt(ArrayLit *al, TypeExpr *et, tyg_local base, int64_t k, const vector<FillLeaf> &leaves) {
+        auto esz = cg.FixedSize(et);
+        auto at = [&](int64_t off) { return tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(base, 0), 0), off); };
+        tyg_zero(p, at(0), std::max<int64_t>(k * esz, 1));
+        if (al->fillval) {
+            FillStore(leaves, tyg_load(p, TYG_I64, tyg_at_local(base, 0), 0), k, al);
+            return;
+        }
+        for (int64_t i = 0; i < k && !Ended(); i++) Into(P { at(i * esz), et }, al->elems[(size_t)i]);
+    }
+    // k slots at base (zeroed), each built from the captured leaves.
+    void FillStore(const vector<FillLeaf> &leaves, tyg_val base, int64_t k, ArrayLit *al) {
+        auto esz = cg.FixedSize(al->exprtype->arr->sub);
+        auto i = tyg_local_new(p, 8, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(i, 0), tyg_iconst(p, TYG_I64, 0), 0);
+        auto head = tyg_block_new(p), body = tyg_block_new(p), done = tyg_block_new(p);
+        tyg_jump(p, head);
+        tyg_block_set(p, head);
+        auto iv = [&] { return tyg_load(p, TYG_I64, tyg_at_local(i, 0), 0); };
+        tyg_branch(p, tyg_cmp(p, TYG_SLT, iv(), tyg_iconst(p, TYG_I64, k)), body, done);
+        tyg_block_set(p, body);
+        auto slot = tyg_bin(p, TYG_ADD, base, tyg_bin(p, TYG_MUL, iv(), tyg_iconst(p, TYG_I64, esz)));
+        for (auto &lf : leaves) {
+            auto a = tyg_at_val(slot, lf.off);
+            if (lf.inner) {
+                FillStore(*lf.sub, tyg_bin(p, TYG_ADD, slot, tyg_iconst(p, TYG_I64, lf.off)),
+                          cg.ArrSize(lf.inner->exprtype->arr), lf.inner);
+                continue;
+            }
+            V y;
+            y.t = lf.ft;
+            if (lf.self) {
+                y.v = slot;
+            } else if (M.IsScalar(lf.ft) || TgModule::IsRel(lf.ft)) {
+                y.v = tyg_load(p, TgModule::IsRel(lf.ft) ? TYG_I64 : M.Scal(lf.ft), tyg_at_local(lf.tmp, 0), 0);
+            } else {
+                y.mem = true;
+                y.a = tyg_at_local(lf.tmp, 0);
+            }
+            Store(P { a, lf.ft }, y);
+        }
+        tyg_store(p, TYG_I64, tyg_at_local(i, 0), tyg_bin(p, TYG_ADD, iv(), tyg_iconst(p, TYG_I64, 1)), 0);
+        tyg_jump(p, head);
+        tyg_block_set(p, done);
+    }
     void Into(const P &pl, Node *n) {
         if (SelfRelLit(n) && cg.TEq(n->exprtype, pl.t)) {
-            SelfRelInto(pl, Is<StructLit>(n));
+            SelfRelInto(pl, n);
             return;
         }
         auto x = GenAs(n, pl.t);
@@ -3564,10 +3721,11 @@ struct TgFn {
         auto k = cg.ArrSize(t->arr);
         auto et = t->arr->sub;
         auto esz = cg.FixedSize(et);
+        // Its links measure from the slot it lies in, which a temporary is not.
+        if (SelfRelLit(al)) No(al->line, al->fillval ? "fill of a value linking to itself" : "self-relative link in a literal");
         auto tmp = Temp(t);
         tyg_zero(p, tyg_at_local(tmp, 0), M.Size(t));
         if (al->fillval) {
-            if (SelfRelLit(al->fillval)) No(al->line, "fill of a value linking to itself");
             auto il = Is<IntLit>(al->fillcount);
             if (!il || il->val != k) No(al->line, "fill count");
             // The value once, then copied into every slot.
@@ -3767,20 +3925,31 @@ struct TgFn {
     V LimPush(Call *c, const P &pl) {
         if (!M.LimHeld(pl.t)) No(c->line, cat("push to ", M.NameWhy(pl.t)));
         auto et = pl.t->arr->sub;
-        auto x = GenAs(c->ArgNodes()[1], et);
-        if (Ended()) return Dummy(c->exprtype);
-        if (!M.IsScalar(et) && !x.mem) No(c->line, "aggregate value");
+        // A literal linking to itself is built in its slot, once the
+        // capacity is checked (CodeGen::EmitPush).
+        auto atslot = cg.HasRelRef(et) && SelfRelLitOk(c->ArgNodes()[1]) && cg.TEq(c->ArgNodes()[1]->exprtype, et);
+        V x;
+        if (!atslot) {
+            x = GenAs(c->ArgNodes()[1], et);
+            if (Ended()) return Dummy(c->exprtype);
+            if (!M.IsScalar(et) && !x.mem) No(c->line, "aggregate value");
+        }
         auto v = LimView(pl);
         auto nl = tyg_local_new(p, 8, 8);
         tyg_store(p, TYG_I64, tyg_at_local(nl, 0), v.len, 0);
         auto n = [&] { return tyg_load(p, TYG_I64, tyg_at_local(nl, 0), 0); };
         AbortUnless(tyg_cmp(p, TYG_SLT, n(), LimCapOf(pl)), "CAPACITY", c->line);
         auto at = ElemAddr(LimView(pl), n());
-        Store(P { tyg_at_val(at, 0), et }, x);
+        if (atslot) SelfRelInto(P { tyg_at_val(at, 0), et }, c->ArgNodes()[1]);
+        else Store(P { tyg_at_val(at, 0), et }, x);
+        if (Ended()) return Dummy(c->exprtype);
         LimSetLen(pl, tyg_bin(p, TYG_ADD, n(), tyg_iconst(p, TYG_I64, 1)));
         V r;
         r.t = c->exprtype && c->exprtype->kind == TY_REF ? c->exprtype : nullptr;
         if (r.t) r.v = at;
+        // The element itself, as a value, where one is wanted.
+        else if (c->exprtype && c->exprtype->kind != TY_VOID && M.TypeOk(et))
+            return Load(P { tyg_at_val(at, 0), et }, c->line);
         return r;
     }
     // A reusable pool's array, its freelist's header and the freelist's
@@ -4026,8 +4195,7 @@ struct TgFn {
         // The value first, then the slot (the checker keeps the array from
         // growing into a fresh one meanwhile); a literal with a self-relative
         // link is built once the slot is known (CodeGen's atslot).
-        auto atslot = Is<StructLit>(an[1]) && cg.HasRelRef(elem) && SelfRelLitOk(an[1]) &&
-                      cg.TEq(an[1]->exprtype, elem);
+        auto atslot = cg.HasRelRef(elem) && SelfRelLitOk(an[1]) && cg.TEq(an[1]->exprtype, elem);
         V x;
         if (!atslot) {
             x = GenAs(an[1], elem);
@@ -4050,7 +4218,7 @@ struct TgFn {
         auto idx = [&] { return tyg_load(p, TYG_I64, tyg_at_local(il, 0), 0); };
         auto base = tyg_load(p, TYG_I64, pl.a, 0);
         auto e = tyg_bin(p, TYG_ADD, base, tyg_bin(p, TYG_MUL, idx(), tyg_iconst(p, TYG_I64, esz)));
-        if (atslot) SelfRelInto(P { tyg_at_val(e, 0), elem }, Is<StructLit>(an[1]));
+        if (atslot) SelfRelInto(P { tyg_at_val(e, 0), elem }, an[1]);
         else Store(P { tyg_at_val(e, 0), elem }, x);
         auto grow = tyg_block_new(p), done = tyg_block_new(p);
         tyg_branch(p, tyg_cmp(p, TYG_EQ, idx(), tyg_load(p, TYG_I64, len, 0)), grow, done);
@@ -4081,6 +4249,25 @@ struct TgFn {
         if (auto cc = Is<Call>(src); cc && cc->builtin == B_COPY && cc->ArgNodes().size() == 1)
             src = cc->ArgNodes()[0];
         View v;
+        if (auto al = Is<ArrayLit>(src); al && !al->capexpr && cg.HasRelRef(et) && al->exprtype &&
+                                         al->exprtype->kind == TY_ARRAY && cg.TEq(al->exprtype->arr->sub, et) &&
+                                         (al->fillval ? Is<IntLit>(al->fillcount) != nullptr : true)) {
+            // A literal of elements holding relative references builds its
+            // run in the free slots, once the capacity is checked.
+            auto k = LitCount(al);
+            auto ol = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(ol, 0), LimLen(pl), 0);
+            auto o = [&] { return tyg_load(p, TYG_I64, tyg_at_local(ol, 0), 0); };
+            AbortUnless(tyg_cmp(p, TYG_SLE, tyg_bin(p, TYG_ADD, o(), tyg_iconst(p, TYG_I64, k)), LimCapOf(pl)), "CAPACITY", c->line);
+            auto leaves = FillCapture(al);
+            if (Ended()) return V {};
+            auto base = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(base, 0), ElemAddr(LimView(pl), o()), 0);
+            LitRunAt(al, et, base, k, leaves);
+            if (Ended()) return V {};
+            LimSetLen(pl, tyg_bin(p, TYG_ADD, o(), tyg_iconst(p, TYG_I64, k)));
+            return V {};
+        }
         if (auto s = Is<StrLit>(src)) {
             if (!IsU8(et)) No(c->line, "string of this type");
             v = { tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)),
@@ -4718,7 +4905,7 @@ struct TgFn {
             auto slot = Top(pl.stk);
             auto sv = tyg_local_new(p, 8, 8);
             tyg_store(p, TYG_I64, tyg_at_local(sv, 0), slot, 0);
-            SelfRelInto(P { tyg_at_val(slot, 0), et }, Is<StructLit>(an[1]));
+            SelfRelInto(P { tyg_at_val(slot, 0), et }, an[1]);
             if (Ended()) return Dummy(c->exprtype);
             auto at = tyg_load(p, TYG_I64, tyg_at_local(sv, 0), 0);
             SetTop(pl.stk, tyg_bin(p, TYG_ADD, at, tyg_iconst(p, TYG_I64, cg.FixedSize(et))));
@@ -4806,6 +4993,23 @@ struct TgFn {
             if (!IsU8(et)) No(l, "string of this type");
             CopyRun(pl.stk, len, et, tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)),
                     tyg_iconst(p, TYG_I64, (int64_t)s->val.size()));
+            return;
+        }
+        if (auto al = Is<ArrayLit>(src); al && !al->capexpr && cg.HasRelRef(et) && al->exprtype &&
+                                         al->exprtype->kind == TY_ARRAY && cg.TEq(al->exprtype->arr->sub, et) &&
+                                         (al->fillval ? Is<IntLit>(al->fillcount) != nullptr : true)) {
+            // A literal of elements holding relative references builds its
+            // run where the elements stay, at the receiver's top (§4.3).
+            auto esz = cg.FixedSize(et);
+            auto k = LitCount(al);
+            auto base = tyg_local_new(p, 8, 8);
+            auto leaves = FillCapture(al);
+            if (Ended()) return;
+            tyg_store(p, TYG_I64, tyg_at_local(base, 0), Top(pl.stk), 0);
+            LitRunAt(al, et, base, k, leaves);
+            if (Ended()) return;
+            SetTop(pl.stk, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, tyg_at_local(base, 0), 0), tyg_iconst(p, TYG_I64, k * esz)));
+            tyg_store(p, TYG_I64, len, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, len, 0), tyg_iconst(p, TYG_I64, k)), 0);
             return;
         }
         // A literal is a fixed array, all of it evaluated before any of it
@@ -6988,6 +7192,11 @@ struct TgFn {
         if (a->op == T_ASSIGN) {
             // The destination's address is taken before the value runs (it
             // is a local slot or an address in a register), as the C does.
+            if (SelfRelLit(a->rhs) && cg.TEq(a->rhs->exprtype, pl.t)) {
+                // A literal linking to itself is built where it lies.
+                SelfRelInto(pl, a->rhs);
+                return;
+            }
             auto x = GenAs(a->rhs, pl.t);
             if (!M.IsScalar(pl.t) && !x.mem && !Ended()) No(a->line, "aggregate value");
             Store(pl, x);
