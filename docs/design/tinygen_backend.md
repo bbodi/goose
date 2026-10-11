@@ -272,6 +272,7 @@ backend compiles:
 | third, so far (+ zero `default<T>()`, globals in whole programs) | 2253 of 3811 (59%) | 172 of 172 |
 | third, so far (+ composites rendered by `print` and `str`) | 2276 of 3811 (60%) | 172 of 172 |
 | third, so far (+ `.=`, `block`, `loop` values, integer `match`) | 2334 of 3811 (61%) | 172 of 172 |
+| third, so far (+ static-capacity limited arrays `T[..k]`) | 2555 of 3811 (67%) | 172 of 172 |
 
 (The first stage's own write-up counted 394 of 3331 over 284 programs, an
 older sweep; the rows above come from the same one.) The step that added
@@ -796,6 +797,74 @@ tinygen puts it in a block that is never placed. Its expressions get a
 dummy value and its stores of a missing value are skipped, so functions
 such as `deep_fail_g` and `earlyblocks_g` no longer fall back with
 tinygen's `invalid value`.
+
+## What the third stage adds next: limited arrays
+
+A static-capacity limited array `T[..k]` of fixed elements
+(`CodeGen::IsStaticLimited`) is a fixed value, and the backend holds it
+as the C half does, so the halves call each other either way:
+
+* **representation**: the C half's `struct { lenT len; T e[k]; }`,
+  packed: the length in the smallest unsigned type that fits `k`
+  (`CodeGen::LenStore`: `u8` up to 255), then all `k` slots, the ones
+  past the length unused. For the ABI a record of an integer and a
+  `tyg_type_array` at the length's width (`TgModule::LimAT`). It is held
+  wherever a fixed array is -- locals, fields, elements, by-value and
+  reference parameters, results (the C return value or an
+  out-pointer), globals -- unless it is larger than the C backend's
+  native value limit (4096 bytes), which puts it on a data stack.
+* **reading**: `len`, `.cap` (a constant), indexing with the bounds
+  check against the length, slicing, `for` (by value, by reference,
+  with an index), equality of integer elements, a view where a slice is
+  wanted, and `print`/`str`, all through the view of its slots and
+  length (`TgFn::LimView`, beside `ViewOf`'s other kinds).
+* **building**: an array literal, a fill `[v; n]` and a string
+  literal typed as one fill the first slots and set the length; any
+  other array or slice of the element type where one is wanted (an
+  assignment, an argument, a result, a field, a range `s[a..b]`) is
+  copied in under the capacity check, its count and elements read
+  before anything is written (`CopyIntoLimited`; `TgFn::LimFrom`).
+  New values have their unused slots zeroed, as the C's `{0}` does. A
+  call returning one where a `T[]` or resizable is built reads the
+  result where it lies.
+* **growing and shrinking** (`codegen_builtins.h`'s order and checks):
+  `push` (the receiver, the element, then the length read and checked;
+  the slot's address is its value), `append` of a string literal, an
+  array, a slice or a literal (evaluated whole first), `pop`, `pop_n`,
+  `resize(n)`/`resize(n, fill)` and `clear`, which move only the
+  length. Past the capacity it aborts with the C half's
+  `GS_E_CAPACITY` ("limited array capacity exceeded" and the Goose
+  line).
+
+Not yet: runtime-capacity `T[..]` (a variable-size value, `[cap u32]
+[len u32]` and the slots on a data stack), `format` into a limited
+`u8[..k]`, `append` of a call's resizable or `T[]` result, `index_of`.
+
+Debug info gives it the C half's layout under its Goose name, the
+length and every slot (`(i64[..8]) a = { len = '\x05' e = ([0] = 9, ...
+[7] = 0) }`). A debugger cannot show only the live slots: that needs
+an array whose count is the `len` member (gap 3); and lldb shows a
+`u8` length as a character (gap 4).
+
+Over the sweep, plain and `--debug` (0 of 580 runs differ), the whole
+path goes from 71 programs to 84 and per-function coverage from 2343
+to 2555 of 3811 (61% to 67%). Goose-in-Goose stays whole, self-compiling
+byte for byte, plain and `--debug`. Limited arrays now block 13
+programs, none alone, all through runtime-capacity `T[..]`; after them,
+205 programs are mixed because of functions left to C, 110 by one class
+alone: ADTs (64 programs, 23 alone), optionals (54, 26), variable-size
+structs (46, 18), variable-size elements (22, 6), format overloads (12,
+5). The fixture is `tinygen_limited` (whole, `--debug`, and three
+builds with functions left to C, and an lldb check of a limited local
+and a struct field holding one).
+
+The same sweep showed `codegen/exit_value_destination` printing
+garbage through tinygen since unreachable code gets values: a return
+nested in another return's `u8[]` value (`return str("x", if c {
+return "y"; } else { n })`) built its result after the bytes the outer
+one had written. Each destination's top is now saved on entry and every
+return builds there, as the C backend's `DstTop0`; the program is in the
+tinygen test section as one it covers in part.
 
 ## Testing
 
