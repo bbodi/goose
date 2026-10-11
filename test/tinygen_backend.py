@@ -149,6 +149,8 @@ PROGRAMS += [
     ("test/tinygen/tinygen_limited.goose", False, ["--tinygen-skip=grow,halves,bag"]),
     ("test/tinygen/tinygen_limited.goose", False,
      ["--tinygen-skip=digits,sum,shrink,named"]),
+    # A return nested in another return's T[] value as it is built.
+    ("test/codegen/exit_value_destination.goose", False, []),
 ]
 WHOLE_PROGRAM |= {"tinygen_limited"}
 

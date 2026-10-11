@@ -876,6 +876,7 @@ struct TgFn {
     // out-parameter in `b` for a resizable one.
     struct Chan {
         tyg_local a = 0, b = 0;
+        tyg_local top0 = 0;   // A destination's top on entry (DstTop0).
     };
     vector<Chan> chans;
     // Data stacks (§6.2), as the C backend uses them: gs_sp in a local,
@@ -3299,6 +3300,7 @@ struct TgFn {
             if (IsVarArr(rets[i])) {
                 // A T[]: its image built at the destination.
                 auto dst = tyg_load(p, TYG_I64, tyg_at_local(chans[i].a, 0), 0);
+                SetTop(dst, tyg_load(p, TYG_I64, tyg_at_local(chans[i].top0, 0), 0));
                 if (xs.empty()) {
                     GenImg(vals[i], dst, rets[i], l);
                 } else {
@@ -3310,6 +3312,7 @@ struct TgFn {
             }
             if (IsGrow(rets[i])) {
                 auto dst = tyg_load(p, TYG_I64, tyg_at_local(chans[i].a, 0), 0);
+                SetTop(dst, tyg_load(p, TYG_I64, tyg_at_local(chans[i].top0, 0), 0));
                 auto hdr = tyg_at_local(tyg_local_new(p, 16, 8), 0);
                 if (xs.empty()) {
                     GenRz(vals[i], dst, hdr, rets[i], l);
@@ -3816,6 +3819,15 @@ struct TgFn {
             }
         }
         if (cg.sinfo[sp].needssp) spl = param();
+        // Each destination's top on entry: a return builds its result
+        // there, also one nested in another return's value that has
+        // started building (`return str("x", if c { return "y"; } ...)`).
+        for (size_t i = 0; i < sp->rets.size(); i++) {
+            if (!IsGrow(sp->rets[i]) && !TgModule::IsVarArr(sp->rets[i])) continue;
+            chans[i].top0 = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(chans[i].top0, 0),
+                      Top(tyg_load(p, TYG_I64, tyg_at_local(chans[i].a, 0), 0)), 0);
+        }
         gblk = tyg_block_new(p);
         gstart = tyg_block_new(p);
         tyg_jump(p, gblk);
