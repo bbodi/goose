@@ -2378,6 +2378,22 @@ struct TgFn {
             return x;
         }
         auto ot = cg.OperandT(u->child->exprtype);
+        if (u->op == T_MINUS && (ot->kind == TY_STRUCT || ot->kind == TY_ARRAY)) {
+            // Elementwise (CodeGen::GenElemwiseNegInto).
+            auto x = GenAs(u->child, ot);
+            if (Ended()) return Dummy(ot);
+            if (!x.mem || !M.TypeOk(ot)) No(u->line, "unary operand type");
+            auto src = Temp(ot);
+            tyg_copy(p, tyg_at_local(src, 0), x.a, M.Size(ot));
+            auto r = MemTemp(ot, false);
+            ElemLeaves(ot, 0, u->line, [&](TypeExpr *tt, int64_t off) {
+                auto v = tyg_load(p, M.Scal(tt), tyg_at_local(src, off), 0);
+                auto d = r.a;
+                d.offset += off;
+                tyg_store(p, M.Scal(tt), d, ScalarNeg(tt, v, u->line), 0);
+            });
+            return r;
+        }
         if (!M.IsScalar(ot) || ot->kind == TY_REF) No(u->line, "unary operand type");
         auto x = GenAs(u->child, ot);
         switch (u->op) {
@@ -2470,6 +2486,9 @@ struct TgFn {
             };
             if (arr(b->left->exprtype) && arr(b->right->exprtype)) return GenArrayEq(b);
         }
+        if ((op == T_PLUS || op == T_MINUS || op == T_MUL || op == T_DIV || op == T_MOD) && b->exprtype &&
+            (b->exprtype->kind == TY_STRUCT || b->exprtype->kind == TY_ARRAY))
+            return GenElemwise(b);
         auto lt = cg.OperandT(b->left->exprtype);
         if ((op == T_EQ || op == T_NEQ) && !M.IsScalar(lt)) return GenValEq(b, lt);
         if (!M.IsScalar(lt) || lt->kind == TY_REF) No(b->line, cat("operand type ", M.NameWhy(lt)));
@@ -2691,6 +2710,105 @@ struct TgFn {
         x.v = tyg_load(p, TYG_I8, tyg_at_local(res, 0), 0);
         if (b->op == T_NEQ) x.v = tyg_cmp(p, TYG_EQ, x.v, tyg_iconst(p, TYG_I8, 0));
         return x;
+    }
+
+    // Elementwise arithmetic on structs and fixed arrays (§6.1;
+    // CodeGen::GenElemwiseInto): each numeric leaf of the result from the
+    // same leaf of each operand, or from a scalar operand itself.
+    template <class F> void ElemLeaves(TypeExpr *t, int64_t off, Line l, F leaf) {
+        switch (t->kind) {
+            case TY_INT: case TY_FLT:
+                if (t->kind == TY_INT && t->intstorage == IS_VARINT) No(l, "elementwise varint");
+                leaf(t, off);
+                return;
+            case TY_STRUCT:
+                for (auto &f : M.Fields(t)) ElemLeaves(f.t, off + f.off, l, leaf);
+                return;
+            case TY_ARRAY: {
+                if (t->arr->akind != A_FIXED || cg.ArrSize(t->arr) > 256) No(l, "elementwise array");
+                auto esz = cg.FixedSize(t->arr->sub);
+                for (int64_t i = 0; i < cg.ArrSize(t->arr); i++) ElemLeaves(t->arr->sub, off + i * esz, l, leaf);
+                return;
+            }
+            default: No(l, cat("elementwise ", M.NameWhy(t)));
+        }
+    }
+    tyg_val ScalarArith(TType op, TypeExpr *t, tyg_val a, tyg_val b, Line l) {
+        switch (op) {
+            case T_PLUSEQ: op = T_PLUS; break;
+            case T_MINUSEQ: op = T_MINUS; break;
+            case T_MULEQ: op = T_MUL; break;
+            case T_DIVEQ: op = T_DIV; break;
+            case T_MODEQ: op = T_MOD; break;
+            default: break;
+        }
+        if (t->kind == TY_FLT) {
+            switch (op) {
+                case T_PLUS: return tyg_bin(p, TYG_FADD, a, b);
+                case T_MINUS: return tyg_bin(p, TYG_FSUB, a, b);
+                case T_MUL: return tyg_bin(p, TYG_FMUL, a, b);
+                case T_DIV: return tyg_bin(p, TYG_FDIV, a, b);
+                default: {
+                    auto f32 = M.Scal(t) == TYG_F32;
+                    auto ft = tyg_type_scalar(m, M.Scal(t));
+                    vector<const tyg_type *> pts { ft, ft };
+                    auto sig = tyg_sig_new(m, ft, pts.data(), 2, 0);
+                    tyg_arg as[2] {};
+                    as[0].val = a;
+                    as[1].val = b;
+                    return tyg_call(p, sig, tyg_direct(M.Sym(f32 ? "fmodf" : "fmod",
+                                                             TYG_SYM_FUNC | TYG_SYM_GLOBAL | TYG_SYM_FOREIGN)),
+                                    as, 2, nullptr, nullptr);
+                }
+            }
+        }
+        return IntOp(op, t, a, b, l);
+    }
+    tyg_val ScalarNeg(TypeExpr *t, tyg_val v, Line l) {
+        if (t->kind == TY_FLT) return tyg_un(p, TYG_FNEG, v);
+        if (!IsUnsigned(t->intstorage) && M.checks) return CheckedShim("neg", t, { v }, l);
+        return tyg_un(p, TYG_NEG, v);
+    }
+    // An operand: a scalar's value, or a copy of the struct or array.
+    struct ElemOp {
+        bool scalar;
+        TypeExpr *t;
+        tyg_val v;
+        tyg_local mem;
+    };
+    ElemOp ElemOperand(Node *n, TypeExpr *et) {
+        auto t = cg.OperandT(n->exprtype);
+        ElemOp o { t->kind != et->kind, t, 0, 0 };
+        auto x = GenAs(n, t);
+        if (Ended()) return o;
+        if (o.scalar) {
+            if (!M.IsScalar(t)) No(n->line, "elementwise operand");
+            o.v = x.v;
+            return o;
+        }
+        if (!x.mem || !M.TypeOk(t)) No(n->line, cat("elementwise operand ", M.NameWhy(t)));
+        o.mem = Temp(t);
+        tyg_copy(p, tyg_at_local(o.mem, 0), x.a, M.Size(t));
+        return o;
+    }
+    tyg_val ElemLeaf(const ElemOp &o, TypeExpr *tt, int64_t off, Line l) {
+        if (!o.scalar) return tyg_load(p, M.Scal(tt), tyg_at_local(o.mem, off), 0);
+        return cg.TEq(o.t, tt) ? o.v : Conv(o.v, o.t, tt, l);
+    }
+    V GenElemwise(Binary *b) {
+        auto et = b->exprtype;
+        if (!M.TypeOk(et)) No(b->line, cat("elementwise ", M.NameWhy(et)));
+        auto lo = ElemOperand(b->left, et);
+        auto ro = ElemOperand(b->right, et);
+        if (Ended()) return Dummy(et);
+        auto r = MemTemp(et, false);
+        ElemLeaves(et, 0, b->line, [&](TypeExpr *tt, int64_t off) {
+            auto d = r.a;
+            d.offset += off;
+            tyg_store(p, M.Scal(tt), d,
+                      ScalarArith(b->op, tt, ElemLeaf(lo, tt, off, b->line), ElemLeaf(ro, tt, off, b->line), b->line), 0);
+        });
+        return r;
     }
 
     // a == b of arrays or slices (GenRangeEq, §4.5): the lengths, then
@@ -5810,6 +5928,22 @@ struct TgFn {
         }
         pl = Deref(pl);
         auto t = pl.t;
+        if ((t->kind == TY_STRUCT || t->kind == TY_ARRAY) && M.TypeOk(t) &&
+            (a->op == T_PLUSEQ || a->op == T_MINUSEQ || a->op == T_MULEQ || a->op == T_DIVEQ || a->op == T_MODEQ)) {
+            // Elementwise, each leaf from its old value, read before the
+            // operand runs, and the operand's.
+            auto old = Temp(t);
+            tyg_copy(p, tyg_at_local(old, 0), pl.a, M.Size(t));
+            auto ro = ElemOperand(a->rhs, t);
+            if (Ended()) return;
+            ElemLeaves(t, 0, a->line, [&](TypeExpr *tt, int64_t off) {
+                auto d = pl.a;
+                d.offset += off;
+                auto was = tyg_load(p, M.Scal(tt), tyg_at_local(old, off), 0);
+                tyg_store(p, M.Scal(tt), d, ScalarArith(a->op, tt, was, ElemLeaf(ro, tt, off, a->line), a->line), 0);
+            });
+            return;
+        }
         if (!M.IsScalar(t) || t->kind == TY_REF) No(a->line, "compound assignment type");
         auto old = tyg_load(p, M.Scal(t), pl.a, 0);
         TType op;
