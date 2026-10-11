@@ -4256,6 +4256,13 @@ struct TgFn {
             x.a = pl.a;
             return x;
         }
+        if (c->builtin == B_HARDWARE_THREADS) {
+            // The runtime's count, capped by the thread limit.
+            V x;
+            x.t = c->exprtype;
+            x.v = CallC("gs_hardware_threads", {}, {}, IT(TYG_I64));
+            return x;
+        }
         if (c->builtin >= 0) No(c->line, cat("builtin ", BuiltinByKind(c->builtin).name));
         if (c->fvbody) return GenFvCall(c);
         if (!c->dispatch.empty()) return GenDispatch(c, idst, dst);
