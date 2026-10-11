@@ -261,6 +261,9 @@ backend compiles:
 | third, so far (strings and resizable arrays handed in) | 1241 of 3811 (33%) | 53 of 172 |
 | third, so far (+ resizable arrays built: locals, results) | 1471 of 3811 (39%) | 92 of 172 |
 | third, so far (+ u8[] values, str/format, string equality, shrinking builtins) | 1674 of 3811 (44%) | 167 of 172 |
+| third, so far (+ free variables) | 1838 of 3811 (48%) | 172 of 172 |
+| third, so far (+ function values) | 2058 of 3811 (54%) | 172 of 172 |
+| third, so far (+ globals on dedicated stacks, whole resizables assigned) | 2146 of 3811 (56%) | 172 of 172 |
 
 (The first stage's own write-up counted 394 of 3331 over 284 programs, an
 older sweep; the rows above come from the same one.) The step that added
@@ -437,6 +440,53 @@ variables of nested functions. Next: globals of resizable and `u8[]`
 types (their dedicated stacks), composites rendered through the C half's
 render functions given external linkage, `default`, then free variables.
 
+## What the third stage adds next: free variables, function values, globals on stacks
+
+* **free variables** of nested functions (§7.5), in the C's order
+  (`SigParams`): after the declared parameters, each as the address of
+  the variable in the frame it lives in -- a fixed one's, a `u8[]`'s
+  image (`uint8_t *`), a resizable's header then its stack. The nested
+  function reads and writes through them as through a by-value `T[]`
+  parameter; a call passes what `Call::FreeVarArg` names (a local of
+  the caller, or a free variable it was handed itself), so a free
+  variable is passed down a chain of nested functions and either half
+  calls the other. Pools and frame objects are not held.
+* **function values** (§7.6): a call of one splices its checked body
+  (`Call::fvbody`) in, as `EmitFvCall` does: the parameters bound in
+  order as locals in a scope of their own (so a resizable one's stack
+  is given back), the body's value copied, a fixed one. Dispatched
+  calls (`Call::dispatch`, over ADTs) stay in C (`call kind: dispatch`).
+* **globals of resizable and `u8[]` types**, which live on dedicated
+  stacks in the C half's instance (`CodeGen::gstks`): the accessor gives
+  the header's address, or the address of the member holding the
+  image's, and a second one (`gs_tg_gs<i>`) the stack; both are read
+  once per invocation like the others. Read, indexed, iterated, pushed,
+  appended, popped, passed on, written in place.
+* **assigning a whole resizable** (a local, a global, one behind a
+  reference), as `Assign::CgStmt` does: the stack's top back to where
+  the elements start, the new ones built there. Not yet: assigning a
+  new image to a `T[]` variable.
+
+Free variables are described to the debugger as the C has them, as
+pointers under the variables' names (`p *n`); describing the variable
+itself needs a location through a pointer, which tinygen lacks (gap 8).
+
+Coverage after this step is the last table row (0 of 582 runs differ).
+Goose-in-Goose now goes through tinygen whole: **172 of 172** functions,
+and so built, plain and `--debug`, it still compiles itself to the same
+C, byte for byte, as the C backend's build. What still sends a function
+to C, by count over the sweep: `return from` (197), operators on types
+not held (63), free variables of types not held (63: resizables of
+variable-size elements such as `Node[>..]`, optionals, ADT variants),
+globals of types not held (59: SIMD vectors, ADTs, limited arrays),
+`print` of composites (40), slices of variable-size elements
+(`Employee[:]` 32, `City[:]` 24), expression kinds `match` and `block`
+(31, 17), `default` (29), reference rebinding `.=` (23), and ADTs,
+optionals, frame objects and limited arrays as parameters and results.
+Dispatched calls are down to 2. Next: `return from` (its channel in the
+C half's thread-local `gs_rf`, gap 6), composites rendered through the
+C half's render functions, `default`, `match` over fixed-mode enums.
+
 ## Testing
 
 `test/tinygen/` holds fixtures the backend covers whole: scalars,
@@ -449,7 +499,10 @@ builds them as `u8[]` values, stays in C), and resizable arrays built,
 pushed and appended to, returned (alone and beside a fixed result) and
 given back on every way out of their scopes, u8[] values built in place
 and returned with `str`, `format` and string comparisons, and arrays
-popped, resized and cleared (ending in a pop of an empty array). They
+popped, resized and cleared (ending in a pop of an empty array),
+nested functions reading and writing their free variables of every
+kind held, function values of every parameter kind, and globals on
+dedicated stacks, read, grown and assigned anew. They
 are ordinary fixtures, run by the
 main suite through both C backends against `test/expected/`.
 `test/tinygen_backend.py` (the "tinygen backend" section of `run_tests.py`)
@@ -457,9 +510,10 @@ builds them with `--backend=tinygen`, requires every function to go through
 tinygen, builds the structs fixture three more times with chosen functions
 left to C (`--tinygen-skip=a,b`, hidden) so that by-value and by-reference
 structs cross the two halves in both directions, and the arrays, results,
-globals, strings, built-arrays, text and shrink fixtures twice more so that arrays and
-slices, out-pointers, globals, fat references, destination stacks and
-`gs_sp` do, builds a few existing
+globals, strings, built-arrays, text, shrink, nested, function-value
+and global-stack fixtures twice more so that arrays and slices,
+out-pointers, globals, fat references, destination stacks, `gs_sp`,
+free variables and dedicated stacks do, builds a few existing
 fixtures and a sample that the stage covers in part, and compares every run
 with the same expected output. Where `lldb` is installed it runs one program
 under it and requires a breakpoint by Goose function name, Goose lines in the
@@ -535,6 +589,14 @@ Recorded here rather than changed in tinygen, which other work is changing:
    (or a DWARF location expression: the TLS block, a load, an offset),
    which tinygen's debug calls cannot express. Until then lldb shows such
    a global as `gs_globals_main.counter_g`.
+8. **Debug info for a variable behind a pointer.** A nested function
+   reaches its free variables through addresses it is handed (§7.5), and
+   `tyg_debug_var`/`tyg_debug_param` take an address that holds the
+   value itself (a local, a symbol, a parameter's copy). Describing the
+   captured variable under its name needs a location that loads a
+   pointer first (DWARF `DW_OP_fbreg`, `DW_OP_deref`; CodeView's
+   `S_REGREL32` with an indirection), so lldb shows `n` as a pointer
+   and `*n` as the variable, as for the C half's `int64_t *n_g`.
 
 ## Plan
 
@@ -555,10 +617,12 @@ Recorded here rather than changed in tinygen, which other work is changing:
    pushed to; `gs_sp`, own stacks and the stack accounting; resizable
    locals and results built in place, `append`, by-value resizable
    arguments; `u8[]` locals and results, `str`/`format` of scalars and
-   strings, string equality, `resize`/`pop`/`pop_n`/`clear`. Next:
-   globals of resizable types, rendering composites through the C half's
-   render functions (given external linkage), free variables of nested
-   functions, function values, `return from`.
+   strings, string equality, `resize`/`pop`/`pop_n`/`clear`; free
+   variables of nested functions, function values, globals of resizable
+   and `u8[]` types, assigning whole resizables (Goose-in-Goose whole).
+   Next: `return from`, rendering composites through the C half's render
+   functions (given external linkage), `default`, assigning `u8[]`
+   images.
 4. **Driver and platforms**: `goose run --backend=tinygen` (build and start,
    or an in-memory loader, see above); Linux and Windows (CodeView) in CI; the
    x86-64 ABI checks; lldb/gdb formatters for Goose arrays shipped with the
