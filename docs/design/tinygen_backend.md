@@ -272,6 +272,7 @@ backend compiles:
 | third, so far (+ zero `default<T>()`, globals in whole programs) | 2253 of 3811 (59%) | 172 of 172 |
 | third, so far (+ composites rendered by `print` and `str`) | 2276 of 3811 (60%) | 172 of 172 |
 | third, so far (+ `.=`, `block`, `loop` values, integer `match`) | 2334 of 3811 (61%) | 172 of 172 |
+| third, so far (+ variable-size structs) | 2360 of 3811 (62%) | 172 of 172 |
 
 (The first stage's own write-up counted 394 of 3331 over 284 programs, an
 older sweep; the rows above come from the same one.) The step that added
@@ -796,6 +797,86 @@ tinygen puts it in a block that is never placed. Its expressions get a
 dummy value and its stores of a missing value are skipped, so functions
 such as `deep_fail_g` and `earlyblocks_g` no longer fall back with
 tinygen's `invalid value`.
+
+### Variable-size structs
+
+A struct with a variable-size field (bytes class, §6.1: `struct Employee
+{ id: i32, name: u8[], dept: u8[u8], salary: i64 }`) is one image of
+its fields in declaration order, packed, each variable-size one inline
+at its own size, and a `uint8_t *` at its start, as a `T[]` is. The
+backend holds one whose fields are fixed values it holds, `T[]`s of
+fixed elements (`u8[]`, `u8[u8]`, not `u8[varint]`) and such structs
+(`TgModule::VsOk`), with the C backend's conventions, so the halves
+call each other either way:
+
+* **as a `T[]`**: a local is its image's address, the image on a stack
+  of its own; a by-value parameter the address of the caller's copy
+  (built on a statement's stack); a result the `gs_stack *gs_dst<i>`
+  channel alone, the callee building the image at its top; a reference
+  `Employee&` a plain pointer to the image; a free variable its address.
+  The code is the `T[]`'s, which now asks `IsImg` where it asked
+  `IsVarArr`.
+* **fields** (`TgFn::VsField`, `CodeGen::FieldPtr`): a constant offset
+  until a variable-size field intervenes, then a cursor past each one by
+  its size (`ImgSize`: a `T[]`'s prefix and elements, a struct's fields
+  walked, `CodeGen::SizeX`); a field read, written (a fixed one), passed
+  on, iterated, rendered where it lies.
+* **building** (`GenVs`, `VsLit`): a literal field by field in layout
+  order at the destination's top (`CodeGen::GenFieldInits`): a fixed
+  field evaluated, then stored; a `T[]` or nested struct built there; an
+  explicit `pad n` zeroed. A call returning one is handed the
+  destination; anything else (`copy(x)`, a variable, a field, a
+  pointee) is copied whole, `ImgSize` bytes.
+* **text**: `print` and `str` render one as `Name { a, b }`, a `u8[]`
+  field quoted (`VsRender`).
+
+Not yet: assigning a whole value to a variable or field of a variable-
+size type (the C moves the bytes behind it, as for a `u8[]`), equality,
+omitted variable-size fields, globals of these types. Debug info names
+the type by its Goose name, a record of its fields up to and including
+the first variable-size one, whose offsets after it are no constants:
+
+```
+(lldb) frame variable
+(Employee *) e = 0x0000007100200000
+(lldb) p *e
+(Employee) {
+  id = 7
+  name = (len = 3, data = u8[] @ 0x0000007708e8d3e8)
+}
+```
+
+A field behind the first variable-size one cannot be described, as a
+`T[]`'s elements cannot (gap 3): it needs a member whose location is an
+expression over the record (DWARF `DW_AT_data_member_location` as a
+location description), which tinygen's `tyg_dt_member` lacks.
+
+The ranking above counted, as "variable-size structs", frame objects too
+(a struct with a resizable field, `struct Bag { tag: i64, items:
+i64[>..] }`: a C struct of the fixed fields with a `gs_rhdr` as its
+last member, another representation); `-v` now names them `frame
+object`. Over the sweep (0 of 580 runs differ but `samples/24_call_c`,
+built without its header), per-function coverage goes from 2343 to 2360
+of 3811 (`bde460a` measured 2343, where the table's previous row says
+2334), and the whole path from 71 programs to 73; Goose-in-Goose stays
+whole, self-compiling byte for byte, plain and `--debug`. Of the 149
+functions the class held (44 programs, 15 alone), frame objects are 80
+(22 programs, 5 alone), and bytes structs with a field of a type not
+held 42 (`varint` 15, optionals 11, ADTs 5, limited arrays 5). Next:
+frame objects, then slices and resizable arrays of variable-size
+elements (`Txt[:]`, `u8[][]`), walked sequentially as the C walks them.
+
+A return inside a value another return is building at a destination
+stack (`return str("x", if c { return "y"; } else { n })`) left what
+was built in front of its own value, which the C moves down
+(`ExitStart`); such a function now stays in C
+(`codegen/exit_value_destination`'s `early_str`, which compiled once
+unreachable code got values, and printed garbage).
+
+`test/tinygen/tinygen_varsize.goose` covers these whole (a whole
+program), and `test/tinygen_backend.py` builds it again with `main`,
+then the builders and by-value callees, then the by-reference ones
+left to C, and reads a by-value parameter under lldb.
 
 ## Testing
 
