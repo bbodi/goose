@@ -166,9 +166,9 @@ PROGRAMS += [
     ("test/tinygen/tinygen_limited.goose", False,
      ["--tinygen-skip=digits,sum,shrink,named"]),
     # A return nested in another return's T[] value as it is built.
-    ("test/codegen/exit_value_destination.goose", False, []),
+    ("test/codegen/exit_value_destination.goose", True, []),
 ]
-WHOLE_PROGRAM |= {"tinygen_limited"}
+WHOLE_PROGRAM |= {"tinygen_limited", "exit_value_destination"}
 
 # Variable-size structs (tinygen_varsize): built in place, read behind
 # their variable-size fields, passed and returned by value and by
