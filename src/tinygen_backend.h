@@ -1581,9 +1581,9 @@ struct TgFn {
             TextInto(stk, len, c, an, 0);
             return;
         }
-        if (auto c = Is<Call>(n); c && c->builtin < 0 && c->spec && !c->spec->sf->isextern &&
-                                   !c->spec->rets.empty() && IsGrow(c->spec->rets[0])) {
-            if (cg.Mangle(c->spec->rets[0]->arr->sub) != cg.Mangle(et)) No(l, "result of another element type");
+        if (auto c = Is<Call>(n); DestSpec(c) &&
+                                   IsGrow(DestSpec(c)->rets[0])) {
+            if (cg.Mangle(DestSpec(c)->rets[0]->arr->sub) != cg.Mangle(et)) No(l, "result of another element type");
             RzDst d { stk, hdr };
             rzdst = &d;
             GenCall(c);
@@ -1603,6 +1603,15 @@ struct TgFn {
         if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
         begin();
         CopyRun(stk, len, et, v.elems, v.len);
+    }
+    // The function a call to it builds its first result at a destination
+    // for (CodeGen's in-place construction): its own, or a dispatch's
+    // first case, whose results all the cases share.
+    FnSpec *DestSpec(Call *c) {
+        if (!c || c->builtin >= 0) return nullptr;
+        auto sp = c->spec ? c->spec : !c->dispatch.empty() ? c->dispatch[0] : nullptr;
+        if (!sp || sp->sf->isextern || sp->rets.empty()) return nullptr;
+        return sp;
     }
     // Where GenCall builds a call's first result, a resizable, instead of
     // a temporary of its own: a local's stack, a return destination.
@@ -1713,8 +1722,8 @@ struct TgFn {
         auto start = tyg_local_new(p, 8, 8);
         tyg_store(p, TYG_I64, tyg_at_local(start, 0), Top(stk), 0);
         auto at = [&] { return tyg_load(p, TYG_I64, tyg_at_local(start, 0), 0); };
-        if (auto c = Is<Call>(n); c && c->builtin < 0 && c->spec && !c->spec->sf->isextern &&
-                                   !c->spec->rets.empty() && cg.Mangle(c->spec->rets[0]) == cg.Mangle(t)) {
+        if (auto c = Is<Call>(n); DestSpec(c) &&
+                                   cg.Mangle(DestSpec(c)->rets[0]) == cg.Mangle(t)) {
             imgdst = stk;
             GenCall(c);
             imgdst = 0;
@@ -3722,7 +3731,8 @@ struct TgFn {
         if (auto cc = Is<Call>(src); cc && cc->builtin == B_COPY && cc->ArgNodes().size() == 1)
             src = cc->ArgNodes()[0];
         auto st = src->exprtype;
-        if (Is<Call>(src) && st && IsGrow(st) && !Is<Call>(src)->spec) No(l, "append of this call");
+        if (Is<Call>(src) && st && IsGrow(st) && Is<Call>(src)->builtin < 0 && !DestSpec(Is<Call>(src)))
+            No(l, "append of this call");
         if (auto cc = Is<Call>(src); cc && cc->builtin < 0 && st && IsGrow(st)) {
             auto tmp = tyg_local_new(p, 16, 8);
             GenRz(src, pl.stk, tyg_at_local(tmp, 0), st, l);
@@ -5857,8 +5867,8 @@ struct TgFn {
         auto start = tyg_local_new(p, 8, 8);
         tyg_store(p, TYG_I64, tyg_at_local(start, 0), Top(stk), 0);
         auto at = [&] { return tyg_load(p, TYG_I64, tyg_at_local(start, 0), 0); };
-        if (auto c = Is<Call>(n); c && c->builtin < 0 && c->spec && !c->spec->sf->isextern &&
-                                   !c->spec->rets.empty() && cg.Mangle(c->spec->rets[0]) == cg.Mangle(t)) {
+        if (auto c = Is<Call>(n); DestSpec(c) &&
+                                   cg.Mangle(DestSpec(c)->rets[0]) == cg.Mangle(t)) {
             imgdst = stk;
             GenCall(c);
             imgdst = 0;
@@ -5925,8 +5935,8 @@ struct TgFn {
             RunLit(sl, stk, ei->en->variants[vi].fields, ei->vftypes[vi]);
             return at();
         }
-        if (auto c = Is<Call>(n); c && c->builtin < 0 && c->spec && !c->spec->sf->isextern &&
-                                   !c->spec->rets.empty() && cg.TEq(c->spec->rets[0], t)) {
+        if (auto c = Is<Call>(n); DestSpec(c) &&
+                                   cg.TEq(DestSpec(c)->rets[0], t)) {
             imgdst = stk;
             GenCall(c);
             imgdst = 0;
@@ -5948,8 +5958,8 @@ struct TgFn {
             VsLit(sl, stk, t);
             return at();
         }
-        if (auto c = Is<Call>(n); c && c->builtin < 0 && c->spec && !c->spec->sf->isextern &&
-                                   !c->spec->rets.empty() && cg.TEq(c->spec->rets[0], t)) {
+        if (auto c = Is<Call>(n); DestSpec(c) &&
+                                   cg.TEq(DestSpec(c)->rets[0], t)) {
             imgdst = stk;
             GenCall(c);
             imgdst = 0;
