@@ -2837,7 +2837,13 @@ struct TgFn {
             case NK_AsCast: return GenCast(static_cast<AsCast *>(n));
             case NK_Call: return GenCall(static_cast<Call *>(n));
             case NK_StructLit: return GenStructLit(static_cast<StructLit *>(n));
-            case NK_Block: return GenBlock(static_cast<Block *>(n), false);
+            case NK_Block: {
+                // An image or a resizable tail: built on a temporary's stack.
+                V w;
+                auto b = static_cast<Block *>(n);
+                if (b->tail && !armwant && WantInPlace(b, false, w)) return w;
+                return GenBlock(b, false);
+            }
             case NK_IfExpr: return GenIf(static_cast<IfExpr *>(n), false);
             case NK_EarlyBlock: return GenEarly(static_cast<EarlyBlock *>(n), false);
             case NK_LoopExpr: return GenLoopX(static_cast<LoopExpr *>(n), false);
@@ -4258,6 +4264,9 @@ struct TgFn {
         } else {
             auto base2 = tyg_load(p, TYG_I64, pl.a, 0);
             r.v = tyg_bin(p, TYG_ADD, base2, tyg_bin(p, TYG_MUL, idx(), tyg_iconst(p, TYG_I64, esz)));
+            // A value the checker decayed the reference to: the element.
+            if (c->exprtype && c->exprtype->kind != TY_REF && !M.IsScalar(c->exprtype) && M.TypeOk(elem))
+                return Load(P { tyg_at_val(r.v, 0), elem }, c->line);
         }
         return r;
     }
