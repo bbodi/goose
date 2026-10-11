@@ -48,6 +48,11 @@ inline string TgFixedShim(const string &name) {
                        "_", sfx, "(a, b, f, l); }\n");
         }
     if (name == "gs_tg_stks") return "void *gs_tg_stks(void) { return gs_stks; }\n";
+    // gs_thread_spawn is the runtime.h helper of a program with threads
+    // (GS_NEED_THREADS); the support object has its own (TgSupportBody).
+    if (name == "gs_tg_thread_spawn")
+        return "int64_t gs_tg_thread_spawn(void (*e)(uint8_t *), const void *a, int64_t n) "
+               "{ return gs_thread_spawn(e, a, n); }\n";
     if (name == "gs_tg_stack_init")
         return "void gs_tg_stack_init(void *s) { gs_stack_init((gs_stack *)s); }\n";
     if (name == "gs_tg_rf") return "void *gs_tg_rf(void) { return &gs_rf; }\n";
@@ -134,7 +139,7 @@ inline string TgSupportBody(string_view runtimeh) {
             if (IsUnsigned(is) && string(op) != "div" && string(op) != "mod") continue;
             s += TgFixedShim(cat("gs_tg_", op, "_", CodeGen::IntSfx(is)));
         }
-    for (auto n : { "gs_tg_stks", "gs_tg_stack_init", "gs_tg_rf", "gs_tg_rfpanic", "gs_tg_f2iwrap", "gs_tg_f2u", "gs_tg_f2i",
+    for (auto n : { "gs_tg_stack_init", "gs_tg_rf", "gs_tg_rfpanic", "gs_tg_f2iwrap", "gs_tg_f2u", "gs_tg_f2i",
                     "gs_tg_range_u", "gs_tg_range", "gs_tg_slicefail" })
         s += TgFixedShim(n);
     // The codes of the runtime's error enum, one per line: "    GS_E_POP,".
@@ -153,10 +158,32 @@ inline string TgSupportBody(string_view runtimeh) {
     for (auto &x : TgSupportExterns())
         Append(s, x.ret, " gs_tg_x_", x.name, "(", x.params, ") { ",
                string(x.ret) == "void" ? "" : "return ", x.name, "(", x.args, "); }\n");
+    // The thread's block of data stacks (gs_stks) is thread-local only in a
+    // program built with GS_NEED_THREADS, which this object is not, so a
+    // thread-local of its own holds the block the procedures reach; a
+    // worker's thunk opens one and its end frees it (the runtime's
+    // gs_stack_block and gs_thread_run).
+    s += "#ifdef _MSC_VER\n#define GS_TG_TLS __declspec(thread)\n#else\n#define GS_TG_TLS __thread\n#endif\n"
+         "static GS_TG_TLS gs_stack *gs_tg_tstks;\n"
+         "void *gs_tg_stks(void) { return gs_tg_tstks; }\n"
+         "void gs_tg_stack_block(int64_t n) {\n"
+         "    gs_tg_tstks = (gs_stack *)calloc((size_t)(n > 0 ? n : 1), sizeof(gs_stack));\n"
+         "    if (!gs_tg_tstks) gs_panic(\"out of memory allocating stack block\");\n"
+         "    for (int64_t i = 0; i < n; i++) gs_stack_init(&gs_tg_tstks[i]);\n"
+         "}\n"
+         "static void gs_tg_thread_run(void (*entry)(uint8_t *), uint8_t *args) {\n"
+         "    entry(args);\n"
+         "    free(gs_tg_tstks);\n"
+         "    gs_tg_tstks = NULL;\n"
+         "}\n"
+         "int64_t gs_tg_thread_spawn(void (*entry)(uint8_t *), const void *args, int64_t size) {\n"
+         "    return gs_thread_start(gs_tg_thread_run, entry, args, size);\n"
+         "}\n";
     s += "static uint8_t gs_tg_noglobals;\n"
          "void gs_tg_start(int argc, char **argv, int64_t mainstacks, int64_t mainregions,\n"
          "                 int64_t workerregions) {\n"
          "    gs_rt_init(argc, argv, mainstacks, mainregions, workerregions);\n"
+         "    gs_tg_tstks = gs_stks;\n"
          "    gs_gl = &gs_tg_noglobals;\n"
          "}\n"
          "void gs_tg_end(void) { gs_rt_stats(); }\n";
@@ -182,6 +209,11 @@ struct TgModule {
     vector<pair<string, string>> shims;
     vector<FnSpec *> externs;   // Extern fns called, for trampolines.
     vector<FnSpec *> direct;    // Extern fns called directly (RuntimeApi).
+    // The queues and worker thunks the procedures name, each through an
+    // accessor returning its address: the C half's static (a shim), or the
+    // object's own in a whole program. Queue accessor -> the C queue's name.
+    map<string, string> queueacc;
+    map<string, FnSpec *> thunkacc;
     // The runtime's declarations (runtime.h, runtime_ext.h), for RuntimeApi.
     string_view rtdecls;
 
@@ -190,6 +222,21 @@ struct TgModule {
     map<string, bool> rtapi;
     bool RuntimeApi(const string &name) {
         if (auto it = rtapi.find(name); it != rtapi.end()) return it->second;
+        // The C library's math functions are plain symbols the linker
+        // resolves (never macros, unlike isnan), so no trampoline either.
+        static const set<string> libm = [] {
+            set<string> r;
+            for (auto f : { "acos", "asin", "atan", "atan2", "cbrt", "ceil", "copysign", "cos", "cosh",
+                            "erf", "exp", "exp2", "expm1", "fabs", "fdim", "floor", "fma", "fmax",
+                            "fmin", "fmod", "hypot", "lgamma", "log", "log10", "log1p", "log2",
+                            "nearbyint", "pow", "remainder", "rint", "round", "sin", "sinh", "sqrt",
+                            "tan", "tanh", "tgamma", "trunc" }) {
+                r.insert(f);
+                r.insert(cat(f, "f"));
+            }
+            return r;
+        }();
+        if (libm.count(name)) return rtapi[name] = true;
         auto found = false;
         for (auto pos = rtdecls.find(cat(name, "(")); pos != string_view::npos && !found;
              pos = rtdecls.find(cat(name, "("), pos + 1)) {
@@ -252,6 +299,26 @@ struct TgModule {
     void NeedShim(const string &name, const string &text) {
         for (auto &s : shims) if (s.first == name) return;
         shims.emplace_back(name, text);
+    }
+    // The accessor of the queue for elements of type t (CodeGen::QueueFor),
+    // which returns the gs_queue's address.
+    string QueueAccessor(TypeExpr *t) {
+        auto q = cg.QueueFor(t);
+        auto name = cat("gs_tg_q_", q);
+        // The shim again for each use: a function abandoned after it took
+        // the shim back (TinyGenBackend::Build).
+        queueacc[name] = q;
+        NeedShim(name, cat("void *", name, "(void) { return &", q, "; }\n"));
+        return name;
+    }
+    // The accessor of a worker's entry thunk (CodeGen::EnsureThreadThunk),
+    // which returns the thunk's address.
+    string ThunkAccessor(FnSpec *sp) {
+        auto thunk = cg.EnsureThreadThunk(sp);
+        auto name = cat("gs_tg_t_", thunk);
+        thunkacc[name] = sp;
+        NeedShim(name, cat("void *", name, "(void) { return (void *)", thunk, "; }\n"));
+        return name;
     }
     // One of the shims that do not depend on the program (TgFixedShim).
     void NeedShim(const string &name) {
@@ -4785,6 +4852,24 @@ struct TgFn {
             x.v = CallC("gs_hardware_threads", {}, {}, IT(TYG_I64));
             return x;
         }
+        if ((c->builtin == B_EMBED_FILE || c->builtin == B_EMBED_SHADER) && c->shaderblob &&
+            c->rettypes.size() == 1) {
+            // A read-only view of static data (CodeGen's B_EMBED_FILE): the
+            // blob's bytes in the object, the slice's data and length.
+            auto &blob = *c->shaderblob;
+            auto t = Temp(c->rettypes[0]);
+            tyg_store(p, TYG_I64, tyg_at_local(t, 0), tyg_addr_of(p, tyg_at_sym(M.Bytes(blob), 0)), 0);
+            tyg_store(p, TYG_I64, tyg_at_local(t, 8), tyg_iconst(p, TYG_I64, (int64_t)blob.size()), 0);
+            V x;
+            x.t = c->rettypes[0];
+            x.mem = true;
+            x.a = tyg_at_local(t, 0);
+            return x;
+        }
+        if (c->builtin == B_THREAD_WAIT) return GenThreadWait(c);
+        if (c->builtin == B_THREAD_SPAWN) return GenThreadSpawn(c);
+        if (c->builtin == B_QPUT) return GenQput(c);
+        if (c->builtin == B_QGET || c->builtin == B_QPOLL) return GenQget(c, idst);
         if (c->builtin >= 0) No(c->line, cat("builtin ", BuiltinByKind(c->builtin).name));
         if (c->fvbody) return GenFvCall(c);
         if (!c->dispatch.empty()) return GenDispatch(c, idst, dst);
@@ -6003,10 +6088,191 @@ struct TgFn {
     vector<V> GenCallAll(Node *n, size_t count) {
         auto c = Is<Call>(n);
         if (c && c->builtin == B_FROM_BYTES && count == 2) return GenFromBytes(c);
+        if (c && c->builtin == B_QPOLL && count == 2) {
+            GenCall(c);
+            if (lastrets.size() != count) No(n->line, "result count");
+            return lastrets;
+        }
         if (!DestSpec(c)) No(n->line, "multiple results of this kind");
         GenCall(c);
         if (lastrets.size() != count) No(n->line, "result count");
         return lastrets;
+    }
+
+    // ---- Threads and queues (§11.2) ------------------------------------------
+
+    // The address of the queue for elements of type t.
+    tyg_val QueueAddr(TypeExpr *t) {
+        cg.usesthreads = true;
+        return CallC(M.QueueAccessor(t), {}, {}, tyg_type_ptr(m));
+    }
+    // Whether a value of type t crosses a queue as this backend holds it: a
+    // fixed value or a T[] / T[..] image (CodeGen's IsBytesT), by its bytes.
+    bool QueueOk(TypeExpr *t) {
+        if (!t || t->kind == TY_REF) return false;
+        if (cg.IsFix(t)) return M.TypeOk(t);
+        return (M.IsRc(t) && M.RcOk(t)) || (IsVarArr(t) && M.RzOk(t)) || (M.IsVs(t) && M.VsOk(t));
+    }
+    // node's value bytes follow its gs_qnode header (next, size).
+    static constexpr int64_t QNODE = 16;
+
+    V GenThreadWait(Call *c) {
+        auto an = c->ArgNodes();
+        cg.usesthreads = true;
+        auto id = GenAs(an[0], M.ast.inttypes[IS_I64]).v;
+        if (Ended()) return V {};
+        CallC("gs_thread_wait", { IT(TYG_I64), tyg_type_ptr(m), IT(TYG_I32) },
+              { id, FileArg(c->line), LineArg(c->line) }, nullptr);
+        return V {};
+    }
+
+    // thread_spawn(worker, args...) (CodeGen::EmitThreadSpawn): the
+    // arguments contiguous on a stack of the statement's, handed to the
+    // worker's thunk, which unpacks them. A worker that names globals needs
+    // the spawn image of them, which this backend does not build.
+    V GenThreadSpawn(Call *c) {
+        auto w = c->spec;
+        auto an = c->ArgNodes();
+        if (!w || an.size() != 1 + w->argtypes.size()) No(c->line, "thread_spawn arguments");
+        string why;
+        if (!M.SigOk(w, false, why)) No(c->line, cat("thread program: ", why));
+        if (!cg.sinfo[w].freevars.empty()) No(c->line, "thread program with free variables");
+        // The globals the worker names, copied as the C packs them: each
+        // as [int64 size][bytes]. Fixed values only; a resizable's or a
+        // T[]'s image is the C half's to build.
+        for (auto d : cg.ThreadGlobals(w))
+            if (!M.GlobalOk(d) || !M.TypeOk(d->type) || !cg.IsFix(d->type) || d->reusable)
+                No(c->line, cat("thread program with a global of type ", M.NameWhy(d->type)));
+        for (size_t i = 0; i < w->argtypes.size(); i++) {
+            auto pt = w->argtypes[i];
+            if (cg.IsPoolParam(w, i) || (M.RzParam(pt) ? M.Resz(pt) || !QueueOk(pt) : !M.TypeOk(pt) || !cg.FixedSize(pt)))
+                No(c->line, cat("thread argument of type ", M.NameWhy(pt)));
+        }
+        cg.usesthreads = true;
+        auto thunk = CallC(M.ThunkAccessor(w), {}, {}, tyg_type_ptr(m));
+        auto stk = Stk(AllocStk(false, c->line), c->line);
+        auto base = Top(stk);
+        for (size_t i = 0; i < w->argtypes.size(); i++) {
+            auto pt = w->argtypes[i];
+            if (M.RzParam(pt)) {
+                // An image, built at the top: the packet holds it whole.
+                GenImg(an[1 + i], stk, pt, c->line);
+                if (Ended()) return Dummy(M.ast.inttypes[IS_I64]);
+                continue;
+            }
+            auto top = Top(stk);
+            Into(P { tyg_at_val(top, 0), pt }, an[1 + i]);
+            if (Ended()) return Dummy(M.ast.inttypes[IS_I64]);
+            SetTop(stk, tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, cg.FixedSize(pt))));
+        }
+        for (auto d : cg.ThreadGlobals(w)) {
+            auto top = Top(stk);
+            auto size = cg.FixedSize(d->type);
+            tyg_store(p, TYG_I64, tyg_at_val(top, 0), tyg_iconst(p, TYG_I64, size), 0);
+            auto at = tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, 8));
+            if (size) tyg_copy(p, tyg_at_val(at, 0), VarPlace(d, c->line).a, size);
+            SetTop(stk, tyg_bin(p, TYG_ADD, at, tyg_iconst(p, TYG_I64, size)));
+        }
+        M.NeedShim("gs_tg_thread_spawn");
+        V x;
+        x.t = M.ast.inttypes[IS_I64];
+        x.v = CallC("gs_tg_thread_spawn", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64) },
+                    { thunk, base, tyg_bin(p, TYG_SUB, Top(stk), base) }, IT(TYG_I64));
+        return x;
+    }
+
+    // qput(v): the value's bytes copied into a node of the queue.
+    V GenQput(Call *c) {
+        auto an = c->ArgNodes();
+        auto t = an[0]->exprtype;
+        if (!QueueOk(t)) No(c->line, cat("queue element of type ", M.NameWhy(t)));
+        // A fixed aggregate is read where it lies, not copied: it may be
+        // large (a native temporary of it could overflow a worker's stack).
+        if (cg.IsFix(t) && !M.IsScalar(t) && cg.TEq(an[0]->exprtype, t)) {
+            auto pl = Place(an[0]);
+            if (Ended()) return V {};
+            CallC("gs_qput", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64) },
+                  { QueueAddr(t), tyg_addr_of(p, pl.a), tyg_iconst(p, TYG_I64, cg.FixedSize(t)) }, nullptr);
+            return V {};
+        }
+        tyg_val ptr, size;
+        if (!cg.IsFix(t)) {
+            // An image, built on a stack of the statement's.
+            auto stk = Stk(AllocStk(false, c->line), c->line);
+            ptr = GenImg(an[0], stk, t, c->line);
+            if (Ended()) return V {};
+            size = tyg_bin(p, TYG_SUB, Top(stk), ptr);
+        } else {
+            auto x = GenAs(an[0], t);
+            if (Ended()) return V {};
+            auto tmp = Temp(t);
+            Store(P { tyg_at_local(tmp, 0), t }, x);
+            ptr = tyg_addr_of(p, tyg_at_local(tmp, 0));
+            size = tyg_iconst(p, TYG_I64, cg.FixedSize(t));
+        }
+        CallC("gs_qput", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64) }, { QueueAddr(t), ptr, size },
+              nullptr);
+        return V {};
+    }
+
+    // qget<T>() and qpoll<T>() (CodeGen's B_QGET): the oldest node's bytes
+    // as the value, the node freed; a missed poll gives the zero value and
+    // false. An image is built at idst's top (or a stack of the
+    // statement's), so a poll of one is left to C.
+    V GenQget(Call *c, tyg_val idst) {
+        auto t = c->rettypes[0];
+        auto poll = c->builtin == B_QPOLL;
+        if (!QueueOk(t) || (poll && !cg.IsFix(t))) No(c->line, cat("queue element of type ", M.NameWhy(t)));
+        auto node = CallC(poll ? "gs_qpoll" : "gs_qget", { tyg_type_ptr(m) }, { QueueAddr(t) }, IT(TYG_I64));
+        auto freenode = [&] { CallC("free", { tyg_type_ptr(m) }, { node }, nullptr); };
+        auto src = [&] { return tyg_at_val(tyg_bin(p, TYG_ADD, node, tyg_iconst(p, TYG_I64, QNODE)), 0); };
+        V x;
+        x.t = t;
+        if (!cg.IsFix(t)) {
+            auto stk = idst ? idst : Stk(AllocStk(false, c->line), c->line);
+            auto top = Top(stk);
+            auto size = tyg_load(p, TYG_I64, tyg_at_val(node, 8), 0);
+            tyg_move_dyn(p, top, tyg_bin(p, TYG_ADD, node, tyg_iconst(p, TYG_I64, QNODE)), size);
+            SetTop(stk, tyg_bin(p, TYG_ADD, top, size));
+            freenode();
+            x.mem = true;
+            x.a = tyg_at_val(top, 0);
+            lastrets.clear();
+            lastrets.push_back(x);
+            return x;
+        }
+        auto size = cg.FixedSize(t);
+        auto tmp = Temp(t);
+        auto at = tyg_at_local(tmp, 0);
+        V got;
+        got.t = M.ast.booltype;
+        if (poll) {
+            tyg_zero(p, at, std::max<int64_t>(size, 1));
+            auto have = tyg_block_new(p), done = tyg_block_new(p);
+            tyg_branch(p, tyg_cmp(p, TYG_NE, node, tyg_iconst(p, TYG_I64, 0)), have, done);
+            // The result of the poll as a bool, kept past the join.
+            tyg_block_set(p, have);
+            if (size) tyg_copy(p, at, src(), size);
+            freenode();
+            tyg_jump(p, done);
+            tyg_block_set(p, done);
+        } else {
+            if (size) tyg_copy(p, at, src(), size);
+            freenode();
+        }
+        if (M.IsScalar(t)) {
+            x = Load(P { at, t }, c->line);
+        } else {
+            x.mem = true;
+            x.a = at;
+        }
+        lastrets.clear();
+        lastrets.push_back(x);
+        if (poll) {
+            got.v = tyg_cmp(p, TYG_NE, node, tyg_iconst(p, TYG_I64, 0));
+            lastrets.push_back(got);
+        }
+        return x;
     }
 
     // An extern fn, through a trampoline the C half defines: the C function
@@ -6045,7 +6311,9 @@ struct TgFn {
         // One trampoline per C name: a call may have a specialization of
         // its own of the same extern. A function the runtime object
         // exports needs none.
+        // Nor does an export's own wrapper, which the object defines.
         auto direct = M.RuntimeApi(callee->sf->cname);
+        for (auto sf : M.ast.functions) direct = direct || (sf->isexport && sf->cname == callee->sf->cname);
         auto &list = direct ? M.direct : M.externs;
         auto known = false;
         for (auto e : list) known = known || e->sf->cname == callee->sf->cname;
@@ -9153,9 +9421,7 @@ struct TgFn {
                 auto init = g->inits[i];
                 if (cg.gstatic.count(d)) continue;   // Static data.
                 Loc(init->line);
-                if (!M.GlobalOk(d) ||
-                    (d->type->kind == TY_REF && d->type->ref->lenstorage >= 0))
-                    No(d->line, "global of this kind");
+                if (!M.GlobalOk(d)) No(d->line, "global of this kind");
                 if (M.FoOk(d->type)) {
                     // A frame object: its tail on the global's own stack.
                     auto at = tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(M.Accessor(d)), 0), 0);
@@ -9349,15 +9615,16 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         else if (!mainsp || !cg.sinfo.count(mainsp) || !mainsp->params.empty() ||
                  !cg.sinfo[mainsp].freevars.empty())
             why = "no plain main";
-        else if (cg.usesthreads || !cg.queues.empty()) why = "threads";
+        // Threads: the procedures' queues and worker thunks are the object's,
+        // but the `return from` channels and gs_rf, which the C half keeps
+        // thread-local, are plain data here.
+        else if ((cg.usesthreads || !cg.queues.empty()) && !cg.fromids.empty())
+            why = "threads with return from";
         if (!why.empty()) return false;
         for (auto sf : ast.functions)
-            if (sf->isexport) return why = "export fns", false;
-        for (auto sp : mod->externs) {
-            auto found = false;
-            for (auto &x : TgSupportExterns()) found = found || sp->sf->cname == x.name;
-            if (!found) return why = cat("extern ", sp->sf->cname), false;
-        }
+            if (sf->isexport && !ExportOk(cg, sf, why)) return false;
+        for (auto sp : mod->externs)
+            if (!ExternHeld(sp)) return why = cat("extern ", sp->sf->cname), false;
         if (!GlobalsOk(cg, why)) return false;
         // A gs_init_globals built but not used stays in the object,
         // unreferenced, with what it asked of the C half.
@@ -9368,8 +9635,214 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                 initsym = TYG_NO_SYM;
                 return why = cat("C half's ", sh.first), false;
             }
+        for (auto &[acc, sp] : mod->thunkacc)
+            for (auto d : cg.ThreadGlobals(sp)) mod->Accessor(d);
         EmitGlobalStorage(cg);
+        EmitExports(cg);
+        ForwardExterns();
+        EmitThreads(cg);
         return true;
+    }
+
+    // Whether a whole program can call an extern fn through its trampoline
+    // (gs_tg_x_): the support object holds one (TgSupportExterns), or the
+    // object does (ForwardExterns) for a symbol the linker resolves, a
+    // package's or the C library's, which no header of the runtime defines.
+    bool ExternHeld(FnSpec *sp) {
+        auto &name = sp->sf->cname;
+        for (auto &x : TgSupportExterns())
+            if (name == x.name) return true;
+        return mod->rtdecls.find(cat(" ", name, "(")) == string_view::npos &&
+               mod->rtdecls.find(cat("*", name, "(")) == string_view::npos;
+    }
+
+    // The trampolines the object holds itself: a procedure of the name the
+    // calls use that calls the C symbol with the same C parameters.
+    void ForwardExterns() {
+        auto m = mod->m;
+        for (auto sp : mod->externs) {
+            auto &name = sp->sf->cname;
+            auto held = false;
+            for (auto &x : TgSupportExterns()) held = held || name == x.name;
+            if (held) continue;
+            auto sig = mod->ExternSig(sp);
+            auto p = tyg_proc_begin(m, mod->Sym(cat("gs_tg_x_", name), TYG_SYM_FUNC | TYG_SYM_GLOBAL), sig);
+            vector<tyg_arg> args;
+            for (size_t i = 0; i < sp->argtypes.size(); i++) {
+                tyg_arg a {};
+                if (mod->IsScalar(sp->argtypes[i])) a.val = tyg_param(p, (int)i);
+                else a.mem = tyg_at_val(tyg_param(p, (int)i), 0);
+                args.push_back(a);
+            }
+            auto callee = tyg_direct(mod->Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL));
+            auto rt = sp->rets.empty() ? nullptr : sp->rets[0];
+            if (!rt) {
+                tyg_call(p, sig, callee, args.data(), (int)args.size(), nullptr, nullptr);
+                tyg_ret(p, 0);
+            } else if (mod->IsScalar(rt)) {
+                tyg_ret(p, tyg_call(p, sig, callee, args.data(), (int)args.size(), nullptr, nullptr));
+            } else {
+                auto t = tyg_local_new(p, mod->Size(rt), 8);
+                auto ra = tyg_at_local(t, 0);
+                tyg_call(p, sig, callee, args.data(), (int)args.size(), nullptr, &ra);
+                tyg_ret_mem(p, ra);
+            }
+            if (tyg_proc_end(p) != 0)
+                throw CompileError { cat("tinygen: ", name, ": ", tyg_error(m) ? tyg_error(m) : "?") };
+        }
+    }
+
+    // The queues and the worker thunks, which the C half holds in a mixed
+    // build: a queue is eight bytes of data with an accessor, started by
+    // main (EmitMain); a thunk is a procedure taking the spawn image, which
+    // opens the thread program's block of data stacks, unpacks the
+    // arguments and calls the worker (CodeGen::EmitThreadThunk), with an
+    // accessor returning its address.
+    void EmitThreads(CodeGen &cg) {
+        auto m = mod->m;
+        auto ptr = tyg_type_ptr(m);
+        auto accessor = [&](const string &name, tyg_sym target) {
+            auto p = tyg_proc_begin(m, mod->Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL),
+                                    tyg_sig_new(m, ptr, nullptr, 0, 0));
+            tyg_ret(p, tyg_addr_of(p, tyg_at_sym(target, 0)));
+            if (tyg_proc_end(p) != 0)
+                throw CompileError { cat("tinygen: ", name, ": ", tyg_error(m) ? tyg_error(m) : "?") };
+        };
+        for (auto &[acc, q] : mod->queueacc) {
+            auto sym = tyg_symbol(m, cat("gs_", q).c_str(), 0);
+            tyg_data(m, sym, TYG_SECTION_BSS, nullptr, 8, 8);
+            accessor(acc, sym);
+        }
+        for (auto &[acc, sp] : mod->thunkacc) {
+            auto &ki = cg.sinfo[sp];
+            auto tsym = mod->Sym(cg.thunks[sp], TYG_SYM_FUNC | TYG_SYM_GLOBAL);
+            const tyg_type *ps[] = { ptr };
+            auto p = tyg_proc_begin(m, tsym, tyg_sig_new(m, nullptr, ps, 1, 0));
+            auto cur = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(cur, 0), tyg_param(p, 0), 0);
+            auto call = [&](tyg_sig *sig, tyg_sym sym, vector<tyg_arg> args) {
+                tyg_call(p, sig, tyg_direct(sym), args.data(), (int)args.size(), nullptr, nullptr);
+            };
+            tyg_arg n {};
+            n.val = tyg_iconst(p, TYG_I64, cg.ProgramStacks({ sp }));
+            const tyg_type *i64s[] = { tyg_type_int(m, TYG_I64, 1) };
+            call(tyg_sig_new(m, nullptr, i64s, 1, 0), mod->Sym("gs_tg_stack_block", TYG_SYM_FUNC | TYG_SYM_GLOBAL),
+                 { n });
+            vector<tyg_arg> args;
+            TgFn fn(*mod, nullptr);   // For the sizes of image arguments.
+            fn.p = p;
+            for (auto t : sp->argtypes) {
+                auto at = tyg_load(p, TYG_I64, tyg_at_local(cur, 0), 0);
+                tyg_arg a {};
+                tyg_val size;
+                if (mod->RzParam(t)) {
+                    a.val = at;   // An image, by its address; the packet is the worker's own copy.
+                    size = fn.ImgSize(t, at);
+                } else {
+                    size = tyg_iconst(p, TYG_I64, cg.FixedSize(t));
+                    if (cg.IsLargeFixed(t)) a.val = at;
+                    else if (mod->IsScalar(t)) a.val = tyg_load(p, mod->Scal(t), tyg_at_val(at, 0), 0);
+                    else a.mem = tyg_at_val(at, 0);
+                }
+                args.push_back(a);
+                tyg_store(p, TYG_I64, tyg_at_local(cur, 0), tyg_bin(p, TYG_ADD, at, size), 0);
+            }
+            // The worker's globals, each [int64 size][bytes], into this
+            // thread's own instance of them.
+            for (auto d : cg.ThreadGlobals(sp)) {
+                auto size = cg.FixedSize(d->type);
+                auto at = tyg_load(p, TYG_I64, tyg_at_local(cur, 0), 0);
+                if (size) {
+                    auto dst = tyg_call(p, tyg_sig_new(m, ptr, nullptr, 0, 0),
+                                        tyg_direct(mod->Sym(mod->accessors.at(d), TYG_SYM_FUNC | TYG_SYM_GLOBAL)),
+                                        nullptr, 0, nullptr, nullptr);
+                    tyg_copy(p, tyg_at_val(dst, 0),
+                             tyg_at_val(tyg_bin(p, TYG_ADD, at, tyg_iconst(p, TYG_I64, 8)), 0), size);
+                }
+                tyg_store(p, TYG_I64, tyg_at_local(cur, 0),
+                          tyg_bin(p, TYG_ADD, at, tyg_iconst(p, TYG_I64, 8 + size)), 0);
+            }
+            if (ki.needssp) {
+                tyg_arg a {};
+                a.val = tyg_iconst(p, TYG_I64, 0);
+                args.push_back(a);
+            }
+            call(mod->Sig(sp), mod->Sym(ki.cname, TYG_SYM_FUNC | TYG_SYM_GLOBAL), args);
+            tyg_ret(p, 0);
+            if (tyg_proc_end(p) != 0)
+                throw CompileError { cat("tinygen: ", cg.thunks[sp], ": ", tyg_error(m) ? tyg_error(m) : "?") };
+            accessor(acc, tsym);
+        }
+    }
+
+    // Whether an `export fn`'s wrapper is one this object writes: a plain
+    // specialization whose parameters and result cross by value as the C
+    // wrapper's do (CodeGen::EmitExports). Else why not.
+    bool ExportOk(CodeGen &cg, SFunction *sf, string &why) {
+        if (sf->specs.size() != 1 || !cg.sinfo.count(sf->specs[0])) return why = "export fns", false;
+        auto sp = sf->specs[0];
+        auto &si = cg.sinfo[sp];
+        if (!si.freevars.empty() || sp->rets.size() > 1 || !mod->SigOk(sp, false, why))
+            return why = "export fns", false;
+        for (size_t i = 0; i < sp->argtypes.size(); i++) {
+            auto t = sp->argtypes[i];
+            if (cg.IsPoolParam(sp, i) || mod->RzParam(t) || cg.IsLargeFixed(t) || !mod->TypeOk(t))
+                return why = "export fns", false;
+        }
+        if (!sp->rets.empty() && (si.cret != 0 || !mod->TypeOk(sp->rets[0]))) return why = "export fns", false;
+        return true;
+    }
+
+    // The C symbol of each `export fn`: a procedure taking the C
+    // parameters, and for a slice result a length out-pointer after them,
+    // which calls the function, passing gs_sp 0 (CodeGen::EmitExports).
+    void EmitExports(CodeGen &cg) {
+        auto m = mod->m;
+        for (auto sf : ast.functions) {
+            if (!sf->isexport) continue;
+            auto sp = sf->specs[0];
+            auto &si = cg.sinfo[sp];
+            auto rt = sp->rets.empty() ? nullptr : sp->rets[0];
+            auto slice = rt && rt->kind == TY_SLICE;
+            vector<const tyg_type *> ps;
+            for (auto t : sp->argtypes) ps.push_back(mod->AT(t));
+            if (slice) ps.push_back(tyg_type_ptr(m));
+            auto csig = tyg_sig_new(m, !rt ? nullptr : slice ? tyg_type_ptr(m) : mod->AT(rt), ps.data(),
+                                    (int)ps.size(), 0);
+            auto p = tyg_proc_begin(m, mod->Sym(sf->cname, TYG_SYM_FUNC | TYG_SYM_GLOBAL), csig);
+            vector<tyg_arg> args;
+            for (size_t i = 0; i < sp->argtypes.size(); i++) {
+                tyg_arg a {};
+                if (mod->IsScalar(sp->argtypes[i])) a.val = tyg_param(p, (int)i);
+                else a.mem = tyg_at_val(tyg_param(p, (int)i), 0);
+                args.push_back(a);
+            }
+            if (si.needssp) {
+                tyg_arg a {};
+                a.val = tyg_iconst(p, TYG_I64, 0);
+                args.push_back(a);
+            }
+            auto callee = tyg_direct(mod->Sym(si.cname, TYG_SYM_FUNC | TYG_SYM_GLOBAL));
+            if (!rt) {
+                tyg_call(p, mod->Sig(sp), callee, args.data(), (int)args.size(), nullptr, nullptr);
+                tyg_ret(p, 0);
+            } else if (mod->IsScalar(rt)) {
+                tyg_ret(p, tyg_call(p, mod->Sig(sp), callee, args.data(), (int)args.size(), nullptr, nullptr));
+            } else {
+                auto t = tyg_local_new(p, mod->Size(rt), 8);
+                auto ra = tyg_at_local(t, 0);
+                tyg_call(p, mod->Sig(sp), callee, args.data(), (int)args.size(), nullptr, &ra);
+                if (slice) {
+                    tyg_store(p, TYG_I64, tyg_at_val(tyg_param(p, (int)sp->argtypes.size()), 0),
+                              tyg_load(p, TYG_I64, tyg_at_local(t, 8), 0), 0);
+                    tyg_ret(p, tyg_load(p, TYG_I64, tyg_at_local(t, 0), 0));
+                } else {
+                    tyg_ret_mem(p, ra);
+                }
+            }
+            if (tyg_proc_end(p) != 0)
+                throw CompileError { cat("tinygen: ", sf->cname, ": ", tyg_error(m) ? tyg_error(m) : "?") };
+        }
     }
 
     // ---- Globals of a whole program ------------------------------------------
@@ -9395,8 +9868,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                     if (mod->accessors.count(d)) return why = cat("global ", d->name, " as static data"), false;
                     continue;
                 }
-                if (!mod->GlobalOk(d) ||
-                    (d->type->kind == TY_REF && d->type->ref->lenstorage >= 0))
+                if (!mod->GlobalOk(d))
                     return why = cat("global ", d->name, " of this kind"), false;
             }
         return true;
@@ -9407,6 +9879,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     bool OwnAccessor(const string &name) {
         if (auto it = mod->channels.find(name); it != mod->channels.end())
             return true;
+        if (mod->queueacc.count(name) || mod->thunkacc.count(name)) return true;
         for (auto &[d, n] : mod->accessors)
             if (n == name) return true;
         for (auto &[d, n] : mod->stkaccessors)
@@ -9447,11 +9920,8 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         for (auto &c : fn.stackcalls) need = std::max(need, c.offset + cg.stackneed[c.callee]);
         if (need > cg.stackneed[nullptr]) return why = "global initializers' data stacks", false;
         // Extern fns: as for any function of a whole program.
-        for (auto sp : mod->externs) {
-            auto found = false;
-            for (auto &x : TgSupportExterns()) found = found || sp->sf->cname == x.name;
-            if (!found) return why = cat("extern ", sp->sf->cname), false;
-        }
+        for (auto sp : mod->externs)
+            if (!ExternHeld(sp)) return why = cat("extern ", sp->sf->cname), false;
         initsym = sym;
         return true;
     }
@@ -9462,9 +9932,13 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         auto m = mod->m;
         map<const VarDef *, tyg_sym> gsyms, ssyms;
         map<const VarDef *, pair<tyg_sym, tyg_sym>> flsyms;
+        // Each thread program has an instance of the globals it names
+        // (§11.2): thread-local storage, which a thread's thunk fills.
+        auto tls = false;
+        for (auto &[acc, sp] : mod->thunkacc) tls = tls || !cg.ThreadGlobals(sp).empty();
         auto def = [&](const string &name, int64_t size, int64_t align, VarDef *d, const tyg_dtype *dt) {
-            auto sym = tyg_symbol(m, cat("gs_g_", name).c_str(), 0);
-            tyg_data(m, sym, TYG_SECTION_BSS, nullptr, std::max<int64_t>(size, 1), align);
+            auto sym = tyg_symbol(m, cat("gs_g_", name).c_str(), tls ? TYG_SYM_TLS : 0);
+            tyg_data(m, sym, tls ? TYG_SECTION_TBSS : TYG_SECTION_BSS, nullptr, std::max<int64_t>(size, 1), align);
             if (dt) tyg_debug_global(m, string(d->name).c_str(), dt, sym, mod->File(d->line.fileidx), d->line.line);
             return sym;
         };
@@ -9545,6 +10019,16 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         call(tyg_sig_new(m, nullptr, sps, 5, 0), "gs_tg_start",
              { tyg_param(p, 0), tyg_param(p, 1), tyg_iconst(p, TYG_I64, cg.rtinit[0]),
                tyg_iconst(p, TYG_I64, cg.rtinit[1]), tyg_iconst(p, TYG_I64, cg.rtinit[2]) });
+        // The queues, before anything that could use one runs.
+        for (auto &[acc, q] : mod->queueacc) {
+            auto addr = tyg_call(p, tyg_sig_new(m, ptr, nullptr, 0, 0), tyg_direct(mod->Sym(acc, TYG_SYM_FUNC | TYG_SYM_GLOBAL)),
+                                 nullptr, 0, nullptr, nullptr);
+            tyg_arg a {};
+            a.val = addr;
+            const tyg_type *qps[] = { ptr };
+            tyg_call(p, tyg_sig_new(m, nullptr, qps, 1, 0),
+                     tyg_direct(mod->Sym("gs_qinit", TYG_SYM_FUNC | TYG_SYM_GLOBAL)), &a, 1, nullptr, nullptr);
+        }
         if (initsym != TYG_NO_SYM) {
             tyg_call(p, tyg_sig_new(m, nullptr, nullptr, 0, 0), tyg_direct(initsym), nullptr, 0, nullptr,
                      nullptr);
