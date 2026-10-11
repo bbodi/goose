@@ -2459,8 +2459,14 @@ struct TgFn {
         auto pc = Is<Call>(n);
         return pc && (pc->builtin == B_POP || pc->builtin == B_DEFAULT);
     }
+    static bool IsToBytes1(Node *n) {
+        auto c = Is<Call>(n);
+        return c && c->builtin == B_TO_BYTES && c->ArgNodes().size() == 1;
+    }
     P ElemsSource(Node *n, Line l) {
-        if (FixedTyped(n)) {
+        // to_bytes is typed as the array it is adapted to, but a u8
+        // resizable is what it builds (CodeGen::EmitToBytes).
+        if (FixedTyped(n) || IsToBytes1(n)) {
             auto x = Gen1(n);
             if (Ended()) return P {};
             if (!x.mem) No(l, "popped value in no memory");
@@ -2656,7 +2662,8 @@ struct TgFn {
                                                          tyg_bin(p, TYG_MUL, cap, tyg_iconst(p, TYG_I64, esz)))));
             return;
         }
-        if (n && !from && !al && !Is<StrLit>(n) && !LimCallResult(n) && !FixedTyped(n) && !IsStrCall(n) && n->exprtype &&
+        if (n && !from && !al && !Is<StrLit>(n) && !LimCallResult(n) && !FixedTyped(n) && !IsToBytes1(n) && !IsStrCall(n) &&
+            n->exprtype &&
             cg.TEq(n->exprtype, t)) {
             auto src = Deref(Place(n));
             if (Ended()) return;
