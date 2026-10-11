@@ -264,6 +264,7 @@ backend compiles:
 | third, so far (+ free variables) | 1838 of 3811 (48%) | 172 of 172 |
 | third, so far (+ function values) | 2058 of 3811 (54%) | 172 of 172 |
 | third, so far (+ globals on dedicated stacks, whole resizables assigned) | 2146 of 3811 (56%) | 172 of 172 |
+| third, so far (+ `return from` with fixed results) | 2239 of 3811 (59%) | 172 of 172 |
 
 (The first stage's own write-up counted 394 of 3331 over 284 programs, an
 older sweep; the rows above come from the same one.) The step that added
@@ -488,6 +489,48 @@ Dispatched calls are down to 2. Next: `return from` (its channel in the
 C half's thread-local `gs_rf`, gap 6), composites rendered through the
 C half's render functions, `default`, `match` over fixed-mode enums.
 
+## What the third stage adds next: `return from`
+
+`return ... from` (§7.9) as the C backend does it (`GenFromReturn`,
+`EmitRfCheck`), so that one return passes through frames of both
+halves in any mix:
+
+* the return site writes each value into the target's channel
+  (`gs_lret_<tid>_<i>`), sets the discriminant `gs_rf` to the target's
+  id (`CodeGen::fromids`), and returns at once, its stacks restored,
+  with a dummy C return value (`PropagateReturn`);
+* after every call to a function that can propagate one (`hasrf`), a
+  nonzero `gs_rf` is caught where this function is the target
+  (`FnSpec::needs`): cleared, the channels returned as its own results;
+  anywhere else it is passed on the same way, or, in a function that
+  cannot propagate, `gs_panic`s as the C does. `--unsafe-no-rf-check`
+  (`norfcheck`) drops the checks in both halves alike.
+
+`gs_rf` and the channels are the C half's `static GS_TLS` variables;
+tinygen code reaches them through accessors the C half exports
+(`gs_tg_rf`, `gs_tg_lret_<tid>_<i>`, gap 6), each read once per
+invocation like the globals' accessors, and asks `EnsureFromChannels`
+for the channels of a target only tinygen code names. Function values'
+plain `return`s (§7.6) are the same mechanism and come along. Not yet:
+targets with a resizable or `u8[]` result, whose values travel on the
+target's destination stack (`gs_fdst_`, `gs_fval_`, moved down at the
+catch); those targets and the returns to them stay in C.
+
+Coverage after this step is the last table row (0 of 582 runs differ;
+Goose-in-Goose still 172 of 172, self-compiling byte for byte, plain and
+`--debug`). Of the 197 functions `return from` sent to C, 93 now go
+through tinygen; the rest hold something else as well. What still
+sends a function to C, by count over the sweep: operands of types not
+held (63: SIMD vectors `vec3<f32>`/`vec2<f32>` 45, struct equality),
+globals of types not held (59: SIMD vectors, ADTs, limited arrays),
+`print` of composites (42), slices of variable-size elements
+(`Employee[:]` 32, `City[:]` 24), expression kinds `match` and `block`
+(31, 17), `default` (29), `return from` with a `u8[]` result (23: 12
+targets, 11 return sites), reference rebinding `.=` (23), and ADTs,
+optionals, frame objects and limited arrays as parameters and results.
+Next: composites rendered through C render functions, `default`,
+`match` over fixed-mode enums, `return from` with `u8[]` results.
+
 ## Testing
 
 `test/tinygen/` holds fixtures the backend covers whole: scalars,
@@ -503,7 +546,8 @@ and returned with `str`, `format` and string comparisons, and arrays
 popped, resized and cleared (ending in a pop of an empty array),
 nested functions reading and writing their free variables of every
 kind held, function values of every parameter kind, and globals on
-dedicated stacks, read, grown and assigned anew. They
+dedicated stacks, read, grown and assigned anew, and `return from`
+of every fixed kind to targets through frames that own stacks. They
 are ordinary fixtures, run by the
 main suite through both C backends against `test/expected/`.
 `test/tinygen_backend.py` (the "tinygen backend" section of `run_tests.py`)
@@ -514,7 +558,9 @@ structs cross the two halves in both directions, and the arrays, results,
 globals, strings, built-arrays, text, shrink, nested, function-value
 and global-stack fixtures twice more so that arrays and slices,
 out-pointers, globals, fat references, destination stacks, `gs_sp`,
-free variables and dedicated stacks do, builds a few existing
+free variables and dedicated stacks do, the `return from` fixture four
+more times with the targets, the return sites and the frames between
+each left to C in turn, builds a few existing
 fixtures and a sample that the stage covers in part, and compares every run
 with the same expected output. Where `lldb` is installed it runs one program
 under it and requires a breakpoint by Goose function name, Goose lines in the
@@ -578,10 +624,11 @@ Recorded here rather than changed in tinygen, which other work is changing:
 6. **Thread-locals on Mach-O.** The runtime keeps `gs_gl`, `gs_stks` and
    `gs_rf` in thread-local storage. Globals and data stacks sidestep it (the
    C half's accessors read `gs_gl` and `gs_stks`, once per invocation that
-   needs them); reaching `gs_rf` from tinygen code for `return from` would
-   need `TYG_SYM_TLS` access on every target, or accessors of its own;
-   tinygen's recent work names ELF thread-locals, and Mach-O's TLV access
-   should be checked.
+   needs them), and so does `return from`: `gs_rf` and the targets'
+   channels through accessors of their own (`gs_tg_rf`,
+   `gs_tg_lret_<tid>_<i>`). Direct `TYG_SYM_TLS` access would save the
+   calls; tinygen's recent work names ELF thread-locals, and Mach-O's TLV
+   access should be checked first.
 
 7. **Debug info for a member of a data symbol.** `tyg_debug_global` takes a
    symbol, and the variable is at its start. A global that lives in the C
@@ -623,8 +670,9 @@ Recorded here rather than changed in tinygen, which other work is changing:
    arguments; `u8[]` locals and results, `str`/`format` of scalars and
    strings, string equality, `resize`/`pop`/`pop_n`/`clear`; free
    variables of nested functions, function values, globals of resizable
-   and `u8[]` types, assigning whole resizables (Goose-in-Goose whole).
-   Next: `return from`, rendering composites through the C half's render
+   and `u8[]` types, assigning whole resizables (Goose-in-Goose whole);
+   `return from` with fixed results, across frames of both halves.
+   Next: `return from` with `u8[]` and resizable results, rendering composites through the C half's render
    functions (given external linkage), `default`, assigning `u8[]`
    images.
 4. **Driver and platforms**: `goose run --backend=tinygen` (build and start,
