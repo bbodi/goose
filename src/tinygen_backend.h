@@ -27,6 +27,55 @@ struct TgUnsupported {
     string why;
 };
 
+// The shims that depend on the runtime alone, not on the program: the
+// runtime.h helpers behind checked arithmetic, the `as` checks and the
+// aborts, and the thread-locals the runtime keeps per thread program
+// (gs_stks, gs_rf). The C half defines the ones a program uses; a whole
+// program build links them all from the support object instead
+// (TgSupportSource). "" for any other name.
+inline string TgFixedShim(const string &name) {
+    static const char *ops[] = { "add", "sub", "mul", "neg", "div", "mod" };
+    static const IntStorage ints[] = { IS_I8, IS_I16, IS_I32, IS_I64, IS_U8, IS_U16, IS_U32, IS_U64 };
+    for (auto op : ops)
+        for (auto is : ints) {
+            auto sfx = string(CodeGen::IntSfx(is));
+            if (name != cat("gs_tg_", op, "_", sfx)) continue;
+            auto ct = string(CodeGen::IntCT(is));
+            if (string(op) == "neg")
+                return cat(ct, " ", name, "(", ct, " a, const char *f, int l) { return gs_", op, "_",
+                           sfx, "(a, f, l); }\n");
+            return cat(ct, " ", name, "(", ct, " a, ", ct, " b, const char *f, int l) { return gs_", op,
+                       "_", sfx, "(a, b, f, l); }\n");
+        }
+    if (name == "gs_tg_stks") return "void *gs_tg_stks(void) { return gs_stks; }\n";
+    if (name == "gs_tg_rf") return "void *gs_tg_rf(void) { return &gs_rf; }\n";
+    if (name == "gs_tg_rfpanic")
+        return "void gs_tg_rfpanic(void) { gs_panic(\"unexpected long-distance return\"); }\n";
+    if (name == "gs_tg_f2iwrap") return "int64_t gs_tg_f2iwrap(double d) { return gs_f2iwrap(d); }\n";
+    if (name == "gs_tg_f2u")
+        return "uint64_t gs_tg_f2u(double d, int s, const char *f, int l) "
+               "{ (void)s; (void)f; (void)l; return GS_F2U(d, s, f, l); }\n";
+    if (name == "gs_tg_f2i")
+        return "int64_t gs_tg_f2i(double d, int s, int64_t lo, int64_t hi, const char *t, "
+               "const char *f, int l) { (void)s; (void)lo; (void)hi; (void)t; (void)f; "
+               "(void)l; return GS_F2I(d, s, lo, hi, t, f, l); }\n";
+    if (name == "gs_tg_range_u")
+        return "uint64_t gs_tg_range_u(uint64_t v, uint64_t hi, const char *t, const char *f, "
+               "int l) { (void)hi; (void)t; (void)f; (void)l; "
+               "return GS_RANGE_U(v, hi, t, f, l); }\n";
+    if (name == "gs_tg_range")
+        return "int64_t gs_tg_range(int64_t v, int64_t lo, int64_t hi, const char *t, "
+               "const char *f, int l) { (void)lo; (void)hi; (void)t; (void)f; (void)l; "
+               "return GS_RANGE(v, lo, hi, t, f, l); }\n";
+    if (name == "gs_tg_slicefail")
+        return "void gs_tg_slicefail(const char *f, int l) { gs_abort(GS_E_SLICE, f, l); }\n";
+    if (name.rfind("gs_tg_abort_", 0) == 0) {
+        auto what = name.substr(12);
+        return cat("void ", name, "(const char *f, int l) { gs_abort(GS_E_", what, ", f, l); }\n");
+    }
+    return "";
+}
+
 // One tinygen module and what its procedures share: types, debug types,
 // symbols, file names, and the shims and extern trampolines their calls
 // need from the C half.
@@ -97,6 +146,12 @@ struct TgModule {
     void NeedShim(const string &name, const string &text) {
         for (auto &s : shims) if (s.first == name) return;
         shims.emplace_back(name, text);
+    }
+    // One of the shims that do not depend on the program (TgFixedShim).
+    void NeedShim(const string &name) {
+        auto text = TgFixedShim(name);
+        assert(!text.empty());
+        NeedShim(name, text);
     }
 
     // ---- Types -------------------------------------------------------------
@@ -696,7 +751,7 @@ struct TgFn {
         auto sp0 = SpVal(l);
         if (!stksl) {
             stksl = tyg_local_new(p, 8, 8);
-            M.NeedShim("gs_tg_stks", "void *gs_tg_stks(void) { return gs_stks; }\n");
+            M.NeedShim("gs_tg_stks");
         }
         auto base = tyg_load(p, TYG_I64, tyg_at_local(stksl, 0), 0);
         auto idx = tyg_bin(p, TYG_ADD, sp0, tyg_iconst(p, TYG_I64, k));
@@ -1275,15 +1330,8 @@ struct TgFn {
     // The runtime.h helper gs_<op>_<sfx> for t (checked arithmetic,
     // division), through a shim of the same signature.
     tyg_val CheckedShim(const string &op, TypeExpr *t, vector<tyg_val> args, Line l) {
-        auto sfx = string(CodeGen::IntSfx(t->intstorage));
-        auto ct = string(CodeGen::IntCT(t->intstorage));
-        auto name = cat("gs_tg_", op, "_", sfx);
-        auto unary = op == "neg";
-        M.NeedShim(name, unary ? cat(ct, " ", name, "(", ct, " a, const char *f, int l) { return gs_",
-                                     op, "_", sfx, "(a, f, l); }\n")
-                               : cat(ct, " ", name, "(", ct, " a, ", ct,
-                                     " b, const char *f, int l) { return gs_", op, "_", sfx,
-                                     "(a, b, f, l); }\n"));
+        auto name = cat("gs_tg_", op, "_", CodeGen::IntSfx(t->intstorage));
+        M.NeedShim(name);
         auto at = M.AT(t);
         vector<const tyg_type *> pts(args.size(), at);
         pts.push_back(tyg_type_ptr(m));
@@ -1465,21 +1513,16 @@ struct TgFn {
             auto f64 = tyg_type_scalar(m, TYG_F64);
             tyg_val r;
             if (c->unchecked) {
-                M.NeedShim("gs_tg_f2iwrap",
-                           "int64_t gs_tg_f2iwrap(double d) { return gs_f2iwrap(d); }\n");
+                M.NeedShim("gs_tg_f2iwrap");
                 r = CallC("gs_tg_f2iwrap", { f64 }, { d }, IT(TYG_I64));
             } else if (is == IS_U64) {
-                M.NeedShim("gs_tg_f2u", "uint64_t gs_tg_f2u(double d, int s, const char *f, int l) "
-                                        "{ (void)s; (void)f; (void)l; return GS_F2U(d, s, f, l); }\n");
+                M.NeedShim("gs_tg_f2u");
                 r = CallC("gs_tg_f2u", { f64, IT(TYG_I32), tyg_type_ptr(m), IT(TYG_I32) },
                           { d, tyg_iconst(p, TYG_I32, M.Scal(st) == TYG_F32), FileArg(c->line),
                             LineArg(c->line) },
                           IT(TYG_I64, false));
             } else {
-                M.NeedShim("gs_tg_f2i",
-                           "int64_t gs_tg_f2i(double d, int s, int64_t lo, int64_t hi, const char *t, "
-                           "const char *f, int l) { (void)s; (void)lo; (void)hi; (void)t; (void)f; "
-                           "(void)l; return GS_F2I(d, s, lo, hi, t, f, l); }\n");
+                M.NeedShim("gs_tg_f2i");
                 auto [lo, hi] = IntRange(is);
                 r = CallC("gs_tg_f2i",
                           { f64, IT(TYG_I32), IT(TYG_I64), IT(TYG_I64), tyg_type_ptr(m), tyg_type_ptr(m),
@@ -1506,10 +1549,7 @@ struct TgFn {
         // release build.
         tyg_val r;
         if (st->intstorage == IS_U64) {
-            M.NeedShim("gs_tg_range_u",
-                       "uint64_t gs_tg_range_u(uint64_t v, uint64_t hi, const char *t, const char *f, "
-                       "int l) { (void)hi; (void)t; (void)f; (void)l; "
-                       "return GS_RANGE_U(v, hi, t, f, l); }\n");
+            M.NeedShim("gs_tg_range_u");
             r = CallC("gs_tg_range_u",
                       { IT(TYG_I64, false), IT(TYG_I64, false), tyg_type_ptr(m), tyg_type_ptr(m),
                         IT(TYG_I32) },
@@ -1519,10 +1559,7 @@ struct TgFn {
             y.v = Conv(r, M.ast.inttypes[IS_U64], tt, c->line);
             return y;
         }
-        M.NeedShim("gs_tg_range",
-                   "int64_t gs_tg_range(int64_t v, int64_t lo, int64_t hi, const char *t, "
-                   "const char *f, int l) { (void)lo; (void)hi; (void)t; (void)f; (void)l; "
-                   "return GS_RANGE(v, lo, hi, t, f, l); }\n");
+        M.NeedShim("gs_tg_range");
         auto [lo, hi] = IntRange(is);
         auto w = Conv(x.v, st, M.ast.inttypes[IS_I64], c->line);
         r = CallC("gs_tg_range",
@@ -1698,8 +1735,7 @@ struct TgFn {
             tyg_block_set(p, c3);
             tyg_branch(p, tyg_cmp(p, TYG_SGT, hi, v.len), bad, ok);
             tyg_block_set(p, bad);
-            M.NeedShim("gs_tg_slicefail",
-                       "void gs_tg_slicefail(const char *f, int l) { gs_abort(GS_E_SLICE, f, l); }\n");
+            M.NeedShim("gs_tg_slicefail");
             CallC("gs_tg_slicefail", { tyg_type_ptr(m), IT(TYG_I32) },
                   { FileArg(se->line), LineArg(se->line) }, nullptr);
             tyg_unreachable(p);
@@ -2102,7 +2138,7 @@ struct TgFn {
     // (the codes are the C half's enum); the block ends there.
     void Abort(const string &what, Line l) {
         auto name = cat("gs_tg_abort_", what);
-        M.NeedShim(name, cat("void ", name, "(const char *f, int l) { gs_abort(GS_E_", what, ", f, l); }\n"));
+        M.NeedShim(name);
         CallC(name, { tyg_type_ptr(m), IT(TYG_I32) }, { FileArg(l), LineArg(l) }, nullptr);
         tyg_unreachable(p);
     }
@@ -2571,7 +2607,7 @@ struct TgFn {
     // C half's, reached through accessors it exports (gap 6), read once
     // per invocation as the globals' are.
     tyg_val RfAddr() {
-        M.NeedShim("gs_tg_rf", "void *gs_tg_rf(void) { return &gs_rf; }\n");
+        M.NeedShim("gs_tg_rf");
         return tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal("gs_tg_rf"), 0), 0);
     }
     tyg_addr LretAt(FnSpec *t, size_t i) {
@@ -2628,8 +2664,7 @@ struct TgFn {
             if (cg.sinfo[sp].hasrf) {
                 Propagate();
             } else {
-                M.NeedShim("gs_tg_rfpanic",
-                           "void gs_tg_rfpanic(void) { gs_panic(\"unexpected long-distance return\"); }\n");
+                M.NeedShim("gs_tg_rfpanic");
                 CallC("gs_tg_rfpanic", {}, {}, nullptr);
                 tyg_unreachable(p);
             }
