@@ -3952,6 +3952,8 @@ struct TgFn {
     // length read and checked; the slot written, the length raised. Its
     // value is the slot's address.
     V LimPush(Call *c, const P &pl) {
+        auto dp = discardpush;
+        discardpush = false;
         if (!M.LimHeld(pl.t)) No(c->line, cat("push to ", M.NameWhy(pl.t)));
         auto et = pl.t->arr->sub;
         // A literal linking to itself is built in its slot, once the
@@ -3978,7 +3980,7 @@ struct TgFn {
         if (r.t) r.v = at;
         // The element itself, as a value, where one is wanted.
         pushed = P { tyg_at_val(at, 0), et };
-        if (!r.t && c->exprtype && c->exprtype->kind != TY_VOID && M.TypeOk(et))
+        if (!r.t && !dp && c->exprtype && c->exprtype->kind != TY_VOID && M.TypeOk(et))
             return Load(*pushed, c->line);
         return r;
     }
@@ -4914,10 +4916,16 @@ struct TgFn {
     // The element the last push added, where it lies: what print renders
     // of a push's value (a reference, §3.3), read there.
     std::optional<P> pushed;
+    bool discardpush = false;   // A push in statement position: its value unwanted.
     V GenPush(Call *c) {
+        auto dp = discardpush;
+        discardpush = false;
         auto an = c->ArgNodes();
         auto pl = Deref(Place(an[0]));
-        if (TgModule::IsLim(pl.t)) return LimPush(c, pl);
+        if (TgModule::IsLim(pl.t)) {
+            discardpush = dp;
+            return LimPush(c, pl);
+        }
         if (IsGrow(pl.t) && M.VeOk(pl.t) && pl.stk) {
             // An image element: built straight at the top of the array's own
             // stack, behind the elements before it, then counted.
@@ -4968,7 +4976,7 @@ struct TgFn {
         if (r.t) r.v = top;
         // The element itself, as a value, where one is wanted.
         pushed = P { tyg_at_val(top, 0), et };
-        if (!r.t && c->exprtype && c->exprtype->kind != TY_VOID && M.TypeOk(et))
+        if (!r.t && !dp && c->exprtype && c->exprtype->kind != TY_VOID && M.TypeOk(et))
             return Load(*pushed, c->line);
         return r;
     }
@@ -6822,7 +6830,13 @@ struct TgFn {
             case NK_FnDecl: case NK_StructDecl: case NK_EnumDecl: case NK_AliasDecl: return;
             case NK_Block: GenBlock(static_cast<Block *>(n), true); return;
             case NK_IfExpr: GenIf(static_cast<IfExpr *>(n), true); return;
-            default: Gen(n); return;
+            default: {
+                auto pc = Is<Call>(n);
+                discardpush = pc && pc->builtin == B_PUSH;
+                Gen(n);
+                discardpush = false;
+                return;
+            }
         }
     }
 
