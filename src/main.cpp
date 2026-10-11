@@ -448,6 +448,29 @@ string RuntimeObjectSource() {
                                           "runtime_ext.h", "runtime_os.h" }));
 }
 
+// The C of the tinygen backend's support object (TgSupportBody): what the C
+// half of a program gives the tinygen object and does not depend on the
+// program, for a build with no C half. Compiled once per runtime and
+// configuration, `checks` (GS_DEBUG) included, as the runtime object is.
+string TinygenSupportSource(bool checks) {
+#if !GOOSE_HAVE_TINYGEN
+    (void)checks;
+    return "";
+#else
+    auto rh = RuntimeSections({ "runtime.h" });
+    return cat("/* The tinygen backend's support object (docs/design/tinygen_backend.md),\n"
+               "   written by the Goose compiler. Do not edit. */\n\n"
+               "#define GS_SEPARATE_RUNTIME 1\n#define GS_RUNTIME_VERSION ", RuntimeVersion(), "\n",
+               checks ? "#define GS_DEBUG 1\n" : "", rh,
+               "#pragma pack(push, 1)\n"
+               "typedef struct { uint8_t *base; int64_t len; } gs_rhdr;\n"
+               "typedef struct { gs_rhdr *hdr; gs_stack *stk; } gs_rref;\n"
+               "typedef struct { uint8_t *data; int64_t len; } sl_u8;\n"
+               "#pragma pack(pop)\n",
+               RuntimeSections({ "runtime_ext.h" }), TgSupportBody(rh));
+#endif
+}
+
 // Locates the src/runtime/ directory (only needed by --gen-runtime-header):
 // an explicit env override, next to the executable, or relative to it in the
 // source tree layout.
@@ -871,8 +894,10 @@ int Main(int argc, char **argv) {
     vector<string> includes;
     // What a JIT run compiles and starts, once the compile produced it.
     string program;
-    // The tinygen backend's object, when it compiled anything.
+    // The tinygen backend's object, when it compiled anything, and whether
+    // it is the whole program (no C half to compile), with GS_DEBUG's checks.
     string tgobject;
+    bool tgwhole = false, tgchecks = false;
     // The program's Ast outlives the compile: a build and a JIT run read
     // its packages, for the native parts the program needs (native.h).
     unique_ptr<Ast> astp;
@@ -996,6 +1021,22 @@ int Main(int argc, char **argv) {
                                 cg.sinfo[sp].cname.c_str(),
                                 ast.sources[sp->sf->line.fileidx].first.c_str(),
                                 sp->sf->line.line, why.c_str());
+                // A build whose every function went through tinygen needs
+                // nothing of the C half the support object does not hold:
+                // its main goes into the object, and no C is compiled.
+                string whynot;
+                if (verb != "build") whynot = "not goose build";
+                else if (standalone) whynot = "--standalone";
+                else if (!includenames.empty()) whynot = "--include";
+                for (auto &d : cdefines)
+                    if (whynot.empty() && d != "GS_DEBUG=1") whynot = cat("-D", d);
+                tgwhole = whynot.empty() && tgb->WholeProgram(cg, whynot);
+                tgchecks = tgb->checks;
+                if (tgwhole) tgb->EmitMain(cg);
+                if (verbose)
+                    fprintf(msgs, tgwhole ? "tinygen: whole program: no C compiled for it\n"
+                                          : "tinygen: mixed: the C half compiled by the C compiler (%s)\n",
+                            whynot.c_str());
                 if (!tgb->taken.empty() && !outfile.empty()) {
                     tgobject = cat(DirOf(outfile), PathStem(outfile), ".tg.o");
                     string err;
@@ -1041,7 +1082,7 @@ int Main(int argc, char **argv) {
                        cg.head, RuntimeSections({ "runtime_ext.h", "runtime_os.h" }), cg.result);
             return out;
         };
-        if (!outfile.empty() && !nocgen) {
+        if (!outfile.empty() && !nocgen && !tgwhole) {
             auto out = assemble(!standalone);
             auto f = fopen(outfile.c_str(), "wb");
             if (!f) throw CompileError { cat("cannot write output file: ", outfile) };
@@ -1108,6 +1149,7 @@ int Main(int argc, char **argv) {
         }
         program.clear();
         tgobject.clear();
+        tgwhole = false;
         astp.reset();
         nativepkgs.clear();
         try {
@@ -1137,10 +1179,18 @@ int Main(int argc, char **argv) {
                     if (!BuildNativePart(*astp, pkg, filename, b, false, nb)) return 1;
                     rsps.push_back(nb.rsp);
                 }
-                return BuildExecutable(filename, outfile, builddir, tc, buildopts, DirOf(exe),
-                                       msgs, rsps, astp->packages[0].output,
+                pair<string, std::function<string()>> tgsupport;
+                if (tgwhole) {
+                    auto src = TinygenSupportSource(tgchecks);
+                    tgsupport = { cat("goose_tgsupport", tgchecks ? "_checks-" : "-", Hex8(src)),
+                                  [src] { return src; } };
+                }
+                return BuildExecutable(filename, tgwhole ? string() : outfile, builddir, tc,
+                                       buildopts, DirOf(exe), msgs, rsps,
+                                       astp->packages[0].output,
                                        tgobject.empty() ? vector<string> {}
-                                                        : vector<string> { tgobject });
+                                                        : vector<string> { tgobject },
+                                       tgsupport);
             }
             if (program.empty()) return code;
             // The native parts the program reaches hand the run their

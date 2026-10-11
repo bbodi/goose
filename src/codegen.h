@@ -401,6 +401,11 @@ struct CodeGen {
     // thunk reserves for its arguments and its copy of the globals.
     int globalregions = 0;
     unordered_map<FnSpec *, int> thunkregions;
+    // What gs_program_init hands gs_rt_init (the main program's stacks,
+    // its regions, a worker's), and whether gs_init_globals does nothing:
+    // what a program without a C half starts with (TinyGenBackend::EmitMain).
+    int64_t rtinit[3] = { 0, 0, 0 };
+    bool noglobalinit = false;
     // GS_MAX_STACKS as the program is configured (main.cpp): the most data
     // stacks one thread program may use at once, zero for no limit.
     int64_t maxstacks = 0;

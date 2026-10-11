@@ -76,6 +76,91 @@ inline string TgFixedShim(const string &name) {
     return "";
 }
 
+// The extern fns of the runtime that runtime_ext.h defines as static
+// functions in the program's own C (or under asm labels): a whole program
+// build has no C half to hold their trampolines, so the support object
+// holds one for each, as the C half would write it (TinyGenBackend::Shims).
+struct TgSupportExtern {
+    const char *name, *ret, *params, *args;
+};
+inline const vector<TgSupportExtern> &TgSupportExterns() {
+    static const vector<TgSupportExtern> v = [] {
+        vector<TgSupportExtern> r = {
+            { "gs_bld_append", "void", "gs_rref a0, const void *a1, int64_t a2", "a0, a1, a2" },
+            { "gs_find_any", "int64_t", "sl_u8 a0, const void *a1", "a0, a1" },
+            { "gs_find_pair", "int64_t", "sl_u8 a0, const void *a1, int64_t a2, const void *a3",
+              "a0, a1, a2, a3" },
+        };
+        static const char *unary[] = { "sqrt", "sin", "cos", "tan", "asin", "acos", "atan",
+                                       "exp", "log", "log2", "log10" };
+        static const char *binary[] = { "atan2", "pow" };
+        static vector<string> names;   // Stable storage for the generated names.
+        names.reserve(64);
+        for (auto f : { false, true }) {
+            for (auto u : unary) {
+                names.push_back(cat("gs_", u, f ? "f" : ""));
+                r.push_back({ names.back().c_str(), f ? "float" : "double", f ? "float a0" : "double a0",
+                              "a0" });
+            }
+            for (auto b : binary) {
+                names.push_back(cat("gs_", b, f ? "f" : ""));
+                r.push_back({ names.back().c_str(), f ? "float" : "double",
+                              f ? "float a0, float a1" : "double a0, double a1", "a0, a1" });
+            }
+        }
+        return r;
+    }();
+    return v;
+}
+
+// What the support object defines beyond runtime.h and runtime_ext.h, which
+// precede it: every program-independent shim (TgFixedShim; an abort shim
+// per GS_E_ code of `runtimeh`'s), the trampolines of TgSupportExterns,
+// the thread-local gs_rf a program with `return from` declares, and the
+// start and end of a program whose main the tinygen object holds
+// (TinyGenBackend::EmitMain), which set up and report the thread-locals
+// kept here (gs_stks, gs_gl).
+inline string TgSupportBody(string_view runtimeh) {
+    string s = "\n/* ---- tinygen support (docs/design/tinygen_backend.md) ---- */\n"
+               "static GS_TLS int32_t gs_rf;\n";
+    static const char *ops[] = { "add", "sub", "mul", "neg", "div", "mod" };
+    static const IntStorage ints[] = { IS_I8, IS_I16, IS_I32, IS_I64, IS_U8, IS_U16, IS_U32, IS_U64 };
+    for (auto op : ops)
+        for (auto is : ints) {
+            // runtime.h's unsigned helpers take no file and line, and only
+            // division and modulo of unsigned values go through a shim.
+            if (IsUnsigned(is) && string(op) != "div" && string(op) != "mod") continue;
+            s += TgFixedShim(cat("gs_tg_", op, "_", CodeGen::IntSfx(is)));
+        }
+    for (auto n : { "gs_tg_stks", "gs_tg_rf", "gs_tg_rfpanic", "gs_tg_f2iwrap", "gs_tg_f2u", "gs_tg_f2i",
+                    "gs_tg_range_u", "gs_tg_range", "gs_tg_slicefail" })
+        s += TgFixedShim(n);
+    // The codes of the runtime's error enum, one per line: "    GS_E_POP,".
+    set<string> codes;
+    for (size_t pos = 0; (pos = runtimeh.find("\n    GS_E_", pos)) != string_view::npos;) {
+        pos += 5;
+        auto end = pos;
+        while (end < runtimeh.size() && (isupper((unsigned char)runtimeh[end]) ||
+                                         isdigit((unsigned char)runtimeh[end]) || runtimeh[end] == '_'))
+            end++;
+        auto code = string(runtimeh.substr(pos + 5, end - pos - 5));
+        if (end < runtimeh.size() && (runtimeh[end] == ',' || runtimeh[end] == ' ') &&
+            codes.insert(code).second)
+            s += TgFixedShim(cat("gs_tg_abort_", code));
+    }
+    for (auto &x : TgSupportExterns())
+        Append(s, x.ret, " gs_tg_x_", x.name, "(", x.params, ") { ",
+               string(x.ret) == "void" ? "" : "return ", x.name, "(", x.args, "); }\n");
+    s += "static uint8_t gs_tg_noglobals;\n"
+         "void gs_tg_start(int argc, char **argv, int64_t mainstacks, int64_t mainregions,\n"
+         "                 int64_t workerregions) {\n"
+         "    gs_rt_init(argc, argv, mainstacks, mainregions, workerregions);\n"
+         "    gs_gl = &gs_tg_noglobals;\n"
+         "}\n"
+         "void gs_tg_end(void) { gs_rt_stats(); }\n";
+    return s;
+}
+
 // One tinygen module and what its procedures share: types, debug types,
 // symbols, file names, and the shims and extern trampolines their calls
 // need from the C half.
@@ -3221,6 +3306,77 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                    sp->rets.empty() ? "" : "return ", name, "(", args, "); }\n");
         }
         return s;
+    }
+
+    // Whether the object can be the whole program, with no C half: every
+    // live specialization compiled, nothing asked of the C half that the
+    // support object (TgSupportBody) does not hold -- no globals to
+    // initialize or reach, no `return from` channels, extern fns the
+    // runtime exports or the support object has trampolines for -- and a
+    // plain main without threads. Else why not.
+    bool WholeProgram(CodeGen &cg, string &why) {
+        auto mainsf = ast.MainFunction();
+        auto mainsp = mainsf && !mainsf->specs.empty() ? mainsf->specs[0] : nullptr;
+        if (!mod) why = "nothing compiled";
+        else if (!left.empty()) why = cat(left.size(), " function(s) left to C");
+        else if (cg.library) why = "a library";
+        else if (!mainsp || !cg.sinfo.count(mainsp) || !mainsp->params.empty() ||
+                 !cg.sinfo[mainsp].freevars.empty())
+            why = "no plain main";
+        else if (cg.usesthreads || !cg.queues.empty()) why = "threads";
+        else if (!cg.noglobalinit) why = "globals to initialize";
+        if (!why.empty()) return false;
+        for (auto sf : ast.functions)
+            if (sf->isexport) return why = "export fns", false;
+        for (auto &sh : mod->shims)
+            if (TgFixedShim(sh.first).empty()) return why = cat("C half's ", sh.first), false;
+        for (auto sp : mod->externs) {
+            auto found = false;
+            for (auto &x : TgSupportExterns()) found = found || sp->sf->cname == x.name;
+            if (!found) return why = cat("extern ", sp->sf->cname), false;
+        }
+        return true;
+    }
+
+    // The C main of a whole program build, which the C half otherwise
+    // writes (CodeGen::EmitProgramInit, EmitMain): the runtime started
+    // with the program's stack counts, fn main() run, the stack report.
+    // In the debugger it is `main` at fn main()'s line.
+    void EmitMain(CodeGen &cg) {
+        auto m = mod->m;
+        auto mainsp = ast.MainFunction()->specs[0];
+        auto i32 = tyg_type_int(m, TYG_I32, 1), i64 = tyg_type_int(m, TYG_I64, 1);
+        auto ptr = tyg_type_ptr(m);
+        const tyg_type *ps[] = { i32, ptr };
+        auto p = tyg_proc_begin(m, mod->Sym("main", TYG_SYM_FUNC | TYG_SYM_GLOBAL),
+                                tyg_sig_new(m, i32, ps, 2, 0));
+        auto line = mainsp->sf->line;
+        auto file = mod->File(line.fileidx);
+        auto dint = tyg_dt_base(m, "int", 4, TYG_DT_SIGNED);
+        const tyg_dtype *pdt[] = { dint, tyg_dt_pointer(m, tyg_dt_void(m)) };
+        tyg_debug_proc(p, "main", file, line.line, tyg_dt_func(m, dint, pdt, 2, 0));
+        tyg_loc(p, file, line.line, 0);
+        auto call = [&](tyg_sig *sig, const string &name, vector<tyg_val> args) {
+            vector<tyg_arg> as;
+            for (auto a : args) {
+                tyg_arg x {};
+                x.val = a;
+                as.push_back(x);
+            }
+            tyg_call(p, sig, tyg_direct(mod->Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL)), as.data(),
+                     (int)as.size(), nullptr, nullptr);
+        };
+        const tyg_type *sps[] = { i32, ptr, i64, i64, i64 };
+        call(tyg_sig_new(m, nullptr, sps, 5, 0), "gs_tg_start",
+             { tyg_param(p, 0), tyg_param(p, 1), tyg_iconst(p, TYG_I64, cg.rtinit[0]),
+               tyg_iconst(p, TYG_I64, cg.rtinit[1]), tyg_iconst(p, TYG_I64, cg.rtinit[2]) });
+        vector<tyg_val> margs;
+        if (cg.sinfo[mainsp].needssp) margs.push_back(tyg_iconst(p, TYG_I64, 0));
+        call(mod->Sig(mainsp), cg.sinfo[mainsp].cname, margs);
+        call(tyg_sig_new(m, nullptr, nullptr, 0, 0), "gs_tg_end", {});
+        tyg_ret(p, tyg_iconst(p, TYG_I32, 0));
+        if (tyg_proc_end(p) != 0)
+            throw CompileError { cat("tinygen: main: ", tyg_error(m) ? tyg_error(m) : "?") };
     }
 
     bool Write(const string &path, string &err) {

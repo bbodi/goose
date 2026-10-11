@@ -791,6 +791,7 @@ inline void CodeGen::EmitGlobalInit() {
     cscopes.clear();
     stackown[nullptr] = std::max(stackown[nullptr], stkmax);
     auto decls = HoistAggregateDecls(body);
+    noglobalinit = decls.empty() && body.empty();
     Append(code, "static void gs_init_globals(void) {\n");
     code += decls;
     code += body;
@@ -840,10 +841,12 @@ inline void CodeGen::EmitProgramInit() {
         EmitThreadThunk(sp, stacks);
         workerregions = std::max(workerregions, stacks + thunkregions[sp]);
     }
+    rtinit[0] = mainstacks;
+    rtinit[1] = mainstacks + globalregions;
+    rtinit[2] = workerregions;
     Append(code, "static void gs_program_init(int argc, char **argv) {\n"
                  "    if (gs_program_initialized) return;\n"
-                 "    gs_rt_init(argc, argv, ", mainstacks, ", ", mainstacks + globalregions,
-           ", ", workerregions, ");\n");
+                 "    gs_rt_init(argc, argv, ", rtinit[0], ", ", rtinit[1], ", ", rtinit[2], ");\n");
     // The queues, before anything that could use one runs.
     vector<string> qnames;
     for (auto &[m, q] : queues) qnames.push_back(q);
