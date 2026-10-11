@@ -1517,7 +1517,9 @@ struct TgModule {
     // a resizable by its header's address and then its stack. Pools and
     // frame objects are not held.
     bool FvOk(const VarDef *fv) {
-        if (!fv->type || cg.PrefVar(fv)) return false;
+        if (!fv->type) return false;
+        // A pool reference handed on (a parameter's), by the address of its gs_pref.
+        if (cg.PrefVar(fv)) return cg.IsFatRef(fv->type) && TypeOk(fv->type);
         if (fv->reusable) return IsGrow(fv->type) && RzOk(fv->type);   // A gs_pref.
         return TypeOk(fv->type) || ((IsGrow(fv->type) || IsVarArr(fv->type)) && RzOk(fv->type)) || VsOk(fv->type) ||
                VrOk(fv->type) || RcOk(fv->type) || FoOk(fv->type) || RbOk(fv->type) ||
@@ -8780,6 +8782,18 @@ struct TgFn {
         // sees the variable itself under its name, reached through the
         // address (tyg_debug_var_ref), where the C half shows a pointer.
         for (auto fv : cg.sinfo[sp].freevars) {
+            if (cg.PrefVar(fv)) {
+                // A pool reference of the enclosing function, by the address
+                // of its gs_pref (SigParams): read as a pool reference
+                // parameter is.
+                auto pr = tyg_local_new(p, 32, 8);
+                tyg_copy(p, tyg_at_local(pr, 0), tyg_at_val(tyg_param(p, pi++), 0), 32);
+                locals[fv] = pr;
+                prefs[fv] = pr;
+                tyg_debug_var(p, string(fv->name).c_str(), M.DT(fv->type), tyg_at_local(pr, 0),
+                              M.File(fv->line.fileidx), fv->line.line);
+                continue;
+            }
             auto loc = param();
             locals[fv] = loc;
             indirect.insert(fv);
