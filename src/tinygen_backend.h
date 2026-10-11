@@ -1339,7 +1339,7 @@ struct TgModule {
         if (!fv->type || cg.PrefVar(fv)) return false;
         if (fv->reusable) return IsGrow(fv->type) && RzOk(fv->type);   // A gs_pref.
         return TypeOk(fv->type) || ((IsGrow(fv->type) || IsVarArr(fv->type)) && RzOk(fv->type)) || VsOk(fv->type) ||
-               RcOk(fv->type) ||
+               RcOk(fv->type) || FoOk(fv->type) ||
                VmOk(fv->type) || VvOk(fv->type) || VarImgOk(fv->type) || VeOk(fv->type);
     }
 
@@ -1369,7 +1369,7 @@ struct TgModule {
                 continue;
             }
             ps.push_back(tyg_type_ptr(m));
-            if (IsGrow(fv->type)) ps.push_back(tyg_type_ptr(m));   // its stack
+            if (Resz(fv->type)) ps.push_back(tyg_type_ptr(m));   // its stack
         }
         for (size_t i = 0; i < sp->rets.size(); i++) {
             if (Resz(sp->rets[i])) {
@@ -2219,7 +2219,7 @@ struct TgFn {
         if (indirect.count(vd)) {
             P pl { tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(it->second, 0), 0), 0), vd->type };
             // A captured resizable: its header's address, its stack.
-            if (auto s = rzstk.find(vd); s != rzstk.end() && IsGrow(vd->type))
+            if (auto s = rzstk.find(vd); s != rzstk.end() && M.Resz(vd->type))
                 pl.stk = tyg_load(p, TYG_I64, tyg_at_local(s->second, 0), 0);
             return pl;
         }
@@ -4393,7 +4393,7 @@ struct TgFn {
             tyg_arg a {};
             a.val = tyg_addr_of(p, pl.a);
             args.push_back(a);
-            if (IsGrow(v->type)) {
+            if (M.Resz(v->type)) {
                 if (!pl.stk) No(c->line, "free variable without its stack");
                 tyg_arg k {};
                 k.val = pl.stk;
@@ -7128,7 +7128,7 @@ struct TgFn {
         }
         for (auto fv : cg.sinfo[sp].freevars) {
             pdt.push_back(tyg_dt_pointer(m, M.DT(fv->type)));
-            if (IsGrow(fv->type)) pdt.push_back(tyg_dt_pointer(m, M.StackDT()));
+            if (M.Resz(fv->type)) pdt.push_back(tyg_dt_pointer(m, M.StackDT()));
             if (fv->reusable) {
                 pdt.push_back(tyg_dt_pointer(m, M.DT(fv->type)));
                 pdt.push_back(tyg_dt_pointer(m, M.StackDT()));
@@ -7164,7 +7164,7 @@ struct TgFn {
             indirect.insert(fv);
             tyg_debug_var_ref(p, string(fv->name).c_str(), M.DT(fv->type), tyg_at_local(loc, 0),
                               M.File(fv->line.fileidx), fv->line.line);
-            if (IsGrow(fv->type)) rzstk[fv] = param();
+            if (M.Resz(fv->type)) rzstk[fv] = param();
             if (fv->reusable) {
                 // A pool, as gs_pref: its freelist's header and stack too.
                 auto pr = tyg_local_new(p, 32, 8);
