@@ -304,7 +304,7 @@ struct TgModule {
             case TY_STRUCT: {
                 if (!cg.IsFix(t) || cg.IsLargeFixed(t)) return false;
                 auto si = cg.SI(t);
-                if (!si || EmptyLayout(si->st->fields)) return false;
+                if (!si) return false;
                 if (Reentered(t)) return true;   // Through an optional (OptRef).
                 Open open { this, t };
                 for (size_t i = 0; i < si->st->fields.size(); i++) {
@@ -370,7 +370,7 @@ struct TgModule {
                 }
                 if (cg.IsLargeFixed(t)) return "large fixed value";
                 auto si = cg.SI(t);
-                if (!si || EmptyLayout(si->st->fields)) return "empty struct";
+                if (!si) return "empty struct";
                 if (Reentered(t)) return "";
                 Open open { this, t };
                 for (size_t i = 0; i < si->st->fields.size(); i++) {
