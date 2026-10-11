@@ -1807,7 +1807,9 @@ struct TgFn {
         }
         if (c->builtin == B_FORMAT && c->ArgNodes().size() >= 1) return GenFormat(c);
         if (c->builtin >= 0) No(c->line, cat("builtin ", BuiltinByKind(c->builtin).name));
-        if (c->fvbody || !c->dispatch.empty() || !c->spec) No(c->line, "call kind");
+        if (c->fvbody) return GenFvCall(c);
+        if (!c->dispatch.empty()) No(c->line, "call kind: dispatch");
+        if (!c->spec) No(c->line, "call kind");
         auto callee = c->spec;
         auto an = c->ArgNodes();
         if (an.size() < callee->argtypes.size()) No(c->line, "argument count");
@@ -1922,6 +1924,36 @@ struct TgFn {
             else lastrets.push_back(rets[i]);
         }
         return lastrets.empty() ? V {} : lastrets[0];
+    }
+
+    // A call of a function value (§7.6; CodeGen::EmitFvCall): the checked
+    // body instance spliced in here, its parameters ordinary locals bound
+    // to the arguments in order, in a scope of its own. Its value is a
+    // copy (§4.1), so that a slice of it never points into a variable the
+    // body names.
+    V GenFvCall(Call *c) {
+        auto et = c->fvbody->exprtype;
+        auto wantsval = !cg.IsVoidT(et);
+        if (wantsval && !M.TypeOk(et)) No(c->line, cat("function value of type ", M.Name(et)));
+        if (c->fvparams.size() > c->args.size()) No(c->line, "function value parameters");
+        tyg_scope_begin(p);
+        OpenScope(false);
+        for (size_t i = 0; i < c->fvparams.size(); i++) {
+            Declare(c->fvparams[i], c->args[i]->line);
+            Init(c->fvparams[i], c->args[i], c->args[i]->line);
+        }
+        auto x = GenBlock(c->fvbody, !wantsval);
+        if (wantsval && x.mem && !Ended()) {
+            auto t = Temp(x.t);
+            P pl { tyg_at_local(t, 0), x.t };
+            Store(pl, x);
+            x.a = pl.a;
+        }
+        CloseScope();
+        tyg_scope_end(p);
+        if (!wantsval) return V {};
+        if (Ended()) return Dummy(et);
+        return x;
     }
 
     // v.push(x) for a fixed element (EmitPush): the receiver, then the
@@ -2575,26 +2607,27 @@ struct TgFn {
         // Every local first, so that a resizable one's stack lies under
         // what its initializer takes for itself.
         for (auto d : vd->defs) Declare(d, vd->line);
-        for (size_t i = 0; i < vd->defs.size(); i++) {
-            auto d = vd->defs[i];
-            P pl { tyg_at_local(locals[d], 0), d->type };
-            if (IsVarArr(d->type)) {
-                // Built on its own stack.
-                auto stk = tyg_load(p, TYG_I64, tyg_at_local(rzstk[d], 0), 0);
-                auto img = GenImg(vd->inits.empty() ? nullptr : vd->inits[i], stk, d->type, vd->line);
-                if (!Ended()) tyg_store(p, TYG_I64, pl.a, img, 0);
-                continue;
-            }
-            if (IsGrow(d->type)) {
-                // Built in place, on its own stack.
-                if (!vd->inits.empty())
-                    GenRz(vd->inits[i], tyg_load(p, TYG_I64, tyg_at_local(rzstk[d], 0), 0), pl.a, d->type,
-                          vd->line);
-                continue;
-            }
-            if (vd->inits.empty()) tyg_zero(p, pl.a, M.Size(d->type));
-            else Into(pl, vd->inits[i]);
+        for (size_t i = 0; i < vd->defs.size(); i++)
+            Init(vd->defs[i], vd->inits.empty() ? nullptr : vd->inits[i], vd->line);
+    }
+    // A declared local's first value: init's, or zero bytes (an empty
+    // array) where there is none.
+    void Init(VarDef *d, Node *init, Line l) {
+        P pl { tyg_at_local(locals[d], 0), d->type };
+        if (IsVarArr(d->type)) {
+            // Built on its own stack.
+            auto stk = tyg_load(p, TYG_I64, tyg_at_local(rzstk[d], 0), 0);
+            auto img = GenImg(init, stk, d->type, l);
+            if (!Ended()) tyg_store(p, TYG_I64, pl.a, img, 0);
+            return;
         }
+        if (IsGrow(d->type)) {
+            // Built in place, on its own stack.
+            if (init) GenRz(init, tyg_load(p, TYG_I64, tyg_at_local(rzstk[d], 0), 0), pl.a, d->type, l);
+            return;
+        }
+        if (!init) tyg_zero(p, pl.a, M.Size(d->type));
+        else Into(pl, init);
     }
 
     void StmtAssign(Assign *a) {
