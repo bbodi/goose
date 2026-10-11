@@ -9,7 +9,8 @@ with chosen functions left to C, so that calls cross between the two
 halves in both directions (structs, arrays and slices, multiple results,
 strings and resizable arrays handed in, and built at a destination,
 u8[] values, arrays shrunk and resized, free variables of nested
-functions, function values, globals on dedicated stacks);
+functions, function values, globals on dedicated stacks, `return from`
+through frames of both halves);
 the other programs are ones the backend covers in part. Where lldb is installed, one program is run under it to see
 that the debugger finds a Goose function by name and shows its Goose source
 line, its parameters and its locals with their Goose types.
@@ -94,6 +95,17 @@ PROGRAMS = [
     ("test/tinygen/tinygen_gstacks.goose", False, ["--tinygen-skip=main"]),
     ("test/tinygen/tinygen_gstacks.goose", False,
      ["--tinygen-skip=record,sum,copied,add_point,name_len,shout,reassign"]),
+    ("test/tinygen/tinygen_retfrom.goose", True, []),
+    ("test/tinygen/tinygen_retfrom.goose", True, ["--debug"]),
+    ("test/tinygen/tinygen_retfrom.goose", False, ["--tinygen-skip=main"]),
+    # Targets in C, the returns and the frames between in tinygen; then
+    # the other way round; then the frames between in C.
+    ("test/tinygen/tinygen_retfrom.goose", False,
+     ["--tinygen-skip=search,check,split,fwd,inner,owner,first_over"]),
+    ("test/tinygen/tinygen_retfrom.goose", False,
+     ["--tinygen-skip=dig,bad,split_fail,forward,inner_leave,deep2,each,leave_nest"]),
+    ("test/tinygen/tinygen_retfrom.goose", False,
+     ["--tinygen-skip=deep,outer,after_owner,give,nest,point"]),
     ("test/codegen/loop_invariant_divisors.goose", False, []),
     ("test/codegen/cnames.goose", False, []),
     ("test/codegen/wider_slot_operations.goose", False, []),
