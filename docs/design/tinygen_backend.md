@@ -272,7 +272,7 @@ backend compiles:
 | third, so far (+ zero `default<T>()`, globals in whole programs) | 2253 of 3811 (59%) | 172 of 172 |
 | third, so far (+ composites rendered by `print` and `str`) | 2276 of 3811 (60%) | 172 of 172 |
 | third, so far (+ `.=`, `block`, `loop` values, integer `match`) | 2334 of 3811 (61%) | 172 of 172 |
-| third, so far (+ static-capacity limited arrays `T[..k]`, variable-size structs) | measured after the merge | 172 of 172 |
+| third, so far (+ static-capacity limited arrays `T[..k]`, variable-size structs) | 2575 of 3811 (68%), 87 whole programs | 172 of 172 |
 
 (The first stage's own write-up counted 394 of 3331 over 284 programs, an
 older sweep; the rows above come from the same one.) The step that added
