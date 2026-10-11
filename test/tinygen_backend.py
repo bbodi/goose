@@ -10,7 +10,8 @@ halves in both directions (structs, arrays and slices, multiple results,
 strings and resizable arrays handed in, and built at a destination,
 u8[] values, arrays shrunk and resized, free variables of nested
 functions, function values, globals on dedicated stacks, `return from`
-through frames of both halves, values rendered by print and str);
+through frames of both halves, values rendered by print and str, block, loop and match values and
+references rebound);
 the other programs are ones the backend covers in part. A program
 tinygen covers whole that needs nothing of a C half (WHOLE_PROGRAM) must
 build without the C compiler compiling any C of its own, and again on the
@@ -114,6 +115,11 @@ PROGRAMS = [
     ("test/tinygen/tinygen_render.goose", True, ["--debug"]),
     ("test/tinygen/tinygen_render.goose", False, ["--tinygen-skip=main"]),
     ("test/tinygen/tinygen_render.goose", False, ["--tinygen-skip=show,label,points,link"]),
+    ("test/tinygen/tinygen_control.goose", True, []),
+    ("test/tinygen/tinygen_control.goose", True, ["--debug"]),
+    ("test/tinygen/tinygen_control.goose", False, ["--tinygen-skip=main"]),
+    ("test/tinygen/tinygen_control.goose", False,
+     ["--tinygen-skip=classify,small,side,valued,first_over,larger"]),
     ("test/codegen/loop_invariant_divisors.goose", False, []),
     ("test/codegen/cnames.goose", False, []),
     ("test/codegen/wider_slot_operations.goose", False, []),
@@ -128,7 +134,7 @@ WHOLE_PROGRAM = {
     "tinygen_slicefail", "tinygen_results", "tinygen_build", "tinygen_text",
     "tinygen_shrink", "tinygen_nested", "tinygen_funvals", "20_life",
     "loop_invariant_divisors", "tinygen_globals", "tinygen_gstacks", "tinygen_retfrom",
-    "tinygen_render", "tinygen_strings",
+    "tinygen_render", "tinygen_strings", "tinygen_control",
 }
 
 

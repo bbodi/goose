@@ -814,6 +814,9 @@ struct TgFn {
     struct LoopTargets {
         tyg_block brk, cnt;
         size_t depth;   // The stack scopes open outside the body (sscopes).
+        tyg_local res = 0;        // Where a break's value goes, if wanted,
+        TypeExpr *rt = nullptr;   // of this type.
+        bool block = false;       // A block, which continue passes by.
     };
     vector<LoopTargets> loops;
     // Each result's channel (CodeGen::SigParams), its parameters kept in
@@ -1417,8 +1420,11 @@ struct TgFn {
             case NK_StructLit: return GenStructLit(static_cast<StructLit *>(n));
             case NK_Block: return GenBlock(static_cast<Block *>(n), false);
             case NK_IfExpr: return GenIf(static_cast<IfExpr *>(n), false);
+            case NK_EarlyBlock: return GenEarly(static_cast<EarlyBlock *>(n), false);
+            case NK_LoopExpr: return GenLoopX(static_cast<LoopExpr *>(n), false);
+            case NK_MatchExpr: return GenMatch(static_cast<MatchExpr *>(n), false);
             case NK_Return: case NK_Break: case NK_Continue: case NK_VarDecl: case NK_Assign:
-            case NK_IncDec: case NK_While: case NK_ForLoop: case NK_LoopExpr:
+            case NK_IncDec: case NK_While: case NK_ForLoop:
                 Stmt(n);
                 return Dummy(n->exprtype && n->exprtype->kind != TY_VOID ? n->exprtype : nullptr);
             default:
@@ -2739,6 +2745,104 @@ struct TgFn {
         return Load(P { tyg_at_local(res, 0), et }, i->line);
     }
 
+    // A value a loop, block or match delivers, if wanted: of a type held.
+    bool Valued(Node *n, bool discard) {
+        auto et = n->exprtype;
+        if (discard || !et || et->kind == TY_VOID) return false;
+        if (!M.TypeOk(et)) No(n->line, cat("value of type ", M.NameWhy(et)));
+        return true;
+    }
+
+    // `block { ... }` (EarlyBlock::CgAny): its tail's value, or a break's.
+    V GenEarly(EarlyBlock *e, bool discard) {
+        auto valued = Valued(e, discard);
+        auto et = e->exprtype;
+        tyg_local res = valued ? Temp(et) : 0;
+        auto done = tyg_block_new(p);
+        loops.push_back({ done, done, sscopes.size(), res, valued ? et : nullptr, true });
+        auto x = GenBlock(e->body, !valued);
+        loops.pop_back();
+        if (valued && !Ended() && x.t) Store(P { tyg_at_local(res, 0), et }, Fit(x, et, e->line));
+        Jump(done);
+        tyg_block_set(p, done);
+        if (!valued) return V {};
+        return Load(P { tyg_at_local(res, 0), et }, e->line);
+    }
+
+    // `loop { ... }`, its value a break's.
+    V GenLoopX(LoopExpr *lp, bool discard) {
+        auto valued = std::any_of(lp->breaks.begin(), lp->breaks.end(), [](Break *b) { return b->val; }) &&
+                      Valued(lp, discard);
+        auto et = lp->exprtype;
+        tyg_local res = valued ? Temp(et) : 0;
+        auto body = tyg_block_new(p), done = tyg_block_new(p);
+        tyg_jump(p, body);
+        tyg_block_set(p, body);
+        loops.push_back({ done, body, sscopes.size(), res, valued ? et : nullptr });
+        GenBlock(lp->body, true);
+        loops.pop_back();
+        Jump(body);
+        tyg_block_set(p, done);
+        if (!valued) return V {};
+        return Load(P { tyg_at_local(res, 0), et }, lp->line);
+    }
+
+    // An integer match (MatchExpr::CgAny): the scrutinee evaluated once,
+    // then the arms tested in order, each listed value or range at the
+    // scrutinee's type, unsigned for an unsigned one. ADTs are not held.
+    V GenMatch(MatchExpr *me, bool discard) {
+        auto ot = cg.OperandT(me->scrutinee->exprtype);
+        if (!ot || ot->kind != TY_INT || ot->intstorage == IS_VARINT)
+            No(me->line, cat("match over type ", ot ? M.NameWhy(ot) : string("?")));
+        auto valued = Valued(me, discard);
+        auto et = me->exprtype;
+        tyg_local res = valued ? Temp(et) : 0;
+        auto uns = IsUnsigned(ot->intstorage);
+        auto x0 = Conv(GenAs(me->scrutinee, ot).v, ot, M.ast.inttypes[IS_I64], me->line);
+        if (Ended()) return valued ? Dummy(et) : V {};
+        auto xl = tyg_local_new(p, 8, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(xl, 0), x0, 0);
+        auto x = [&] { return tyg_load(p, TYG_I64, tyg_at_local(xl, 0), 0); };
+        auto k = [&](int64_t v) { return tyg_iconst(p, TYG_I64, v); };
+        auto done = tyg_block_new(p);
+        auto arm = [&](Node *body) {
+            auto v = GenArm(body, !valued);
+            if (valued && !Ended() && v.t) Store(P { tyg_at_local(res, 0), et }, Fit(v, et, body->line));
+            Jump(done);
+        };
+        auto wild = false;
+        for (auto &a : me->arms) {
+            if (a.binder) No(me->line, "match arm with a binding");
+            if (a.pat.kind == P_WILDCARD) {
+                arm(a.body);
+                wild = true;
+                break;
+            }
+            auto hit = tyg_block_new(p), next = tyg_block_new(p);
+            for (size_t i = 0; i < a.ranges.size(); i++) {
+                auto &r = a.ranges[i];
+                auto miss = i + 1 < a.ranges.size() ? tyg_block_new(p) : next;
+                if (r.lo == r.hi) {
+                    tyg_branch(p, tyg_cmp(p, TYG_EQ, x(), k(r.lo)), hit, miss);
+                } else {
+                    auto upper = tyg_block_new(p);
+                    tyg_branch(p, tyg_cmp(p, uns ? TYG_UGE : TYG_SGE, x(), k(r.lo)), upper, miss);
+                    tyg_block_set(p, upper);
+                    tyg_branch(p, tyg_cmp(p, uns ? TYG_ULE : TYG_SLE, x(), k(r.hi)), hit, miss);
+                }
+                if (miss != next) tyg_block_set(p, miss);
+            }
+            if (a.ranges.empty()) tyg_jump(p, next);
+            tyg_block_set(p, hit);
+            arm(a.body);
+            tyg_block_set(p, next);
+        }
+        if (!wild) Jump(done);
+        tyg_block_set(p, done);
+        if (!valued) return V {};
+        return Load(P { tyg_at_local(res, 0), et }, me->line);
+    }
+
     // ---- Statements ----------------------------------------------------------
 
     // A statement's temporaries' stacks are free again at its end.
@@ -2781,19 +2885,9 @@ struct TgFn {
                 tyg_block_set(p, done);
                 return;
             }
-            case NK_LoopExpr: {
-                auto lp = static_cast<LoopExpr *>(n);
-                for (auto b : lp->breaks) if (b->val) No(n->line, "loop with a value");
-                auto body = tyg_block_new(p), done = tyg_block_new(p);
-                tyg_jump(p, body);
-                tyg_block_set(p, body);
-                loops.push_back({ done, body, sscopes.size() });
-                GenBlock(lp->body, true);
-                loops.pop_back();
-                Jump(body);
-                tyg_block_set(p, done);
-                return;
-            }
+            case NK_LoopExpr: GenLoopX(static_cast<LoopExpr *>(n), true); return;
+            case NK_EarlyBlock: GenEarly(static_cast<EarlyBlock *>(n), true); return;
+            case NK_MatchExpr: GenMatch(static_cast<MatchExpr *>(n), true); return;
             case NK_ForLoop: return StmtFor(static_cast<ForLoop *>(n));
             case NK_Return: {
                 auto r = static_cast<Return *>(n);
@@ -2802,18 +2896,33 @@ struct TgFn {
                 return DoReturn(r->vals, r->line);
             }
             case NK_Break: {
+                // To the innermost loop or block (CodeGen::GenBreakPath):
+                // its value first, then the stacks of the scopes left.
                 auto b = static_cast<Break *>(n);
-                if (b->val) No(n->line, "break with a value");
                 if (loops.empty()) No(n->line, "break target");
-                RestoreFrom(loops.back().depth);
-                tyg_jump(p, loops.back().brk);
+                auto t = loops.back();
+                if (b->val) {
+                    if (t.rt) {
+                        auto x = GenAs(b->val, t.rt);
+                        if (!M.IsScalar(t.rt) && !x.mem && !Ended()) No(n->line, "aggregate value");
+                        Store(P { tyg_at_local(t.res, 0), t.rt }, x);
+                    } else {
+                        Stmt1(b->val);
+                    }
+                    if (Ended()) return;
+                }
+                RestoreFrom(t.depth);
+                tyg_jump(p, t.brk);
                 return;
             }
-            case NK_Continue:
-                if (loops.empty()) No(n->line, "continue target");
-                RestoreFrom(loops.back().depth);
-                tyg_jump(p, loops.back().cnt);
+            case NK_Continue: {
+                auto i = loops.size();
+                while (i > 0 && loops[i - 1].block) i--;
+                if (i == 0) No(n->line, "continue target");
+                RestoreFrom(loops[i - 1].depth);
+                tyg_jump(p, loops[i - 1].cnt);
                 return;
+            }
             case NK_FnDecl: case NK_StructDecl: case NK_EnumDecl: case NK_AliasDecl: return;
             case NK_Block: GenBlock(static_cast<Block *>(n), true); return;
             case NK_IfExpr: GenIf(static_cast<IfExpr *>(n), true); return;
