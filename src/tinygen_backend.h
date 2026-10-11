@@ -7047,7 +7047,7 @@ struct TgFn {
                 No(c->line, cat("thread program with a global of type ", M.NameWhy(d->type)));
         for (size_t i = 0; i < w->argtypes.size(); i++) {
             auto pt = w->argtypes[i];
-            if (cg.IsPoolParam(w, i) || (M.RzParam(pt) ? !QueueOk(pt) : !M.TypeOk(pt)))
+            if (cg.IsPoolParam(w, i) || (M.RzParam(pt) ? !(QueueOk(pt) || (M.IsRs(pt) && M.RsOk(pt))) : !M.TypeOk(pt)))
                 No(c->line, cat("thread argument of type ", M.NameWhy(pt)));
         }
         cg.usesthreads = true;
@@ -7059,6 +7059,23 @@ struct TgFn {
             if (M.Resz(pt)) {
                 // [int64 size][flat image]: the worker's thunk rebuilds the
                 // header on a stack of its own (CodeGen::EmitThreadSpawn).
+                if (M.IsRs(pt)) {
+                    // A variable-prefix struct: built straight into the
+                    // packet, prefix and tail elements as they lie, the
+                    // count from its header (CodeGen::EmitThreadSpawn).
+                    auto szp = Top(stk);
+                    auto cntp = tyg_at_val(tyg_bin(p, TYG_ADD, szp, tyg_iconst(p, TYG_I64, 8)), 0);
+                    SetTop(stk, tyg_bin(p, TYG_ADD, szp, tyg_iconst(p, TYG_I64, 16)));
+                    auto hdr = tyg_at_local(tyg_local_new(p, 16, 8), 0);
+                    auto hlen = hdr;
+                    hlen.offset += 8;
+                    GenRs(an[1 + i], stk, hdr, pt, c->line);
+                    if (Ended()) return Dummy(M.ast.inttypes[IS_I64]);
+                    tyg_store(p, TYG_I64, cntp, tyg_load(p, TYG_I64, hlen, 0), 0);
+                    tyg_store(p, TYG_I64, tyg_at_val(szp, 0),
+                              tyg_bin(p, TYG_SUB, Top(stk), tyg_bin(p, TYG_ADD, szp, tyg_iconst(p, TYG_I64, 8))), 0);
+                    continue;
+                }
                 auto src = RzValue(an[1 + i], pt, c->line);
                 if (Ended()) return Dummy(M.ast.inttypes[IS_I64]);
                 auto szp = Top(stk);
