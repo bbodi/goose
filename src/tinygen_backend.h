@@ -286,7 +286,8 @@ struct TgModule {
                 if (IsRel(t)) return depth > 0 && RelOk(t, depth);
                 return (IsPlainRef(t) || OptRef(t)) &&
                        ((cg.IsFix(t->ref->sub) && TypeOk(t->ref->sub, depth + 1)) || IsVarint(t->ref->sub) ||
-                        ImgOk(t->ref->sub, depth + 1) || (IsPlainRef(t) && FoOk(t->ref->sub, depth + 1)));
+                        ImgOk(t->ref->sub, depth + 1) ||
+                        (IsPlainRef(t) && (FoOk(t->ref->sub, depth + 1) || VeOk(t->ref->sub, depth + 1))));
             case TY_ARRAY:
                 // T[k]: k elements, packed; a static-capacity T[..k], a
                 // length beside them (LimOk).
@@ -2063,6 +2064,10 @@ struct TgFn {
         // A scalar without a value comes from code after a return or break,
         // which tinygen keeps in a block that is never placed.
         if (M.IsScalar(pl.t) && !x.v) return;
+        if (M.FoOk(pl.t) && x.mem && pl.stk && x.stk) {
+            FoCopy(pl, P { x.a, x.t, x.stk }, Line {});
+            return;
+        }
         if (!M.IsScalar(pl.t) && !M.TypeOk(pl.t)) No(Line {}, cat("store of a ", M.Name(pl.t)));
         if (M.IsScalar(pl.t)) tyg_store(p, M.Scal(pl.t), pl.a, x.v, 0);
         else tyg_move(p, pl.a, x.a, M.Size(pl.t));
@@ -6348,14 +6353,41 @@ struct TgFn {
         if (f->idxdef) Declare(f->idxdef, f->line);
         auto head = tyg_block_new(p), body = tyg_block_new(p), step = tyg_block_new(p),
              done = tyg_block_new(p);
+        tyg_local wb = 0;
         if (walk) {
             cl = tyg_local_new(p, 8, 8);
-            tyg_store(p, TYG_I64, tyg_at_local(cl, 0), ViewOf(at(), f->line).elems, 0);
+            wb = tyg_local_new(p, 8, 8);
+            auto e0 = ViewOf(at(), f->line).elems;
+            tyg_store(p, TYG_I64, tyg_at_local(cl, 0), e0, 0);
+            tyg_store(p, TYG_I64, tyg_at_local(wb, 0), e0, 0);
         }
         tyg_jump(p, head);
         tyg_block_set(p, head);
         Loc(f->line);
         auto v = ViewOf(at(), f->line);
+        if (walk && path) {
+            // The path re-pointed: the cursor walks to the same index from
+            // the start of the elements it leads to now.
+            auto moved = tyg_block_new(p), rewalk = tyg_block_new(p), more = tyg_block_new(p), same = tyg_block_new(p);
+            tyg_branch(p, tyg_cmp(p, TYG_NE, v.elems, tyg_load(p, TYG_I64, tyg_at_local(wb, 0), 0)), moved, same);
+            tyg_block_set(p, moved);
+            tyg_store(p, TYG_I64, tyg_at_local(wb, 0), v.elems, 0);
+            tyg_store(p, TYG_I64, tyg_at_local(cl, 0), v.elems, 0);
+            auto k = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(k, 0), tyg_iconst(p, TYG_I64, 0), 0);
+            tyg_jump(p, rewalk);
+            tyg_block_set(p, rewalk);
+            tyg_branch(p, tyg_cmp(p, TYG_SLT, tyg_load(p, TYG_I64, tyg_at_local(k, 0), 0),
+                                  tyg_load(p, TYG_I64, tyg_at_local(gi, 0), 0)), more, same);
+            tyg_block_set(p, more);
+            auto c1 = tyg_load(p, TYG_I64, tyg_at_local(cl, 0), 0);
+            tyg_store(p, TYG_I64, tyg_at_local(cl, 0), tyg_bin(p, TYG_ADD, c1, ImgSize(ielem, c1)), 0);
+            tyg_store(p, TYG_I64, tyg_at_local(k, 0),
+                      tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, tyg_at_local(k, 0), 0), tyg_iconst(p, TYG_I64, 1)), 0);
+            tyg_jump(p, rewalk);
+            tyg_block_set(p, same);
+            v = ViewOf(at(), f->line);
+        }
         auto i = tyg_load(p, TYG_I64, tyg_at_local(gi, 0), 0);
         tyg_branch(p, tyg_cmp(p, TYG_SLT, i, v.len), body, done);
         tyg_block_set(p, body);
