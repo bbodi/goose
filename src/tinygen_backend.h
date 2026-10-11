@@ -281,7 +281,7 @@ struct TgModule {
                 // resizable array it reads in place (RzOk): a fat reference
                 // { hdr, stk } for a resizable one (gs_rref).
                 return IsPlainRef(t) && ((cg.IsFix(t->ref->sub) && TypeOk(t->ref->sub, depth + 1)) ||
-                                         RzOk(t->ref->sub, depth + 1));
+                                         ImgOk(t->ref->sub, depth + 1));
             case TY_ARRAY:
                 // T[k]: k elements, packed; a static-capacity T[..k], a
                 // length beside them (LimOk).
@@ -314,7 +314,7 @@ struct TgModule {
             case TY_REF:
                 if (t->ref->optional) return "optional";
                 if (!IsPlainRef(t)) return "relative reference";
-                if (RzOk(t->ref->sub, depth + 1)) return "";
+                if (ImgOk(t->ref->sub, depth + 1)) return "";
                 return Blocker(t->ref->sub, depth + 1);
             case TY_SLICE:
                 return cg.IsFix(t->sub) ? Blocker(t->sub, depth + 1) : "variable-size elements";
@@ -342,7 +342,17 @@ struct TgModule {
             case TY_STRUCT: {
                 if (Name(t).rfind("dictionary", 0) == 0) return "dictionary";
                 if (Name(t).rfind("vec", 0) == 0) return "SIMD vector";
-                if (!cg.IsFix(t)) return "variable-size struct";
+                if (cg.IsFrameObj(t)) return "frame object";
+                if (!cg.IsFix(t)) {
+                    if (VsOk(t, depth)) return "";
+                    auto si = cg.SI(t);
+                    for (size_t i = 0; i < si->st->fields.size(); i++) {
+                        if (si->st->fields[i].ispad) continue;
+                        auto b = Blocker(si->ftypes[i], depth + 1);
+                        if (!b.empty() && b != "variable-size value") return cat("variable-size struct with ", b);
+                    }
+                    return "variable-size struct";
+                }
                 if (cg.IsLargeFixed(t)) return "large fixed value";
                 auto si = cg.SI(t);
                 if (!si || EmptyLayout(si->st->fields)) return "empty struct";
@@ -386,6 +396,8 @@ struct TgModule {
         }
         return cg.IsFix(t->arr->sub) && TypeOk(t->arr->sub, depth + 1);
     }
+    // A variable-size struct (VsOk) is an image too, read where it lies.
+    bool ImgOk(TypeExpr *t, int depth = 0) { return RzOk(t, depth) || VsOk(t, depth); }
     static bool IsGrow(TypeExpr *t) {
         return t && t->kind == TY_ARRAY && (t->arr->akind == A_GROW || t->arr->akind == A_GROWSHRINK);
     }
@@ -402,8 +414,8 @@ struct TgModule {
             default: return 0;
         }
     }
-    // A by-value parameter of a type RzOk holds.
-    bool RzParam(TypeExpr *t) { return t->kind == TY_ARRAY && RzOk(t); }
+    // A by-value parameter of a type RzOk or VsOk holds.
+    bool RzParam(TypeExpr *t) { return (t->kind == TY_ARRAY && RzOk(t)) || VsOk(t); }
     tyg_scalar Scal(TypeExpr *t) {
         switch (t->kind) {
             case TY_INT:
@@ -562,6 +574,7 @@ struct TgModule {
                 return rec;
             }
             case TY_STRUCT: {
+                if (IsVs(t)) return VsDT(t, name);
                 auto si = cg.SI(t);
                 auto rec = tyg_dt_record(m, TYG_DT_STRUCT, name.c_str(), File(si->st->line.fileidx),
                                          si->st->line.line);
@@ -628,6 +641,65 @@ struct TgModule {
         stackdt = rec;
         tyg_dt_member(m, rec, "top", tyg_dt_pointer(m, DT(ast.inttypes[IS_U8])), 0);
         tyg_dt_record_complete(m, rec, 8, 1);
+        return rec;
+    }
+
+    // ---- Variable-size structs ----------------------------------------------
+
+    // A struct with a variable-size field (bytes class, §6.1): one image of
+    // its fields in declaration order, packed, each variable-size one (a
+    // T[], or such a struct) inline at its own size, which a uint8_t *
+    // points at, as a T[]'s does. Frame objects (a resizable field) are
+    // another representation.
+    bool IsVs(TypeExpr *t) { return t && t->kind == TY_STRUCT && !cg.IsFix(t) && !cg.IsFrameObj(t); }
+    // An image: a T[] or such a struct.
+    bool IsImg(TypeExpr *t) { return IsVarArr(t) || IsVs(t); }
+    // One this backend holds: its fields fixed values it holds, T[]s of
+    // fixed elements (RzOk), or such structs; no relative references.
+    bool VsOk(TypeExpr *t, int depth = 0) {
+        if (!IsVs(t) || depth > 32 || cg.SI(t)->sclass != SC_VARIABLE) return false;
+        auto si = cg.SI(t);
+        for (size_t i = 0; i < si->st->fields.size(); i++) {
+            if (si->st->fields[i].ispad) continue;
+            auto ft = si->ftypes[i];
+            if (cg.IsFix(ft) ? !TypeOk(ft, depth + 1) : !((IsVarArr(ft) && RzOk(ft, depth + 1)) || VsOk(ft, depth + 1)))
+                return false;
+        }
+        return true;
+    }
+    // The fewest bytes an image of t takes: its fields up to the first
+    // variable-size one, and that one's least (a T[]'s prefix).
+    int64_t VsMinSize(TypeExpr *t) {
+        if (cg.IsFix(t)) return cg.FixedSize(t);
+        if (IsVarArr(t)) return LenWidth(t);
+        auto si = cg.SI(t);
+        int64_t off = 0;
+        for (size_t i = 0; i < si->st->fields.size(); i++) {
+            auto &f = si->st->fields[i];
+            if (f.ispad) { off += f.padsize > 0 ? f.padsize : 0; continue; }
+            if (!cg.IsFix(si->ftypes[i])) return off + VsMinSize(si->ftypes[i]);
+            off += cg.FixedSize(si->ftypes[i]);
+        }
+        return off;
+    }
+    // Its debug type, under its Goose name: a record of its fields at their
+    // offsets up to and including the first variable-size one (a T[]'s
+    // `len` and `data`), where the offsets of those after it stop being
+    // constants. A variable of it is a pointer to the record, as for a T[].
+    const tyg_dtype *VsDT(TypeExpr *t, const string &name) {
+        auto si = cg.SI(t);
+        auto rec = tyg_dt_record(m, TYG_DT_STRUCT, name.c_str(), File(si->st->line.fileidx), si->st->line.line);
+        dtypes[name] = rec;
+        int64_t off = 0;
+        for (size_t i = 0; i < si->st->fields.size(); i++) {
+            auto &f = si->st->fields[i];
+            if (f.ispad) { off += f.padsize > 0 ? f.padsize : 0; continue; }
+            auto ft = si->ftypes[i];
+            tyg_dt_member(m, rec, string(f.name).c_str(), DT(ft), off);
+            if (!cg.IsFix(ft)) break;
+            off += cg.FixedSize(ft);
+        }
+        tyg_dt_record_complete(m, rec, VsMinSize(t), 1);
         return rec;
     }
 
@@ -803,14 +875,14 @@ struct TgModule {
     // A result this backend holds: a fixed value, or a resizable array or
     // a T[] image of fixed elements, built at the caller's destination
     // stack.
-    bool RetOk(TypeExpr *t) { return TypeOk(t) || ((IsGrow(t) || IsVarArr(t)) && RzOk(t)); }
+    bool RetOk(TypeExpr *t) { return TypeOk(t) || ((IsGrow(t) || IsVarArr(t)) && RzOk(t)) || VsOk(t); }
     // A free variable of a nested function (§7.5), as SigParams passes it:
     // a fixed variable by its address, a T[] by its image's address, and
     // a resizable by its header's address and then its stack. Pools and
     // frame objects are not held.
     bool FvOk(const VarDef *fv) {
         if (!fv->type || fv->reusable || cg.PrefVar(fv)) return false;
-        return TypeOk(fv->type) || ((IsGrow(fv->type) || IsVarArr(fv->type)) && RzOk(fv->type));
+        return TypeOk(fv->type) || ((IsGrow(fv->type) || IsVarArr(fv->type)) && RzOk(fv->type)) || VsOk(fv->type);
     }
 
     tyg_sig *Sig(FnSpec *sp) {
@@ -835,7 +907,7 @@ struct TgModule {
             if (IsGrow(sp->rets[i])) {
                 ps.push_back(tyg_type_ptr(m));   // gs_dst<i>
                 ps.push_back(tyg_type_ptr(m));   // gs_rl<i>
-            } else if (IsVarArr(sp->rets[i])) {
+            } else if (IsImg(sp->rets[i])) {
                 ps.push_back(tyg_type_ptr(m));   // gs_dst<i>: the image at its top
             } else if ((int)i != si.cret) {
                 ps.push_back(tyg_type_ptr(m));   // gs_r<i>
@@ -1110,6 +1182,7 @@ struct TgFn {
     // stack, a return destination.
     tyg_val imgdst = 0;
     static bool IsVarArr(TypeExpr *t) { return TgModule::IsVarArr(t); }
+    bool IsImg(TypeExpr *t) { return M.IsImg(t); }
 
     // A T[] length prefix (EmitPrefixPatch): n, checked against the
     // prefix's range as the C checks it, stored at pre.
@@ -1136,6 +1209,10 @@ struct TgFn {
     // elements (GenRz) behind a prefix patched once they are counted --
     // or the elements of `from`, or none. Its address.
     tyg_val GenImg(Node *n, tyg_val stk, TypeExpr *t, Line l, const View *from = nullptr) {
+        if (M.IsVs(t)) {
+            if (!n || from) No(l, cat("value of type ", M.NameWhy(t)));
+            return GenVs(n, stk, t, l);
+        }
         auto start = tyg_local_new(p, 8, 8);
         tyg_store(p, TYG_I64, tyg_at_local(start, 0), Top(stk), 0);
         auto at = [&] { return tyg_load(p, TYG_I64, tyg_at_local(start, 0), 0); };
@@ -1233,7 +1310,7 @@ struct TgFn {
             x.v = tyg_load(p, M.Scal(pl.t), pl.a, 0);
             return x;
         }
-        if (!M.TypeOk(pl.t) && M.RzOk(pl.t)) {
+        if (!M.TypeOk(pl.t) && M.ImgOk(pl.t)) {
             // A T[] or a resizable is read where it lies (its uses copy it).
             x.mem = true;
             x.a = pl.a;
@@ -1292,6 +1369,7 @@ struct TgFn {
 
         if (auto d = Is<Dot>(n); d && d->IsField()) {
             auto base = Deref(Place(d->obj));
+            if (M.VsOk(base.t)) return VsFieldPlace(base, d->fieldidx);
             if (base.t->kind != TY_STRUCT || !M.TypeOk(base.t)) No(n->line, "field of this type");
             auto si = cg.SI(base.t);
             auto &lay = cg.StructLayout(si);
@@ -1392,8 +1470,9 @@ struct TgFn {
             x.a = tyg_at_local(tmp, 0);
             return x;
         }
-        if (t && IsPlainRef(t) && n->exprtype && IsVarArr(n->exprtype) && M.RzOk(t->ref->sub)) {
-            // A T[] where a reference to one is wanted: its image's address.
+        if (t && IsPlainRef(t) && n->exprtype && IsImg(n->exprtype) && M.ImgOk(t->ref->sub)) {
+            // A T[] (or a variable-size struct) where a reference to one is
+            // wanted: its image's address.
             auto pl = Deref(Place(n));
             V x;
             x.t = t;
@@ -2461,7 +2540,7 @@ struct TgFn {
         for (size_t i = 0; i < callee->rets.size(); i++) {
             auto &r = rets[i];
             r.t = callee->rets[i];
-            if (IsVarArr(r.t)) {
+            if (IsImg(r.t)) {
                 // A T[]: built whole at the top of a temporary's stack, or
                 // of the one this call builds at.
                 auto stk = i == 0 && idst ? idst : Stk(AllocStk(false, c->line), c->line);
@@ -2693,6 +2772,10 @@ struct TgFn {
                 FmtScalar(stk, len, t, Load(pl, l).v);
                 return;
             case TY_STRUCT: {
+                if (M.VsOk(t)) {
+                    VsRender(stk, len, pl, l, depth);
+                    return;
+                }
                 if (!M.TypeOk(t)) break;
                 auto si = cg.SI(t);
                 auto &lay = cg.StructLayout(si);
@@ -3034,7 +3117,7 @@ struct TgFn {
                 Open();
                 Loc(b->tail->line);
                 x = Gen(b->tail);
-                if (x.t && (IsGrow(x.t) || IsVarArr(x.t))) No(b->tail->line, "array value of a block");
+                if (x.t && (IsGrow(x.t) || IsImg(x.t))) No(b->tail->line, "array value of a block");
             }
         }
         CloseScope();
@@ -3051,7 +3134,7 @@ struct TgFn {
         }
         OpenScope(true);
         auto x = Gen(n);
-        if (x.t && (IsGrow(x.t) || IsVarArr(x.t))) No(n->line, "array value of an arm");
+        if (x.t && (IsGrow(x.t) || IsImg(x.t))) No(n->line, "array value of an arm");
         CloseScope();
         return x;
     }
@@ -3272,6 +3355,7 @@ struct TgFn {
     // A resizable result is built at its destination stack, its count
     // written through its out-parameter. Then every scope's stacks are
     // restored, and the C return value returned.
+    int retopen = 0;   // Returns building their results (DoReturn).
     void DoReturn(const vector<Node *> &vals, Line l) {
         auto &rets = sp->rets;
         auto cret = cg.sinfo[sp].cret;
@@ -3291,18 +3375,32 @@ struct TgFn {
             else tyg_ret(p, x.v);
             return;
         }
+        // A return inside a value one is building at the destination
+        // (`return str("x", if c { return "y"; } else { n })`) would leave
+        // what was built in front of its own value; the C moves it down
+        // (ExitStart, LandValue). Such a function stays in C.
+        auto stacked = false;
+        for (auto r : rets) stacked = stacked || IsGrow(r) || IsImg(r);
+        if (stacked && retopen) No(l, "return inside a result under construction");
+        struct Opened {
+            int &n, by;
+            Opened(int &k, int b) : n(k), by(b) { n += by; }
+            ~Opened() { n -= by; }
+        } opened(retopen, stacked ? 1 : 0);
         vector<V> xs;
         if (vals.size() == 1 && rets.size() > 1) xs = GenCallAll(vals[0], rets.size());
         else if (vals.size() != rets.size()) No(l, "result count");
         P first {};
         if (cret >= 0) first = P { tyg_at_local(Temp(rets[cret]), 0), rets[cret] };
         for (size_t i = 0; i < rets.size(); i++) {
-            if (IsVarArr(rets[i])) {
+            if (IsImg(rets[i])) {
                 // A T[]: its image built at the destination.
                 auto dst = tyg_load(p, TYG_I64, tyg_at_local(chans[i].a, 0), 0);
                 SetTop(dst, tyg_load(p, TYG_I64, tyg_at_local(chans[i].top0, 0), 0));
                 if (xs.empty()) {
                     GenImg(vals[i], dst, rets[i], l);
+                } else if (M.IsVs(rets[i])) {
+                    VsCopy(dst, xs[i], rets[i], l);
                 } else {
                     auto v = ViewOf(P { xs[i].a, xs[i].t, xs[i].stk }, l);
                     GenImg(nullptr, dst, rets[i], l, &v);
@@ -3462,7 +3560,7 @@ struct TgFn {
                           M.File(d->line.fileidx), d->line.line);
             return;
         }
-        if (IsVarArr(d->type) && M.RzOk(d->type) && !cg.PrefVar(d)) {
+        if (((IsVarArr(d->type) && M.RzOk(d->type)) || M.VsOk(d->type)) && !cg.PrefVar(d)) {
             // A T[] local: its image's address, the image on a stack of its
             // own (built by StmtVarDecl).
             auto stk = Stk(AllocStk(true, l), l);
@@ -3492,6 +3590,11 @@ struct TgFn {
             auto xs = GenCallAll(vd->inits[0], vd->defs.size());
             for (size_t i = 0; i < xs.size(); i++) {
                 auto d = vd->defs[i];
+                if (M.IsVs(d->type) && !Ended()) {
+                    auto stk = tyg_load(p, TYG_I64, tyg_at_local(rzstk[d], 0), 0);
+                    tyg_store(p, TYG_I64, tyg_at_local(locals[d], 0), VsCopy(stk, xs[i], d->type, vd->line), 0);
+                    continue;
+                }
                 if (IsVarArr(d->type) && !Ended()) {
                     auto v = ViewOf(P { xs[i].a, xs[i].t, xs[i].stk }, vd->line);
                     auto stk = tyg_load(p, TYG_I64, tyg_at_local(rzstk[d], 0), 0);
@@ -3526,7 +3629,7 @@ struct TgFn {
     // array) where there is none.
     void Init(VarDef *d, Node *init, Line l) {
         P pl { tyg_at_local(locals[d], 0), d->type };
-        if (IsVarArr(d->type)) {
+        if (IsImg(d->type)) {
             // Built on its own stack.
             auto stk = tyg_load(p, TYG_I64, tyg_at_local(rzstk[d], 0), 0);
             auto img = GenImg(init, stk, d->type, l);
@@ -3729,6 +3832,141 @@ struct TgFn {
         tyg_scope_end(p);
     }
 
+    // ---- Variable-size structs -------------------------------------------------
+
+    // A variable-size struct the module holds (TgModule::VsOk) is a bytes
+    // value as a T[] is (§6.1): its locals, by-value parameters, results,
+    // free variables and temporaries are a T[]'s -- an image on a stack,
+    // a uint8_t * at its start (Declare, Emit, GenCall, DoReturn) -- and
+    // what differs is here: its size and its fields' addresses walk the
+    // variable-size fields before them, and it is built field by field.
+
+    // The bytes of the image of type t at `at` (CodeGen::SizeX).
+    tyg_val ImgSize(TypeExpr *t, tyg_val at) {
+        if (cg.IsFix(t)) return tyg_iconst(p, TYG_I64, cg.FixedSize(t));
+        if (IsVarArr(t)) {
+            auto v = ViewOf(P { tyg_at_val(at, 0), t }, Line {});
+            auto bytes = tyg_bin(p, TYG_MUL, v.len, tyg_iconst(p, TYG_I64, cg.FixedSize(t->arr->sub)));
+            return tyg_bin(p, TYG_ADD, bytes, tyg_iconst(p, TYG_I64, TgModule::LenWidth(t)));
+        }
+        return tyg_bin(p, TYG_SUB, VsField(t, at, -1), at);
+    }
+    // The address of field fi of the image of the struct t at `at`, or its
+    // end where fi < 0 (CodeGen::FieldPtr): a constant offset until a
+    // variable-size field intervenes, then a cursor past each one.
+    tyg_val VsField(TypeExpr *t, tyg_val at, int fi) {
+        auto si = cg.SI(t);
+        auto n = fi < 0 ? (int)si->st->fields.size() : fi;
+        int64_t off = 0;
+        auto cur = at;
+        for (int i = 0; i < n; i++) {
+            auto &f = si->st->fields[(size_t)i];
+            if (f.ispad) { off += f.padsize > 0 ? f.padsize : 0; continue; }
+            auto ft = si->ftypes[(size_t)i];
+            if (cg.IsFix(ft)) { off += cg.FixedSize(ft); continue; }
+            if (off) cur = tyg_bin(p, TYG_ADD, cur, tyg_iconst(p, TYG_I64, off));
+            off = 0;
+            cur = tyg_bin(p, TYG_ADD, cur, ImgSize(ft, cur));
+        }
+        return off ? tyg_bin(p, TYG_ADD, cur, tyg_iconst(p, TYG_I64, off)) : cur;
+    }
+    P VsFieldPlace(const P &base, int fi) {
+        auto si = cg.SI(base.t);
+        return P { tyg_at_val(VsField(base.t, tyg_addr_of(p, base.a), fi), 0), si->ftypes[(size_t)fi] };
+    }
+
+    // Copies the image of type t at src to the top of stk; its new address.
+    // The source may lie on stk itself, below its top.
+    tyg_val ImgCopy(tyg_val stk, tyg_val src, TypeExpr *t) {
+        auto top = Top(stk);
+        auto size = ImgSize(t, src);
+        tyg_move_dyn(p, top, src, size);
+        SetTop(stk, tyg_bin(p, TYG_ADD, top, size));
+        return top;
+    }
+    // A result of a call delivered elsewhere (a multi-value one), copied.
+    tyg_val VsCopy(tyg_val stk, const V &x, TypeExpr *t, Line l) {
+        if (!x.mem || !x.t || !cg.TEq(x.t, t)) No(l, cat("value of type ", M.NameWhy(t)));
+        return ImgCopy(stk, tyg_addr_of(p, x.a), t);
+    }
+
+    // Builds n's value, of the variable-size struct t, at the top of stk
+    // (CodeGen::GenConstruct); its address. A literal field by field, a
+    // call returning one handed stk as its destination, anything else (a
+    // variable, a field, a pointee) copied whole.
+    tyg_val GenVs(Node *n, tyg_val stk, TypeExpr *t, Line l) {
+        auto start = tyg_local_new(p, 8, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(start, 0), Top(stk), 0);
+        auto at = [&] { return tyg_load(p, TYG_I64, tyg_at_local(start, 0), 0); };
+        if (auto c = Is<Call>(n); c && c->builtin == B_COPY && c->ArgNodes().size() == 1) n = c->ArgNodes()[0];
+        if (auto sl = Is<StructLit>(n); sl && sl->sinst && !sl->variant && cg.TEq(sl->exprtype, t)) {
+            VsLit(sl, stk, t);
+            return at();
+        }
+        if (auto c = Is<Call>(n); c && c->builtin < 0 && c->spec && !c->spec->sf->isextern &&
+                                   !c->spec->rets.empty() && cg.TEq(c->spec->rets[0], t)) {
+            imgdst = stk;
+            GenCall(c);
+            imgdst = 0;
+            return at();
+        }
+        auto pl = Deref(Place(n));
+        if (Ended()) return at();
+        if (!cg.TEq(pl.t, t)) No(l, cat("value of type ", M.NameWhy(pl.t), " as ", M.Name(t)));
+        ImgCopy(stk, tyg_addr_of(p, pl.a), t);
+        return at();
+    }
+    // A literal's fields in layout order (CodeGen::GenFieldInits), each
+    // built at the top in turn: a fixed one evaluated, then stored; a
+    // variable-size one built there; explicit padding zeroed.
+    void VsLit(StructLit *sl, tyg_val stk, TypeExpr *t) {
+        auto si = cg.SI(t);
+        auto zero = [&](int64_t n) {
+            auto top = Top(stk);
+            tyg_zero(p, tyg_at_val(top, 0), n);
+            SetTop(stk, tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, n)));
+        };
+        for (size_t i = 0; i < si->st->fields.size() && !Ended(); i++) {
+            auto &f = si->st->fields[i];
+            if (f.ispad) {
+                if (f.padsize > 0) zero(f.padsize);
+                continue;
+            }
+            auto ft = si->ftypes[i];
+            auto init = sl->InitFor((int)i);
+            if (!cg.IsFix(ft)) {
+                if (!init) No(sl->line, "omitted variable-size field");
+                GenImg(init, stk, ft, init->line);
+                continue;
+            }
+            if (!init) {
+                zero(cg.FixedSize(ft));
+                continue;
+            }
+            auto x = GenAs(init, ft);
+            if (Ended()) return;
+            if (!M.IsScalar(ft) && !x.mem) No(init->line, "aggregate value");
+            auto top = Top(stk);
+            Store(P { tyg_at_val(top, 0), ft }, x);
+            SetTop(stk, tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, cg.FixedSize(ft))));
+        }
+    }
+
+    // `Name { a, b }` (CodeGen::RenderLoc), each field where the walk finds
+    // it.
+    void VsRender(tyg_val stk, tyg_addr len, const P &pl, Line l, int depth) {
+        auto si = cg.SI(pl.t);
+        TextLit(stk, len, cat(M.Name(pl.t), " { "));
+        auto first = true;
+        for (size_t i = 0; i < si->st->fields.size(); i++) {
+            if (si->st->fields[i].ispad) continue;
+            if (!first) TextLit(stk, len, ", ");
+            first = false;
+            RenderInto(stk, len, VsFieldPlace(pl, (int)i), true, l, depth + 1);
+        }
+        TextLit(stk, len, " }");
+    }
+
     // ---- The procedure -------------------------------------------------------
 
     void Emit() {
@@ -3814,7 +4052,7 @@ struct TgFn {
             if (IsGrow(sp->rets[i])) {
                 chans[i].a = param();
                 chans[i].b = param();
-            } else if (TgModule::IsVarArr(sp->rets[i]) || (int)i != cret) {
+            } else if (M.IsImg(sp->rets[i]) || (int)i != cret) {
                 chans[i].a = param();
             }
         }

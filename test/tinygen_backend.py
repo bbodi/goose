@@ -154,6 +154,39 @@ PROGRAMS += [
 ]
 WHOLE_PROGRAM |= {"tinygen_limited"}
 
+# Variable-size structs (tinygen_varsize): built in place, read behind
+# their variable-size fields, passed and returned by value and by
+# reference, crossing the halves both ways.
+PROGRAMS += [
+    ("test/tinygen/tinygen_varsize.goose", True, []),
+    ("test/tinygen/tinygen_varsize.goose", True, ["--debug"]),
+    ("test/tinygen/tinygen_varsize.goose", False, ["--tinygen-skip=main"]),
+    ("test/tinygen/tinygen_varsize.goose", False, ["--tinygen-skip=hire,pay,pick,with_count"]),
+    ("test/tinygen/tinygen_varsize.goose", False, ["--tinygen-skip=raise,describe,initials"]),
+]
+WHOLE_PROGRAM |= {"tinygen_varsize"}
+
+
+def check_lldb_varsize(exe, base, lldb, ok, fail):
+    """A variable-size struct parameter as the image it points at, its
+    fields up to the first variable-size one by their Goose types."""
+    source = HERE / "tinygen" / "tinygen_varsize.goose"
+    out = base / f"lldb-varsize{tc.EXE_SUFFIX}"
+    good, log, _, _ = build(exe, source, out, [])
+    if not good:
+        fail("tinygen lldb varsize build", log)
+        return
+    code, o, e = tc.run_capture([lldb, "-b", "-o", "b pay", "-o", "run", "-o", "frame variable",
+                                 "-o", "p *e", "-o", "kill", out])
+    text = o + e
+    wants = [r"pay_g.* at tinygen_varsize\.goose:19", r"\(Employee \*\) e = 0x",
+             r"id = 7", r"name = \(len = 3, data = "]
+    missing = [w for w in wants if not re.search(w, text)]
+    if missing:
+        fail("tinygen variable-size struct debug info under lldb", f"missing {missing}:\n{text}")
+        return
+    ok("tinygen debug info under lldb: a variable-size struct")
+
 
 def expected(source):
     """The blessed stdout of a program, whether its run aborts, and the
@@ -290,6 +323,7 @@ def check_lldb(exe, base, ok, fail, say):
         return
     ok("tinygen debug info under lldb: Goose function, lines, parameters and locals")
     check_lldb_arrays(exe, base, lldb, ok, fail)
+    check_lldb_varsize(exe, base, lldb, ok, fail)
 
 
 def check_lldb_arrays(exe, base, lldb, ok, fail):
