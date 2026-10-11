@@ -1935,6 +1935,15 @@ struct TgFn {
         return x;
     }
 
+    // default<T>() of zero bytes: a scalar's, or a fixed array's of
+    // such elements (the checker's per-element default).
+    static bool ZeroDefault(Node *n) {
+        auto c = Is<Call>(n);
+        if (!c || c->builtin != B_DEFAULT || c->rettypes.size() != 1) return false;
+        auto t = c->rettypes[0];
+        if (!c->defaultinit) return t->kind == TY_INT || t->kind == TY_FLT || t->kind == TY_BOOL;
+        return t->kind == TY_ARRAY && t->arr->akind == A_FIXED && ZeroDefault(c->defaultinit);
+    }
     V GenCall(Call *c) {
         auto dst = rzdst;   // For this call only, not for its arguments'.
         rzdst = nullptr;
@@ -1969,6 +1978,17 @@ struct TgFn {
             return V {};
         }
         if (c->builtin == B_FORMAT && c->ArgNodes().size() >= 1) return GenFormat(c);
+        if (ZeroDefault(c) && M.TypeOk(c->rettypes[0])) {
+            // Zero bytes (CodeGen::EmitDefaultInto).
+            auto t = c->rettypes[0];
+            if (M.IsScalar(t)) return Dummy(t);
+            V x;
+            x.t = t;
+            x.mem = true;
+            x.a = tyg_at_local(Temp(t), 0);
+            tyg_zero(p, x.a, M.Size(t));
+            return x;
+        }
         if (c->builtin >= 0) No(c->line, cat("builtin ", BuiltinByKind(c->builtin).name));
         if (c->fvbody) return GenFvCall(c);
         if (!c->dispatch.empty()) No(c->line, "call kind: dispatch");
