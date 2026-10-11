@@ -291,8 +291,9 @@ struct TgModule {
                 return t->arr->akind == A_FIXED && cg.IsFix(t) && !cg.IsLargeFixed(t) &&
                        cg.ArrSize(t->arr) > 0 && TypeOk(t->arr->sub, depth + 1);
             case TY_SLICE:
-                // { data, len }, over fixed elements (C.3).
-                return cg.IsFix(t->sub) && TypeOk(t->sub, depth + 1);
+                // { data, len }, over fixed elements (C.3), or over images
+                // walked by their sizes.
+                return cg.IsFix(t->sub) ? TypeOk(t->sub, depth + 1) : ImgOk(t->sub, depth + 1);
             case TY_STRUCT: {
                 if (!cg.IsFix(t) || cg.IsLargeFixed(t)) return false;
                 auto si = cg.SI(t);
@@ -322,7 +323,8 @@ struct TgModule {
                 if (ImgOk(t->ref->sub, depth + 1)) return "";
                 return Blocker(t->ref->sub, depth + 1);
             case TY_SLICE:
-                return cg.IsFix(t->sub) ? Blocker(t->sub, depth + 1) : "variable-size elements";
+                if (!cg.IsFix(t->sub)) return ImgOk(t->sub, depth + 1) ? "" : "variable-size elements";
+                return Blocker(t->sub, depth + 1);
             case TY_ARRAY:
                 switch (t->arr->akind) {
                     case A_LIMITED:
@@ -338,7 +340,8 @@ struct TgModule {
                         break;
                     default: break;
                 }
-                if (!cg.IsFix(t->arr->sub)) return "variable-size elements";
+                if (!cg.IsFix(t->arr->sub))
+                    return VarImgOk(t, depth) || VeOk(t, depth) ? "" : "variable-size elements";
                 {
                     auto b = Blocker(t->arr->sub, depth + 1);
                     if (!b.empty()) return b;
@@ -404,7 +407,15 @@ struct TgModule {
         return cg.IsFix(t->arr->sub) && TypeOk(t->arr->sub, depth + 1);
     }
     // A variable-size struct (VsOk) is an image too, read where it lies.
-    bool ImgOk(TypeExpr *t, int depth = 0) { return RzOk(t, depth) || VsOk(t, depth); }
+    bool ImgOk(TypeExpr *t, int depth = 0) { return RzOk(t, depth) || VsOk(t, depth) || VarImgOk(t, depth); }
+    // A T[] whose elements are images themselves (u8[][], an array of
+    // strings): its length prefix, then the elements back to back, each
+    // walked by its size; never indexed (the checker forbids it).
+    bool VarImgOk(TypeExpr *t, int depth = 0) {
+        if (!t || t->kind != TY_ARRAY || t->arr->akind != A_VAR || depth > 32 || LenWidth(t) == 0) return false;
+        auto e = t->arr->sub;
+        return e && !cg.IsFix(e) && ImgOk(e, depth + 1);
+    }
     // A resizable array whose elements are images (strings, variable-size
     // structs): their bytes back to back on its stack, each walked by its
     // size (CodeGen::SizeFn). The checker never lets one be indexed; it is
@@ -432,7 +443,7 @@ struct TgModule {
         }
     }
     // A by-value parameter of a type RzOk or VsOk holds.
-    bool RzParam(TypeExpr *t) { return (t->kind == TY_ARRAY && RzOk(t)) || VsOk(t); }
+    bool RzParam(TypeExpr *t) { return (t->kind == TY_ARRAY && (RzOk(t) || VarImgOk(t))) || VsOk(t); }
     tyg_scalar Scal(TypeExpr *t) {
         switch (t->kind) {
             case TY_INT:
@@ -753,7 +764,8 @@ struct TgModule {
         for (size_t i = 0; i < si->st->fields.size(); i++) {
             if (si->st->fields[i].ispad) continue;
             auto ft = si->ftypes[i];
-            if (cg.IsFix(ft) ? !TypeOk(ft, depth + 1) : !((IsVarArr(ft) && RzOk(ft, depth + 1)) || VsOk(ft, depth + 1)))
+            if (cg.IsFix(ft) ? !TypeOk(ft, depth + 1)
+                             : !((IsVarArr(ft) && (RzOk(ft, depth + 1) || VarImgOk(ft, depth + 1))) || VsOk(ft, depth + 1)))
                 return false;
         }
         return true;
@@ -1348,6 +1360,7 @@ struct TgFn {
     // Appends x, of the element type et, at the top of stk to the
     // resizable whose count is at len.
     void PushRaw(tyg_val stk, tyg_addr len, TypeExpr *et, const V &x) {
+        if (!cg.IsFix(et)) No(Line {}, "an element of variable size");
         auto top = Top(stk);
         Store(P { tyg_at_val(top, 0), et }, x);
         SetTop(stk, tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, cg.FixedSize(et))));
@@ -1356,6 +1369,7 @@ struct TgFn {
     // Copies n elements of et from elems to the top of stk, adding them to
     // the count at len. The source may lie on stk itself, below its top.
     void CopyRun(tyg_val stk, tyg_addr len, TypeExpr *et, tyg_val elems, tyg_val n) {
+        if (!cg.IsFix(et)) No(Line {}, "a copy of elements of variable size");
         auto top = Top(stk);
         auto bytes = tyg_bin(p, TYG_MUL, n, tyg_iconst(p, TYG_I64, cg.FixedSize(et)));
         tyg_move_dyn(p, top, elems, bytes);
@@ -1470,6 +1484,7 @@ struct TgFn {
             imgdst = 0;
             return at();
         }
+        if (M.VarImgOk(t)) return GenImgOfImgs(n, stk, t, l, from, start);
         SetTop(stk, tyg_bin(p, TYG_ADD, at(), tyg_iconst(p, TYG_I64, TgModule::LenWidth(t))));
         auto hdr = tyg_at_local(tyg_local_new(p, 16, 8), 0);
         auto len = hdr;
@@ -1486,6 +1501,41 @@ struct TgFn {
         }
         if (Ended()) return at();
         PatchPrefix(at(), t, tyg_load(p, TYG_I64, len, 0));
+        return at();
+    }
+
+    // A T[] of images built at the top of stk (its start in `start`): the
+    // length prefix, then a literal's elements each built in place behind
+    // the last, or another such array's elements copied as one run of
+    // bytes, then the prefix patched with the count.
+    tyg_val GenImgOfImgs(Node *n, tyg_val stk, TypeExpr *t, Line l, const View *from, tyg_local start) {
+        auto at = [&] { return tyg_load(p, TYG_I64, tyg_at_local(start, 0), 0); };
+        auto et = t->arr->sub;
+        SetTop(stk, tyg_bin(p, TYG_ADD, at(), tyg_iconst(p, TYG_I64, TgModule::LenWidth(t))));
+        auto cnt = tyg_local_new(p, 8, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(cnt, 0), tyg_iconst(p, TYG_I64, 0), 0);
+        View v {};
+        auto al = n ? Is<ArrayLit>(n) : nullptr;
+        if (al && !al->fillval && !al->capexpr) {
+            for (auto e : al->elems) {
+                GenImg(e, stk, et, l);
+                if (Ended()) return at();
+                tyg_store(p, TYG_I64, tyg_at_local(cnt, 0),
+                          tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, tyg_at_local(cnt, 0), 0), tyg_iconst(p, TYG_I64, 1)), 0);
+            }
+        } else {
+            if (from) v = *from;
+            else if (n) v = ViewOf(Place(n), l);
+            else No(l, "array of images without a value");
+            if (Ended()) return at();
+            if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
+            auto bytes = tyg_bin(p, TYG_SUB, RunEnd(v), v.elems);
+            auto top = Top(stk);
+            tyg_move_dyn(p, top, v.elems, bytes);
+            SetTop(stk, tyg_bin(p, TYG_ADD, top, bytes));
+            tyg_store(p, TYG_I64, tyg_at_local(cnt, 0), v.len, 0);
+        }
+        PatchPrefix(at(), t, tyg_load(p, TYG_I64, tyg_at_local(cnt, 0), 0));
         return at();
     }
 
@@ -2203,7 +2253,7 @@ struct TgFn {
             a8.offset += 8;
             return { tyg_load(p, TYG_I64, pl.a, 0), tyg_load(p, TYG_I64, a8, 0), pl.t->arr->sub, -1 };
         }
-        if (IsArrayKind(pl.t, A_VAR) && M.RzOk(pl.t)) {
+        if (IsArrayKind(pl.t, A_VAR) && (M.RzOk(pl.t) || M.VarImgOk(pl.t))) {
             // A T[] image: the length prefix, the elements behind it.
             auto w = TgModule::LenWidth(pl.t);
             auto s = w == 1 ? TYG_I8 : w == 2 ? TYG_I16 : w == 4 ? TYG_I32 : TYG_I64;
@@ -2226,6 +2276,28 @@ struct TgFn {
     tyg_val StepElem(const View &v, tyg_val at) {
         if (cg.IsFix(v.elem)) return tyg_bin(p, TYG_ADD, at, tyg_iconst(p, TYG_I64, cg.FixedSize(v.elem)));
         return tyg_bin(p, TYG_ADD, at, ImgSize(v.elem, at));
+    }
+
+    // The end of a view's elements: past the last, each walked by its size
+    // where they vary (CodeGen's SizeFn).
+    tyg_val RunEnd(const View &v) {
+        if (cg.IsFix(v.elem))
+            return tyg_bin(p, TYG_ADD, v.elems, tyg_bin(p, TYG_MUL, v.len, tyg_iconst(p, TYG_I64, cg.FixedSize(v.elem))));
+        auto cl = tyg_local_new(p, 8, 8), il = tyg_local_new(p, 8, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(cl, 0), v.elems, 0);
+        tyg_store(p, TYG_I64, tyg_at_local(il, 0), tyg_iconst(p, TYG_I64, 0), 0);
+        auto head = tyg_block_new(p), body = tyg_block_new(p), done = tyg_block_new(p);
+        tyg_jump(p, head);
+        tyg_block_set(p, head);
+        auto i = tyg_load(p, TYG_I64, tyg_at_local(il, 0), 0);
+        tyg_branch(p, tyg_cmp(p, TYG_SLT, i, v.len), body, done);
+        tyg_block_set(p, body);
+        auto c = tyg_load(p, TYG_I64, tyg_at_local(cl, 0), 0);
+        tyg_store(p, TYG_I64, tyg_at_local(cl, 0), tyg_bin(p, TYG_ADD, c, ImgSize(v.elem, c)), 0);
+        tyg_store(p, TYG_I64, tyg_at_local(il, 0), tyg_bin(p, TYG_ADD, i, tyg_iconst(p, TYG_I64, 1)), 0);
+        tyg_jump(p, head);
+        tyg_block_set(p, done);
+        return tyg_load(p, TYG_I64, tyg_at_local(cl, 0), 0);
     }
 
     // An index as the i64 the checks and the address arithmetic take.
@@ -2264,7 +2336,7 @@ struct TgFn {
     V GenLen(Node *obj, Node *n) {
         auto ot = obj->exprtype;
         while (ot && IsAddrRef(ot)) ot = ot->ref->sub;
-        if (!ot || !(M.TypeOk(ot) || M.RzOk(ot) || M.VeOk(ot)) || (ot->kind != TY_ARRAY && ot->kind != TY_SLICE))
+        if (!ot || !(M.TypeOk(ot) || M.RzOk(ot) || M.VeOk(ot) || M.VarImgOk(ot)) || (ot->kind != TY_ARRAY && ot->kind != TY_SLICE))
             No(n->line, "len of this type");
         tyg_val len;
         if (ot->kind == TY_ARRAY && ot->arr->akind == A_FIXED) {
@@ -4735,6 +4807,7 @@ struct TgFn {
         if (cg.IsFix(t)) return tyg_iconst(p, TYG_I64, cg.FixedSize(t));
         if (IsVarArr(t)) {
             auto v = ViewOf(P { tyg_at_val(at, 0), t }, Line {});
+            if (!cg.IsFix(t->arr->sub)) return tyg_bin(p, TYG_SUB, RunEnd(v), at);
             auto bytes = tyg_bin(p, TYG_MUL, v.len, tyg_iconst(p, TYG_I64, cg.FixedSize(t->arr->sub)));
             return tyg_bin(p, TYG_ADD, bytes, tyg_iconst(p, TYG_I64, TgModule::LenWidth(t)));
         }
