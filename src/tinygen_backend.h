@@ -373,8 +373,14 @@ struct TgModule {
     // with a compile-time initializer, which the C makes static data
     // (CodeGen::EmitGlobalDecls), is static data in this object too, read
     // where it lies (StaticGlobal).
+    // A resizable or T[] global of fixed elements (RzOk) lives on a
+    // dedicated stack of its own (CodeGen::gstks), which a second accessor
+    // gives (StackAccessor): its header, or its image's address, in the
+    // instance, and that stack beside it.
     bool GlobalOk(VarDef *d) {
-        return d->isglobal && !d->reusable && !cg.PrefVar(d) && cg.gnames.count(d) && TypeOk(d->type);
+        if (!d->isglobal || d->reusable || cg.PrefVar(d) || !cg.gnames.count(d)) return false;
+        if (TypeOk(d->type)) return true;
+        return (IsGrow(d->type) || IsVarArr(d->type)) && RzOk(d->type) && cg.gstks.count(d);
     }
 
     map<const VarDef *, string> accessors;
@@ -383,6 +389,15 @@ struct TgModule {
         auto name = it != accessors.end() ? it->second
                                           : (accessors[d] = cat("gs_tg_g", accessors.size()));
         NeedShim(name, cat("void *", name, "(void) { return (void *)&(", cg.gnames[d], "); }\n"));
+        return name;
+    }
+
+    map<const VarDef *, string> stkaccessors;
+    string StackAccessor(VarDef *d) {
+        auto it = stkaccessors.find(d);
+        auto name = it != stkaccessors.end() ? it->second
+                                             : (stkaccessors[d] = cat("gs_tg_gs", stkaccessors.size()));
+        NeedShim(name, cat("void *", name, "(void) { return (void *)", cg.gstks[d], "; }\n"));
         return name;
     }
 
@@ -608,7 +623,7 @@ struct TgFn {
     // once per invocation, in a block the entry block jumps to (gblk),
     // filled once the body is done: a body runs on one thread, whose
     // instance does not change under it.
-    vector<pair<VarDef *, tyg_local>> gaddrs;
+    vector<pair<string, tyg_local>> gaddrs;   // By accessor.
     tyg_block gblk = 0, gstart = 0;
     // By-value T[] parameters, whose locals hold their images' addresses;
     // and by-value T[>..] ones, whose locals hold their headers, with the
@@ -1037,21 +1052,26 @@ struct TgFn {
 
     P GlobalPlace(VarDef *d, Line l) {
         if (!M.GlobalOk(d)) No(l, "global of this kind");
-        auto s = M.StaticGlobal(d);
+        auto s = M.TypeOk(d->type) ? M.StaticGlobal(d) : TYG_NO_SYM;
         if (s != TYG_NO_SYM) return P { tyg_at_sym(s, 0), d->type };
-        tyg_local loc = 0;
-        auto found = false;
-        for (auto &[g, at] : gaddrs)
-            if (g == d) {
-                loc = at;
-                found = true;
-            }
-        if (!found) {
-            M.Accessor(d);   // The shim, now, so that an abandoned body takes it back.
-            loc = tyg_local_new(p, 8, 8);
-            gaddrs.emplace_back(d, loc);
+        // The shims now, so that an abandoned body takes them back.
+        auto at = tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(M.Accessor(d)), 0), 0);
+        if (IsVarArr(d->type)) {
+            // A T[]: the instance holds its image's address.
+            return P { tyg_at_val(tyg_load(p, TYG_I64, tyg_at_val(at, 0), 0), 0), d->type };
         }
-        return P { tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(loc, 0), 0), 0), d->type };
+        P pl { tyg_at_val(at, 0), d->type };
+        if (IsGrow(d->type))
+            pl.stk = tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(M.StackAccessor(d)), 0), 0);
+        return pl;
+    }
+    // The local an accessor's result is kept in, read once per invocation.
+    tyg_local AccessorLocal(const string &name) {
+        for (auto &[g, at] : gaddrs)
+            if (g == name) return at;
+        auto loc = tyg_local_new(p, 8, 8);
+        gaddrs.emplace_back(name, loc);
+        return loc;
     }
 
     // Builds n's value at the place.
@@ -2903,8 +2923,8 @@ struct TgFn {
         tyg_block_set(p, gblk);
         Loc(sp->sf->line);
         if (stksl) tyg_store(p, TYG_I64, tyg_at_local(stksl, 0), CallC("gs_tg_stks", {}, {}, tyg_type_ptr(m)), 0);
-        for (auto &[d, loc] : gaddrs)
-            tyg_store(p, TYG_I64, tyg_at_local(loc, 0), CallC(M.Accessor(d), {}, {}, tyg_type_ptr(m)), 0);
+        for (auto &[acc, loc] : gaddrs)
+            tyg_store(p, TYG_I64, tyg_at_local(loc, 0), CallC(acc, {}, {}, tyg_type_ptr(m)), 0);
         tyg_jump(p, gstart);
         if (tyg_proc_end(p) != 0) {
             p = nullptr;
