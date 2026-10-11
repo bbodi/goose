@@ -5492,7 +5492,9 @@ struct TgFn {
         // One trampoline per C name: a call may have a specialization of
         // its own of the same extern. A function the runtime object
         // exports needs none.
+        // Nor does an export's own wrapper, which the object defines.
         auto direct = M.RuntimeApi(callee->sf->cname);
+        for (auto sf : M.ast.functions) direct = direct || (sf->isexport && sf->cname == callee->sf->cname);
         auto &list = direct ? M.direct : M.externs;
         auto known = false;
         for (auto e : list) known = known || e->sf->cname == callee->sf->cname;
@@ -7898,7 +7900,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         else if (cg.usesthreads || !cg.queues.empty()) why = "threads";
         if (!why.empty()) return false;
         for (auto sf : ast.functions)
-            if (sf->isexport) return why = "export fns", false;
+            if (sf->isexport && !ExportOk(cg, sf, why)) return false;
         for (auto sp : mod->externs) {
             auto found = false;
             for (auto &x : TgSupportExterns()) found = found || sp->sf->cname == x.name;
@@ -7915,7 +7917,78 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                 return why = cat("C half's ", sh.first), false;
             }
         EmitGlobalStorage(cg);
+        EmitExports(cg);
         return true;
+    }
+
+    // Whether an `export fn`'s wrapper is one this object writes: a plain
+    // specialization whose parameters and result cross by value as the C
+    // wrapper's do (CodeGen::EmitExports). Else why not.
+    bool ExportOk(CodeGen &cg, SFunction *sf, string &why) {
+        if (sf->specs.size() != 1 || !cg.sinfo.count(sf->specs[0])) return why = "export fns", false;
+        auto sp = sf->specs[0];
+        auto &si = cg.sinfo[sp];
+        if (!si.freevars.empty() || sp->rets.size() > 1 || !mod->SigOk(sp, false, why))
+            return why = "export fns", false;
+        for (size_t i = 0; i < sp->argtypes.size(); i++) {
+            auto t = sp->argtypes[i];
+            if (cg.IsPoolParam(sp, i) || mod->RzParam(t) || cg.IsLargeFixed(t) || !mod->TypeOk(t))
+                return why = "export fns", false;
+        }
+        if (!sp->rets.empty() && (si.cret != 0 || !mod->TypeOk(sp->rets[0]))) return why = "export fns", false;
+        return true;
+    }
+
+    // The C symbol of each `export fn`: a procedure taking the C
+    // parameters, and for a slice result a length out-pointer after them,
+    // which calls the function, passing gs_sp 0 (CodeGen::EmitExports).
+    void EmitExports(CodeGen &cg) {
+        auto m = mod->m;
+        for (auto sf : ast.functions) {
+            if (!sf->isexport) continue;
+            auto sp = sf->specs[0];
+            auto &si = cg.sinfo[sp];
+            auto rt = sp->rets.empty() ? nullptr : sp->rets[0];
+            auto slice = rt && rt->kind == TY_SLICE;
+            vector<const tyg_type *> ps;
+            for (auto t : sp->argtypes) ps.push_back(mod->AT(t));
+            if (slice) ps.push_back(tyg_type_ptr(m));
+            auto csig = tyg_sig_new(m, !rt ? nullptr : slice ? tyg_type_ptr(m) : mod->AT(rt), ps.data(),
+                                    (int)ps.size(), 0);
+            auto p = tyg_proc_begin(m, mod->Sym(sf->cname, TYG_SYM_FUNC | TYG_SYM_GLOBAL), csig);
+            vector<tyg_arg> args;
+            for (size_t i = 0; i < sp->argtypes.size(); i++) {
+                tyg_arg a {};
+                if (mod->IsScalar(sp->argtypes[i])) a.val = tyg_param(p, (int)i);
+                else a.mem = tyg_at_val(tyg_param(p, (int)i), 0);
+                args.push_back(a);
+            }
+            if (si.needssp) {
+                tyg_arg a {};
+                a.val = tyg_iconst(p, TYG_I64, 0);
+                args.push_back(a);
+            }
+            auto callee = tyg_direct(mod->Sym(si.cname, TYG_SYM_FUNC | TYG_SYM_GLOBAL));
+            if (!rt) {
+                tyg_call(p, mod->Sig(sp), callee, args.data(), (int)args.size(), nullptr, nullptr);
+                tyg_ret(p, 0);
+            } else if (mod->IsScalar(rt)) {
+                tyg_ret(p, tyg_call(p, mod->Sig(sp), callee, args.data(), (int)args.size(), nullptr, nullptr));
+            } else {
+                auto t = tyg_local_new(p, mod->Size(rt), 8);
+                auto ra = tyg_at_local(t, 0);
+                tyg_call(p, mod->Sig(sp), callee, args.data(), (int)args.size(), nullptr, &ra);
+                if (slice) {
+                    tyg_store(p, TYG_I64, tyg_at_val(tyg_param(p, (int)sp->argtypes.size()), 0),
+                              tyg_load(p, TYG_I64, tyg_at_local(t, 8), 0), 0);
+                    tyg_ret(p, tyg_load(p, TYG_I64, tyg_at_local(t, 0), 0));
+                } else {
+                    tyg_ret_mem(p, ra);
+                }
+            }
+            if (tyg_proc_end(p) != 0)
+                throw CompileError { cat("tinygen: ", sf->cname, ": ", tyg_error(m) ? tyg_error(m) : "?") };
+        }
     }
 
     // ---- Globals of a whole program ------------------------------------------
