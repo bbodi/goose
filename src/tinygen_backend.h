@@ -485,7 +485,7 @@ struct TgModule {
         if (IsScalar(t)) return ScalSize(Scal(t));
         // A payload-less variant as a value of its own: the gs_empty byte.
         if (t->kind == TY_VARIANT && !cg.FixedSize(t)) return 1;
-        if (FoOk(t)) return FoLayout(t).tail + 16;
+        if (FoOk(t)) return FoLayout(t).tail + FoTailSize(t);
         return cg.FixedSize(t);
     }
 
@@ -548,8 +548,8 @@ struct TgModule {
             if (si->st->fields[(size_t)i].ispad) continue;
             fs.push_back({ AT(si->ftypes[(size_t)i]), fl.offs[(size_t)i] });
         }
-        fs.push_back({ SliceAT(), fl.tail });
-        return atypes[key] = tyg_type_record(m, fl.tail + 16, 1, fs.data(), (int)fs.size());
+        fs.push_back({ AT(si->ftypes[(size_t)fl.tailfi]), fl.tail });
+        return atypes[key] = tyg_type_record(m, fl.tail + FoTailSize(t), 1, fs.data(), (int)fs.size());
     }
     // A resizable value: a T[>..]'s header, or a frame object, with a stack.
     bool Resz(TypeExpr *t) { return IsGrow(t) || (t && t->kind == TY_STRUCT && cg.IsFrameObj(t)); }
@@ -780,13 +780,25 @@ struct TgModule {
         auto fl = FoLayout(t);
         if ((size_t)fl.tailfi + 1 != si->st->fields.size()) return false;
         auto tail = si->ftypes[(size_t)fl.tailfi];
-        if (!IsGrow(tail) || !RzOk(tail, depth + 1)) return false;
+        if (!(IsGrow(tail) && RzOk(tail, depth + 1)) && !FoOk(tail, depth + 1)) return false;
         for (int i = 0; i < fl.tailfi; i++) {
             if (si->st->fields[(size_t)i].ispad) continue;
             auto ft = si->ftypes[(size_t)i];
             if (!cg.IsFix(ft) || !TypeOk(ft, depth + 1)) return false;
         }
         return true;
+    }
+    // The tail's bytes: a resizable's header, or a nested frame object's
+    // struct, which ends in its own tail.
+    int64_t FoTailSize(TypeExpr *t) {
+        auto tail = cg.SI(t)->ftypes[(size_t)FoLayout(t).tailfi];
+        return IsGrow(tail) ? 16 : Size(tail);
+    }
+    // Where the innermost tail's header lies in the struct.
+    int64_t FoHdrOff(TypeExpr *t) {
+        auto fl = FoLayout(t);
+        auto tail = cg.SI(t)->ftypes[(size_t)fl.tailfi];
+        return IsGrow(tail) ? fl.tail : fl.tail + FoHdrOff(tail);
     }
     const tyg_dtype *FoDT(TypeExpr *t, const string &name) {
         auto si = cg.SI(t);
@@ -799,7 +811,7 @@ struct TgModule {
             auto off = i == fl.tailfi ? fl.tail : fl.offs[(size_t)i];
             tyg_dt_member(m, rec, string(f.name).c_str(), DT(si->ftypes[(size_t)i]), off);
         }
-        tyg_dt_record_complete(m, rec, fl.tail + 16, 1);
+        tyg_dt_record_complete(m, rec, fl.tail + FoTailSize(t), 1);
         return rec;
     }
 
@@ -1139,7 +1151,7 @@ struct TgModule {
         if (d->reusable) return IsGrow(d->type) && RzOk(d->type) && cg.gstks.count(d) && cg.gpools.count(d);
         if (TypeOk(d->type)) return true;
         return ((IsGrow(d->type) || IsVarArr(d->type)) && RzOk(d->type) && cg.gstks.count(d)) ||
-               (IsGrow(d->type) && VeOk(d->type) && cg.gstks.count(d));
+               (IsGrow(d->type) && VeOk(d->type) && cg.gstks.count(d)) || (FoOk(d->type) && cg.gstks.count(d));
     }
 
     map<const VarDef *, string> accessors;
@@ -2118,7 +2130,7 @@ struct TgFn {
             return P { tyg_at_val(tyg_load(p, TYG_I64, tyg_at_val(at, 0), 0), 0), d->type };
         }
         P pl { tyg_at_val(at, 0), d->type };
-        if (IsGrow(d->type))
+        if (IsGrow(d->type) || M.FoOk(d->type))
             pl.stk = tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(M.StackAccessor(d)), 0), 0);
         return pl;
     }
@@ -5416,8 +5428,7 @@ struct TgFn {
             auto sl = tyg_local_new(p, 8, 8);
             tyg_store(p, TYG_I64, tyg_at_local(sl, 0), stk, 0);
             tyg_zero(p, tyg_at_local(fo, 0), M.Size(d->type));
-            auto tail = M.FoLayout(d->type).tail;
-            tyg_store(p, TYG_I64, tyg_at_local(fo, tail), Top(stk), 0);
+            tyg_store(p, TYG_I64, tyg_at_local(fo, M.FoHdrOff(d->type)), Top(stk), 0);
             locals[d] = fo;
             rzstk[d] = sl;
             tyg_debug_var(p, string(d->name).c_str(), M.DT(d->type), tyg_at_local(fo, 0),
@@ -5803,6 +5814,19 @@ struct TgFn {
             if (si->st->fields[i].ispad) continue;
             auto init = sl->InitFor((int)i);
             auto fp = FoFieldPlace(pl, (int)i, l);
+            if ((int)i == fl.tailfi && M.FoOk(fp.t)) {
+                // A nested frame object, its tail on the same stack.
+                if (init) {
+                    GenFo(init, fp, l);
+                } else {
+                    tyg_zero(p, fp.a, M.Size(fp.t));
+                    auto h = fp.a;
+                    h.offset += M.FoHdrOff(fp.t);
+                    tyg_store(p, TYG_I64, h, Top(pl.stk), 0);
+                }
+                if (Ended()) return;
+                continue;
+            }
             if ((int)i == fl.tailfi) {
                 if (init) GenRz(init, pl.stk, fp.a, fp.t, l);
                 else {
@@ -5825,6 +5849,11 @@ struct TgFn {
         auto fl = M.FoLayout(dst.t);
         if (!dst.stk || !src.stk) No(l, "frame object without its stack");
         auto tl = FoFieldPlace(src, fl.tailfi, l);
+        if (M.FoOk(tl.t)) {
+            if (fl.tail) tyg_move(p, dst.a, src.a, fl.tail);
+            FoCopy(FoFieldPlace(dst, fl.tailfi, l), tl, l);
+            return;
+        }
         auto v = ViewOf(tl, l);
         // The tail's start and count first: the source may be anywhere.
         auto el = tyg_local_new(p, 16, 8);
@@ -6290,9 +6319,18 @@ struct TgFn {
                 auto init = g->inits[i];
                 if (cg.gstatic.count(d)) continue;   // Static data.
                 Loc(init->line);
-                if (!M.GlobalOk(d) || cg.IsFrameObj(d->type) ||
+                if (!M.GlobalOk(d) ||
                     (d->type->kind == TY_REF && d->type->ref->lenstorage >= 0))
                     No(d->line, "global of this kind");
+                if (M.FoOk(d->type)) {
+                    // A frame object: its tail on the global's own stack.
+                    auto at = tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(M.Accessor(d)), 0), 0);
+                    auto stk = tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(M.StackAccessor(d)), 0), 0);
+                    M.NeedShim("gs_tg_stack_init");
+                    CallC("gs_tg_stack_init", { tyg_type_ptr(m) }, { stk }, nullptr);
+                    GenFo(init, P { tyg_at_val(at, 0), d->type, stk }, init->line);
+                    continue;
+                }
                 if (IsGrow(d->type) || IsVarArr(d->type)) {
                     auto at = tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(M.Accessor(d)), 0), 0);
                     auto stk = tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(M.StackAccessor(d)), 0), 0);
@@ -6500,7 +6538,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                     if (mod->accessors.count(d)) return why = cat("global ", d->name, " as static data"), false;
                     continue;
                 }
-                if (!mod->GlobalOk(d) || cg.IsFrameObj(d->type) ||
+                if (!mod->GlobalOk(d) ||
                     (d->type->kind == TY_REF && d->type->ref->lenstorage >= 0))
                     return why = cat("global ", d->name, " of this kind"), false;
             }
