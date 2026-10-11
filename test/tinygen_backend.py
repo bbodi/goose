@@ -7,7 +7,7 @@ one the C backends are held to. The test/tinygen/ fixtures must go through
 tinygen whole (every function compiled by it), and some are also built
 with chosen functions left to C, so that calls cross between the two
 halves in both directions (structs, arrays and slices, multiple results,
-strings and resizable arrays);
+strings and resizable arrays handed in, and built at a destination);
 the other programs are ones the backend covers in part. Where lldb is installed, one program is run under it to see
 that the debugger finds a Goose function by name and shows its Goose source
 line, its parameters and its locals with their Goose types.
@@ -57,6 +57,12 @@ PROGRAMS = [
     ("test/tinygen/tinygen_strings.goose", False,
      ["--tinygen-skip=count,first_last,total,sum_view,addto,own"]),
     ("test/tinygen/tinygen_strings.goose", False, ["--tinygen-skip=walk,shout,far"]),
+    ("test/tinygen/tinygen_build.goose", True, []),
+    ("test/tinygen/tinygen_build.goose", True, ["--debug"]),
+    ("test/tinygen/tinygen_build.goose", False, ["--tinygen-skip=main"]),
+    ("test/tinygen/tinygen_build.goose", False,
+     ["--tinygen-skip=squares,word,evens,label,split,points"]),
+    ("test/tinygen/tinygen_build.goose", False, ["--tinygen-skip=sum,own_sum,scan,nested"]),
     ("test/codegen/loop_invariant_divisors.goose", False, []),
     ("test/codegen/cnames.goose", False, []),
     ("test/codegen/wider_slot_operations.goose", False, []),
