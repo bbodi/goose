@@ -7706,9 +7706,7 @@ struct TgFn {
                 auto init = g->inits[i];
                 if (cg.gstatic.count(d)) continue;   // Static data.
                 Loc(init->line);
-                if (!M.GlobalOk(d) ||
-                    (d->type->kind == TY_REF && d->type->ref->lenstorage >= 0))
-                    No(d->line, "global of this kind");
+                if (!M.GlobalOk(d)) No(d->line, "global of this kind");
                 if (M.FoOk(d->type)) {
                     // A frame object: its tail on the global's own stack.
                     auto at = tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(M.Accessor(d)), 0), 0);
@@ -8014,8 +8012,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                     if (mod->accessors.count(d)) return why = cat("global ", d->name, " as static data"), false;
                     continue;
                 }
-                if (!mod->GlobalOk(d) ||
-                    (d->type->kind == TY_REF && d->type->ref->lenstorage >= 0))
+                if (!mod->GlobalOk(d))
                     return why = cat("global ", d->name, " of this kind"), false;
             }
         return true;
