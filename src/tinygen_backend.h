@@ -1972,10 +1972,19 @@ struct TgFn {
         }
         return false;
     }
+    // The value a literal being built in place starts at, which `self` in
+    // its fields refers to (§3.9), or 0.
+    tyg_val selfbase = 0;
     // Such a literal built at pl: zero bytes, then its fields where they lie.
     void SelfRelInto(const P &pl, StructLit *sl) {
         auto t = sl->exprtype;
         tyg_zero(p, pl.a, M.Size(t));
+        auto outer = selfbase;
+        selfbase = tyg_addr_of(p, pl.a);
+        struct Back {
+            tyg_val &at, was;
+            ~Back() { at = was; }
+        } back { selfbase, outer };
         auto si = cg.SI(t);
         auto &lay = cg.StructLayout(si);
         for (size_t i = 0; i < si->st->fields.size() && !Ended(); i++) {
@@ -2074,6 +2083,14 @@ struct TgFn {
                 return x;
             }
             case NK_NullLit: return Null(n->exprtype, n->line);
+            case NK_SelfRef: {
+                // `self` in a literal built where it lies: its start.
+                if (!selfbase) No(n->line, "self outside a literal built in place");
+                V x;
+                x.t = n->exprtype;
+                x.v = selfbase;
+                return x;
+            }
             case NK_BoolLit: {
                 V x;
                 x.t = M.ast.booltype;
@@ -2701,6 +2718,7 @@ struct TgFn {
         auto tmp = Temp(t);
         tyg_zero(p, tyg_at_local(tmp, 0), M.Size(t));
         if (al->fillval) {
+            if (SelfRelLit(al->fillval)) No(al->line, "fill of a value linking to itself");
             auto il = Is<IntLit>(al->fillcount);
             if (!il || il->val != k) No(al->line, "fill count");
             // The value once, then copied into every slot.
