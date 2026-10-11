@@ -760,6 +760,13 @@ struct TgFn {
             }
             return;
         }
+        if (auto c = Is<Call>(n); c && c->builtin == B_STR) {
+            if (!IsU8(et)) No(l, "str of this type");
+            begin();
+            auto an = c->ArgNodes();
+            TextInto(stk, len, c, an, 0);
+            return;
+        }
         if (auto c = Is<Call>(n); c && c->builtin < 0 && c->spec && !c->spec->sf->isextern &&
                                    !c->spec->rets.empty() && IsGrow(c->spec->rets[0])) {
             if (cg.Mangle(c->spec->rets[0]->arr->sub) != cg.Mangle(et)) No(l, "result of another element type");
@@ -1265,6 +1272,13 @@ struct TgFn {
         }
         if (op == T_DOTEQ || op == T_DOTNEQ) No(b->line, "reference identity");
         if (Is<NullLit>(b->left) || Is<NullLit>(b->right)) No(b->line, "null test");
+        if (op == T_EQ || op == T_NEQ) {
+            auto arr = [](TypeExpr *t) {
+                while (t && IsPlainRef(t)) t = t->ref->sub;
+                return t && (t->kind == TY_SLICE || t->kind == TY_ARRAY) ? t : nullptr;
+            };
+            if (arr(b->left->exprtype) && arr(b->right->exprtype)) return GenArrayEq(b);
+        }
         auto lt = cg.OperandT(b->left->exprtype);
         if (!M.IsScalar(lt) || lt->kind == TY_REF) No(b->line, "operand type");
         auto isflt = lt->kind == TY_FLT;
@@ -1337,6 +1351,34 @@ struct TgFn {
     // An integer operation at t's width: unsigned and release-build signed
     // arithmetic wraps, a debug build's signed arithmetic checks (runtime.h),
     // and division and modulo check in every build (§6.2).
+    // a == b of arrays or slices (GenRangeEq, §4.5): the lengths, then
+    // the elements' bytes where that is their equality (integers, bools).
+    V GenArrayEq(Binary *b) {
+        auto l = ViewOf(Place(b->left), b->line);
+        auto r = ViewOf(Place(b->right), b->line);
+        auto et = l.elem;
+        if (cg.Mangle(et) != cg.Mangle(r.elem) || !(et->kind == TY_INT || et->kind == TY_BOOL) ||
+            et->intstorage == IS_VARINT)
+            No(b->line, "array comparison of this element type");
+        auto res = tyg_local_new(p, 1, 1);
+        auto same = tyg_cmp(p, TYG_EQ, l.len, r.len);
+        tyg_store(p, TYG_I8, tyg_at_local(res, 0), same, 0);
+        auto cmp = tyg_block_new(p), done = tyg_block_new(p);
+        tyg_branch(p, same, cmp, done);
+        tyg_block_set(p, cmp);
+        auto bytes = tyg_bin(p, TYG_MUL, l.len, tyg_iconst(p, TYG_I64, cg.FixedSize(et)));
+        auto d = CallC("memcmp", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64, false) },
+                       { l.elems, r.elems, bytes }, IT(TYG_I32));
+        tyg_store(p, TYG_I8, tyg_at_local(res, 0), tyg_cmp(p, TYG_EQ, d, tyg_iconst(p, TYG_I32, 0)), 0);
+        tyg_jump(p, done);
+        tyg_block_set(p, done);
+        V x;
+        x.t = M.ast.booltype;
+        x.v = tyg_load(p, TYG_I8, tyg_at_local(res, 0), 0);
+        if (b->op == T_NEQ) x.v = tyg_cmp(p, TYG_EQ, x.v, tyg_iconst(p, TYG_I8, 0));
+        return x;
+    }
+
     tyg_val IntOp(TType op, TypeExpr *t, tyg_val l, tyg_val r, Line ln) {
         auto sgn = TgModule::IsSigned(t);
         switch (op) {
@@ -1715,6 +1757,8 @@ struct TgFn {
         if (c->builtin == B_LEN && c->ArgNodes().size() == 1) return GenLen(c->ArgNodes()[0], c);
         if (c->builtin == B_PUSH && c->ArgNodes().size() == 2) return GenPush(c);
         if (c->builtin == B_APPEND && c->ArgNodes().size() == 2) return GenAppend(c);
+        if (c->builtin == B_STR) return GenStr(c);
+        if (c->builtin == B_FORMAT && c->ArgNodes().size() >= 1) return GenFormat(c);
         if (c->builtin >= 0) No(c->line, cat("builtin ", BuiltinByKind(c->builtin).name));
         if (c->fvbody || !c->dispatch.empty() || !c->fvremap.empty() || !c->spec)
             No(c->line, "call kind");
@@ -1880,6 +1924,81 @@ struct TgFn {
         return V {};
     }
     static bool IsGrow(TypeExpr *t) { return TgModule::IsGrow(t); }
+
+    // The text of an[from..] appended at the top of stk to the u8
+    // resizable whose count is at len (EmitStr, EmitFormatInto), each
+    // argument evaluated and written in turn: a scalar formatted by the
+    // runtime's gs_fmt_* straight at the top, a u8 array or slice copied.
+    // Anything else renders structurally in the C half (not yet here).
+    void TextInto(tyg_val stk, tyg_addr len, Call *c, const vector<Node *> &an, size_t from) {
+        if (!c->fmtspecs.empty()) No(c->line, "text with format overloads");
+        for (size_t i = from; i < an.size(); i++) {
+            auto a = an[i];
+            auto bt = a->exprtype;
+            while (bt && IsPlainRef(bt)) bt = bt->ref->sub;
+            if (bt && ((bt->kind == TY_ARRAY && IsU8(bt->arr->sub)) || (bt->kind == TY_SLICE && IsU8(bt->sub)))) {
+                if (auto s = Is<StrLit>(a)) {
+                    CopyRun(stk, len, bt->kind == TY_ARRAY ? bt->arr->sub : bt->sub,
+                            tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)),
+                            tyg_iconst(p, TYG_I64, (int64_t)s->val.size()));
+                    continue;
+                }
+                auto v = ViewOf(Place(a), a->line);
+                if (Ended()) return;
+                CopyRun(stk, len, v.elem, v.elems, v.len);
+                continue;
+            }
+            auto ot = cg.OperandT(a->exprtype);
+            if (!ot || !M.IsScalar(ot) || ot->kind == TY_REF) No(a->line, "text of this type");
+            tyg_val n;
+            if (ot->kind == TY_INT && ot->intstorage == IS_U64) {
+                auto x = GenAs(a, ot).v;
+                if (Ended()) return;
+                n = CallC("gs_fmt_u64", { tyg_type_ptr(m), IT(TYG_I64, false) }, { Top(stk), x }, IT(TYG_I64));
+            } else if (ot->kind == TY_INT) {
+                auto x = GenAs(a, M.ast.inttypes[IS_I64]).v;
+                if (Ended()) return;
+                n = CallC("gs_fmt_i64", { tyg_type_ptr(m), IT(TYG_I64) }, { Top(stk), x }, IT(TYG_I64));
+            } else if (ot->kind == TY_FLT && M.Scal(ot) == TYG_F32) {
+                auto x = GenAs(a, ot).v;
+                if (Ended()) return;
+                n = CallC("gs_fmt_f32", { tyg_type_ptr(m), tyg_type_scalar(m, TYG_F32) }, { Top(stk), x },
+                          IT(TYG_I64));
+            } else if (ot->kind == TY_FLT) {
+                auto x = GenAs(a, ot).v;
+                if (Ended()) return;
+                n = CallC("gs_fmt_f64", { tyg_type_ptr(m), tyg_type_scalar(m, TYG_F64) }, { Top(stk), x },
+                          IT(TYG_I64));
+            } else {
+                auto x = GenAs(a, ot).v;
+                if (Ended()) return;
+                n = CallC("gs_fmt_bool", { tyg_type_ptr(m), IT(TYG_I64) },
+                          { Top(stk), tyg_convert(p, TYG_ZEXT, TYG_I64, x) }, IT(TYG_I64));
+            }
+            SetTop(stk, tyg_bin(p, TYG_ADD, Top(stk), n));
+            tyg_store(p, TYG_I64, len, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, len, 0), n), 0);
+        }
+    }
+
+    // str(a, b, ...): a fresh u8[>..] on a stack of the statement's (or
+    // where GenRz builds it); format(out, a, b, ...): appended to out.
+    V GenStr(Call *c) {
+        auto t = c->exprtype;
+        if (!t || !IsGrow(t) || !IsU8(t->arr->sub)) No(c->line, "str of this type");
+        auto x = RzTemp(t, c->line);
+        GenRz(c, x.stk, x.a, t, c->line);
+        return x;
+    }
+    V GenFormat(Call *c) {
+        auto an = c->ArgNodes();
+        auto pl = Deref(Place(an[0]));
+        if (!IsGrow(pl.t) || !M.RzOk(pl.t) || !pl.stk || !IsU8(pl.t->arr->sub))
+            No(c->line, "format into an array of this kind");
+        auto len = pl.a;
+        len.offset += 8;
+        TextInto(pl.stk, len, c, an, 1);
+        return V {};
+    }
 
     // A call whose every result is wanted: `let a, b = f()`, `return f()`.
     vector<V> GenCallAll(Node *n, size_t count) {
