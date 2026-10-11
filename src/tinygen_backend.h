@@ -5177,7 +5177,7 @@ struct TgFn {
             x.a = tyg_at_val(GenImg(c, stk, et, c->line), 0);
             return x;
         }
-        if (wantsval && !M.TypeOk(et) && IsGrow(et) && M.RzOk(et)) {
+        if (wantsval && !M.TypeOk(et) && IsGrow(et) && (M.RzOk(et) || M.VeOk(et))) {
             auto x = RzTemp(et, c->line);
             GenRz(c, x.stk, x.a, et, c->line);
             return x;
