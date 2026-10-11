@@ -9,7 +9,7 @@ with chosen functions left to C, so that calls cross between the two
 halves in both directions (structs, arrays and slices, multiple results,
 strings and resizable arrays handed in, and built at a destination,
 u8[] values, arrays shrunk and resized, free variables of nested
-functions);
+functions, function values);
 the other programs are ones the backend covers in part. Where lldb is installed, one program is run under it to see
 that the debugger finds a Goose function by name and shows its Goose source
 line, its parameters and its locals with their Goose types.
@@ -84,6 +84,11 @@ PROGRAMS = [
     ("test/tinygen/tinygen_nested.goose", False,
      ["--tinygen-skip=bump,grow,twice,total,add,inner,go"]),
     ("test/tinygen/tinygen_nested.goose", False, ["--tinygen-skip=main,mid"]),
+    ("test/tinygen/tinygen_funvals.goose", True, []),
+    ("test/tinygen/tinygen_funvals.goose", True, ["--debug"]),
+    ("test/tinygen/tinygen_funvals.goose", False, ["--tinygen-skip=main"]),
+    ("test/tinygen/tinygen_funvals.goose", False,
+     ["--tinygen-skip=apply,both,pair,mapp,sum_by,fill,each,countdown"]),
     ("test/codegen/loop_invariant_divisors.goose", False, []),
     ("test/codegen/cnames.goose", False, []),
     ("test/codegen/wider_slot_operations.goose", False, []),
