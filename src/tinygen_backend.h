@@ -1302,7 +1302,7 @@ struct TgModule {
             if (!FvOk(fv)) { why = cat("free variable of type ", fv->type ? NameWhy(fv->type) : "?"); return false; }
         if (define && cg.fromids.count(sp))
             for (auto r : sp->rets)
-                if (!RetOk(r) || cg.IsFrameObj(r)) {
+                if (!RetOk(r)) {
                     why = cat("return from target with result type ", NameWhy(r));
                     return false;
                 }
@@ -5316,17 +5316,17 @@ struct TgFn {
         // A nonfixed value lands at its channel's top, which the catch
         // moves down to where the target's caller expects it.
         for (size_t i = 0; i < rets.size(); i++)
-            if (IsImg(rets[i]) || IsGrow(rets[i]))
+            if (IsImg(rets[i]) || M.Resz(rets[i]))
                 tyg_store(p, TYG_I64, ChanAt(t, i, "fval"),
                           Top(tyg_load(p, TYG_I64, ChanAt(t, i, "fdst"), 0)), 0);
         vector<V> xs;
         if (vals.size() == 1 && rets.size() > 1) xs = GenCallAll(vals[0], rets.size());
         else if (vals.size() != rets.size()) No(l, "result count");
         for (size_t i = 0; i < rets.size(); i++) {
-            if (IsImg(rets[i]) || IsGrow(rets[i])) {
+            if (IsImg(rets[i]) || M.Resz(rets[i])) {
                 auto dst = tyg_load(p, TYG_I64, ChanAt(t, i, "fdst"), 0);
                 BuildAt(xs.empty() ? vals[i] : nullptr, xs.empty() ? nullptr : &xs[i], dst, rets[i],
-                        IsGrow(rets[i]) ? LretAt(t, i) : tyg_addr {}, l);
+                        M.Resz(rets[i]) ? LretAt(t, i) : tyg_addr {}, l);
                 if (Ended()) return;
                 continue;
             }
@@ -5367,7 +5367,7 @@ struct TgFn {
             auto cret = cg.sinfo[sp].cret;
             for (size_t i = 0; i < rets.size(); i++) {
                 if ((int)i == cret) continue;
-                if (IsImg(rets[i]) || IsGrow(rets[i])) {
+                if (IsImg(rets[i]) || M.Resz(rets[i])) {
                     // The value is on our destination, behind anything the
                     // calls it unwound had built there (CodeGen::LandValue).
                     auto dst = tyg_load(p, TYG_I64, tyg_at_local(chans[i].a, 0), 0);
@@ -5379,6 +5379,15 @@ struct TgFn {
                     if (IsGrow(rets[i])) {
                         auto rl = tyg_load(p, TYG_I64, tyg_at_local(chans[i].b, 0), 0);
                         tyg_store(p, TYG_I64, tyg_at_val(rl, 0), tyg_load(p, TYG_I64, LretAt(sp, i), 0), 0);
+                    } else if (M.FoOk(rets[i])) {
+                        // The frame object, its tail's base moved with it.
+                        auto rl = tyg_load(p, TYG_I64, tyg_at_local(chans[i].b, 0), 0);
+                        tyg_copy(p, tyg_at_val(rl, 0), LretAt(sp, i), M.Size(rets[i]));
+                        auto hb = tyg_at_val(rl, M.FoHdrOff(rets[i]));
+                        auto start2 = tyg_load(p, TYG_I64, ChanAt(sp, i, "fval"), 0);
+                        auto top02 = tyg_load(p, TYG_I64, tyg_at_local(chans[i].top0, 0), 0);
+                        tyg_store(p, TYG_I64, hb,
+                                  tyg_bin(p, TYG_ADD, top02, tyg_bin(p, TYG_SUB, tyg_load(p, TYG_I64, hb, 0), start2)), 0);
                     }
                     continue;
                 }
@@ -5480,6 +5489,11 @@ struct TgFn {
                     auto stk = tyg_load(p, TYG_I64, tyg_at_local(rzstk[d], 0), 0);
                     auto img = GenImg(nullptr, stk, d->type, vd->line, &v);
                     tyg_store(p, TYG_I64, tyg_at_local(locals[d], 0), img, 0);
+                    continue;
+                }
+                if (M.FoOk(d->type) && !Ended()) {
+                    auto stk = tyg_load(p, TYG_I64, tyg_at_local(rzstk[d], 0), 0);
+                    FoCopy(P { tyg_at_local(locals[d], 0), d->type, stk }, P { xs[i].a, xs[i].t, xs[i].stk }, vd->line);
                     continue;
                 }
                 if (IsGrow(d->type) && !Ended()) {
@@ -6251,7 +6265,7 @@ struct TgFn {
             // A `return from` target: its destinations are where values
             // in flight to it are built (CodeGen::EmitSpec).
             for (size_t i = 0; i < sp->rets.size(); i++) {
-                if (!IsImg(sp->rets[i]) && !IsGrow(sp->rets[i])) continue;
+                if (!IsImg(sp->rets[i]) && !M.Resz(sp->rets[i])) continue;
                 auto at = ChanAt(sp, i, "fdst");
                 auto sav = tyg_local_new(p, 8, 8);
                 tyg_store(p, TYG_I64, tyg_at_local(sav, 0), tyg_load(p, TYG_I64, at, 0), 0);
