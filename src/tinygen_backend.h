@@ -7985,6 +7985,15 @@ struct TgFn {
             GenRz(a->rhs, pl.stk, pl.a, pl.t, a->line);
             return;
         }
+        if (a->op == T_ASSIGN && M.FoOk(pl.t) && pl.stk) {
+            // A whole frame object (Assign::CgStmt): its tail's stack back
+            // to where its elements start, then the new value built in place.
+            auto hb = pl.a;
+            hb.offset += M.FoHdrOff(pl.t);
+            SetTop(pl.stk, tyg_load(p, TYG_I64, hb, 0));
+            GenFo(a->rhs, pl, a->line);
+            return;
+        }
         if (a->op == T_ASSIGN && M.IsRb(pl.t)) {
             // A whole resizable ADT (Assign::CgStmt): its stack's top back to
             // where its bytes start, then the new value built there.
