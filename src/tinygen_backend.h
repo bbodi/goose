@@ -283,6 +283,7 @@ struct TgModule {
                 // resizable array it reads in place (RzOk): a fat reference
                 // { hdr, stk } for a resizable one (gs_rref).
                 // An optional one is the same address, null where empty.
+                if (IsRel(t)) return depth > 0 && RelOk(t, depth);
                 return (IsPlainRef(t) || OptRef(t)) &&
                        ((cg.IsFix(t->ref->sub) && TypeOk(t->ref->sub, depth + 1)) ||
                         ImgOk(t->ref->sub, depth + 1) || (IsPlainRef(t) && FoOk(t->ref->sub, depth + 1)));
@@ -320,6 +321,7 @@ struct TgModule {
             case TY_INT: return "";
             case TY_FLT: case TY_BOOL: return "";
             case TY_REF:
+                if (IsRel(t) && depth > 0 && RelOk(t, depth)) return "";
                 if (!IsPlainRef(t) && !OptRef(t))
                     return t->ref->optional ? "optional relative reference" : "relative reference";
                 if (ImgOk(t->ref->sub, depth + 1)) return "";
@@ -461,7 +463,7 @@ struct TgModule {
                 }
             case TY_FLT: return t->fltstorage == FS_F32 ? TYG_F32 : TYG_F64;
             case TY_BOOL: return TYG_I8;
-            default: return TYG_I64;   // A reference: an address.
+            default: return IsRel(t) ? RelScal(t) : TYG_I64;   // A reference: an address.
         }
     }
     static int ScalSize(tyg_scalar s) {
@@ -501,6 +503,7 @@ struct TgModule {
     // makes them in the C half.
     const tyg_type *AT(TypeExpr *t) {
         if (t->kind == TY_REF && cg.IsFatRef(t)) return PairAT();
+        if (IsRel(t)) return tyg_type_int(m, RelScal(t), 0);
         if (t->kind == TY_REF) return tyg_type_ptr(m);
         if (IsGrow(t)) return SliceAT();   // gs_rhdr { base, len }, as a slice.
         if (t->kind == TY_INT) return tyg_type_int(m, Scal(t), IsSigned(t));
@@ -573,6 +576,14 @@ struct TgModule {
                 break;
             case TY_BOOL: d = scalar("_Bool", TYG_DT_BOOL); break;
             case TY_REF: {
+                if (IsRel(t)) {
+                    // The offset the slot holds, under the reference's name.
+                    static const char *un[] = { "unsigned char", "unsigned short", "unsigned int",
+                                                "unsigned long long" };
+                    auto sz = ScalSize(Scal(t));
+                    d = scalar(un[sz == 1 ? 0 : sz == 2 ? 1 : sz == 4 ? 2 : 3], TYG_DT_UNSIGNED);
+                    break;
+                }
                 if (OptRef(t) && !cg.IsFatRef(t)) {
                     d = OptDT(t, name);
                     break;
@@ -929,6 +940,27 @@ struct TgModule {
     // Held where every variant's payload is a fixed value of fields held.
     static bool IsVm(TypeExpr *t) { return t && t->kind == TY_ENUM && t->enu->varmode; }
     static bool IsVarint(TypeExpr *t) { return t && t->kind == TY_INT && t->intstorage == IS_VARINT; }
+    // A relative reference (§3.9): an offset of a fixed width in the slot,
+    // from its pool's base less one where it is `in pool` (0 is null), else
+    // from the slot itself. Held in a slot of an aggregate, the `in pool`
+    // form only, its pointee a fixed value held; a value of one is the
+    // address it decodes to, as any reference's.
+    static bool IsRel(const TypeExpr *t) { return t && t->kind == TY_REF && t->ref->lenstorage >= 0; }
+    bool RelOk(TypeExpr *t, int depth = 0) {
+        if (!IsRel(t) || depth > 32) return false;
+        auto w = t->ref->lenstorage;
+        if (w != IS_U8 && w != IS_U16 && w != IS_U32 && w != IS_U64) return false;
+        auto sub = t->ref->sub;
+        return cg.IsFix(sub) && TypeOk(sub, depth + 1);
+    }
+    tyg_scalar RelScal(TypeExpr *t) {
+        switch (t->ref->lenstorage) {
+            case IS_U8: return TYG_I8;
+            case IS_U16: return TYG_I16;
+            case IS_U32: return TYG_I32;
+            default: return TYG_I64;
+        }
+    }
     bool VmOk(TypeExpr *t, int depth = 0) {
         if (!IsVm(t) || depth > 32) return false;
         auto ei = cg.EIOf(t);
@@ -1725,6 +1757,10 @@ struct TgFn {
             x.v = ZigRead(tyg_addr_of(p, pl.a));
             return x;
         }
+        if (TgModule::IsRel(pl.t)) {
+            x.v = RelLoad(pl, l);
+            return x;
+        }
         if (M.IsScalar(pl.t)) {
             x.v = tyg_load(p, M.Scal(pl.t), pl.a, 0);
             return x;
@@ -1749,6 +1785,10 @@ struct TgFn {
     void Store(const P &pl, const V &x) {
         if (Ended()) return;
         if (pl.enc) No(Line {}, "a store into a varint in a bytes value");
+        if (TgModule::IsRel(pl.t)) {
+            RelStore(pl, x.v, Line {});
+            return;
+        }
         // A scalar without a value comes from code after a return or break,
         // which tinygen keeps in a block that is never placed.
         if (M.IsScalar(pl.t) && !x.v) return;
@@ -1762,6 +1802,7 @@ struct TgFn {
     // What the reference at pl refers to: a fat reference's header, with
     // its stack.
     P Step(const P &pl) {
+        if (TgModule::IsRel(pl.t)) return P { tyg_at_val(RelLoad(pl, Line {}), 0), pl.t->ref->sub };
         auto ptr = tyg_load(p, TYG_I64, pl.a, 0);
         P r { tyg_at_val(ptr, 0), pl.t->ref->sub };
         if (cg.IsFatRef(pl.t)) {
@@ -1774,8 +1815,54 @@ struct TgFn {
     // Through references to what they refer to: an optional one is
     // narrowed wherever the checker lets a path through it (§3.8).
     P Deref(P pl) {
-        while (IsAddrRef(pl.t)) pl = Step(pl);
+        while (IsAddrRef(pl.t) || TgModule::IsRel(pl.t)) pl = Step(pl);
         return pl;
+    }
+
+    // ---- Relative references (§3.9) ----------------------------------------
+
+    // What an offset measures from (CodeGen::RelOrigin): the slot itself,
+    // or for an `in pool` reference the pool's base less one, so that 0
+    // stays null (PoolBase).
+    tyg_val RelOrigin(const P &pl, Line l) {
+        auto pool = pl.t->ref->pool;
+        if (!pool) return tyg_addr_of(p, pl.a);
+        auto pp = VarPlace(const_cast<VarDef *>(pool), l);
+        auto base = tyg_load(p, TYG_I64, pp.a, 0);
+        return tyg_bin(p, TYG_SUB, base, tyg_iconst(p, TYG_I64, 1));
+    }
+    // The address the slot at pl decodes to, null for a 0 offset.
+    tyg_val RelLoad(const P &pl, Line l) {
+        auto s = M.RelScal(pl.t);
+        // Signed from the slot, unsigned from a pool (CodeGen::RelParts).
+        auto off = tyg_load(p, s, pl.a, 0);
+        if (s != TYG_I64) off = tyg_convert(p, pl.t->ref->pool ? TYG_ZEXT : TYG_SEXT, TYG_I64, off);
+        auto at = tyg_bin(p, TYG_ADD, RelOrigin(pl, l), off);
+        if (!pl.t->ref->optional) return at;
+        return tyg_select(p, tyg_cmp(p, TYG_EQ, off, tyg_iconst(p, TYG_I64, 0)), tyg_iconst(p, TYG_I64, 0), at);
+    }
+    // The address v as the slot's offset, range-checked (EmitRelStoreAt).
+    void RelStore(const P &pl, tyg_val v, Line l) {
+        auto s = M.RelScal(pl.t);
+        auto pool = pl.t->ref->pool;
+        auto off = tyg_bin(p, TYG_SUB, v, RelOrigin(pl, l));
+        if (pl.t->ref->optional) {
+            auto isnull = tyg_cmp(p, TYG_EQ, v, tyg_iconst(p, TYG_I64, 0));
+            off = tyg_select(p, isnull, tyg_iconst(p, TYG_I64, 0), off);
+            // A link to its own slot would read back as null (RelOffset).
+            if (!pool)
+                AbortUnless(tyg_bin(p, TYG_OR, isnull, tyg_cmp(p, TYG_NE, off, tyg_iconst(p, TYG_I64, 0))),
+                            "RELNULL", l);
+        }
+        auto bits = TgModule::ScalSize(s) * 8;
+        if (bits < 64 && pool)
+            AbortUnless(tyg_cmp(p, TYG_ULE, off, tyg_iconst(p, TYG_I64, (int64_t)((1ull << bits) - 1))), "RELOFF", l);
+        if (bits < 64 && !pool) {
+            auto lo = tyg_cmp(p, TYG_SGE, off, tyg_iconst(p, TYG_I64, -(int64_t)(1ull << (bits - 1))));
+            auto hi = tyg_cmp(p, TYG_SLT, off, tyg_iconst(p, TYG_I64, (int64_t)(1ull << (bits - 1))));
+            AbortUnless(tyg_bin(p, TYG_AND, lo, hi), "RELOFF", l);
+        }
+        tyg_store(p, s, pl.a, s == TYG_I64 ? off : tyg_convert(p, TYG_TRUNC, s, off), 0);
     }
     // What a reference value refers to.
     P RefTarget(const V &x) {
@@ -2348,7 +2435,12 @@ struct TgFn {
             if (si->st->fields[i].ispad) continue;
             auto init = sl->InitFor((int)i);
             if (!init) continue;
-            Into(P { tyg_at_local(tmp, lay.offs[i]), si->ftypes[i] }, init);
+            // A self-relative link measures from the slot it lies in, which a
+            // literal built here and copied out of is not.
+            auto ft = si->ftypes[i];
+            if (TgModule::IsRel(ft) && !ft->ref->pool && !Is<NullLit>(init))
+                No(sl->line, "self-relative link in a literal");
+            Into(P { tyg_at_local(tmp, lay.offs[i]), ft }, init);
         }
         V x;
         x.t = t;
@@ -3968,13 +4060,13 @@ struct TgFn {
             x.a = tyg_at_local(tmp, 0);
             return x;
         }
-        if (!t || t->kind != TY_REF || t->ref->lenstorage >= 0) No(l, "null of this type");
+        if (!t || t->kind != TY_REF || (t->ref->lenstorage >= 0 && !M.RelOk(t, 1))) No(l, "null of this type");
         x.v = tyg_iconst(p, TYG_I64, 0);
         return x;
     }
     // A reference value's address: a fat reference's hdr.
     tyg_val Addr(const V &x, Line l) {
-        if (!x.t || x.t->kind != TY_REF || x.t->ref->lenstorage >= 0) No(l, "address of this value");
+        if (!x.t || x.t->kind != TY_REF || (x.t->ref->lenstorage >= 0 && !M.RelOk(x.t, 1))) No(l, "address of this value");
         if (x.mem) return tyg_load(p, TYG_I64, x.a, 0);
         return x.v;
     }
