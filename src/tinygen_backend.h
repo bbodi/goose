@@ -2968,8 +2968,10 @@ struct TgFn {
         if (cret >= 0) first = P { tyg_at_local(Temp(rets[cret]), 0), rets[cret] };
         for (size_t i = 0; i < rets.size(); i++) {
             if (IsVarArr(rets[i])) {
-                // A T[]: its image built at the destination.
+                // A T[]: its image built at the destination, from where
+                // it started (CodeGen's exit landing at its destination).
                 auto dst = tyg_load(p, TYG_I64, tyg_at_local(chans[i].a, 0), 0);
+                SetTop(dst, tyg_load(p, TYG_I64, tyg_at_local(chans[i].b, 0), 0));
                 if (xs.empty()) {
                     GenImg(vals[i], dst, rets[i], l);
                 } else {
@@ -3482,7 +3484,14 @@ struct TgFn {
             if (IsGrow(sp->rets[i])) {
                 chans[i].a = param();
                 chans[i].b = param();
-            } else if (TgModule::IsVarArr(sp->rets[i]) || (int)i != cret) {
+            } else if (TgModule::IsVarArr(sp->rets[i])) {
+                // The image starts at the destination's top on entry, in
+                // `b`: a return nested in another's value lands there too.
+                chans[i].a = param();
+                chans[i].b = tyg_local_new(p, 8, 8);
+                auto dst = tyg_load(p, TYG_I64, tyg_at_local(chans[i].a, 0), 0);
+                tyg_store(p, TYG_I64, tyg_at_local(chans[i].b, 0), Top(dst), 0);
+            } else if ((int)i != cret) {
                 chans[i].a = param();
             }
         }
