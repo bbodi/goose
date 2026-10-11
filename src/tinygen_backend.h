@@ -1593,6 +1593,17 @@ struct TgFn {
         tyg_store(p, TYG_I64, len, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, len, 0), n), 0);
     }
 
+    // CopyRun of a view's elements, which may be images: their bytes as
+    // one run (to RunEnd), their count added to the one at len.
+    void CopyView(tyg_val stk, tyg_addr len, TypeExpr *et, const View &v) {
+        if (cg.IsFix(et)) return CopyRun(stk, len, et, v.elems, v.len);
+        auto bytes = tyg_bin(p, TYG_SUB, RunEnd(v), v.elems);
+        auto top = Top(stk);
+        tyg_move_dyn(p, top, v.elems, bytes);
+        SetTop(stk, tyg_bin(p, TYG_ADD, top, bytes));
+        tyg_store(p, TYG_I64, len, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, len, 0), v.len), 0);
+    }
+
     // Builds n's value, a resizable array of type t, at the top of stk,
     // its header at hdr (CodeGen::GenConstruct): a literal's elements one
     // by one, a call's at the destination it is handed, anything else (an
@@ -1703,7 +1714,7 @@ struct TgFn {
         auto v = ViewOf(pl, l);
         if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
         begin();
-        CopyRun(stk, len, et, v.elems, v.len);
+        CopyView(stk, len, et, v);
     }
     // The function a call to it builds its first result at a destination
     // for (CodeGen's in-place construction): its own, or a dispatch's
@@ -1889,7 +1900,7 @@ struct TgFn {
         tyg_store(p, TYG_I64, len, tyg_iconst(p, TYG_I64, 0), 0);
         if (from) {
             if (cg.Mangle(from->elem) != cg.Mangle(et)) No(l, "array of another element type");
-            CopyRun(stk, len, et, from->elems, from->len);
+            CopyView(stk, len, et, *from);
         } else if (al || Is<StrLit>(n)) {
             GenRz(n, stk, hdr, t, l);
         } else if (n) {
@@ -1897,7 +1908,7 @@ struct TgFn {
             auto v = ViewOf(LimCallResult(n) ? LimCallPlace(n) : Place(n), l);
             if (Ended()) return;
             if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
-            CopyRun(stk, len, et, v.elems, v.len);
+            CopyView(stk, len, et, v);
         }
         if (Ended()) return;
         auto cnt = tyg_load(p, TYG_I64, len, 0);
@@ -4608,7 +4619,7 @@ struct TgFn {
         if (Ended()) return;
         auto v = ViewOf(from, l);
         if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "append of another element type");
-        CopyRun(pl.stk, len, et, v.elems, v.len);
+        CopyView(pl.stk, len, et, v);
         return;
     }
     static bool IsGrow(TypeExpr *t) { return TgModule::IsGrow(t); }
@@ -6141,7 +6152,7 @@ struct TgFn {
             auto v = ViewOf(P { x->a, x->t, x->stk }, l);
             tyg_store(p, TYG_I64, hdr, Top(dst), 0);
             tyg_store(p, TYG_I64, hlen, tyg_iconst(p, TYG_I64, 0), 0);
-            CopyRun(dst, hlen, t->arr->sub, v.elems, v.len);
+            CopyView(dst, hlen, t->arr->sub, v);
         }
         if (Ended()) return;
         tyg_store(p, TYG_I64, len, tyg_load(p, TYG_I64, hlen, 0), 0);
@@ -6450,7 +6461,7 @@ struct TgFn {
                         No(vd->line, "array result of another type");
                     auto v = ViewOf(P { xs[i].a, xs[i].t, xs[i].stk }, vd->line);
                     auto stk = tyg_load(p, TYG_I64, tyg_at_local(rzstk[d], 0), 0);
-                    CopyRun(stk, tyg_at_local(locals[d], 8), d->type->arr->sub, v.elems, v.len);
+                    CopyView(stk, tyg_at_local(locals[d], 8), d->type->arr->sub, v);
                     continue;
                 }
                 auto x = Fit(xs[i], d->type, vd->line);
