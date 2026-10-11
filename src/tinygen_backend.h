@@ -1956,7 +1956,42 @@ struct TgFn {
     }
 
     // Builds n's value at the place.
+    // A literal of a fixed struct with a non-null self-relative link: the
+    // C builds it where it lies, whose slots the offsets measure from.
+    bool SelfRelLit(Node *n) {
+        auto sl = Is<StructLit>(n);
+        if (!sl || !sl->sinst || sl->variant || !sl->exprtype || sl->exprtype->kind != TY_STRUCT ||
+            !M.TypeOk(sl->exprtype))
+            return false;
+        auto si = cg.SI(sl->exprtype);
+        for (size_t i = 0; i < si->st->fields.size(); i++) {
+            if (si->st->fields[i].ispad) continue;
+            auto ft = si->ftypes[i];
+            auto init = sl->InitFor((int)i);
+            if (init && TgModule::IsRel(ft) && !ft->ref->pool && !Is<NullLit>(init)) return true;
+        }
+        return false;
+    }
+    // Such a literal built at pl: zero bytes, then its fields where they lie.
+    void SelfRelInto(const P &pl, StructLit *sl) {
+        auto t = sl->exprtype;
+        tyg_zero(p, pl.a, M.Size(t));
+        auto si = cg.SI(t);
+        auto &lay = cg.StructLayout(si);
+        for (size_t i = 0; i < si->st->fields.size() && !Ended(); i++) {
+            if (si->st->fields[i].ispad) continue;
+            auto init = sl->InitFor((int)i);
+            if (!init) continue;
+            auto a = pl.a;
+            a.offset += lay.offs[i];
+            Into(P { a, si->ftypes[i] }, init);
+        }
+    }
     void Into(const P &pl, Node *n) {
+        if (SelfRelLit(n) && cg.TEq(n->exprtype, pl.t)) {
+            SelfRelInto(pl, Is<StructLit>(n));
+            return;
+        }
         auto x = GenAs(n, pl.t);
         if (M.IsScalar(pl.t) || x.mem) Store(pl, x);
         else if (!Ended()) No(n->line, "aggregate value");
@@ -2890,10 +2925,15 @@ struct TgFn {
             return V {};
         }
         // The value first, then the slot (the checker keeps the array from
-        // growing into a fresh one meanwhile).
-        auto x = GenAs(an[1], elem);
-        if (Ended()) return Dummy(c->exprtype);
-        if (!M.IsScalar(elem) && !x.mem) No(c->line, "aggregate value");
+        // growing into a fresh one meanwhile); a literal with a self-relative
+        // link is built once the slot is known (CodeGen's atslot).
+        auto atslot = SelfRelLit(an[1]) && cg.TEq(an[1]->exprtype, elem);
+        V x;
+        if (!atslot) {
+            x = GenAs(an[1], elem);
+            if (Ended()) return Dummy(c->exprtype);
+            if (!M.IsScalar(elem) && !x.mem) No(c->line, "aggregate value");
+        }
         auto il = tyg_local_new(p, 8, 8);
         auto pop = tyg_block_new(p), fresh = tyg_block_new(p), got = tyg_block_new(p);
         tyg_branch(p, tyg_cmp(p, TYG_SGT, tyg_load(p, TYG_I64, fllen, 0), tyg_iconst(p, TYG_I64, 0)), pop, fresh);
@@ -2910,7 +2950,8 @@ struct TgFn {
         auto idx = [&] { return tyg_load(p, TYG_I64, tyg_at_local(il, 0), 0); };
         auto base = tyg_load(p, TYG_I64, pl.a, 0);
         auto e = tyg_bin(p, TYG_ADD, base, tyg_bin(p, TYG_MUL, idx(), tyg_iconst(p, TYG_I64, esz)));
-        Store(P { tyg_at_val(e, 0), elem }, x);
+        if (atslot) SelfRelInto(P { tyg_at_val(e, 0), elem }, Is<StructLit>(an[1]));
+        else Store(P { tyg_at_val(e, 0), elem }, x);
         auto grow = tyg_block_new(p), done = tyg_block_new(p);
         tyg_branch(p, tyg_cmp(p, TYG_EQ, idx(), tyg_load(p, TYG_I64, len, 0)), grow, done);
         tyg_block_set(p, grow);
@@ -3399,6 +3440,23 @@ struct TgFn {
         }
         if (!IsGrow(pl.t) || !M.RzOk(pl.t) || !pl.stk) No(c->line, "push to an array of this kind");
         auto et = pl.t->arr->sub;
+        if (SelfRelLit(an[1]) && cg.TEq(an[1]->exprtype, et)) {
+            // Built in its slot at the top, then counted.
+            auto slot = Top(pl.stk);
+            auto sv = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(sv, 0), slot, 0);
+            SelfRelInto(P { tyg_at_val(slot, 0), et }, Is<StructLit>(an[1]));
+            if (Ended()) return Dummy(c->exprtype);
+            auto at = tyg_load(p, TYG_I64, tyg_at_local(sv, 0), 0);
+            SetTop(pl.stk, tyg_bin(p, TYG_ADD, at, tyg_iconst(p, TYG_I64, cg.FixedSize(et))));
+            auto la = pl.a;
+            la.offset += 8;
+            tyg_store(p, TYG_I64, la, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, la, 0), tyg_iconst(p, TYG_I64, 1)), 0);
+            V r;
+            r.t = c->exprtype && c->exprtype->kind == TY_REF ? c->exprtype : nullptr;
+            if (r.t) r.v = at;
+            return r;
+        }
         auto x = GenAs(an[1], et);
         if (Ended()) return Dummy(c->exprtype);
         if (!M.IsScalar(et) && !x.mem) No(c->line, "aggregate value");
@@ -5079,7 +5137,8 @@ struct TgFn {
             // A reference re-pointed (CodeGen::GenRebind): the slot holding
             // it takes the new address, an optional's null too. Relative
             // references and pooled ones are not held.
-            if (!(IsPlainRef(pl.t) || M.OptRef(pl.t)) || !M.TypeOk(pl.t))
+            auto rel = TgModule::IsRel(pl.t) && M.RelOk(pl.t, 1);
+            if (!rel && (!(IsPlainRef(pl.t) || M.OptRef(pl.t)) || !M.TypeOk(pl.t)))
                 No(a->line, cat("rebind of type ", M.NameWhy(pl.t)));
             auto x = GenAs(a->rhs, pl.t);
             if (!M.IsScalar(pl.t) && !x.mem && !Ended()) No(a->line, "aggregate value");
