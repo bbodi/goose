@@ -286,7 +286,7 @@ struct TgModule {
                 // A relative reference outside a slot (a local, a parameter,
                 // a global) holds the offset too: of the `in pool` form, or
                 // a self-relative one only null reaches (§3.9).
-                if (IsRel(t)) return RelOk(t, depth);
+                if (IsRel(t)) return !IsVr(t) && RelOk(t, depth);   // The varint width is an image (ImgOk).
                 return (IsPlainRef(t) || OptRef(t)) &&
                        ((cg.IsFix(t->ref->sub) && TypeOk(t->ref->sub, depth + 1)) || IsVarint(t->ref->sub) ||
                         ImgOk(t->ref->sub, depth + 1) ||
@@ -414,7 +414,7 @@ struct TgModule {
     }
     // A variable-size struct (VsOk) is an image too, read where it lies.
     bool ImgOk(TypeExpr *t, int depth = 0) {
-        return RzOk(t, depth) || VsOk(t, depth) || VarImgOk(t, depth) || VmOk(t, depth) || VvOk(t, depth) ||
+        return RzOk(t, depth) || VsOk(t, depth) || VrOk(t, depth) || VarImgOk(t, depth) || VmOk(t, depth) || VvOk(t, depth) ||
                RcOk(t, depth);
     }
     // A T[] whose elements are images themselves (u8[][], an array of
@@ -460,7 +460,7 @@ struct TgModule {
     }
     // A by-value parameter of a type RzOk or VsOk holds.
     bool RzParam(TypeExpr *t) {
-        return (t->kind == TY_ARRAY && (RzOk(t) || VarImgOk(t) || RcOk(t))) || VsOk(t) || VmOk(t) || VvOk(t) ||
+        return (t->kind == TY_ARRAY && (RzOk(t) || VarImgOk(t) || RcOk(t))) || VsOk(t) || VrOk(t) || VmOk(t) || VvOk(t) ||
                FoOk(t);
     }
     tyg_scalar Scal(TypeExpr *t) {
@@ -486,6 +486,7 @@ struct TgModule {
         }
     }
     int64_t Size(TypeExpr *t) {
+        if (IsVr(t)) return 16;   // A temporary for the value: up to ten bytes of varint.
         if (IsScalar(t)) return ScalSize(Scal(t));
         // A payload-less variant as a value of its own: the gs_empty byte.
         if (t->kind == TY_VARIANT && !cg.FixedSize(t)) return 1;
@@ -514,8 +515,8 @@ struct TgModule {
     // makes them in the C half.
     const tyg_type *AT(TypeExpr *t) {
         if (t->kind == TY_REF && cg.IsFatRef(t)) return PairAT();
-        if (IsRel(t)) return tyg_type_int(m, RelScal(t), 0);
-        if (t->kind == TY_REF) return tyg_type_ptr(m);
+        if (IsRel(t) && !IsVr(t)) return tyg_type_int(m, RelScal(t), 0);
+        if (t->kind == TY_REF) return tyg_type_ptr(m);   // A varint-width relative reference: its image.
         if (IsGrow(t)) return SliceAT();   // gs_rhdr { base, len }, as a slice.
         if (t->kind == TY_STRUCT && cg.IsFrameObj(t)) return FoAT(t);
         if (t->kind == TY_INT) return tyg_type_int(m, Scal(t), IsSigned(t));
@@ -609,7 +610,7 @@ struct TgModule {
                     // The offset the slot holds, under the reference's name.
                     static const char *un[] = { "unsigned char", "unsigned short", "unsigned int",
                                                 "unsigned long long" };
-                    auto sz = ScalSize(Scal(t));
+                    auto sz = IsVr(t) ? 1 : ScalSize(Scal(t));   // A varint's first byte.
                     d = scalar(un[sz == 1 ? 0 : sz == 2 ? 1 : sz == 4 ? 2 : 3], TYG_DT_UNSIGNED);
                     break;
                 }
@@ -828,7 +829,7 @@ struct TgModule {
     // another representation.
     bool IsVs(TypeExpr *t) { return t && t->kind == TY_STRUCT && !cg.IsFix(t) && !cg.IsFrameObj(t); }
     // An image: a T[] or such a struct.
-    bool IsImg(TypeExpr *t) { return IsVarArr(t) || IsVs(t) || IsVm(t) || IsVv(t) || IsRc(t); }
+    bool IsImg(TypeExpr *t) { return IsVarArr(t) || IsVs(t) || IsVm(t) || IsVv(t) || IsRc(t) || IsVr(t); }
     // One this backend holds: its fields fixed values it holds, T[]s of
     // fixed elements (RzOk), or such structs; no relative references.
     bool VsOk(TypeExpr *t, int depth = 0) {
@@ -838,6 +839,10 @@ struct TgModule {
             if (si->st->fields[i].ispad) continue;
             auto ft = si->ftypes[i];
             if (IsVarint(ft)) continue;
+            if (IsVr(ft)) {
+                if (!VrOk(ft, depth + 1)) return false;
+                continue;
+            }
             if (cg.IsFix(ft) ? !TypeOk(ft, depth + 1)
                              : !((IsVarArr(ft) && (RzOk(ft, depth + 1) || VarImgOk(ft, depth + 1))) ||
                                  VsOk(ft, depth + 1) || VmOk(ft, depth + 1)))
@@ -849,7 +854,7 @@ struct TgModule {
     // variable-size one, and that one's least (a T[]'s prefix).
     int64_t VsMinSize(TypeExpr *t) {
         if (cg.IsFix(t)) return cg.FixedSize(t);
-        if (IsVarint(t)) return 1;
+        if (IsVarint(t) || IsVr(t)) return 1;
         if (IsVarArr(t)) return PrefixBytes(t);
         auto si = cg.SI(t);
         int64_t off = 0;
@@ -1006,7 +1011,15 @@ struct TgModule {
     bool RelOk(TypeExpr *t, int depth = 0) {
         if (!IsRel(t) || depth > 32) return false;
         auto w = t->ref->lenstorage;
-        if (w != IS_U8 && w != IS_U16 && w != IS_U32 && w != IS_U64) return false;
+        if (w != IS_U8 && w != IS_U16 && w != IS_U32 && w != IS_U64 && w != IS_VARINT) return false;
+        return RelSubOk(t, depth);
+    }
+    // The varint width (`T&<varint in pool>`, `T&<varint>`): its offset is
+    // ULEB128 (zigzag when self-relative), so the value is variable-size,
+    // a bytes value a uint8_t * points at, as a T[] is (SC_VARIABLE).
+    static bool IsVr(const TypeExpr *t) { return IsRel(t) && t->ref->lenstorage == IS_VARINT; }
+    bool VrOk(TypeExpr *t, int depth = 0) { return IsVr(t) && depth <= 32 && RelSubOk(t, depth); }
+    bool RelSubOk(TypeExpr *t, int depth) {
         auto sub = t->ref->sub;
         if (cg.IsFix(sub)) return TypeOk(sub, depth + 1);
         // An image it points at, which may hold such links to its own type.
@@ -1039,6 +1052,10 @@ struct TgModule {
             if (fields[i].ispad) continue;
             auto ft = ftypes[i];
             if (IsVarint(ft)) continue;
+            if (IsVr(ft)) {
+                if (!VrOk(ft, depth + 1)) return false;
+                continue;
+            }
             if (cg.IsFix(ft) ? !TypeOk(ft, depth + 1)
                              : !((IsVarArr(ft) && (RzOk(ft, depth + 1) || VarImgOk(ft, depth + 1))) ||
                                  VsOk(ft, depth + 1) || VmOk(ft, depth + 1)))
@@ -1156,7 +1173,7 @@ struct TgModule {
         if (TypeOk(d->type)) return true;
         return ((IsGrow(d->type) || IsVarArr(d->type)) && RzOk(d->type) && cg.gstks.count(d)) ||
                (VarImgOk(d->type) && cg.gstks.count(d)) ||
-               ((VsOk(d->type) || VmOk(d->type) || VvOk(d->type) || RcOk(d->type)) && cg.gstks.count(d)) ||
+               ((VsOk(d->type) || VmOk(d->type) || VvOk(d->type) || RcOk(d->type) || VrOk(d->type)) && cg.gstks.count(d)) ||
                (IsGrow(d->type) && VeOk(d->type) && cg.gstks.count(d)) || (FoOk(d->type) && cg.gstks.count(d));
     }
 
@@ -1339,7 +1356,7 @@ struct TgModule {
         if (!fv->type || cg.PrefVar(fv)) return false;
         if (fv->reusable) return IsGrow(fv->type) && RzOk(fv->type);   // A gs_pref.
         return TypeOk(fv->type) || ((IsGrow(fv->type) || IsVarArr(fv->type)) && RzOk(fv->type)) || VsOk(fv->type) ||
-               RcOk(fv->type) || FoOk(fv->type) ||
+               VrOk(fv->type) || RcOk(fv->type) || FoOk(fv->type) ||
                VmOk(fv->type) || VvOk(fv->type) || VarImgOk(fv->type) || VeOk(fv->type);
     }
 
@@ -1780,6 +1797,20 @@ struct TgFn {
             BuildFv(c, l, [&](Node *v) { GenImg(v, stk, t, l); });
             return tyg_load(p, TYG_I64, tyg_at_local(start, 0), 0);
         }
+        if (TgModule::IsVr(t)) {
+            // A varint-width relative reference: the offset of the plain
+            // reference n is, whatever relative width it came from.
+            if (from) No(l, "relative reference without a value");
+            if (!n) {   // Declared without one: null, the zero byte.
+                auto top = Top(stk);
+                tyg_store(p, TYG_I8, tyg_at_val(top, 0), tyg_iconst(p, TYG_I8, 0), 0);
+                SetTop(stk, tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, 1)));
+                return top;
+            }
+            auto x = GenAs(n, t);
+            if (Ended()) return Top(stk);
+            return GenVr(x, stk, t, l);
+        }
         if (M.IsVm(t)) {
             if (!n || from) No(l, cat("value of type ", M.NameWhy(t)));
             return GenVm(n, stk, t, l);
@@ -2076,6 +2107,12 @@ struct TgFn {
     void Store(const P &pl, const V &x) {
         if (Ended()) return;
         if (pl.enc) No(Line {}, "a store into a varint in a bytes value");
+        if (TgModule::IsVr(pl.t)) {
+            // Only into a temporary carrying a value across blocks (Size):
+            // the language never assigns one.
+            RelOffsetInto(pl, x.v, Line {});
+            return;
+        }
         if (TgModule::IsRel(pl.t)) {
             RelStore(pl, x.v, Line {});
             return;
@@ -2131,15 +2168,21 @@ struct TgFn {
     tyg_val RelLoad(const P &pl, Line l) {
         auto s = M.RelScal(pl.t);
         // Signed from the slot, unsigned from a pool (CodeGen::RelParts).
-        auto off = tyg_load(p, s, pl.a, 0);
-        if (s != TYG_I64) off = tyg_convert(p, pl.t->ref->pool ? TYG_ZEXT : TYG_SEXT, TYG_I64, off);
+        tyg_val off;
+        if (TgModule::IsVr(pl.t)) {
+            auto at = tyg_addr_of(p, pl.a);
+            off = pl.t->ref->pool ? UlebRead(at) : ZigRead(at);
+        } else {
+            off = tyg_load(p, s, pl.a, 0);
+            if (s != TYG_I64) off = tyg_convert(p, pl.t->ref->pool ? TYG_ZEXT : TYG_SEXT, TYG_I64, off);
+        }
         auto at = tyg_bin(p, TYG_ADD, RelOrigin(pl, l), off);
         if (!pl.t->ref->optional) return at;
         return tyg_select(p, tyg_cmp(p, TYG_EQ, off, tyg_iconst(p, TYG_I64, 0)), tyg_iconst(p, TYG_I64, 0), at);
     }
-    // The address v as the slot's offset, range-checked (EmitRelStoreAt).
-    void RelStore(const P &pl, tyg_val v, Line l) {
-        auto s = M.RelScal(pl.t);
+    // The offset the slot at pl holds for the address v: its distance
+    // from the origin, zero for a null (CodeGen::RelOffset).
+    tyg_val RelOffset(const P &pl, tyg_val v, Line l) {
         auto pool = pl.t->ref->pool;
         auto off = tyg_bin(p, TYG_SUB, v, RelOrigin(pl, l));
         if (pl.t->ref->optional) {
@@ -2150,6 +2193,27 @@ struct TgFn {
                 AbortUnless(tyg_bin(p, TYG_OR, isnull, tyg_cmp(p, TYG_NE, off, tyg_iconst(p, TYG_I64, 0))),
                             "RELNULL", l);
         }
+        return off;
+    }
+    // The address v as a varint-width offset written at the top of stk:
+    // ULEB128 of an `in pool` one, zigzag of a self-relative one
+    // (CodeGen::EmitRelStore); no range to check.
+    tyg_val RelOffsetInto(const P &pl, tyg_val v, Line l) {
+        auto off = RelOffset(pl, v, l);
+        auto at = tyg_addr_of(p, pl.a);
+        return pl.t->ref->pool ? UlebWrite(at, off) : ZigWrite(at, off);
+    }
+    tyg_val GenVr(const V &x, tyg_val stk, TypeExpr *t, Line l) {
+        auto top = Top(stk);
+        auto n = RelOffsetInto(P { tyg_at_val(top, 0), t }, x.v, l);
+        SetTop(stk, tyg_bin(p, TYG_ADD, top, n));
+        return top;
+    }
+    // The address v as the slot's offset, range-checked (EmitRelStoreAt).
+    void RelStore(const P &pl, tyg_val v, Line l) {
+        auto s = M.RelScal(pl.t);
+        auto pool = pl.t->ref->pool;
+        auto off = RelOffset(pl, v, l);
         auto bits = TgModule::ScalSize(s) * 8;
         if (bits < 64 && pool)
             AbortUnless(tyg_cmp(p, TYG_ULE, off, tyg_iconst(p, TYG_I64, (int64_t)((1ull << bits) - 1))), "RELOFF", l);
@@ -5341,7 +5405,7 @@ struct TgFn {
                 Open();
                 Loc(b->tail->line);
                 x = want ? GenSliceAs(b->tail, want) : Gen(b->tail);
-                if (x.t && (IsGrow(x.t) || IsImg(x.t))) No(b->tail->line, "array value of a block");
+                if (x.t && (IsGrow(x.t) || (IsImg(x.t) && !TgModule::IsVr(x.t)))) No(b->tail->line, "array value of a block");
             }
         }
         CloseScope();
@@ -5503,7 +5567,7 @@ struct TgFn {
         }
         OpenScope(true);
         auto x = want ? GenSliceAs(n, want) : Gen(n);
-        if (x.t && (IsGrow(x.t) || IsImg(x.t))) No(n->line, "array value of an arm");
+        if (x.t && (IsGrow(x.t) || (IsImg(x.t) && !TgModule::IsVr(x.t)))) No(n->line, "array value of an arm");
         CloseScope();
         return x;
     }
@@ -5511,7 +5575,9 @@ struct TgFn {
     V GenIf(IfExpr *i, bool discard) {
         auto et = i->exprtype;
         auto valued = !discard && et && et->kind != TY_VOID;
-        if (valued && i->elseb && !M.TypeOk(et)) {
+        // A varint-width relative reference is carried through a temporary
+        // as any value of one is: encoded in it, decoded out.
+        if (valued && i->elseb && !M.TypeOk(et) && !M.VrOk(et)) {
             // An image or a resizable: each arm builds it on a temporary's
             // stack (GenImg, GenRz).
             if (IsImg(et) && M.ImgOk(et)) {
@@ -5528,7 +5594,7 @@ struct TgFn {
                 return x;
             }
         }
-        if (valued && !M.TypeOk(et)) No(i->line, "if value type");
+        if (valued && !M.TypeOk(et) && !M.VrOk(et)) No(i->line, "if value type");
         tyg_local res = 0;
         if (valued) res = Temp(et);
         auto c = Truth(i->cond);
@@ -5554,7 +5620,7 @@ struct TgFn {
     bool Valued(Node *n, bool discard) {
         auto et = n->exprtype;
         if (discard || !et || et->kind == TY_VOID) return false;
-        if (!M.TypeOk(et)) No(n->line, cat("value of type ", M.NameWhy(et)));
+        if (!M.TypeOk(et) && !M.VrOk(et)) No(n->line, cat("value of type ", M.NameWhy(et)));
         return true;
     }
 
@@ -6347,7 +6413,7 @@ struct TgFn {
             return;
         }
         if (((IsVarArr(d->type) && (M.RzOk(d->type) || M.VarImgOk(d->type))) || M.VsOk(d->type) || M.VmOk(d->type) ||
-             M.VvOk(d->type) || M.RcOk(d->type)) &&
+             M.VvOk(d->type) || M.RcOk(d->type) || M.VrOk(d->type)) &&
             !cg.PrefVar(d)) {
             // A T[] local: its image's address, the image on a stack of its
             // own (built by StmtVarDecl).
@@ -6646,8 +6712,8 @@ struct TgFn {
         TypeExpr *ielem = !itt ? nullptr : itt->kind == TY_ARRAY ? itt->arr->sub
                         : itt->kind == TY_SLICE ? itt->sub : nullptr;
         auto walk = ielem && !cg.IsFix(ielem);
-        // A varint element is bound by its value, decoded.
-        auto bindptr = walk && !TgModule::IsVarint(ielem);
+        // A varint element, or a relative reference one, is bound by its value, decoded.
+        auto bindptr = walk && !TgModule::IsVarint(ielem) && !TgModule::IsVr(ielem);
         tyg_local cl = 0;
         tyg_scope_begin(p);
         if (f->vdef && bindptr) {
@@ -6842,7 +6908,7 @@ struct TgFn {
     // The bytes of the image of type t at `at` (CodeGen::SizeX).
     tyg_val ImgSize(TypeExpr *t, tyg_val at) {
         if (cg.IsFix(t)) return tyg_iconst(p, TYG_I64, cg.FixedSize(t));
-        if (TgModule::IsVarint(t)) return UlebSize(at);
+        if (TgModule::IsVarint(t) || TgModule::IsVr(t)) return UlebSize(at);   // Zigzag has ULEB128's shape.
         if (M.IsVv(t)) return tyg_bin(p, TYG_SUB, VvField(t, at, -1), at);
         if (M.IsVm(t)) {
             // The tag, and its variant's payload: a variable one walked,
@@ -7072,6 +7138,10 @@ struct TgFn {
             auto ft = ftypes[i];
             auto init = sl->InitFor((int)i);
             if (!cg.IsFix(ft)) {
+                if (!init && TgModule::IsVr(ft)) {
+                    zero(1);   // An omitted optional: the one zero byte.
+                    continue;
+                }
                 if (!init) No(sl->line, "omitted variable-size field");
                 GenImg(init, stk, ft, init->line);
                 continue;
