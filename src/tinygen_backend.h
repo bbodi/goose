@@ -1411,6 +1411,7 @@ struct TgFn {
     // the tops of the stacks it took, on every way out of it, from marks
     // saved as each was taken (CodeGen::CScope).
     tyg_local spl = 0, stksl = 0;
+    bool hassp = false;   // spl holds gs_sp (a local's id may be 0).
     int live = 0, maxown = 0;
     vector<CodeGen::StackCall> stackcalls;
     struct Mark {
@@ -1493,7 +1494,7 @@ struct TgFn {
     // ---- Data stacks ---------------------------------------------------------
 
     tyg_val SpVal(Line l) {
-        if (!spl) No(l, "data stack without gs_sp");
+        if (!hassp) No(l, "data stack without gs_sp");
         return tyg_load(p, TYG_I64, tyg_at_local(spl, 0), 0);
     }
     // GS(gs_sp + k): the gs_stack (one pointer, its top) at that index.
@@ -6891,7 +6892,10 @@ struct TgFn {
                 chans[i].a = param();
             }
         }
-        if (cg.sinfo[sp].needssp) spl = param();
+        if (cg.sinfo[sp].needssp) {
+            spl = param();
+            hassp = true;
+        }
         // Each destination's top on entry: a return builds its result
         // there, also one nested in another return's value that has
         // started building (`return str("x", if c { return "y"; } ...)`).
@@ -6962,6 +6966,7 @@ struct TgFn {
                        tyg_dt_func(m, tyg_dt_void(m), nullptr, 0, 0));
         Loc(line);
         spl = tyg_local_new(p, 8, 8);
+        hassp = true;
         tyg_store(p, TYG_I64, tyg_at_local(spl, 0), tyg_iconst(p, TYG_I64, 0), 0);
         gblk = tyg_block_new(p);
         gstart = tyg_block_new(p);
