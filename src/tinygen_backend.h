@@ -2471,6 +2471,19 @@ struct TgFn {
     // value. The checker may have typed the node as the slice already.
     V GenSliceAs(Node *n, TypeExpr *t) {
         if (!M.TypeOk(t)) No(n->line, "slice type");
+        if (auto al = Is<ArrayLit>(n); al && !al->fillval && !al->capexpr && cg.IsFix(t->sub)) {
+            // A literal at a slice destination: its elements in a temporary
+            // of their own, viewed.
+            auto et = t->sub;
+            auto esz = cg.FixedSize(et);
+            auto k = (int64_t)al->elems.size();
+            auto tmp = tyg_local_new(p, std::max<int64_t>(k * esz, 1), 8);
+            for (int64_t i = 0; i < k; i++) {
+                Into(P { tyg_at_local(tmp, i * esz), et }, al->elems[(size_t)i]);
+                if (Ended()) return Dummy(t);
+            }
+            return SliceValue(t, tyg_addr_of(p, tyg_at_local(tmp, 0)), tyg_iconst(p, TYG_I64, k));
+        }
         auto d = Is<Dot>(n);
         P pl;
         if (Is<Ident>(n) || Is<Index>(n) || (d && d->IsField())) {
