@@ -1199,6 +1199,9 @@ struct TgFn {
 
     void Store(const P &pl, const V &x) {
         if (Ended()) return;
+        // A scalar without a value comes from code after a return or break,
+        // which tinygen keeps in a block that is never placed.
+        if (M.IsScalar(pl.t) && !x.v) return;
         if (!M.IsScalar(pl.t) && !M.TypeOk(pl.t)) No(Line {}, cat("store of a ", M.Name(pl.t)));
         if (M.IsScalar(pl.t)) tyg_store(p, M.Scal(pl.t), pl.a, x.v, 0);
         else tyg_move(p, pl.a, x.a, M.Size(pl.t));
@@ -1313,6 +1316,9 @@ struct TgFn {
 
     V Gen(Node *n) {
         auto x = Gen1(n);
+        // After a return or break the rest is unreachable, but the code using
+        // this value is still built: it needs a value, not none.
+        if (Ended() && !x.v && !x.mem && n->exprtype && M.IsScalar(n->exprtype)) return Dummy(n->exprtype);
         if (Ended() || !x.t || !n->exprtype || n->exprtype->kind == TY_VOID) return x;
         return Fit(x, n->exprtype, n->line);
     }

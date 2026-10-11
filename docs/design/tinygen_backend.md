@@ -791,14 +791,11 @@ variable-size structs (44, 16), variable-size elements (22, 5), format
 overloads (12, 5); then `return from` with `u8[]` results, SIMD
 vectors, `if` values of types not held and varints (9 or 10 each).
 
-One more thing keeps functions in C, outside any class: nine of them
-(`early_g`, `classify_g`, `choose_g`, `deep_fail_g`, ..., in five
-programs) are abandoned with tinygen's own `invalid value`
-(`tg_val_check`). The backend passes value 0, the empty `V {}` of an
-expression whose code ended (`if c { return 10; } else { return 20; }`
-as an operand; a `guard ... else { return }` before a fixed array is
-used), where it should pass a dummy. A backend bug, harmless since
-tinygen refuses the procedure; a dummy there would let them through.
+Code after a `return` or `break` is unreachable but still built, and
+tinygen puts it in a block that is never placed. Its expressions get a
+dummy value and its stores of a missing value are skipped, so functions
+such as `deep_fail_g` and `earlyblocks_g` no longer fall back with
+tinygen's `invalid value`.
 
 ## Testing
 
