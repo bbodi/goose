@@ -1312,7 +1312,8 @@ struct TgModule {
         for (auto r : sp->rets)
             if (!RetOk(r)) { why = cat("result type ", NameWhy(r)); return false; }
         for (size_t i = 0; i < sp->argtypes.size(); i++)
-            if (cg.IsPoolParam(sp, i) || !(TypeOk(sp->argtypes[i]) || RzParam(sp->argtypes[i]))) {
+            if (cg.IsPoolParam(sp, i) ? !(cg.IsFatRef(sp->argtypes[i]) && TypeOk(sp->argtypes[i]))
+                                      : !(TypeOk(sp->argtypes[i]) || RzParam(sp->argtypes[i]))) {
                 why = cat("parameter type ", NameWhy(sp->argtypes[i]));
                 return false;
             }
@@ -1341,7 +1342,13 @@ struct TgModule {
         if (auto it = sigs.find(sp); it != sigs.end()) return it->second;
         auto &si = cg.sinfo[sp];
         vector<const tyg_type *> ps;
-        for (auto t : sp->argtypes) {
+        for (size_t i = 0; i < sp->argtypes.size(); i++) {
+            auto t = sp->argtypes[i];
+            if (cg.IsPoolParam(sp, i)) {
+                // A pool reference, gs_pref, as its four members (ParamFields).
+                for (int k = 0; k < 4; k++) ps.push_back(tyg_type_ptr(m));
+                continue;
+            }
             // A by-value T[] is its image's address; a by-value T[>..] its
             // header, then its stack (CodeGen::SigParams).
             if (RzParam(t) && !Resz(t)) {
@@ -1438,6 +1445,8 @@ struct TgFn {
     // A reusable pool's freelist (§5.4): its header { base, len } and the
     // slot holding its stack, by the pool's variable.
     map<const VarDef *, pair<tyg_local, tyg_local>> poolfl;
+    // Pool reference parameters (gs_pref), by the parameter.
+    map<const VarDef *, tyg_local> prefs;
 
     TgFn(TgModule &_M, FnSpec *_sp) : M(_M), cg(_M.cg), sp(_sp), m(_M.m) {}
 
@@ -3548,6 +3557,13 @@ struct TgFn {
     // A reusable pool's array, its freelist's header and the freelist's
     // stack: a local's, or a global's through its accessors.
     void PoolAt(VarDef *vd, Line l, P &pl, tyg_addr &fl, tyg_val &flstk) {
+        if (vd && prefs.count(vd)) {
+            auto loc = prefs[vd];
+            pl = Deref(VarPlace(vd, l));
+            fl = tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(loc, 16), 0), 0);
+            flstk = tyg_load(p, TYG_I64, tyg_at_local(loc, 24), 0);
+            return;
+        }
         if (!vd || !(poolfl.count(vd) || (vd->isglobal && vd->reusable))) No(l, "pool of this kind");
         pl = VarPlace(vd, l);
         if (vd->isglobal) {
@@ -4176,6 +4192,10 @@ struct TgFn {
         vector<tyg_arg> args;
         for (size_t i = 0; i < an.size(); i++) {
             auto pt = callee->argtypes[i];
+            if (cg.IsPoolParam(callee, i)) {
+                PrefArg(an[i], args);
+                continue;
+            }
             if (M.RzParam(pt)) {
                 ValArg(an[i], pt, args);
                 continue;
@@ -4275,6 +4295,26 @@ struct TgFn {
             if (!M.IsScalar(r.t)) r.mem = true;
         }
         return rets;
+    }
+
+    // A pool reference argument (CodeGen::GenPrefVal): &pool, or a pool
+    // reference parameter handed on, as gs_pref's four members.
+    void PrefArg(Node *n, vector<tyg_arg> &args) {
+        auto c = n;
+        if (auto u = Is<Unary>(n); u && u->op == T_BITAND) c = u->child;
+        auto id = Is<Ident>(c);
+        auto vd = id ? id->vdef : nullptr;
+        if (!vd) No(n->line, "pool reference argument of this kind");
+        P pl;
+        tyg_addr fl;
+        tyg_val flstk;
+        PoolAt(vd, n->line, pl, fl, flstk);
+        if (!pl.stk) No(n->line, "pool without its stack");
+        for (auto v : { tyg_addr_of(p, pl.a), pl.stk, tyg_addr_of(p, fl), flstk }) {
+            tyg_arg a {};
+            a.val = v;
+            args.push_back(a);
+        }
     }
 
     // A by-value array, image or frame object argument: a copy of its own,
@@ -5803,6 +5843,8 @@ struct TgFn {
                 if ((int)i != pos && cg.Mangle(sp->argtypes[i]) != cg.Mangle(sp0->argtypes[i]))
                     No(c->line, "dispatch with arguments of different types");
             if (M.RzParam(sp->argtypes[(size_t)pos])) No(c->line, "dispatch to a case of this kind");
+            for (size_t i = 0; i < sp->argtypes.size(); i++)
+                if (cg.IsPoolParam(sp, i)) No(c->line, "dispatch with a pool reference");
         }
         // The shared arguments, each kept in a local of its own: the arms
         // are blocks of their own.
@@ -7040,7 +7082,13 @@ struct TgFn {
         if (!p) No(sp->sf->line, cat("tyg_proc_begin: ", tyg_error(m) ? tyg_error(m) : "?"));
         auto file = M.File(sp->sf->line.fileidx);
         vector<const tyg_dtype *> pdt;
-        for (auto t : sp->argtypes) {
+        for (size_t i = 0; i < sp->argtypes.size(); i++) {
+            auto t = sp->argtypes[i];
+            if (cg.IsPoolParam(sp, i)) {
+                auto vp = tyg_dt_pointer(m, M.DT(M.ast.inttypes[IS_U8]));
+                for (int k = 0; k < 4; k++) pdt.push_back(vp);
+                continue;
+            }
             if (M.RzParam(t) && !M.Resz(t)) pdt.push_back(tyg_dt_pointer(m, M.DT(t)));
             else pdt.push_back(M.DT(t));
             if (M.RzParam(t) && M.Resz(t)) pdt.push_back(tyg_dt_pointer(m, M.StackDT()));
@@ -7059,7 +7107,10 @@ struct TgFn {
         // for the debugger as the parameters' do (tyg_debug_var_ref,
         // tyg_debug_param).
         int pi = 0;
-        for (auto t : sp->argtypes) pi += M.RzParam(t) && M.Resz(t) ? 2 : 1;
+        for (size_t i = 0; i < sp->argtypes.size(); i++) {
+            auto t = sp->argtypes[i];
+            pi += cg.IsPoolParam(sp, i) ? 4 : M.RzParam(t) && M.Resz(t) ? 2 : 1;
+        }
         auto param = [&] {
             auto loc = tyg_local_new(p, 8, 8);
             tyg_store(p, TYG_I64, tyg_at_local(loc, 0), tyg_param(p, pi++), 0);
@@ -7083,6 +7134,17 @@ struct TgFn {
         for (size_t i = 0; i < sp->params.size(); i++) {
             auto vd = sp->params[i];
             auto t = sp->argtypes[i];
+            if (cg.IsPoolParam(sp, i)) {
+                // gs_pref { hdr, stk, fl, flstk }: a fat reference, then
+                // the freelist's header and stack.
+                auto loc = tyg_local_new(p, 32, 8);
+                for (int k = 0; k < 4; k++) tyg_store(p, TYG_I64, tyg_at_local(loc, 8 * k), tyg_param(p, pi++), 0);
+                locals[vd] = loc;
+                prefs[vd] = loc;
+                tyg_debug_param(p, string(vd->name).c_str(), M.DT(t), tyg_at_local(loc, 0),
+                                M.File(vd->line.fileidx), vd->line.line);
+                continue;
+            }
             auto pv = tyg_param(p, pi++);
             if (M.RzParam(t) && !M.Resz(t)) {
                 // A by-value T[]: its image's address, the image a copy the
