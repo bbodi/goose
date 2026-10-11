@@ -260,6 +260,7 @@ backend compiles:
 | second, so far (+ multiple results, globals) | 1099 of 3811 (29%) | 1 of 172 |
 | third, so far (strings and resizable arrays handed in) | 1241 of 3811 (33%) | 53 of 172 |
 | third, so far (+ resizable arrays built: locals, results) | 1471 of 3811 (39%) | 92 of 172 |
+| third, so far (+ u8[] values, str/format, string equality, shrinking builtins) | 1674 of 3811 (44%) | 167 of 172 |
 
 (The first stage's own write-up counted 394 of 3331 over 284 programs, an
 older sweep; the rows above come from the same one.) The step that added
@@ -387,6 +388,55 @@ composites through the C half's render functions, `resize`/`pop`/`clear`,
 globals of resizable types (their dedicated stacks), and `default`/
 `assert`/`abort`.
 
+## What the third stage adds next: u8[] values, text, shrinking
+
+* **u8[] values** (any `T[]` / `T[uN]` of fixed elements): a local is
+  its image's address, the image on a stack of its own (`AllocStk`,
+  given back where its scope ends), built from a string literal, a
+  slice or any other array (`copy(x)` too), `str(...)`, or a call
+  returning one, which is handed the local's stack as its destination.
+  A result has the channel `SigParams` gives it, `gs_stack *gs_dst<i>`
+  alone: the callee builds the whole image, prefix and elements, at that
+  stack's top and leaves the top after it (the C half's own
+  element-run twin, `_er`, stays a C function). Anything else is built
+  as a resizable's elements behind a reserved prefix, which is then
+  patched with the count, checked against the prefix's range with the
+  C's `gs_panic` message. A by-value `T[]` argument is an image copied
+  onto a statement's stack and passed by its address; a `T[]` where a
+  `T[]&` is wanted, its address. Not yet: assigning a new value to a
+  `T[]` variable (the C moves the image down its stack).
+* **text**: `str(a, b, ...)` and `format(out, a, b, ...)` of scalars
+  and of u8 arrays and slices, each argument evaluated and written in
+  turn at the builder's top: a scalar through the runtime's exported
+  `gs_fmt_i64`/`_u64`/`_f64`/`_f32`/`_bool`, which return the byte
+  count, bytes copied. A `str` the checker typed as the slice it is
+  passed as is a view of a builder on a statement's stack, as in the C.
+  Composite arguments, which the C half renders structurally (its
+  render functions), and format overloads still send a function to C.
+* **equality** of arrays and slices of integer or bool elements: the
+  lengths, then `memcmp` of the bytes (the C's `gs_memeq`).
+* **shrinking**: `pop`, `pop_n`, `clear`, and `resize(n)` /
+  `resize(n, fill)` of a resizable through a reference or on a local,
+  with the C's checks and order: the receiver, the arguments, the
+  checks; the top moves with the count, new slots filled through a
+  cursor and the top written once. `assert`, `abort(msg)` and `exit`.
+  The aborts go through shims naming the C half's codes
+  (`gs_tg_abort_POP`, ...).
+
+Coverage after this step is the last table row (0 of 582 runs differ).
+What still sends a function to C, by count over the sweep: free variables
+(329), calls through function values and dispatch (195), globals (167:
+mostly strings and resizable arrays, which live on dedicated stacks),
+`return from` (158), operators on types not held (56: optionals, enums,
+structs), `print` of composites (33) and format overloads (13), slices of
+variable-size elements (`Employee[:]` 32, `City[:]` 24), expression kinds
+`match` and `block` (31, 17), `default` (29), ADTs and optionals as
+parameters and results, frame objects (`Node&`), limited arrays
+(`u8[..8]`). In Goose-in-Goose only five functions remain, all for free
+variables of nested functions. Next: globals of resizable and `u8[]`
+types (their dedicated stacks), composites rendered through the C half's
+render functions given external linkage, `default`, then free variables.
+
 ## Testing
 
 `test/tinygen/` holds fixtures the backend covers whole: scalars,
@@ -397,14 +447,17 @@ bounds check), a slice whose bounds fail, multiple results, globals
 strings and resizable arrays handed to functions (whose `main`, which
 builds them as `u8[]` values, stays in C), and resizable arrays built,
 pushed and appended to, returned (alone and beside a fixed result) and
-given back on every way out of their scopes. They are ordinary fixtures, run by the
+given back on every way out of their scopes, u8[] values built in place
+and returned with `str`, `format` and string comparisons, and arrays
+popped, resized and cleared (ending in a pop of an empty array). They
+are ordinary fixtures, run by the
 main suite through both C backends against `test/expected/`.
 `test/tinygen_backend.py` (the "tinygen backend" section of `run_tests.py`)
 builds them with `--backend=tinygen`, requires every function to go through
 tinygen, builds the structs fixture three more times with chosen functions
 left to C (`--tinygen-skip=a,b`, hidden) so that by-value and by-reference
 structs cross the two halves in both directions, and the arrays, results,
-globals, strings and built-arrays fixtures twice more so that arrays and
+globals, strings, built-arrays, text and shrink fixtures twice more so that arrays and
 slices, out-pointers, globals, fat references, destination stacks and
 `gs_sp` do, builds a few existing
 fixtures and a sample that the stage covers in part, and compares every run
@@ -412,8 +465,9 @@ with the same expected output. Where `lldb` is installed it runs one program
 under it and requires a breakpoint by Goose function name, Goose lines in the
 frame and its caller, and a parameter and a local with Goose types; and one
 more for a slice parameter's `data` and `len` and a fixed array's elements,
-one for a static global by its Goose name, and one for a `u8[]` image and
-a resizable array's fat reference, header and elements.
+one for a static global by its Goose name, one for a `u8[]` image and
+a resizable array's fat reference, header and elements, and one for a
+resizable local and a `u8[]` local built in a tinygen function.
 
 ## What tinygen lacks for Goose
 
@@ -437,7 +491,11 @@ Recorded here rather than changed in tinygen, which other work is changing:
    lldb and gdb show its elements directly. The same holds for a
    resizable array's header (`base` and `len`) and a `u8[]` image, whose
    `data` is an array of unknown size, so a debugger shows only its
-   address.
+   address. A `u8[]` local is a pointer to that record; lldb shows
+   `frame variable *s` as `(len = 3, data = ...)`, but once it has
+   shown the pointer itself it reports the record behind it as an
+   invalid aggregate (an lldb quirk with a record whose last member has
+   no size; a counted array would avoid it too).
 4. **The source language, and lldb's formatters.** tinygen now names the
    unit's language (`tyg_module_language`); the backend says C11, as the C
    half's unit does. Tried under lldb (Xcode's, macOS arm64) with C99, C11,
@@ -496,10 +554,11 @@ Recorded here rather than changed in tinygen, which other work is changing:
    elements as reference and by-value parameters, read, passed on and
    pushed to; `gs_sp`, own stacks and the stack accounting; resizable
    locals and results built in place, `append`, by-value resizable
-   arguments. Next: variable-size values (`u8[]` locals and results),
-   `resize`/`pop`/`clear`, `str`/`format`, rendering composites through the
-   C half's render functions (given external linkage), free variables of
-   nested functions, function values, `return from`.
+   arguments; `u8[]` locals and results, `str`/`format` of scalars and
+   strings, string equality, `resize`/`pop`/`pop_n`/`clear`. Next:
+   globals of resizable types, rendering composites through the C half's
+   render functions (given external linkage), free variables of nested
+   functions, function values, `return from`.
 4. **Driver and platforms**: `goose run --backend=tinygen` (build and start,
    or an in-memory loader, see above); Linux and Windows (CodeView) in CI; the
    x86-64 ABI checks; lldb/gdb formatters for Goose arrays shipped with the
