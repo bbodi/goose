@@ -1968,12 +1968,33 @@ struct TgFn {
                     tyg_iconst(p, TYG_I64, (int64_t)s->val.size()));
             return;
         }
-        auto pl = LimCallResult(n) ? LimCallPlace(n) : Place(n);
+        auto pl = ElemsSource(n, l);
         if (Ended()) return;
         auto v = ViewOf(pl, l);
         if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
         begin();
         CopyView(stk, len, et, v);
+    }
+    // Where the elements an array is built from lie: the place of n.
+    // The checker types a popped or default fixed array as the T[] it is
+    // adapted to, but a fixed array is what lies there: its elements are
+    // copied from it (CodeGen::EmitPop, B_DEFAULT).
+    static bool IsStrCall(Node *n) {
+        auto c = Is<Call>(n);
+        return c && c->builtin == B_STR;
+    }
+    static bool FixedTyped(Node *n) {
+        auto pc = Is<Call>(n);
+        return pc && (pc->builtin == B_POP || pc->builtin == B_DEFAULT);
+    }
+    P ElemsSource(Node *n, Line l) {
+        if (FixedTyped(n)) {
+            auto x = Gen1(n);
+            if (Ended()) return P {};
+            if (!x.mem) No(l, "popped value in no memory");
+            return P { x.a, x.t, x.stk };
+        }
+        return LimCallResult(n) ? LimCallPlace(n) : Place(n);
     }
     // The function a call to it builds its first result at a destination
     // for (CodeGen's in-place construction): its own, or a dispatch's
@@ -2163,7 +2184,8 @@ struct TgFn {
                                                          tyg_bin(p, TYG_MUL, cap, tyg_iconst(p, TYG_I64, esz)))));
             return;
         }
-        if (n && !from && !al && !Is<StrLit>(n) && !LimCallResult(n) && n->exprtype && cg.TEq(n->exprtype, t)) {
+        if (n && !from && !al && !Is<StrLit>(n) && !LimCallResult(n) && !FixedTyped(n) && !IsStrCall(n) && n->exprtype &&
+            cg.TEq(n->exprtype, t)) {
             auto src = Deref(Place(n));
             if (Ended()) return;
             ImgCopy(stk, tyg_addr_of(p, src.a), t);
@@ -2180,12 +2202,13 @@ struct TgFn {
         if (from) {
             if (cg.Mangle(from->elem) != cg.Mangle(et)) No(l, "array of another element type");
             CopyView(stk, len, et, *from);
-        } else if (al || Is<StrLit>(n)) {
+        } else if (al || Is<StrLit>(n) || IsStrCall(n)) {
             GenRz(n, stk, hdr, t, l);
         } else if (n) {
             if (auto c = Is<Call>(n); c && c->builtin == B_COPY) n = c->ArgNodes()[0];
-            auto v = ViewOf(LimCallResult(n) ? LimCallPlace(n) : Place(n), l);
+            auto pl = ElemsSource(n, l);
             if (Ended()) return;
+            auto v = ViewOf(pl, l);
             if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
             CopyView(stk, len, et, v);
         }
@@ -5883,7 +5906,18 @@ struct TgFn {
     V GenStr(Call *c) {
         auto t = c->exprtype;
         auto slice = t && t->kind == TY_SLICE && IsU8(t->sub);
-        if (t && TgModule::IsLim(t) && M.LimHeld(t) && IsU8(t->arr->sub)) {
+        if (t && M.RcOk(t) && IsU8(t->arr->sub)) {
+            // Typed as a runtime-capacity u8[..]: its image, the text
+            // its elements (GenRc).
+            auto stk = Stk(AllocStk(false, c->line), c->line);
+            auto at = GenImg(c, stk, t, c->line);
+            V r;
+            r.t = t;
+            r.mem = true;
+            r.a = tyg_at_val(at, 0);
+            return r;
+        }
+        if (t && TgModule::IsLim(t) && M.TypeOk(t) && IsU8(t->arr->sub)) {
             // Typed as a static-capacity u8[..k]: the text rendered as a
             // resizable's, then copied under the capacity check.
             auto r = RzTemp(cg.GrowU8(), c->line);
