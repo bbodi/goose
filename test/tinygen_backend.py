@@ -11,7 +11,10 @@ strings and resizable arrays handed in, and built at a destination,
 u8[] values, arrays shrunk and resized, free variables of nested
 functions, function values, globals on dedicated stacks, `return from`
 through frames of both halves);
-the other programs are ones the backend covers in part. Where lldb is installed, one program is run under it to see
+the other programs are ones the backend covers in part. A program
+tinygen covers whole that needs nothing of a C half (WHOLE_PROGRAM) must
+build without the C compiler compiling any C of its own, and again on the
+mixed path (--tinygen-mixed) to the same output. Where lldb is installed, one program is run under it to see
 that the debugger finds a Goose function by name and shows its Goose source
 line, its parameters and its locals with their Goose types.
 
@@ -68,6 +71,7 @@ PROGRAMS = [
     ("test/tinygen/tinygen_build.goose", False, ["--tinygen-skip=sum,own_sum,scan,nested"]),
     ("test/tinygen/tinygen_text.goose", True, []),
     ("test/tinygen/tinygen_text.goose", True, ["--debug"]),
+    ("test/tinygen/tinygen_text.goose", True, ["--tinygen-mixed"]),
     ("test/tinygen/tinygen_text.goose", False, ["--tinygen-skip=main"]),
     ("test/tinygen/tinygen_text.goose", False,
      ["--tinygen-skip=lit,greet,first,pair,tail,wide,label"]),
@@ -110,7 +114,17 @@ PROGRAMS = [
     ("test/codegen/cnames.goose", False, []),
     ("test/codegen/wider_slot_operations.goose", False, []),
     ("samples/21_raytrace.goose", False, []),
+    ("samples/20_life.goose", True, []),
 ]
+
+# The programs tinygen builds whole with no C half: main in the object,
+# the rest from the support object, no C of the program compiled.
+WHOLE_PROGRAM = {
+    "tinygen_scalars", "tinygen_structs", "tinygen_divzero", "tinygen_arrays",
+    "tinygen_slicefail", "tinygen_results", "tinygen_build", "tinygen_text",
+    "tinygen_shrink", "tinygen_nested", "tinygen_funvals", "20_life",
+    "loop_invariant_divisors",
+}
 
 
 def expected(source):
@@ -162,6 +176,16 @@ def check_tinygen_backend(exe, base, ok, fail, say):
         if done == 0 or (whole and done != total):
             fail(f"{label}: {done} of {total} functions through tinygen", log)
             continue
+        # The path the build took: whole for the WHOLE_PROGRAM fixtures
+        # (unless asked for the mixed one or told to leave functions to
+        # C), with no compile of the program's C, else mixed.
+        alone = (source.stem in WHOLE_PROGRAM and
+                 not any(f.startswith("--tinygen-") for f in flags))
+        cfile = f"{source.stem}.c"
+        compiled = [line for line in log.splitlines() if cfile in line and " -o " in line]
+        if alone != ("tinygen: whole program" in log) or (alone and compiled):
+            fail(f"{label}: expected the {'whole program' if alone else 'mixed'} path", log)
+            continue
         want, aborts, markers = expected(source)
         code, got, err = tc.run_capture([out], cwd=source.parent)
         if (code != 0) != aborts:
@@ -174,7 +198,7 @@ def check_tinygen_backend(exe, base, ok, fail, say):
         if got.rstrip("\n") != want.rstrip("\n"):
             fail(label, f"--- got:\n{got}\n--- want:\n{want}")
             continue
-        ok(f"{label} ({done} of {total} functions)")
+        ok(f"{label} ({done} of {total} functions{', whole program' if alone else ''})")
     check_lldb(exe, base, ok, fail, say)
 
 
@@ -317,6 +341,7 @@ def check_lldb_built(exe, base, lldb, ok, fail):
             return
     ok("tinygen debug info under lldb: a resizable and a u8[] local built in place")
     check_lldb_freevars(exe, base, lldb, ok, fail)
+    check_lldb_whole(exe, base, lldb, ok, fail)
 
 
 def check_lldb_freevars(exe, base, lldb, ok, fail):
@@ -343,6 +368,31 @@ def check_lldb_freevars(exe, base, lldb, ok, fail):
         fail("tinygen free-variable debug info under lldb", f"missing {missing}:\n{text}")
         return
     ok("tinygen debug info under lldb: free variables through their addresses")
+
+
+def check_lldb_whole(exe, base, lldb, ok, fail):
+    """A whole program build, whose C main is the tinygen object's: the
+    backtrace ends in `main` at fn main()'s Goose line, and fn main()'s
+    locals show by their Goose names and types."""
+    source = HERE / "tinygen" / "tinygen_structs.goose"
+    out = base / f"lldb-whole{tc.EXE_SUFFIX}"
+    good, log, _, _ = build(exe, source, out, [])
+    if not good or "tinygen: whole program" not in log:
+        fail("tinygen lldb whole program build", log)
+        return
+    code, o, e = tc.run_capture([lldb, "-b", "-o", "b tinygen_structs.goose:41", "-o", "run",
+                                 "-o", "frame variable", "-o", "bt", "-o", "kill", out])
+    text = o + e
+    wants = [
+        r"main_g at tinygen_structs\.goose:41",
+        r"\(Vec2\) v = \(x = 4\.5, y = -1",
+        r"frame #1: .*`main at tinygen_structs\.goose:39",
+    ]
+    missing = [w for w in wants if not re.search(w, text)]
+    if missing:
+        fail("tinygen whole program debug info under lldb", f"missing {missing}:\n{text}")
+        return
+    ok("tinygen debug info under lldb: a whole program's main and its caller")
 
 
 if __name__ == "__main__":

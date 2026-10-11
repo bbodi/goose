@@ -656,6 +656,7 @@ int Main(int argc, char **argv) {
     // Goose source (docs/design/tinygen_backend.md).
     string backendname = "c";
     vector<string> tinygenskip;
+    auto tinygenmixed = false;
     vector<string> cdefines, progargs, includenames, files;
     for (int i = firstarg; i < argc; i++) {
         string arg = argv[i];
@@ -726,6 +727,9 @@ int Main(int argc, char **argv) {
         else if (arg == "-O2") optlevel = 2, optgiven = true;
         else if (arg.rfind("--backend=", 0) == 0) backendname = arg.substr(10);
         else if (arg == "--backend" && i + 1 < argc) backendname = argv[++i];
+        // Hidden: the mixed path for a program tinygen could build whole,
+        // for comparing the two.
+        else if (arg == "--tinygen-mixed") tinygenmixed = true;
         // Hidden: functions the tinygen backend leaves to C, by name, for
         // testing calls between the two halves.
         else if (arg.rfind("--tinygen-skip=", 0) == 0) {
@@ -1028,6 +1032,7 @@ int Main(int argc, char **argv) {
                 if (verb != "build") whynot = "not goose build";
                 else if (standalone) whynot = "--standalone";
                 else if (!includenames.empty()) whynot = "--include";
+                else if (tinygenmixed) whynot = "--tinygen-mixed";
                 for (auto &d : cdefines)
                     if (whynot.empty() && d != "GS_DEBUG=1") whynot = cat("-D", d);
                 tgwhole = whynot.empty() && tgb->WholeProgram(cg, whynot);
