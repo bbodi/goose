@@ -7980,7 +7980,7 @@ struct TgFn {
         if (a->op == T_ASSIGN && IsGrow(pl.t)) {
             // A whole resizable (Assign::CgStmt): its stack's top back to
             // where its elements start, then the new ones built there.
-            if (!M.RzOk(pl.t) || !pl.stk) No(a->line, "assignment to an array of this kind");
+            if (!(M.RzOk(pl.t) || M.VeOk(pl.t)) || !pl.stk) No(a->line, "assignment to an array of this kind");
             SetTop(pl.stk, tyg_load(p, TYG_I64, pl.a, 0));
             GenRz(a->rhs, pl.stk, pl.a, pl.t, a->line);
             return;
