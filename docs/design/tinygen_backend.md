@@ -946,6 +946,93 @@ program), and `test/tinygen_backend.py` builds it again with `main`,
 then the builders and by-value callees, then the by-reference ones
 left to C, and reads a by-value parameter under lldb.
 
+### Fixed-mode ADTs, `match` over them, case-function dispatch
+
+ADTs blocked 62 of the mixed programs, 20 alone. The part held now is
+fixed mode, in the C backend's representation, so that either half
+passes, returns and reads the other's values (the ADT section of
+`TgModule` and of `TgFn` in `src/tinygen_backend.h`):
+
+* **Types.** A fixed-mode ADT (`Shape`, `Dir`) is `CodeGen::CT`'s packed
+  `struct { tag; union { v_Circle; ... } u; }`: the tag the variant's
+  declaration index in a `u8` (a `u16` past 256 variants), every
+  non-empty payload behind it, the size the tag's plus the largest
+  payload's. For the calling convention it is a record of the tag and
+  each payload's record at the tag's size, overlapping as a union's
+  members do (`AdtAT`). A variant type (`Shape.Circle`) is a packed
+  struct of its fields at `VariantLayout`'s offsets, and a payload-less
+  one, as a value of its own, C's one `gs_empty` byte. Held when every
+  payload field is (`AdtOk`), by value and behind plain references, as
+  parameters, results, locals, fields, elements and free variables.
+* **Values.** Variant literals, built as the variant or straight as
+  the ADT with its tag (`GenVariantLit`); payload-less constants
+  (`Dot::variantconst`); a variant, a call's variant result included,
+  adapted to its ADT where one is wanted (`Fit`, as
+  `CodeGen::AdaptToFixed`: its tag, its value the payload); payload
+  fields read and written through a variant, by value or by reference;
+  whole ADTs assigned anew, another variant overwriting the old in
+  place.
+* **`match`** over a fixed-mode value or through a reference to one
+  (`GenAdtMatch`): the value copied once and its tag read once, then a
+  compare per listed variant in arm order, several per arm and `_`; a
+  binder is a local of the variant's type the payload is copied into
+  (fixed mode binds by value only, §8.1), described to the debugger in
+  the arm's scope, and the arm's line is a line entry after the copy.
+* **Case functions** (§8.2, `GenDispatch`, as `CodeGen::EmitDispatch`):
+  every argument evaluated once in order, the scrutinee's in any
+  position, the others kept in locals; the variant's case then called
+  with its payload by value and the shared arguments, each case
+  through its own signature, a single fixed result delivered from
+  every arm. Cases with results through out-pointers, by-value arrays
+  or a variable-mode scrutinee go to C.
+* **No variant matches**: as `GS_UNREACHABLE`, under `--debug` an abort
+  with `GS_E_TAG` and the Goose line, else `tyg_unreachable`.
+* **Debug info**: `Shape` a struct of `tag`, an enum named `Shape.tag`
+  whose enumerators are the variants' names, and `u`, a union of the
+  payloads by variant name; a variant a struct of its fields:
+
+      (lldb) frame variable s r d
+      (Shape) s = {
+        tag = Rect
+        u = {
+          Circle = (r = 3)
+          Rect = (w = 3, h = 4)
+          Tri = (a = 3, b = 4, c = 0)
+        }
+      }
+      (Shape.Rect) r = (w = 3, h = 4)
+      (Dir) d = (tag = West)
+
+Not held yet: **variable-mode ADTs** (`Shape..`, each value its own
+variant's size: by value an image on a data stack like a `u8[]`,
+results built at a destination, `&`-binders into the payload), which
+now block 22 programs, 5 alone, the largest ADT remainder; ADTs whose
+payloads hold what is not held (an optional, a limited array: `ADT
+with optional` and so on in `-v`); `print` and `str` of ADTs; `==` on
+them; and dispatch with out-pointer results.
+
+**tinygen gaps met.** tinygen has no multiway branch: a match or a
+dispatch is a chain of compares, linear in the variants, where the C
+compiler makes a jump table (`switch`). A `tyg_switch` (value, cases,
+default) would give both halves the same shape. DWARF for a
+discriminated union (`DW_TAG_variant_part`, which Rust's enums use and
+lldb shows as the active variant only) would need the tag's position
+and per-variant discriminants in `tyg_dt_record`; the struct of an
+enum and a union above shows every payload, the inactive ones as
+whatever bytes are there.
+
+Over the sweep (0 of 580 runs differ, plain and `--debug`; the one
+pair that differed before, `codegen/exit_value_destination`, was a
+`u8[]` return nested in another's value, which now lands where the
+destination starts, as the C's exits do), per-function coverage goes
+from 2343 to 2509 of 3811 (61% to 66%) and the whole path from 71
+programs to 76; `codegen/cnames`, whose enum is held now, builds whole.
+Goose-in-Goose stays whole, self-compiling byte for byte, plain and
+`--debug`. `tinygen_adts` covers it whole, and with the cases, the
+scrutinees' owners and `main` left to C in turn; `samples/05_shapes`,
+whose variable-mode array stays in C, runs with its case functions and
+`match` in tinygen.
+
 ## Testing
 
 `test/tinygen/` holds fixtures the backend covers whole: scalars,

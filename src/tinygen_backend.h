@@ -301,6 +301,7 @@ struct TgModule {
                 }
                 return true;
             }
+            case TY_ENUM: case TY_VARIANT: return AdtOk(t, depth);
             default: return false;
         }
     }
@@ -363,7 +364,7 @@ struct TgModule {
                 }
                 return "";
             }
-            case TY_ENUM: case TY_VARIANT: return "ADT";
+            case TY_ENUM: case TY_VARIANT: return AdtBlocker(t, depth);
             case TY_FN: return "function type";
             default: return "unknown type";
         }
@@ -438,7 +439,12 @@ struct TgModule {
             default: return 8;
         }
     }
-    int64_t Size(TypeExpr *t) { return IsScalar(t) ? ScalSize(Scal(t)) : cg.FixedSize(t); }
+    int64_t Size(TypeExpr *t) {
+        if (IsScalar(t)) return ScalSize(Scal(t));
+        // A payload-less variant as a value of its own: the gs_empty byte.
+        if (t->kind == TY_VARIANT && !cg.FixedSize(t)) return 1;
+        return cg.FixedSize(t);
+    }
 
     struct FieldAt {
         TypeExpr *t;
@@ -446,6 +452,7 @@ struct TgModule {
         string_view name;
     };
     vector<FieldAt> Fields(TypeExpr *t) {
+        if (t->kind == TY_VARIANT) return VariantFields(t);
         auto si = cg.SI(t);
         auto &lay = cg.StructLayout(si);
         vector<FieldAt> fs;
@@ -469,6 +476,12 @@ struct TgModule {
         auto key = cg.Mangle(t);
         if (auto it = atypes.find(key); it != atypes.end()) return it->second;
         if (IsLim(t)) return LimAT(t);
+        if (t->kind == TY_ENUM) return atypes[key] = AdtAT(t);
+        if (t->kind == TY_VARIANT && !cg.FixedSize(t)) {
+            // struct { uint8_t gs_empty; }
+            tyg_field f { tyg_type_int(m, TYG_I8, 0), 0 };
+            return atypes[key] = tyg_type_record(m, 1, 1, &f, 1);
+        }
         if (t->kind == TY_ARRAY) {
             // The C half's struct { T e[k]; }, packed.
             tyg_field f { tyg_type_array(m, AT(t->arr->sub), cg.ArrSize(t->arr)), 0 };
@@ -584,6 +597,7 @@ struct TgModule {
                 tyg_dt_record_complete(m, rec, cg.FixedSize(t), 1);
                 return rec;
             }
+            case TY_ENUM: case TY_VARIANT: return AdtDT(t, name);
             default: d = tyg_dt_void(m); break;
         }
         return dtypes[name] = d;
@@ -700,6 +714,111 @@ struct TgModule {
             off += cg.FixedSize(ft);
         }
         tyg_dt_record_complete(m, rec, VsMinSize(t), 1);
+        return rec;
+    }
+
+    // ---- ADTs ----------------------------------------------------------------
+    //
+    // As the C backend lays them out (CodeGen::CT, docs/implementation.md):
+    // a fixed-mode ADT is the packed struct { tag; union { v_<Variant> } },
+    // its tag the variant's declaration index in a u8 (a u16 past 256
+    // variants), every non-empty variant's payload behind it, the size the
+    // tag's plus the largest payload's; a variant type is a packed struct
+    // of its payload's fields, and a payload-less one, as a value of its
+    // own, C's one gs_empty byte. Variable-mode ADTs (`Shape..`) are not
+    // held: each value is its own variant's size.
+
+    EnumInst *EI(TypeExpr *t) { return t->kind == TY_VARIANT ? cg.EIVar(t) : cg.EIOf(t); }
+    int VariantIdx(TypeExpr *vt) { return cg.EIVar(vt)->en->VariantIndex(vt->var->variant); }
+    int64_t TagSize(TypeExpr *t) { return cg.TagSize(EI(t)->en); }
+    tyg_scalar TagScal(TypeExpr *t) { return TagSize(t) == 1 ? TYG_I8 : TYG_I16; }
+
+    // A fixed-mode ADT or a fixed variant whose payload fields it holds.
+    bool AdtOk(TypeExpr *t, int depth) {
+        if (t->kind == TY_ENUM && t->enu->varmode) return false;
+        if (!cg.IsFix(t) || cg.IsLargeFixed(t)) return false;
+        auto ei = EI(t);
+        auto ok = [&](int vi) {
+            for (size_t i = 0; i < ei->en->variants[vi].fields.size(); i++)
+                if (!ei->en->variants[vi].fields[i].ispad && !TypeOk(ei->vftypes[vi][i], depth + 1))
+                    return false;
+            return true;
+        };
+        if (t->kind == TY_VARIANT) return ok(VariantIdx(t));
+        for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
+            if (!ok((int)vi)) return false;
+        return true;
+    }
+    string AdtBlocker(TypeExpr *t, int depth) {
+        if (t->kind == TY_ENUM && t->enu->varmode) return "variable-mode ADT";
+        if (!cg.IsFix(t)) return "variable-size ADT";
+        if (cg.IsLargeFixed(t)) return "large fixed value";
+        auto ei = EI(t);
+        for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
+            if (t->kind == TY_VARIANT && (int)vi != VariantIdx(t)) continue;
+            for (size_t i = 0; i < ei->en->variants[vi].fields.size(); i++) {
+                if (ei->en->variants[vi].fields[i].ispad) continue;
+                auto b = Blocker(ei->vftypes[vi][i], depth + 1);
+                // An ADT reached through its own payload is one class.
+                if (!b.empty()) return b.rfind("ADT", 0) == 0 ? b : cat("ADT with ", b);
+            }
+        }
+        return "";
+    }
+    vector<FieldAt> VariantFields(TypeExpr *vt) {
+        auto ei = cg.EIVar(vt);
+        auto vi = VariantIdx(vt);
+        auto &v = ei->en->variants[vi];
+        auto &lay = cg.VariantLayout(ei, vi);
+        vector<FieldAt> fs;
+        for (size_t i = 0; i < v.fields.size(); i++)
+            if (!v.fields[i].ispad) fs.push_back({ ei->vftypes[vi][i], lay.offs[i], v.fields[i].name });
+        return fs;
+    }
+    // The tag, and each non-empty variant's payload record behind it,
+    // overlapping as the union's members do.
+    const tyg_type *AdtAT(TypeExpr *t) {
+        auto ei = cg.EIOf(t);
+        vector<tyg_field> fs { { tyg_type_int(m, TagScal(t), 0), 0 } };
+        for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
+            if (cg.VariantLayout(ei, (int)vi).size)
+                fs.push_back({ AT(cg.VariantType(t, (int)vi)), TagSize(t) });
+        return tyg_type_record(m, cg.FixedSize(t), 1, fs.data(), (int)fs.size());
+    }
+    // The debugger's view, the C's under Goose names: `Shape` a struct of
+    // `tag`, an enum of the variants' names, and `u`, a union of the
+    // payloads by variant name; `Shape.Circle` a struct of its fields.
+    const tyg_dtype *AdtDT(TypeExpr *t, const string &name) {
+        if (t->kind == TY_VARIANT) {
+            auto fs = Fields(t);
+            auto rec = tyg_dt_record(m, TYG_DT_STRUCT, name.c_str(), File(0), 0);
+            dtypes[name] = rec;
+            if (fs.empty()) tyg_dt_member(m, rec, "gs_empty", DT(ast.inttypes[IS_U8]), 0);
+            for (auto &f : fs) tyg_dt_member(m, rec, string(f.name).c_str(), DT(f.t), f.off);
+            tyg_dt_record_complete(m, rec, Size(t), 1);
+            return rec;
+        }
+        auto ei = cg.EIOf(t);
+        auto en = ei->en;
+        auto rec = tyg_dt_record(m, TYG_DT_STRUCT, name.c_str(), File(en->line.fileidx), en->line.line);
+        dtypes[name] = rec;
+        auto tagbase = TagSize(t) == 1 ? tyg_dt_base(m, "unsigned char", 1, TYG_DT_UNSIGNED)
+                                       : tyg_dt_base(m, "unsigned short", 2, TYG_DT_UNSIGNED);
+        auto tag = tyg_dt_enum(m, cat(name, ".tag").c_str(), tagbase, File(en->line.fileidx), en->line.line);
+        for (size_t vi = 0; vi < en->variants.size(); vi++)
+            tyg_dt_enumerator(m, tag, string(en->variants[vi].name).c_str(), (int64_t)vi);
+        tyg_dt_member(m, rec, "tag", tag, 0);
+        auto psize = cg.FixedSize(t) - TagSize(t);
+        if (psize > 0) {
+            auto u = tyg_dt_record(m, TYG_DT_UNION, nullptr, File(0), 0);
+            for (size_t vi = 0; vi < en->variants.size(); vi++)
+                if (cg.VariantLayout(ei, (int)vi).size)
+                    tyg_dt_member(m, u, string(en->variants[vi].name).c_str(),
+                                  DT(cg.VariantType(t, (int)vi)), 0);
+            tyg_dt_record_complete(m, u, psize, 1);
+            tyg_dt_member(m, rec, "u", u, TagSize(t));
+        }
+        tyg_dt_record_complete(m, rec, cg.FixedSize(t), 1);
         return rec;
     }
 
@@ -1294,6 +1413,7 @@ struct TgFn {
             return x;
         }
         if (LimAdapts(x, want)) return LimFrom(x, want, l);
+        if (x.t->kind == TY_VARIANT && want->kind == TY_ENUM && x.mem) return AdaptToAdt(x, want, l);
         if (M.IsScalar(x.t) != M.IsScalar(want) || !cg.TEq(x.t, want)) {
             string a, b;
             x.t->Dump(a);
@@ -1370,6 +1490,7 @@ struct TgFn {
         if (auto d = Is<Dot>(n); d && d->IsField()) {
             auto base = Deref(Place(d->obj));
             if (M.VsOk(base.t)) return VsFieldPlace(base, d->fieldidx);
+            if (base.t->kind == TY_VARIANT && M.TypeOk(base.t)) return VariantField(base, d->fieldidx);
             if (base.t->kind != TY_STRUCT || !M.TypeOk(base.t)) No(n->line, "field of this type");
             auto si = cg.SI(base.t);
             auto &lay = cg.StructLayout(si);
@@ -1531,6 +1652,7 @@ struct TgFn {
                 auto d = static_cast<Dot *>(n);
                 if (d->member == B_LEN) return GenLen(d->obj, n);
                 if (d->member == B_CAP) return GenCap(d);
+                if (d->variantconst) return GenVariantConst(d);
                 if (!d->IsField()) No(n->line, "property or variant constant");
                 return Load(Place(n), n->line);
             }
@@ -1892,6 +2014,7 @@ struct TgFn {
 
     V GenStructLit(StructLit *sl) {
         auto t = sl->exprtype;
+        if (t->kind == TY_VARIANT || t->kind == TY_ENUM) return GenVariantLit(sl);
         if (!sl->sinst || sl->variant || t->kind != TY_STRUCT || !M.TypeOk(t))
             No(sl->line, "literal of this type");
         auto tmp = Temp(t);
@@ -2475,7 +2598,7 @@ struct TgFn {
         }
         if (c->builtin >= 0) No(c->line, cat("builtin ", BuiltinByKind(c->builtin).name));
         if (c->fvbody) return GenFvCall(c);
-        if (!c->dispatch.empty()) No(c->line, "call kind: dispatch");
+        if (!c->dispatch.empty()) return GenDispatch(c);
         if (!c->spec) No(c->line, "call kind");
         auto callee = c->spec;
         auto an = c->ArgNodes();
@@ -2514,19 +2637,7 @@ struct TgFn {
         // The callee's free variables (CodeGen::EmitFvArg): what this call
         // passes for each (Call::FreeVarArg), a variable of this frame or
         // one this function was handed, by its address.
-        for (auto fv : ci.freevars) {
-            auto v = c->FreeVarArg(fv);
-            auto pl = VarPlace(v, c->line);
-            tyg_arg a {};
-            a.val = tyg_addr_of(p, pl.a);
-            args.push_back(a);
-            if (IsGrow(v->type)) {
-                if (!pl.stk) No(c->line, "free variable without its stack");
-                tyg_arg k {};
-                k.val = pl.stk;
-                args.push_back(k);
-            }
-        }
+        FvArgs(c, ci, args);
         lastrets.clear();
         if (Ended()) {
             for (auto r : callee->rets) lastrets.push_back(Dummy(r));
@@ -2592,6 +2703,22 @@ struct TgFn {
             else lastrets.push_back(rets[i]);
         }
         return lastrets.empty() ? V {} : lastrets[0];
+    }
+
+    void FvArgs(Call *c, CodeGen::SpecInfo &ci, vector<tyg_arg> &args) {
+        for (auto fv : ci.freevars) {
+            auto v = c->FreeVarArg(fv);
+            auto pl = VarPlace(v, c->line);
+            tyg_arg a {};
+            a.val = tyg_addr_of(p, pl.a);
+            args.push_back(a);
+            if (IsGrow(v->type)) {
+                if (!pl.stk) No(c->line, "free variable without its stack");
+                tyg_arg k {};
+                k.val = pl.stk;
+                args.push_back(k);
+            }
+        }
     }
 
     // A call of a function value (§7.6; CodeGen::EmitFvCall): the checked
@@ -3210,6 +3337,7 @@ struct TgFn {
     // then the arms tested in order, each listed value or range at the
     // scrutinee's type, unsigned for an unsigned one. ADTs are not held.
     V GenMatch(MatchExpr *me, bool discard) {
+        if (auto adt = AdtOf(me->scrutinee->exprtype)) return GenAdtMatch(me, adt, discard);
         auto ot = cg.OperandT(me->scrutinee->exprtype);
         if (!ot || ot->kind != TY_INT || ot->intstorage == IS_VARINT)
             No(me->line, cat("match over type ", ot ? M.NameWhy(ot) : string("?")));
@@ -3260,6 +3388,259 @@ struct TgFn {
         tyg_block_set(p, done);
         if (!valued) return V {};
         return Load(P { tyg_at_local(res, 0), et }, me->line);
+    }
+
+    // ---- ADTs ------------------------------------------------------------------
+    //
+    // Fixed-mode ADTs and variants as the C backend builds and reads them
+    // (TgModule's ADT section has the layout): literals and constants,
+    // a variant adapted to its ADT (CodeGen::AdaptToFixed), payload
+    // fields, `match` (MatchExpr::CgAny) and case-function dispatch
+    // (CodeGen::EmitDispatch), each a chain of tag compares in variant
+    // order (tinygen has no switch), with GS_UNREACHABLE's abort past the
+    // last under --debug.
+
+    // The ADT a scrutinee is, or refers to, if a fixed-mode one.
+    static TypeExpr *AdtOf(TypeExpr *t) {
+        if (t && IsPlainRef(t)) t = t->ref->sub;
+        return t && t->kind == TY_ENUM ? t : nullptr;
+    }
+    V MemTemp(TypeExpr *t, bool zero) {
+        V x;
+        x.t = t;
+        x.mem = true;
+        x.a = tyg_at_local(Temp(t), 0);
+        if (zero) tyg_zero(p, x.a, M.Size(t));
+        return x;
+    }
+    void StoreTag(tyg_addr a, TypeExpr *adt, int vi) {
+        tyg_store(p, M.TagScal(adt), a, tyg_iconst(p, M.TagScal(adt), vi), 0);
+    }
+    // The tag at a, widened.
+    tyg_val LoadTag(tyg_addr a, TypeExpr *adt) {
+        return tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, M.TagScal(adt), a, 0));
+    }
+    // A variant's value as its fixed-mode ADT: the variant's tag, the
+    // payload behind it.
+    V AdaptToAdt(const V &x, TypeExpr *adt, Line l) {
+        if (adt->enu->varmode || !M.TypeOk(adt) || M.EI(x.t) != M.EI(adt)) No(l, "ADT adaptation");
+        auto r = MemTemp(adt, true);
+        StoreTag(r.a, adt, M.VariantIdx(x.t));
+        if (cg.FixedSize(x.t)) {
+            auto pa = r.a;
+            pa.offset += M.TagSize(adt);
+            tyg_copy(p, pa, x.a, cg.FixedSize(x.t));
+        }
+        return r;
+    }
+    // Shape.Circle { r: 1.0 }, as the variant or as its ADT.
+    V GenVariantLit(StructLit *sl) {
+        auto t = sl->exprtype;
+        if (!M.TypeOk(t) || (t->kind == TY_ENUM && !sl->variant)) No(sl->line, "literal of this type");
+        auto ei = M.EI(t);
+        auto vi = t->kind == TY_VARIANT ? M.VariantIdx(t) : ei->en->VariantIndex(sl->variant);
+        auto x = MemTemp(t, true);
+        int64_t base = 0;
+        if (t->kind == TY_ENUM) {
+            StoreTag(x.a, t, vi);
+            base = M.TagSize(t);
+        }
+        auto &v = ei->en->variants[vi];
+        auto &lay = cg.VariantLayout(ei, vi);
+        for (size_t i = 0; i < v.fields.size(); i++) {
+            if (v.fields[i].ispad) continue;
+            auto init = sl->InitFor((int)i);
+            if (!init) continue;
+            auto a = x.a;
+            a.offset += base + lay.offs[i];
+            Into(P { a, ei->vftypes[vi][i] }, init);
+        }
+        return x;
+    }
+    // A payload-less variant constant (Dot::CgX).
+    V GenVariantConst(Dot *d) {
+        auto t = d->exprtype;
+        if (!M.TypeOk(t)) No(d->line, cat("variant constant of type ", M.NameWhy(t)));
+        auto x = MemTemp(t, true);
+        if (t->kind == TY_ENUM) StoreTag(x.a, t, d->einst->en->VariantIndex(d->variantconst));
+        return x;
+    }
+    // A payload field of a variant at base.
+    P VariantField(const P &base, int fieldidx) {
+        auto ei = cg.EIVar(base.t);
+        auto vi = M.VariantIdx(base.t);
+        auto a = base.a;
+        a.offset += cg.VariantLayout(ei, vi).offs[fieldidx];
+        return P { a, ei->vftypes[vi][fieldidx] };
+    }
+    // Past the last variant: a corrupt tag, which --debug reports
+    // (GS_UNREACHABLE) and a release build assumes away.
+    void BadTag(Line l) {
+        if (M.checks) Abort("TAG", l);
+        else tyg_unreachable(p);
+    }
+    // The ADT value a match or dispatch reads: a copy in memory of this
+    // frame's (the C's sv), its tag read once, kept in a local.
+    struct Scrut {
+        V v;
+        TypeExpr *adt;
+        tyg_local tag;
+    };
+    Scrut AdtScrutinee(Node *n, TypeExpr *adt) {
+        if (!M.TypeOk(adt)) No(n->line, cat("match over type ", M.NameWhy(adt)));
+        Scrut s { GenAs(n, adt), adt, tyg_local_new(p, 8, 8) };
+        if (Ended()) s.v = MemTemp(adt, false);
+        tyg_store(p, TYG_I64, tyg_at_local(s.tag, 0), LoadTag(s.v.a, adt), 0);
+        return s;
+    }
+    // Branches to `hit` if the scrutinee's tag is variant vi, else on.
+    void TagIs(const Scrut &s, int vi, tyg_block hit) {
+        auto next = tyg_block_new(p);
+        auto tag = tyg_load(p, TYG_I64, tyg_at_local(s.tag, 0), 0);
+        tyg_branch(p, tyg_cmp(p, TYG_EQ, tag, tyg_iconst(p, TYG_I64, vi)), hit, next);
+        tyg_block_set(p, next);
+    }
+    // Variant vi's payload, copied out of the scrutinee into `to`.
+    void CopyPayload(const Scrut &s, int vi, tyg_addr to) {
+        auto vt = cg.VariantType(s.adt, vi);
+        auto sz = cg.FixedSize(vt);
+        if (!sz) {
+            tyg_zero(p, to, 1);
+            return;
+        }
+        auto from = s.v.a;
+        from.offset += M.TagSize(s.adt);
+        tyg_copy(p, to, from, sz);
+    }
+
+    V GenAdtMatch(MatchExpr *me, TypeExpr *adt, bool discard) {
+        auto valued = Valued(me, discard);
+        auto et = me->exprtype;
+        tyg_local res = valued ? Temp(et) : 0;
+        auto s = AdtScrutinee(me->scrutinee, adt);
+        auto done = tyg_block_new(p);
+        auto wild = false;
+        for (auto &a : me->arms) {
+            auto hit = tyg_block_new(p);
+            if (a.pat.kind == P_WILDCARD) {
+                wild = true;
+                tyg_jump(p, hit);
+            } else {
+                for (auto v : a.variants) TagIs(s, adt->enu->en->VariantIndex(v), hit);
+            }
+            auto next = tyg_block_new(p);
+            if (!wild) tyg_jump(p, next);
+            tyg_block_set(p, hit);
+            tyg_scope_begin(p);
+            if (a.binder) {
+                if (a.pat.byref) No(me->line, "match arm binding by reference");
+                Declare(a.binder, me->line);
+                CopyPayload(s, adt->enu->en->VariantIndex(a.variants[0]),
+                            tyg_at_local(locals[a.binder], 0));
+            }
+            Loc(a.body->line);   // A breakpoint on the arm's line stops here, bound.
+            auto v = GenArm(a.body, !valued);
+            if (valued && !Ended() && v.t) Store(P { tyg_at_local(res, 0), et }, Fit(v, et, a.body->line));
+            tyg_scope_end(p);
+            Jump(done);
+            tyg_block_set(p, next);
+            if (wild) break;
+        }
+        if (!wild) BadTag(me->line);
+        else tyg_unreachable(p);
+        tyg_block_set(p, done);
+        if (!valued) return V {};
+        return Load(P { tyg_at_local(res, 0), et }, me->line);
+    }
+
+    // A case-function call dispatched on its ADT argument's tag (§8.2):
+    // every argument evaluated once, in order, then the variant's case
+    // called with its payload by value and the others shared.
+    V GenDispatch(Call *c) {
+        auto sp0 = c->dispatch[0];
+        auto pos = c->dispatcharg;
+        auto an = c->ArgNodes();
+        if (an.size() < sp0->argtypes.size()) No(c->line, "argument count");
+        an.resize(sp0->argtypes.size());
+        auto adt = AdtOf(an[pos]->exprtype);
+        if (!adt) No(c->line, "dispatch over this type");
+        for (auto sp : c->dispatch) {
+            string why;
+            if (!M.SigOk(sp, false, why)) No(c->line, cat("call to ", sp->sf->name, ": ", why));
+            if (sp->rets.size() > 1 || (sp->rets.size() == 1 && cg.sinfo[sp].cret != 0))
+                No(c->line, "dispatch with results through out-pointers");
+            for (size_t i = 0; i < sp->argtypes.size(); i++)
+                if (M.RzParam(sp->argtypes[i])) No(c->line, "dispatch with an array by value");
+        }
+        // The shared arguments, each kept in a local of its own: the arms
+        // are blocks of their own.
+        Scrut s {};
+        vector<tyg_local> shared(an.size());
+        for (size_t i = 0; i < an.size(); i++) {
+            if ((int)i == pos) {
+                s = AdtScrutinee(an[i], adt);
+                continue;
+            }
+            auto pt = sp0->argtypes[i];
+            if (!M.TypeOk(pt)) No(an[i]->line, "argument of this type");
+            auto x = GenAs(an[i], pt);
+            shared[i] = Temp(pt);
+            if (Ended()) continue;
+            if (M.IsScalar(pt)) tyg_store(p, M.Scal(pt), tyg_at_local(shared[i], 0), x.v, 0);
+            else tyg_copy(p, tyg_at_local(shared[i], 0), x.a, M.Size(pt));
+        }
+        auto rt = sp0->rets.empty() ? nullptr : sp0->rets[0];
+        tyg_local res = rt ? Temp(rt) : 0;
+        lastrets.clear();
+        if (Ended()) {
+            if (rt) lastrets.push_back(Dummy(rt));
+            return Dummy(rt);
+        }
+        auto done = tyg_block_new(p);
+        auto &variants = adt->enu->en->variants;
+        vector<tyg_block> arms;
+        for (size_t vi = 0; vi < variants.size(); vi++) {
+            arms.push_back(tyg_block_new(p));
+            TagIs(s, (int)vi, arms.back());
+        }
+        BadTag(c->line);
+        for (size_t vi = 0; vi < variants.size(); vi++) {
+            tyg_block_set(p, arms[vi]);
+            auto sp = c->dispatch[vi];
+            auto &ci = cg.sinfo[sp];
+            vector<tyg_arg> args;
+            for (size_t i = 0; i < an.size(); i++) {
+                auto pt = sp->argtypes[i];
+                tyg_arg a {};
+                if ((int)i == pos) {
+                    if (pt->kind != TY_VARIANT) No(c->line, "dispatch to a case of this kind");
+                    auto t = Temp(pt);
+                    CopyPayload(s, (int)vi, tyg_at_local(t, 0));
+                    a.mem = tyg_at_local(t, 0);
+                } else if (M.IsScalar(pt)) {
+                    a.val = tyg_load(p, M.Scal(pt), tyg_at_local(shared[i], 0), 0);
+                } else {
+                    a.mem = tyg_at_local(shared[i], 0);
+                }
+                args.push_back(a);
+            }
+            FvArgs(c, ci, args);
+            if (ci.needssp) {
+                tyg_arg sa {};
+                sa.val = CalleeSp(sp, c->line);
+                args.push_back(sa);
+            }
+            auto sym = M.Sym(ci.cname, TYG_SYM_FUNC | TYG_SYM_GLOBAL);
+            auto x = Result(sp, ci.cret, M.Sig(sp), tyg_direct(sym), args);
+            if (rt) Store(P { tyg_at_local(res, 0), rt }, x);
+            RfCheck(sp);
+            Jump(done);
+        }
+        tyg_block_set(p, done);
+        if (!rt) return V {};
+        auto x = Load(P { tyg_at_local(res, 0), rt }, c->line);
+        lastrets.push_back(x);
+        return x;
     }
 
     // ---- Statements ----------------------------------------------------------
@@ -3355,7 +3736,6 @@ struct TgFn {
     // A resizable result is built at its destination stack, its count
     // written through its out-parameter. Then every scope's stacks are
     // restored, and the C return value returned.
-    int retopen = 0;   // Returns building their results (DoReturn).
     void DoReturn(const vector<Node *> &vals, Line l) {
         auto &rets = sp->rets;
         auto cret = cg.sinfo[sp].cret;
@@ -3375,18 +3755,6 @@ struct TgFn {
             else tyg_ret(p, x.v);
             return;
         }
-        // A return inside a value one is building at the destination
-        // (`return str("x", if c { return "y"; } else { n })`) would leave
-        // what was built in front of its own value; the C moves it down
-        // (ExitStart, LandValue). Such a function stays in C.
-        auto stacked = false;
-        for (auto r : rets) stacked = stacked || IsGrow(r) || IsImg(r);
-        if (stacked && retopen) No(l, "return inside a result under construction");
-        struct Opened {
-            int &n, by;
-            Opened(int &k, int b) : n(k), by(b) { n += by; }
-            ~Opened() { n -= by; }
-        } opened(retopen, stacked ? 1 : 0);
         vector<V> xs;
         if (vals.size() == 1 && rets.size() > 1) xs = GenCallAll(vals[0], rets.size());
         else if (vals.size() != rets.size()) No(l, "result count");
@@ -4061,7 +4429,7 @@ struct TgFn {
         // there, also one nested in another return's value that has
         // started building (`return str("x", if c { return "y"; } ...)`).
         for (size_t i = 0; i < sp->rets.size(); i++) {
-            if (!IsGrow(sp->rets[i]) && !TgModule::IsVarArr(sp->rets[i])) continue;
+            if (!IsGrow(sp->rets[i]) && !IsImg(sp->rets[i])) continue;
             chans[i].top0 = tyg_local_new(p, 8, 8);
             tyg_store(p, TYG_I64, tyg_at_local(chans[i].top0, 0),
                       Top(tyg_load(p, TYG_I64, tyg_at_local(chans[i].a, 0), 0)), 0);
