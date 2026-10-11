@@ -332,7 +332,7 @@ struct TgModule {
             case TY_ARRAY:
                 switch (t->arr->akind) {
                     case A_LIMITED:
-                        if (cg.ArrSize(t->arr) < 0) return "runtime-capacity limited array";
+                        if (cg.ArrSize(t->arr) < 0) return RcOk(t, depth) ? "" : "runtime-capacity limited array";
                         if (cg.IsLargeFixed(t)) return "large fixed value";
                         if (cg.ArrSize(t->arr) == 0) return "limited array of capacity 0";
                         break;
@@ -412,7 +412,8 @@ struct TgModule {
     }
     // A variable-size struct (VsOk) is an image too, read where it lies.
     bool ImgOk(TypeExpr *t, int depth = 0) {
-        return RzOk(t, depth) || VsOk(t, depth) || VarImgOk(t, depth) || VmOk(t, depth) || VvOk(t, depth);
+        return RzOk(t, depth) || VsOk(t, depth) || VarImgOk(t, depth) || VmOk(t, depth) || VvOk(t, depth) ||
+               RcOk(t, depth);
     }
     // A T[] whose elements are images themselves (u8[][], an array of
     // strings): its length prefix, then the elements back to back, each
@@ -450,7 +451,7 @@ struct TgModule {
     }
     // A by-value parameter of a type RzOk or VsOk holds.
     bool RzParam(TypeExpr *t) {
-        return (t->kind == TY_ARRAY && (RzOk(t) || VarImgOk(t))) || VsOk(t) || VmOk(t) || VvOk(t);
+        return (t->kind == TY_ARRAY && (RzOk(t) || VarImgOk(t) || RcOk(t))) || VsOk(t) || VmOk(t) || VvOk(t);
     }
     tyg_scalar Scal(TypeExpr *t) {
         switch (t->kind) {
@@ -662,13 +663,21 @@ struct TgModule {
     // fixed array is: locals, fields, elements, parameters, results,
     // globals. A runtime-capacity T[..] is a variable-size value and is not.
     static bool IsLim(TypeExpr *t) { return t && t->kind == TY_ARRAY && t->arr->akind == A_LIMITED; }
+    // A runtime-capacity T[..] is an image: [cap u32][len u32][cap slots].
+    bool IsRc(TypeExpr *t) { return IsLim(t) && cg.ArrSize(t->arr) < 0; }
+    bool RcOk(TypeExpr *t, int depth = 0) {
+        return IsRc(t) && depth <= 32 && cg.IsFix(t->arr->sub) && TypeOk(t->arr->sub, depth + 1);
+    }
+    // A limited array this backend holds, of either kind.
+    bool LimHeld(TypeExpr *t) { return TypeOk(t) || RcOk(t); }
     bool LimOk(TypeExpr *t, int depth) {
         return cg.IsStaticLimited(t) && !cg.IsLargeFixed(t) && cg.ArrSize(t->arr) > 0 &&
                TypeOk(t->arr->sub, depth + 1);
     }
     // The length field's bytes: where the slots start.
-    int LimWidth(TypeExpr *t) { return (int)CodeGen::IntSize(cg.LenStore(t->arr)); }
+    int LimWidth(TypeExpr *t) { return IsRc(t) ? 8 : (int)CodeGen::IntSize(cg.LenStore(t->arr)); }
     tyg_scalar LimLenScal(TypeExpr *t) {
+        if (IsRc(t)) return TYG_I32;
         switch (LimWidth(t)) {
             case 1: return TYG_I8;
             case 2: return TYG_I16;
@@ -689,6 +698,13 @@ struct TgModule {
     // `len` and the slots `e` (all k of them: tinygen has no array whose
     // count is another member, gap 3).
     const tyg_dtype *LimDT(TypeExpr *t, tyg_dtype *rec) {
+        if (IsRc(t)) {
+            // Its header; the slots' count is in the image.
+            tyg_dt_member(m, rec, "cap", DT(ast.inttypes[IS_U32]), 0);
+            tyg_dt_member(m, rec, "len", DT(ast.inttypes[IS_U32]), 4);
+            tyg_dt_record_complete(m, rec, 8, 1);
+            return rec;
+        }
         auto w = LimWidth(t);
         auto lt = ast.inttypes[w == 1 ? IS_U8 : w == 2 ? IS_U16 : w == 4 ? IS_U32 : IS_U64];
         tyg_dt_member(m, rec, "len", DT(lt), 0);
@@ -772,7 +788,7 @@ struct TgModule {
     // another representation.
     bool IsVs(TypeExpr *t) { return t && t->kind == TY_STRUCT && !cg.IsFix(t) && !cg.IsFrameObj(t); }
     // An image: a T[] or such a struct.
-    bool IsImg(TypeExpr *t) { return IsVarArr(t) || IsVs(t) || IsVm(t) || IsVv(t); }
+    bool IsImg(TypeExpr *t) { return IsVarArr(t) || IsVs(t) || IsVm(t) || IsVv(t) || IsRc(t); }
     // One this backend holds: its fields fixed values it holds, T[]s of
     // fixed elements (RzOk), or such structs; no relative references.
     bool VsOk(TypeExpr *t, int depth = 0) {
@@ -1254,7 +1270,7 @@ struct TgModule {
     // a T[] image of fixed elements, built at the caller's destination
     // stack.
     bool RetOk(TypeExpr *t) {
-        return TypeOk(t) || ((IsGrow(t) || IsVarArr(t)) && RzOk(t)) || VsOk(t) || VmOk(t) || VvOk(t) ||
+        return TypeOk(t) || ((IsGrow(t) || IsVarArr(t)) && RzOk(t)) || VsOk(t) || VmOk(t) || VvOk(t) || RcOk(t) ||
                VarImgOk(t) || VeOk(t);
     }
     // A free variable of a nested function (§7.5), as SigParams passes it:
@@ -1264,6 +1280,7 @@ struct TgModule {
     bool FvOk(const VarDef *fv) {
         if (!fv->type || fv->reusable || cg.PrefVar(fv)) return false;
         return TypeOk(fv->type) || ((IsGrow(fv->type) || IsVarArr(fv->type)) && RzOk(fv->type)) || VsOk(fv->type) ||
+               RcOk(fv->type) ||
                VmOk(fv->type) || VvOk(fv->type) || VarImgOk(fv->type) || VeOk(fv->type);
     }
 
@@ -1646,6 +1663,10 @@ struct TgFn {
             return at();
         }
         if (M.VarImgOk(t)) return GenImgOfImgs(n, stk, t, l, from, start);
+        if (M.IsRc(t)) {
+            GenRc(n, stk, t, l, from, at());
+            return at();
+        }
         SetTop(stk, tyg_bin(p, TYG_ADD, at(), tyg_iconst(p, TYG_I64, TgModule::LenWidth(t))));
         auto hdr = tyg_at_local(tyg_local_new(p, 16, 8), 0);
         auto len = hdr;
@@ -1663,6 +1684,57 @@ struct TgFn {
         if (Ended()) return at();
         PatchPrefix(at(), t, tyg_load(p, TYG_I64, len, 0));
         return at();
+    }
+
+    // A T[..] built at the top of stk, at `at` (CodeGen::GenArrayLit):
+    // [..cap] its capacity and no elements, the slots left as they are;
+    // another T[..] copied whole, capacity and all; any other array or
+    // literal its elements, the capacity their count.
+    void GenRc(Node *n, tyg_val stk, TypeExpr *t, Line l, const View *from, tyg_val at) {
+        auto et = t->arr->sub;
+        auto esz = cg.FixedSize(et);
+        P pl { tyg_at_val(at, 0), t };
+        auto al = n && !from ? Is<ArrayLit>(n) : nullptr;
+        if (al && al->capexpr) {
+            auto cap = Index64(al->capexpr);
+            if (Ended()) return;
+            AbortUnless(tyg_cmp(p, TYG_ULE, cap, tyg_iconst(p, TYG_I64, 0xffffffffll)), "CAPRANGE", l);
+            tyg_store(p, TYG_I32, pl.a, tyg_convert(p, TYG_TRUNC, TYG_I32, cap), 0);
+            LimSetLen(pl, tyg_iconst(p, TYG_I64, 0));
+            SetTop(stk, tyg_bin(p, TYG_ADD, at, tyg_bin(p, TYG_ADD, tyg_iconst(p, TYG_I64, 8),
+                                                         tyg_bin(p, TYG_MUL, cap, tyg_iconst(p, TYG_I64, esz)))));
+            return;
+        }
+        if (n && !from && !al && n->exprtype && cg.TEq(n->exprtype, t)) {
+            auto src = Deref(Place(n));
+            if (Ended()) return;
+            ImgCopy(stk, tyg_addr_of(p, src.a), t);
+            return;
+        }
+        // The elements behind an 8-byte header, built as a resizable's
+        // are; then the header, capacity and length both their count.
+        SetTop(stk, tyg_bin(p, TYG_ADD, at, tyg_iconst(p, TYG_I64, 8)));
+        auto hdr = tyg_at_local(tyg_local_new(p, 16, 8), 0);
+        auto len = hdr;
+        len.offset += 8;
+        tyg_store(p, TYG_I64, hdr, Top(stk), 0);
+        tyg_store(p, TYG_I64, len, tyg_iconst(p, TYG_I64, 0), 0);
+        if (from) {
+            if (cg.Mangle(from->elem) != cg.Mangle(et)) No(l, "array of another element type");
+            CopyRun(stk, len, et, from->elems, from->len);
+        } else if (al) {
+            GenRz(n, stk, hdr, t, l);
+        } else if (n) {
+            auto v = ViewOf(Place(n), l);
+            if (Ended()) return;
+            if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
+            CopyRun(stk, len, et, v.elems, v.len);
+        }
+        if (Ended()) return;
+        auto cnt = tyg_load(p, TYG_I64, len, 0);
+        AbortUnless(tyg_cmp(p, TYG_ULE, cnt, tyg_iconst(p, TYG_I64, 0xffffffffll)), "CAPRANGE", l);
+        tyg_store(p, TYG_I32, pl.a, tyg_convert(p, TYG_TRUNC, TYG_I32, cnt), 0);
+        LimSetLen(pl, cnt);
     }
 
     // A T[] of images built at the top of stk (its start in `start`): the
@@ -2539,7 +2611,7 @@ struct TgFn {
             auto elem = pl.t->kind == TY_SLICE ? pl.t->sub : pl.t->arr->sub;
             return { tyg_load(p, TYG_I64, pl.a, 0), tyg_load(p, TYG_I64, a8, 0), elem, -1 };
         }
-        if (TgModule::IsLim(pl.t) && M.TypeOk(pl.t)) return LimView(pl);
+        if (TgModule::IsLim(pl.t) && M.LimHeld(pl.t)) return LimView(pl);
         if (IsGrow(pl.t) && M.VeOk(pl.t)) {
             // Elements of variable size: walked from the first (StepElem).
             auto a8 = pl.a;
@@ -2629,7 +2701,8 @@ struct TgFn {
     V GenLen(Node *obj, Node *n) {
         auto ot = obj->exprtype;
         while (ot && IsAddrRef(ot)) ot = ot->ref->sub;
-        if (!ot || !(M.TypeOk(ot) || M.RzOk(ot) || M.VeOk(ot) || M.VarImgOk(ot)) || (ot->kind != TY_ARRAY && ot->kind != TY_SLICE))
+        if (!ot || !(M.TypeOk(ot) || M.RzOk(ot) || M.VeOk(ot) || M.VarImgOk(ot) || M.RcOk(ot)) ||
+            (ot->kind != TY_ARRAY && ot->kind != TY_SLICE))
             No(n->line, "len of this type");
         tyg_val len;
         if (ot->kind == TY_ARRAY && ot->arr->akind == A_FIXED) {
@@ -2786,15 +2859,25 @@ struct TgFn {
     // The length at pl, as an i64.
     tyg_val LimLen(const P &pl) {
         auto s = M.LimLenScal(pl.t);
-        auto n = tyg_load(p, s, pl.a, 0);
+        auto n = tyg_load(p, s, LimLenAt(pl), 0);
         return s == TYG_I64 ? n : tyg_convert(p, TYG_ZEXT, TYG_I64, n);
     }
     // Stores n, an i64 within the capacity, as the length at pl.
     void LimSetLen(const P &pl, tyg_val n) {
         auto s = M.LimLenScal(pl.t);
-        tyg_store(p, s, pl.a, s == TYG_I64 ? n : tyg_convert(p, TYG_TRUNC, s, n), 0);
+        tyg_store(p, s, LimLenAt(pl), s == TYG_I64 ? n : tyg_convert(p, TYG_TRUNC, s, n), 0);
+    }
+    tyg_addr LimLenAt(const P &pl) {
+        auto a = pl.a;
+        if (M.IsRc(pl.t)) a.offset += 4;
+        return a;
     }
     int64_t LimCap(TypeExpr *t) { return cg.ArrSize(t->arr); }
+    // The capacity at pl, as an i64: the type's, or a T[..]'s own.
+    tyg_val LimCapOf(const P &pl) {
+        if (!M.IsRc(pl.t)) return tyg_iconst(p, TYG_I64, LimCap(pl.t));
+        return tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, TYG_I32, pl.a, 0));
+    }
     View LimView(const P &pl) {
         auto elems = tyg_bin(p, TYG_ADD, tyg_addr_of(p, pl.a), tyg_iconst(p, TYG_I64, M.LimWidth(pl.t)));
         return { elems, LimLen(pl), pl.t->arr->sub, -1 };
@@ -2816,10 +2899,14 @@ struct TgFn {
     V GenCap(Dot *d) {
         auto ot = d->obj->exprtype;
         while (ot && IsPlainRef(ot)) ot = ot->ref->sub;
-        if (!TgModule::IsLim(ot) || !M.TypeOk(ot)) No(d->line, "cap of this type");
-        if (!Is<Ident>(d->obj) && !Is<Dot>(d->obj)) Gen(d->obj);   // What it does, it does.
+        if (!TgModule::IsLim(ot) || !M.LimHeld(ot)) No(d->line, "cap of this type");
         V x;
         x.t = M.ast.inttypes[IS_I64];
+        if (M.IsRc(ot)) {
+            x.v = LimCapOf(Deref(Place(d->obj)));
+            return x;
+        }
+        if (!Is<Ident>(d->obj) && !Is<Dot>(d->obj)) Gen(d->obj);   // What it does, it does.
         x.v = tyg_iconst(p, TYG_I64, LimCap(ot));
         return x;
     }
@@ -2840,7 +2927,7 @@ struct TgFn {
         auto nl = tyg_local_new(p, 8, 8);
         tyg_store(p, TYG_I64, tyg_at_local(nl, 0), v.len, 0);
         auto n = [&] { return tyg_load(p, TYG_I64, tyg_at_local(nl, 0), 0); };
-        AbortUnless(tyg_cmp(p, TYG_SLE, n(), tyg_iconst(p, TYG_I64, LimCap(dst.t))), "CAPACITY", l);
+        AbortUnless(tyg_cmp(p, TYG_SLE, n(), LimCapOf(dst)), "CAPACITY", l);
         auto to = LimView(dst).elems;
         tyg_move_dyn(p, to, v.elems, tyg_bin(p, TYG_MUL, n(), tyg_iconst(p, TYG_I64, cg.FixedSize(et))));
         LimSetLen(dst, n());
@@ -2915,7 +3002,7 @@ struct TgFn {
     // length read and checked; the slot written, the length raised. Its
     // value is the slot's address.
     V LimPush(Call *c, const P &pl) {
-        if (!M.TypeOk(pl.t)) No(c->line, cat("push to ", M.NameWhy(pl.t)));
+        if (!M.LimHeld(pl.t)) No(c->line, cat("push to ", M.NameWhy(pl.t)));
         auto et = pl.t->arr->sub;
         auto x = GenAs(c->ArgNodes()[1], et);
         if (Ended()) return Dummy(c->exprtype);
@@ -2924,7 +3011,7 @@ struct TgFn {
         auto nl = tyg_local_new(p, 8, 8);
         tyg_store(p, TYG_I64, tyg_at_local(nl, 0), v.len, 0);
         auto n = [&] { return tyg_load(p, TYG_I64, tyg_at_local(nl, 0), 0); };
-        AbortUnless(tyg_cmp(p, TYG_SLT, n(), tyg_iconst(p, TYG_I64, LimCap(pl.t))), "CAPACITY", c->line);
+        AbortUnless(tyg_cmp(p, TYG_SLT, n(), LimCapOf(pl)), "CAPACITY", c->line);
         auto at = ElemAddr(LimView(pl), n());
         Store(P { tyg_at_val(at, 0), et }, x);
         LimSetLen(pl, tyg_bin(p, TYG_ADD, n(), tyg_iconst(p, TYG_I64, 1)));
@@ -3022,7 +3109,7 @@ struct TgFn {
     // evaluated whole), then the length read and the capacity checked,
     // the elements copied after it.
     V LimAppend(Call *c, const P &pl) {
-        if (!M.TypeOk(pl.t)) No(c->line, cat("append to ", M.NameWhy(pl.t)));
+        if (!M.LimHeld(pl.t)) No(c->line, cat("append to ", M.NameWhy(pl.t)));
         auto et = pl.t->arr->sub;
         auto src = c->ArgNodes()[1];
         if (auto cc = Is<Call>(src); cc && cc->builtin == B_COPY && cc->ArgNodes().size() == 1)
@@ -3047,7 +3134,7 @@ struct TgFn {
         tyg_store(p, TYG_I64, tyg_at_local(ol, 0), LimLen(pl), 0);
         auto o = [&] { return tyg_load(p, TYG_I64, tyg_at_local(ol, 0), 0); };
         auto total = [&] { return tyg_bin(p, TYG_ADD, o(), n()); };
-        AbortUnless(tyg_cmp(p, TYG_SLE, total(), tyg_iconst(p, TYG_I64, LimCap(pl.t))), "CAPACITY", c->line);
+        AbortUnless(tyg_cmp(p, TYG_SLE, total(), LimCapOf(pl)), "CAPACITY", c->line);
         tyg_move_dyn(p, ElemAddr(LimView(pl), o()), v.elems,
                      tyg_bin(p, TYG_MUL, n(), tyg_iconst(p, TYG_I64, cg.FixedSize(et))));
         LimSetLen(pl, total());
@@ -3056,7 +3143,7 @@ struct TgFn {
     // pop, pop_n, resize and clear (codegen_builtins.h): the receiver,
     // the arguments, the checks; only the length moves.
     V LimShrink(Call *c, const P &pl) {
-        if (!M.TypeOk(pl.t)) No(c->line, cat(BuiltinByKind(c->builtin).name, " of ", M.NameWhy(pl.t)));
+        if (!M.LimHeld(pl.t)) No(c->line, cat(BuiltinByKind(c->builtin).name, " of ", M.NameWhy(pl.t)));
         auto an = c->ArgNodes();
         auto et = pl.t->arr->sub;
         auto i64 = [&](int64_t v) { return tyg_iconst(p, TYG_I64, v); };
@@ -3107,7 +3194,7 @@ struct TgFn {
         if (an.size() <= 2) {
             Abort("RESIZEFILL", c->line);
         } else {
-            AbortUnless(tyg_cmp(p, TYG_SLE, n(), i64(LimCap(pl.t))), "CAPACITY", c->line);
+            AbortUnless(tyg_cmp(p, TYG_SLE, n(), LimCapOf(pl)), "CAPACITY", c->line);
             auto il = tyg_local_new(p, 8, 8);
             tyg_store(p, TYG_I64, tyg_at_local(il, 0), o(), 0);
             auto i = [&] { return tyg_load(p, TYG_I64, tyg_at_local(il, 0), 0); };
@@ -3974,7 +4061,7 @@ struct TgFn {
     V GenFormat(Call *c) {
         auto an = c->ArgNodes();
         auto pl = Deref(Place(an[0]));
-        if (TgModule::IsLim(pl.t) && M.TypeOk(pl.t) && IsU8(pl.t->arr->sub)) {
+        if (TgModule::IsLim(pl.t) && M.LimHeld(pl.t) && IsU8(pl.t->arr->sub)) {
             // Into a static-capacity u8[..k] (CodeGen::AppendBytes): the
             // text rendered into a builder of the statement's, then its
             // bytes appended under the capacity check.
@@ -3987,7 +4074,7 @@ struct TgFn {
             if (Ended()) return V {};
             auto n = tyg_load(p, TYG_I64, blen, 0);
             auto ol = LimLen(pl);
-            AbortUnless(tyg_cmp(p, TYG_SLE, tyg_bin(p, TYG_ADD, ol, n), tyg_iconst(p, TYG_I64, LimCap(pl.t))),
+            AbortUnless(tyg_cmp(p, TYG_SLE, tyg_bin(p, TYG_ADD, ol, n), LimCapOf(pl)),
                         "CAPACITY", c->line);
             auto v = LimView(pl);
             tyg_copy_dyn(p, tyg_bin(p, TYG_ADD, v.elems, LimLen(pl)), tyg_load(p, TYG_I64, b.a, 0), n);
@@ -5126,7 +5213,8 @@ struct TgFn {
                           M.File(d->line.fileidx), d->line.line);
             return;
         }
-        if (((IsVarArr(d->type) && M.RzOk(d->type)) || M.VsOk(d->type) || M.VmOk(d->type) || M.VvOk(d->type)) &&
+        if (((IsVarArr(d->type) && M.RzOk(d->type)) || M.VsOk(d->type) || M.VmOk(d->type) || M.VvOk(d->type) ||
+             M.RcOk(d->type)) &&
             !cg.PrefVar(d)) {
             // A T[] local: its image's address, the image on a stack of its
             // own (built by StmtVarDecl).
@@ -5519,6 +5607,11 @@ struct TgFn {
             tyg_jump(p, done);
             tyg_block_set(p, done);
             return tyg_load(p, TYG_I64, tyg_at_local(res, 0), 0);
+        }
+        if (M.IsRc(t)) {
+            auto cap = LimCapOf(P { tyg_at_val(at, 0), t });
+            return tyg_bin(p, TYG_ADD, tyg_bin(p, TYG_MUL, cap, tyg_iconst(p, TYG_I64, cg.FixedSize(t->arr->sub))),
+                           tyg_iconst(p, TYG_I64, 8));
         }
         if (IsVarArr(t)) {
             auto v = ViewOf(P { tyg_at_val(at, 0), t }, Line {});
