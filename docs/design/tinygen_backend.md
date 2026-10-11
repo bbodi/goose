@@ -83,12 +83,9 @@ specialization whose interface or body holds anything unsupported anywhere is
 left to C whole (no partial bodies). `Choose` builds each candidate straight
 into the module; one that meets something unsupported is abandoned
 (`tyg_proc_abort`), the shims and trampolines it asked for are taken back, and
-it leaves the set. A body may call a specialization that takes `gs_sp` only
-if that one is tinygen's too (it then never uses the stacks it is handed, and
-is passed 0): where one that left was called so by a body already built, the
-module is built again from scratch without it, until nothing called leaves
-(rare: such callees mostly use data stacks and leave on the first pass).
-`-v` lists what stayed in C and why
+it leaves the set. Both halves pass `gs_sp` as two C functions do (see
+Data stacks), so what one half takes does not depend on the other, and
+each specialization is built once. `-v` lists what stayed in C and why
 (`tinygen: main_g (prog.goose:13) left to C: builtin push (line 17)`).
 
 **The runtime.** Everything the runtime object exports (`GS_API`: printing,
@@ -110,11 +107,16 @@ directly. The externs called count as used (`CodeGen::usedexterns`), so the
 native parts of the packages they come from are built and linked as for C
 (`NativePackagesUsed`).
 
-**Data stacks** (§6.2) stay in C for now: a tinygen function allocates
-nothing on a stack of its own (it grows only arrays it was handed, see the
-third stage), and calls no C function that takes `gs_sp`. The stack
-accounting (`codegen_stacks.h`) counts what C functions use; a tinygen
-function counts as owning none.
+**Data stacks** (§6.2) are used as the C backend uses them: a tinygen
+function that takes `gs_sp` owns `GS(gs_sp + k)` for the indices it counts
+up and down as its locals and temporaries take them, and hands a callee in
+either half `gs_sp` plus the indices in use. Its stack block is the C half's
+thread-local `gs_stks`, which an exported shim (`gs_tg_stks`) returns once
+per invocation (gap 6). The stack accounting (`codegen_stacks.h`) counts a
+tinygen function as it counts a C one: the backend gives `CodeGen::stackown`
+the most indices the body holds at once and `CodeGen::stackcalls` every
+call it hands an index to, so `BoundStacks`, `--stacks` and the thread cap
+see no difference. See the third stage.
 
 **Packages** need nothing new: their Goose functions are specializations like
 any other, their C parts are linked as before, and their extern fns go
@@ -257,6 +259,7 @@ backend compiles:
 | second, so far (fixed arrays, slices) | 952 of 3811 (25%) | 1 of 172 |
 | second, so far (+ multiple results, globals) | 1099 of 3811 (29%) | 1 of 172 |
 | third, so far (strings and resizable arrays handed in) | 1241 of 3811 (33%) | 53 of 172 |
+| third, so far (+ resizable arrays built: locals, results) | 1471 of 3811 (39%) | 92 of 172 |
 
 (The first stage's own write-up counted 394 of 3331 over 284 programs, an
 older sweep; the rows above come from the same one.) The step that added
@@ -322,18 +325,67 @@ with `hdr` and `stk` (a pointer to a `gs_stack` record with its `top`):
 (lldb) parray 3 v.hdr->base
 ```
 
+Built so (`goose build --backend=tinygen`, plain and `--debug`), the
+Goose-in-Goose compiler compiles itself to the same C, byte for byte, as
+the C backend's build of it.
+
+## What the third stage adds next: resizable arrays built
+
+A function builds resizable arrays of fixed elements of its own, and
+returns them, with the C backend's conventions, so the halves still call
+each other either way:
+
+* **own stacks**: a function with `gs_sp` keeps it in a local and reads the
+  thread's stack block once per invocation (beside the globals' accessors,
+  in the block the entry jumps to). A resizable local (`var v: i64[>..] =
+  ...`, `u8[>..]`, `T[>..<]`) takes the next free index for its block
+  (`AllocStk(forlocal)`), and a temporary -- a call's resizable result, a
+  by-value argument's copy -- one for its statement, each with the top it
+  found saved. Every scope gives its stacks back (top restored) where it
+  ends, and a `break`, `continue` or `return` gives back every scope it
+  leaves; the right operand of `&&`/`||`, a value arm of an `if` and a
+  `while` condition have scopes of their own, since they may not run. A
+  local's index is taken before its initializer runs, so what that takes
+  lies above it.
+* **building**: a local built in place on its own stack, from `[]`, a
+  literal (element by element), a call (handed the local's stack as its
+  destination), a string literal, or a copy of any array or slice
+  (`copy(x)` included); `push` to it; `append` of a call's resizable
+  result (built straight at the receiver's top, its count added), of a
+  string literal, and of an array, slice or literal (evaluated whole, then
+  copied, as in the C).
+* **results**: every result has its `SigParams` channel -- the first fixed
+  one the C return value (`cret`, not necessarily result 0), other fixed
+  ones out-pointers, and a resizable one `gs_stack *gs_dst<i>, int64_t
+  *gs_rl<i>`. `return e` builds a resizable result at `gs_dst<i>` (a call
+  is handed it; a local's elements are copied, which the C avoids when it
+  builds a named result there, an optimization only), writes the count,
+  restores the body's stacks and returns. A call passes a temporary's stack
+  (or a local's, or the destination it is building at) and the count's
+  address; `let a, n = f()` copies a resizable result onto the local's own
+  stack.
+* **calls**: any callee taking `gs_sp`, in either half, is handed `gs_sp`
+  plus the indices in use and recorded for the accounting. A call into the
+  recursive cycle the function is in must be made with none in use (§7.8;
+  the checker ensures it for the C backend's allocation, which this one
+  matches); where it would not be, the function stays in C. A by-value
+  resizable argument is copied onto a temporary's stack and passed as its
+  header and stack.
+
 What still sends a function to C, by count over the sweep: a parameter of
-a type the backend does not hold (462: variable-size elements, frame
-objects such as a `Compiler&`, ADTs, pools), a local of such a type (390:
-mostly `var s: u8[>..] = []` builders), a result of such a type (385),
-free variables (329 and 32 calls), builtins other than `print`, `len` and
-`push` (184: `append`, `str`, `format`, `copy`), calls through function
-values and dispatch (174), `return from` (158), globals (129), and calls to
-functions using data stacks (103). Next: locals and results, which need a
-tinygen function to own stack indices (`AllocStk`, `SpTop`, the stack
-accounting of `codegen_stacks.h` counting it), scope-exit restores, and the
-destination-stack result convention (`gs_dst`, `gs_rl`); then `append`,
-and `str`/`format` through the C half's render functions.
+a type the backend does not hold (467: slices of variable-size elements
+such as `Employee[:]`, frame objects such as `Node&`, ADTs, optionals,
+pools), free variables (329, and 42 calls), a result type (264: a `u8[]`
+string 51, optionals, limited arrays `u8[..8]`, ADTs), builtins (242:
+`format` 61, `resize` 40, `str` 22, `default` 22, `pop` 17, `assert` 16,
+`abort` 14), a local of a type not held (218: frame objects, limited
+arrays, ADTs, `u8[]`), calls through function values and dispatch (183),
+`return from` (158), globals (154: mostly strings and resizable arrays),
+and operators on types not held (84). Next: `u8[]` values (a prefixed
+image on a stack: locals, results, `str`), `format` and `print` of
+composites through the C half's render functions, `resize`/`pop`/`clear`,
+globals of resizable types (their dedicated stacks), and `default`/
+`assert`/`abort`.
 
 ## Testing
 
@@ -342,16 +394,19 @@ structs, extern calls with C of their own (a sidecar), a division by zero
 that must abort with the Goose line, arrays and slices (ending in a failed
 bounds check), a slice whose bounds fail, multiple results, globals
 (mutable ones, static data, and one whose initializer calls a function),
-and strings and resizable arrays handed to functions (whose `main`, which
-builds them, stays in C). They are ordinary fixtures, run by the
+strings and resizable arrays handed to functions (whose `main`, which
+builds them as `u8[]` values, stays in C), and resizable arrays built,
+pushed and appended to, returned (alone and beside a fixed result) and
+given back on every way out of their scopes. They are ordinary fixtures, run by the
 main suite through both C backends against `test/expected/`.
 `test/tinygen_backend.py` (the "tinygen backend" section of `run_tests.py`)
 builds them with `--backend=tinygen`, requires every function to go through
 tinygen, builds the structs fixture three more times with chosen functions
 left to C (`--tinygen-skip=a,b`, hidden) so that by-value and by-reference
-structs cross the two halves in both directions, and the arrays, results
-and globals fixtures twice more so that arrays and slices, out-pointers and
-globals do, builds a few existing
+structs cross the two halves in both directions, and the arrays, results,
+globals, strings and built-arrays fixtures twice more so that arrays and
+slices, out-pointers, globals, fat references, destination stacks and
+`gs_sp` do, builds a few existing
 fixtures and a sample that the stage covers in part, and compares every run
 with the same expected output. Where `lldb` is installed it runs one program
 under it and requires a breakpoint by Goose function name, Goose lines in the
@@ -406,9 +461,10 @@ Recorded here rather than changed in tinygen, which other work is changing:
    whether tinygen's classifier does the same for an align-1 record is
    unchecked, and the Windows x64 rules differ again. This needs a test on
    those targets before the backend is enabled there.
-6. **Thread-locals on Mach-O.** The runtime keeps `gs_gl` and `gs_rf` in
-   thread-local storage. Globals sidestep it (the C half's accessors read
-   `gs_gl`); reaching `gs_rf` from tinygen code for `return from` would
+6. **Thread-locals on Mach-O.** The runtime keeps `gs_gl`, `gs_stks` and
+   `gs_rf` in thread-local storage. Globals and data stacks sidestep it (the
+   C half's accessors read `gs_gl` and `gs_stks`, once per invocation that
+   needs them); reaching `gs_rf` from tinygen code for `return from` would
    need `TYG_SYM_TLS` access on every target, or accessors of its own;
    tinygen's recent work names ELF thread-locals, and Mach-O's TLV access
    should be checked.
@@ -438,9 +494,10 @@ Recorded here rather than changed in tinygen, which other work is changing:
    `-O2` builds stay in tinygen.
 3. **Data stacks**: done so far: strings and resizable arrays of fixed
    elements as reference and by-value parameters, read, passed on and
-   pushed to. Next: resizable and variable-size values, `gs_sp` and the stack
-   accounting (`CodeGen` exposing `NoteStackCall`/`stackown` to the second
-   backend), `push`/`append`/`str`/`format`, rendering composites through the
+   pushed to; `gs_sp`, own stacks and the stack accounting; resizable
+   locals and results built in place, `append`, by-value resizable
+   arguments. Next: variable-size values (`u8[]` locals and results),
+   `resize`/`pop`/`clear`, `str`/`format`, rendering composites through the
    C half's render functions (given external linkage), free variables of
    nested functions, function values, `return from`.
 4. **Driver and platforms**: `goose run --backend=tinygen` (build and start,
