@@ -1101,9 +1101,9 @@ struct TgModule {
     }
 
     map<const VarDef *, string> stkaccessors;
-    // The `return from` channels' accessors (gs_tg_lret_<tid>_<i>), with
-    // the target and result each gives.
-    map<string, pair<FnSpec *, size_t>> channels;
+    // The `return from` channels' accessors (gs_tg_lret_<tid>_<i>, and
+    // gs_tg_fdst_, gs_tg_fval_), with the size of each channel.
+    map<string, int64_t> channels;
     string StackAccessor(VarDef *d) {
         auto it = stkaccessors.find(d);
         auto name = it != stkaccessors.end() ? it->second
@@ -1228,7 +1228,7 @@ struct TgModule {
             if (!FvOk(fv)) { why = cat("free variable of type ", fv->type ? NameWhy(fv->type) : "?"); return false; }
         if (define && cg.fromids.count(sp))
             for (auto r : sp->rets)
-                if (!TypeOk(r)) { why = cat("return from target with result type ", NameWhy(r)); return false; }
+                if (!RetOk(r)) { why = cat("return from target with result type ", NameWhy(r)); return false; }
         for (auto r : sp->rets)
             if (!RetOk(r)) { why = cat("result type ", NameWhy(r)); return false; }
         for (size_t i = 0; i < sp->argtypes.size(); i++)
@@ -4833,6 +4833,36 @@ struct TgFn {
         }
     }
 
+    // A nonfixed result built at the top of dst, from val or from x (a
+    // forwarded call's value): a T[]'s image, or a resizable's elements,
+    // whose count is stored at len.
+    void BuildAt(Node *val, V *x, tyg_val dst, TypeExpr *t, tyg_addr len, Line l) {
+        if (IsImg(t)) {
+            if (!x) {
+                GenImg(val, dst, t, l);
+            } else if (M.IsVs(t) || M.IsVm(t)) {
+                VsCopy(dst, *x, t, l);
+            } else {
+                auto v = ViewOf(P { x->a, x->t, x->stk }, l);
+                GenImg(nullptr, dst, t, l, &v);
+            }
+            return;
+        }
+        auto hdr = tyg_at_local(tyg_local_new(p, 16, 8), 0);
+        auto hlen = hdr;
+        hlen.offset += 8;
+        if (!x) {
+            GenRz(val, dst, hdr, t, l);
+        } else {
+            auto v = ViewOf(P { x->a, x->t, x->stk }, l);
+            tyg_store(p, TYG_I64, hdr, Top(dst), 0);
+            tyg_store(p, TYG_I64, hlen, tyg_iconst(p, TYG_I64, 0), 0);
+            CopyRun(dst, hlen, t->arr->sub, v.elems, v.len);
+        }
+        if (Ended()) return;
+        tyg_store(p, TYG_I64, len, tyg_load(p, TYG_I64, hlen, 0), 0);
+    }
+
     // return, return x, return a, b (each result in turn, the ones the C
     // does not return written through their channels as they are made, as
     // the C does), or return f() forwarding all of a call's results (§7.1).
@@ -4845,7 +4875,7 @@ struct TgFn {
         if (rets.empty()) {
             for (auto v : vals) Gen(v);
             if (Ended()) return;
-            RestoreFrom(0);
+            Leave();
             tyg_ret(p, 0);
             return;
         }
@@ -4853,7 +4883,7 @@ struct TgFn {
             auto x = GenAs(vals.at(0), rets[0]);
             if (Ended()) return;
             if (!M.IsScalar(rets[0]) && !x.mem) No(l, "aggregate value");
-            RestoreFrom(0);
+            Leave();
             if (x.mem) tyg_ret_mem(p, x.a);
             else tyg_ret(p, x.v);
             return;
@@ -4864,40 +4894,13 @@ struct TgFn {
         P first {};
         if (cret >= 0) first = P { tyg_at_local(Temp(rets[cret]), 0), rets[cret] };
         for (size_t i = 0; i < rets.size(); i++) {
-            if (IsImg(rets[i])) {
-                // A T[]: its image built at the destination.
+            if (IsImg(rets[i]) || IsGrow(rets[i])) {
                 auto dst = tyg_load(p, TYG_I64, tyg_at_local(chans[i].a, 0), 0);
                 SetTop(dst, tyg_load(p, TYG_I64, tyg_at_local(chans[i].top0, 0), 0));
-                if (xs.empty()) {
-                    GenImg(vals[i], dst, rets[i], l);
-                } else if (M.IsVs(rets[i]) || M.IsVm(rets[i])) {
-                    VsCopy(dst, xs[i], rets[i], l);
-                } else {
-                    auto v = ViewOf(P { xs[i].a, xs[i].t, xs[i].stk }, l);
-                    GenImg(nullptr, dst, rets[i], l, &v);
-                }
+                auto rl = IsGrow(rets[i]) ? tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(chans[i].b, 0), 0), 0)
+                                          : tyg_addr {};
+                BuildAt(xs.empty() ? vals[i] : nullptr, xs.empty() ? nullptr : &xs[i], dst, rets[i], rl, l);
                 if (Ended()) return;
-                continue;
-            }
-            if (IsGrow(rets[i])) {
-                auto dst = tyg_load(p, TYG_I64, tyg_at_local(chans[i].a, 0), 0);
-                SetTop(dst, tyg_load(p, TYG_I64, tyg_at_local(chans[i].top0, 0), 0));
-                auto hdr = tyg_at_local(tyg_local_new(p, 16, 8), 0);
-                if (xs.empty()) {
-                    GenRz(vals[i], dst, hdr, rets[i], l);
-                } else {
-                    auto v = ViewOf(P { xs[i].a, xs[i].t, xs[i].stk }, l);
-                    tyg_store(p, TYG_I64, hdr, Top(dst), 0);
-                    auto len = hdr;
-                    len.offset += 8;
-                    tyg_store(p, TYG_I64, len, tyg_iconst(p, TYG_I64, 0), 0);
-                    CopyRun(dst, len, rets[i]->arr->sub, v.elems, v.len);
-                }
-                if (Ended()) return;
-                auto len = hdr;
-                len.offset += 8;
-                auto rl = tyg_load(p, TYG_I64, tyg_at_local(chans[i].b, 0), 0);
-                tyg_store(p, TYG_I64, tyg_at_val(rl, 0), tyg_load(p, TYG_I64, len, 0), 0);
                 continue;
             }
             auto x = xs.empty() ? GenAs(vals[i], rets[i]) : Fit(xs[i], rets[i], l);
@@ -4910,7 +4913,7 @@ struct TgFn {
             auto ptr = tyg_load(p, TYG_I64, tyg_at_local(chans[i].a, 0), 0);
             Store(P { tyg_at_val(ptr, 0), rets[i] }, x);
         }
-        RestoreFrom(0);
+        Leave();
         if (cret < 0) tyg_ret(p, 0);
         else if (M.IsScalar(rets[cret])) tyg_ret(p, tyg_load(p, M.Scal(rets[cret]), first.a, 0));
         else tyg_ret_mem(p, first.a);
@@ -4931,18 +4934,29 @@ struct TgFn {
         M.NeedShim("gs_tg_rf");
         return tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal("gs_tg_rf"), 0), 0);
     }
-    tyg_addr LretAt(FnSpec *t, size_t i) {
+    // A target's channel for result i: gs_lret_ (a fixed value, or a
+    // resizable's count), gs_fdst_ (a nonfixed one's destination stack)
+    // or gs_fval_ (where its value starts there).
+    tyg_addr ChanAt(FnSpec *t, size_t i, const char *kind) {
         cg.EnsureFromChannels(t);
         auto tid = cg.fromids[t];
-        auto name = cat("gs_tg_lret_", tid, "_", i);
-        M.NeedShim(name, cat("void *", name, "(void) { return &gs_lret_", tid, "_", i, "; }\n"));
-        M.channels[name] = { t, i };
+        auto name = cat("gs_tg_", kind, "_", tid, "_", i);
+        M.NeedShim(name, cat("void *", name, "(void) { return (void *)&gs_", kind, "_", tid, "_", i, "; }\n"));
+        auto rt = t->rets[i];
+        M.channels[name] = string(kind) == "lret" && !IsGrow(rt) ? M.Size(rt) : 8;
         return tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(name), 0), 0), 0);
+    }
+    tyg_addr LretAt(FnSpec *t, size_t i) { return ChanAt(t, i, "lret"); }
+    // A target's saves of its gs_fdst_ channels, restored as it returns.
+    vector<pair<tyg_addr, tyg_local>> fdstsaves;
+    void Leave() {
+        RestoreFrom(0);
+        for (auto &[at, sav] : fdstsaves) tyg_store(p, TYG_I64, at, tyg_load(p, TYG_I64, tyg_at_local(sav, 0), 0), 0);
     }
     // Every frame on a propagation's way out returns at once: its stacks
     // restored, a dummy C return value (CodeGen::PropagateReturn).
     void Propagate() {
-        RestoreFrom(0);
+        Leave();
         auto cret = cg.sinfo[sp].cret;
         if (cret < 0) {
             tyg_ret(p, 0);
@@ -4960,12 +4974,25 @@ struct TgFn {
         if (!sp || !t || !cg.fromids.count(t) || !cg.sinfo[sp].hasrf) No(l, "return from");
         auto &rets = t->rets;
         for (auto rt : rets)
-            if (!M.TypeOk(rt)) No(l, cat("return from with a result of type ", M.Name(rt)));
+            if (!M.RetOk(rt)) No(l, cat("return from with a result of type ", M.Name(rt)));
         auto &vals = r->vals;
+        // A nonfixed value lands at its channel's top, which the catch
+        // moves down to where the target's caller expects it.
+        for (size_t i = 0; i < rets.size(); i++)
+            if (IsImg(rets[i]) || IsGrow(rets[i]))
+                tyg_store(p, TYG_I64, ChanAt(t, i, "fval"),
+                          Top(tyg_load(p, TYG_I64, ChanAt(t, i, "fdst"), 0)), 0);
         vector<V> xs;
         if (vals.size() == 1 && rets.size() > 1) xs = GenCallAll(vals[0], rets.size());
         else if (vals.size() != rets.size()) No(l, "result count");
         for (size_t i = 0; i < rets.size(); i++) {
+            if (IsImg(rets[i]) || IsGrow(rets[i])) {
+                auto dst = tyg_load(p, TYG_I64, ChanAt(t, i, "fdst"), 0);
+                BuildAt(xs.empty() ? vals[i] : nullptr, xs.empty() ? nullptr : &xs[i], dst, rets[i],
+                        IsGrow(rets[i]) ? LretAt(t, i) : tyg_addr {}, l);
+                if (Ended()) return;
+                continue;
+            }
             auto x = xs.empty() ? GenAs(vals[i], rets[i]) : Fit(xs[i], rets[i], l);
             if (Ended()) return;
             if (!M.IsScalar(rets[i]) && !x.mem) No(l, "aggregate value");
@@ -5003,10 +5030,25 @@ struct TgFn {
             auto cret = cg.sinfo[sp].cret;
             for (size_t i = 0; i < rets.size(); i++) {
                 if ((int)i == cret) continue;
+                if (IsImg(rets[i]) || IsGrow(rets[i])) {
+                    // The value is on our destination, behind anything the
+                    // calls it unwound had built there (CodeGen::LandValue).
+                    auto dst = tyg_load(p, TYG_I64, tyg_at_local(chans[i].a, 0), 0);
+                    auto top0 = tyg_load(p, TYG_I64, tyg_at_local(chans[i].top0, 0), 0);
+                    auto start = tyg_load(p, TYG_I64, ChanAt(sp, i, "fval"), 0);
+                    auto n = tyg_bin(p, TYG_SUB, Top(dst), start);
+                    tyg_move_dyn(p, top0, start, n);
+                    SetTop(dst, tyg_bin(p, TYG_ADD, top0, n));
+                    if (IsGrow(rets[i])) {
+                        auto rl = tyg_load(p, TYG_I64, tyg_at_local(chans[i].b, 0), 0);
+                        tyg_store(p, TYG_I64, tyg_at_val(rl, 0), tyg_load(p, TYG_I64, LretAt(sp, i), 0), 0);
+                    }
+                    continue;
+                }
                 auto ptr = tyg_load(p, TYG_I64, tyg_at_local(chans[i].a, 0), 0);
                 Store(P { tyg_at_val(ptr, 0), rets[i] }, Load(P { LretAt(sp, i), rets[i] }, Line {}));
             }
-            RestoreFrom(0);
+            Leave();
             if (cret < 0) tyg_ret(p, 0);
             else if (M.IsScalar(rets[cret])) tyg_ret(p, Load(P { LretAt(sp, cret), rets[cret] }, Line {}).v);
             else tyg_ret_mem(p, LretAt(sp, cret));
@@ -5770,6 +5812,18 @@ struct TgFn {
         gstart = tyg_block_new(p);
         tyg_jump(p, gblk);
         tyg_block_set(p, gstart);
+        if (cg.fromids.count(sp)) {
+            // A `return from` target: its destinations are where values
+            // in flight to it are built (CodeGen::EmitSpec).
+            for (size_t i = 0; i < sp->rets.size(); i++) {
+                if (!IsImg(sp->rets[i]) && !IsGrow(sp->rets[i])) continue;
+                auto at = ChanAt(sp, i, "fdst");
+                auto sav = tyg_local_new(p, 8, 8);
+                tyg_store(p, TYG_I64, tyg_at_local(sav, 0), tyg_load(p, TYG_I64, at, 0), 0);
+                tyg_store(p, TYG_I64, at, tyg_load(p, TYG_I64, tyg_at_local(chans[i].a, 0), 0), 0);
+                fdstsaves.emplace_back(at, sav);
+            }
+        }
         // The tail of a body with a result is returned as the C returns it
         // (EmitSpec): unless it is an `if` without an `else`, or no value.
         auto body = sp->body;
@@ -6042,7 +6096,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     // a global's accessor, or a `return from` channel's of a fixed type.
     bool OwnAccessor(const string &name) {
         if (auto it = mod->channels.find(name); it != mod->channels.end())
-            return mod->TypeOk(it->second.first->rets[it->second.second]);
+            return true;
         for (auto &[d, n] : mod->accessors)
             if (n == name) return true;
         for (auto &[d, n] : mod->stkaccessors)
@@ -6131,9 +6185,8 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         for (auto &sh : mod->shims) {
             auto it = mod->channels.find(sh.first);
             if (it == mod->channels.end()) continue;
-            auto t = it->second.first->rets[it->second.second];
             auto sym = tyg_symbol(m, cat("gs_", sh.first.substr(6)).c_str(), 0);   // gs_lret_<tid>_<i>
-            tyg_data(m, sym, TYG_SECTION_BSS, nullptr, std::max<int64_t>(mod->Size(t), 1), 8);
+            tyg_data(m, sym, TYG_SECTION_BSS, nullptr, std::max<int64_t>(it->second, 1), 8);
             accessor(sh.first, sym);
         }
     }
