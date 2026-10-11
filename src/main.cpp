@@ -974,7 +974,8 @@ int Main(int argc, char **argv) {
             if (tinygen && !nocgen) {
                 auto checks = std::find(cdefines.begin(), cdefines.end(), "GS_DEBUG=1") !=
                               cdefines.end();
-                tgb = make_unique<TinyGenBackend>(ast, checks, filename, runtime_ext_text);
+                tgb = make_unique<TinyGenBackend>(ast, checks, filename, runtime_ext_text,
+                                                  RuntimeSections({ "runtime.h", "runtime_ext.h" }));
                 tgb->skip = tinygenskip;
             }
             CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, stackcfg.maxstacks,

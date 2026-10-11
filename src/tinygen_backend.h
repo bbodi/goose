@@ -94,6 +94,25 @@ struct TgModule {
     // The C the procedures call into, by name: shim definitions in order.
     vector<pair<string, string>> shims;
     vector<FnSpec *> externs;   // Extern fns called, for trampolines.
+    vector<FnSpec *> direct;    // Extern fns called directly (RuntimeApi).
+    // The runtime's declarations (runtime.h, runtime_ext.h), for RuntimeApi.
+    string_view rtdecls;
+
+    // Whether the C function `name` is one the runtime object exports
+    // (GS_API): a plain symbol, called directly without a trampoline.
+    map<string, bool> rtapi;
+    bool RuntimeApi(const string &name) {
+        if (auto it = rtapi.find(name); it != rtapi.end()) return it->second;
+        auto found = false;
+        for (auto pos = rtdecls.find(cat(name, "(")); pos != string_view::npos && !found;
+             pos = rtdecls.find(cat(name, "("), pos + 1)) {
+            if (pos == 0 || (rtdecls[pos - 1] != ' ' && rtdecls[pos - 1] != '*')) continue;
+            auto bol = rtdecls.rfind('\n', pos);
+            bol = bol == string_view::npos ? 0 : bol + 1;
+            found = rtdecls.substr(bol, 7) == "GS_API ";
+        }
+        return rtapi[name] = found;
+    }
 
     TgModule(Ast &_ast, CodeGen &_cg, bool _checks, const string &source)
         : ast(_ast), cg(_cg), checks(_checks) {
@@ -2310,12 +2329,16 @@ struct TgFn {
         for (auto t : callee->argtypes) cg.CT(t);
         for (auto t : callee->rets) cg.CT(t);
         // One trampoline per C name: a call may have a specialization of
-        // its own of the same extern.
+        // its own of the same extern. A function the runtime object
+        // exports needs none.
+        auto direct = M.RuntimeApi(callee->sf->cname);
+        auto &list = direct ? M.direct : M.externs;
         auto known = false;
-        for (auto e : M.externs) known = known || e->sf->cname == callee->sf->cname;
-        if (!known) M.externs.push_back(callee);
+        for (auto e : list) known = known || e->sf->cname == callee->sf->cname;
+        if (!known) list.push_back(callee);
         if (Ended()) return Dummy(callee->rets.empty() ? nullptr : callee->rets[0]);
-        auto sym = M.Sym(cat("gs_tg_x_", callee->sf->cname), TYG_SYM_FUNC | TYG_SYM_GLOBAL);
+        auto sym = M.Sym(direct ? callee->sf->cname : cat("gs_tg_x_", callee->sf->cname),
+                         TYG_SYM_FUNC | TYG_SYM_GLOBAL);
         return Result(callee, callee->rets.empty() ? -1 : 0, M.ExternSig(callee), tyg_direct(sym), args);
     }
 
@@ -3100,12 +3123,15 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     vector<pair<FnSpec *, string>> left;   // Specializations left to C, and why.
     unique_ptr<TgModule> mod;
     string_view runtime_ext_text;
+    string runtime_decls;   // runtime.h and runtime_ext.h (TgModule::RuntimeApi).
     // Functions left to C whatever they hold (--tinygen-skip): what tests
     // calls across the two halves with.
     vector<string> skip;
 
-    TinyGenBackend(Ast &_ast, bool _checks, const string &_source, string_view _ext)
-        : ast(_ast), checks(_checks), source(_source), runtime_ext_text(_ext) {}
+    TinyGenBackend(Ast &_ast, bool _checks, const string &_source, string_view _ext,
+                   string _decls)
+        : ast(_ast), checks(_checks), source(_source), runtime_ext_text(_ext),
+          runtime_decls(std::move(_decls)) {}
 
     // Builds sp into the module. A construct this backend does not
     // support anywhere in the body abandons the procedure (tyg_proc_abort),
@@ -3118,7 +3144,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         string why;
         if (sp->sf->issimd) return "simd function";
         if (!mod->SigOk(sp, true, why)) return cat("interface: ", why);
-        auto nshims = mod->shims.size(), nexterns = mod->externs.size();
+        auto nshims = mod->shims.size(), nexterns = mod->externs.size(), ndirect = mod->direct.size();
         TgFn fn(*mod, sp);
         try {
             fn.Emit();
@@ -3126,6 +3152,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
             if (fn.p) tyg_proc_abort(fn.p);
             mod->shims.resize(nshims);
             mod->externs.resize(nexterns);
+            mod->direct.resize(ndirect);
             return u.line.line > 0 ? cat(u.why, " (line ", u.line.line, ")") : u.why;
         }
         cg.stackown[sp] = fn.maxown;
@@ -3140,6 +3167,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     set<FnSpec *> Choose(CodeGen &cg, const vector<FnSpec *> &specs) override {
         set<FnSpec *> ours;
         mod = make_unique<TgModule>(ast, cg, checks, source);
+        mod->rtdecls = runtime_decls;
         if (!mod->m) {
             for (auto sp : specs) left.emplace_back(sp, "tinygen has no module for this target");
             mod.reset();
@@ -3166,9 +3194,10 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     void Compile(CodeGen &cg) {
         if (!mod) return;
         declared.insert(cg.usedexterns.begin(), cg.usedexterns.end());
-        for (auto sp : mod->externs)
-            if (std::find(cg.usedexterns.begin(), cg.usedexterns.end(), sp) == cg.usedexterns.end())
-                cg.usedexterns.push_back(sp);
+        for (auto list : { &mod->externs, &mod->direct })
+            for (auto sp : *list)
+                if (std::find(cg.usedexterns.begin(), cg.usedexterns.end(), sp) == cg.usedexterns.end())
+                    cg.usedexterns.push_back(sp);
     }
 
     // The C the object calls into: the shims, and a trampoline per extern
