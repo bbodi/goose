@@ -1197,6 +1197,14 @@ struct TgModule {
         renderq.emplace_back(name, t);
         return name;
     }
+    // The verifier procedure of an image's element type (CodeGen::VerifyFn):
+    // int64(payload, n, bitmap), queued like a render procedure.
+    string VerifyFn(TypeExpr *elem) {
+        auto k = cg.Mangle(elem);
+        auto name = cat("gs_tg_verify_", k);
+        if (renderfns.emplace(name, name).second) renderq.emplace_back(name, elem);
+        return name;
+    }
     // Whether a render procedure can take the type: a fixed struct or ADT
     // whose parts are all held (TypeOk), or an image of one (a variable-size
     // struct, a variable-mode ADT), handed the address of its value.
@@ -2462,6 +2470,26 @@ struct TgFn {
     void Into(const P &pl, Node *n) {
         if (SelfRelLit(n) && cg.TEq(n->exprtype, pl.t)) {
             SelfRelInto(pl, Is<StructLit>(n));
+            return;
+        }
+        if (auto al = Is<ArrayLit>(n);
+            al && !al->fillval && !al->capexpr && pl.t->kind == TY_ARRAY && cg.HasRelRef(pl.t) &&
+            cg.TEq(n->exprtype, pl.t) && M.TypeOk(pl.t) && cg.ArrSize(pl.t->arr) > 0 &&
+            (pl.t->arr->akind == A_FIXED || cg.IsStaticLimited(pl.t))) {
+            // An array of links built where it lies, so each offset measures
+            // from its own slot (CodeGen::GenArrayLit's in-place path).
+            auto lim = pl.t->arr->akind != A_FIXED;
+            auto et = pl.t->arr->sub;
+            auto esz = cg.FixedSize(et);
+            auto cnt = (int64_t)al->elems.size();
+            if (cnt > cg.ArrSize(pl.t->arr)) No(n->line, "array literal length");
+            tyg_zero(p, pl.a, M.Size(pl.t));
+            for (int64_t i = 0; i < cnt && !Ended(); i++) {
+                auto a = pl.a;
+                a.offset += (lim ? M.LimWidth(pl.t) : 0) + i * esz;
+                Into(P { a, et }, al->elems[(size_t)i]);
+            }
+            if (lim && !Ended()) LimSetLen(pl, tyg_iconst(p, TYG_I64, cnt));
             return;
         }
         auto x = GenAs(n, pl.t);
@@ -4661,7 +4689,7 @@ struct TgFn {
         }
         if (!IsGrow(pl.t) || !M.RzOk(pl.t) || !pl.stk) No(c->line, "push to an array of this kind");
         auto et = pl.t->arr->sub;
-        if (SelfRelLit(an[1]) && cg.TEq(an[1]->exprtype, et)) {
+        if ((SelfRelLit(an[1]) || (cg.HasRelRef(et) && SelfRelLitOk(an[1]))) && cg.TEq(an[1]->exprtype, et)) {
             // Built in its slot at the top, then counted.
             auto slot = Top(pl.stk);
             auto sv = tyg_local_new(p, 8, 8);
@@ -5369,17 +5397,17 @@ struct TgFn {
         return r;
     }
     // from_bytes<T[>..]>(bytes) (CodeGen::EmitFromBytes): the framing
-    // prefix has to count exactly the rest of the slice, and the payload
-    // has to be whole elements; then it is copied as the array's elements.
-    // Only elements whose bytes need no walk (VerifyFn: no bool, enum,
-    // limited array or reference in them) are verified here. The array
+    // prefix has to count exactly the rest of the slice; then the payload
+    // is verified as an image of elements (plain fixed ones by their size
+    // alone, the others by the element's verifier procedure,
+    // TgModule::VerifyFn) and copied as the array's elements. The array
     // result, and whether the bytes were one.
     vector<V> GenFromBytes(Call *c) {
         auto t = c->rettypes.empty() ? nullptr : c->rettypes[0];
-        if (!t || !IsGrow(t) || !M.RzOk(t)) No(c->line, "from_bytes of this type");
+        if (!t || !IsGrow(t) || !(M.RzOk(t) || M.VeOk(t))) No(c->line, "from_bytes of this type");
         auto et = t->arr->sub;
-        if (!cg.IsFix(et) || cg.NeedsVerifyWalk(et) || cg.FixedSize(et) <= 0) No(c->line, "from_bytes of this type");
-        auto esz = cg.FixedSize(et);
+        auto plain = cg.IsFix(et) && !cg.NeedsVerifyWalk(et) && cg.FixedSize(et) > 0;
+        auto esz = plain ? cg.FixedSize(et) : 0;
         auto an = c->ArgNodes();
         auto v = ViewOf(Place(an[0]), c->line);
         if (Ended()) return { Dummy(t), Dummy(M.ast.booltype) };
@@ -5409,13 +5437,51 @@ struct TgFn {
         tyg_block_set(p, good);
         st(pay, tyg_bin(p, TYG_ADD, ld(src), ld(uc.k)));
         st(pn, ld(uc.v));
-        // Whole elements: their count, else not an image.
-        tyg_branch(p, tyg_cmp(p, TYG_EQ, tyg_bin(p, TYG_SREM, ld(pn), i64(esz)), i64(0)), whole, framed);
-        tyg_block_set(p, whole);
-        st(okl, i64(1));
-        st(cnt, tyg_bin(p, TYG_SDIV, ld(pn), i64(esz)));
-        tyg_jump(p, framed);
+        if (plain) {
+            // Whole elements: their count, else not an image.
+            tyg_branch(p, tyg_cmp(p, TYG_EQ, tyg_bin(p, TYG_SREM, ld(pn), i64(esz)), i64(0)), whole, framed);
+            tyg_block_set(p, whole);
+            st(okl, i64(1));
+            st(cnt, tyg_bin(p, TYG_SDIV, ld(pn), i64(esz)));
+            tyg_jump(p, framed);
+        } else {
+            st(okl, i64(1));
+            tyg_jump(p, whole);
+            tyg_block_set(p, whole);
+            tyg_jump(p, framed);
+        }
         tyg_block_set(p, framed);
+        if (!plain) {
+            // The verifier. An image with relative links to variable
+            // elements gets a bitmap of element starts, on a stack of its
+            // own; one needing more of that stack than is reserved (GS_BM_MAX)
+            // cannot be verified and is rejected.
+            tyg_val bm = i64(0);
+            if (!cg.IsFix(et) && cg.HasRelRefAny(et)) {
+                auto bstk = Stk(AllocStk(false, c->line), c->line);
+                bm = Top(bstk);
+                auto bn = tyg_local_new(p, 8, 8);
+                st(bn, tyg_bin(p, TYG_SDIV, tyg_bin(p, TYG_ADD, ld(pn), i64(7)), i64(8)));
+                auto big = tyg_block_new(p), fits = tyg_block_new(p);
+                tyg_branch(p, tyg_cmp(p, TYG_SGT, ld(bn), i64(2048ll << 20)), big, fits);
+                tyg_block_set(p, big);
+                st(bn, i64(0));
+                st(okl, i64(0));
+                tyg_jump(p, fits);
+                tyg_block_set(p, fits);
+                tyg_set_dyn(p, bm, i64(0), ld(bn));
+                SetTop(bstk, tyg_bin(p, TYG_ADD, bm, ld(bn)));
+            }
+            auto run = tyg_block_new(p), ran = tyg_block_new(p);
+            tyg_branch(p, tyg_cmp(p, TYG_NE, ld(okl), i64(0)), run, ran);
+            tyg_block_set(p, run);
+            auto i64t = IT(TYG_I64);
+            auto n = CallC(M.VerifyFn(et), { i64t, i64t, i64t }, { ld(pay), ld(pn), bm }, i64t);
+            st(cnt, n);
+            st(okl, tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_cmp(p, TYG_SGE, n, i64(0))));
+            tyg_jump(p, ran);
+            tyg_block_set(p, ran);
+        }
         tyg_store(p, TYG_I64, r.a, Top(r.stk), 0);
         tyg_store(p, TYG_I64, rlen, i64(0), 0);
         auto copy = tyg_block_new(p), out = tyg_block_new(p);
@@ -7645,6 +7711,342 @@ struct TgFn {
         Finish(Line {});
     }
 
+    // ---- The verifier of an image's elements ---------------------------------
+    //
+    // gs_tg_verify_<T>(p, n, bm) (CodeGen::VerifyFn): the element count of the
+    // image at p, or -1 if its n bytes are not one. The walk of each type
+    // mirrors CodeGen::EmitVerifyWalk step for step, over a cursor `vq`;
+    // any failure jumps to `vfail`, which returns -1.
+    tyg_val vP = 0, vN = 0, vBM = 0, vE = 0;
+    tyg_local vq = 0;
+    tyg_block vfail = 0;
+    TypeExpr *velem = nullptr;
+
+    tyg_val VI(int64_t x) { return tyg_iconst(p, TYG_I64, x); }
+    tyg_val VQ() { return tyg_load(p, TYG_I64, tyg_at_local(vq, 0), 0); }
+    void VSetQ(tyg_val x) { tyg_store(p, TYG_I64, tyg_at_local(vq, 0), x, 0); }
+    void VAddQ(tyg_val x) { VSetQ(tyg_bin(p, TYG_ADD, VQ(), x)); }
+    tyg_val VL(tyg_local l) { return tyg_load(p, TYG_I64, tyg_at_local(l, 0), 0); }
+    void VS(tyg_local l, tyg_val x) { tyg_store(p, TYG_I64, tyg_at_local(l, 0), x, 0); }
+    tyg_local VNew() { return tyg_local_new(p, 8, 8); }
+    // The integer of `size` bytes at address `at`, widened to 64 bits.
+    tyg_val VLoad(tyg_val at, int64_t size, bool sgn) {
+        auto s = size == 1 ? TYG_I8 : size == 2 ? TYG_I16 : size == 4 ? TYG_I32 : TYG_I64;
+        auto x = tyg_load(p, s, tyg_at_val(at, 0), 0);
+        return size == 8 ? x : tyg_convert(p, sgn ? TYG_SEXT : TYG_ZEXT, TYG_I64, x);
+    }
+    // Fail where `bad`, else go on.
+    void VFailIf(tyg_val bad) {
+        auto ok = tyg_block_new(p);
+        tyg_branch(p, bad, vfail, ok);
+        tyg_block_set(p, ok);
+    }
+    // n - q < bytes: fewer bytes left than a value needs.
+    void VNeed(tyg_val bytes) {
+        VFailIf(tyg_cmp(p, TYG_SLT, tyg_bin(p, TYG_SUB, vN, VQ()), bytes));
+    }
+    // for (i = 0; i < count; i++) body
+    template<typename F> void VLoop(tyg_val count, F body) {
+        auto cl = VNew(), il = VNew();
+        VS(cl, count);
+        VS(il, VI(0));
+        auto head = tyg_block_new(p), bd = tyg_block_new(p), done = tyg_block_new(p);
+        tyg_jump(p, head);
+        tyg_block_set(p, head);
+        tyg_branch(p, tyg_cmp(p, TYG_SLT, VL(il), VL(cl)), bd, done);
+        tyg_block_set(p, bd);
+        body();
+        VS(il, tyg_bin(p, TYG_ADD, VL(il), VI(1)));
+        tyg_jump(p, head);
+        tyg_block_set(p, done);
+    }
+
+    // One self-relative reference at field offset q holding `off`
+    // (CodeGen::EmitVerifyLink): the target must be the start of an element,
+    // and where typed at a variant, one carrying that tag.
+    void VLink(TypeExpr *rt, tyg_val off) {
+        auto offl = VNew();
+        VS(offl, off);
+        auto pt = rt->ref->sub;
+        auto variant = pt->kind == TY_VARIANT && velem->kind == TY_ENUM;
+        int64_t skip = 0, vi = 0;
+        IntStorage ts = IS_U8;
+        if (variant) {
+            auto ei = cg.EIVar(pt);
+            vi = ei->en->VariantIndex(pt->var->variant);
+            ts = cg.TagStore(ei->en);
+            skip = CodeGen::IntSize(ts);
+        }
+        auto skipb = tyg_block_new(p);
+        if (rt->ref->optional) {
+            auto inb = tyg_block_new(p);
+            tyg_branch(p, tyg_cmp(p, TYG_NE, VL(offl), VI(0)), inb, skipb);
+            tyg_block_set(p, inb);
+        }
+        auto v = VNew();
+        VS(v, tyg_bin(p, TYG_SUB, VQ(), VI(skip)));
+        // The untrusted offset is bounded against the image before it is added.
+        VFailIf(tyg_cmp(p, TYG_SLT, VL(offl), tyg_un(p, TYG_NEG, VL(v))));
+        VFailIf(tyg_cmp(p, TYG_SGE, VL(offl), tyg_bin(p, TYG_SUB, vN, VL(v))));
+        VS(v, tyg_bin(p, TYG_ADD, VL(v), VL(offl)));
+        if (cg.IsFix(velem)) {
+            VFailIf(tyg_cmp(p, TYG_NE, tyg_bin(p, TYG_SREM, VL(v), VI(std::max<int64_t>(cg.FixedSize(velem), 1))),
+                            VI(0)));
+        } else {
+            // GS_BM_GET(bm, v)
+            auto byte = VLoad(tyg_bin(p, TYG_ADD, vBM, tyg_bin(p, TYG_LSHR, VL(v), VI(3))), 1, false);
+            auto bit = tyg_bin(p, TYG_AND, tyg_bin(p, TYG_LSHR, byte, tyg_bin(p, TYG_AND, VL(v), VI(7))), VI(1));
+            VFailIf(tyg_cmp(p, TYG_EQ, bit, VI(0)));
+        }
+        if (variant) {
+            VFailIf(tyg_cmp(p, TYG_SLT, tyg_bin(p, TYG_SUB, vN, VL(v)), VI(skip)));
+            auto tag = VLoad(tyg_bin(p, TYG_ADD, vP, VL(v)), skip, false);
+            VFailIf(tyg_cmp(p, TYG_NE, tag, VI(vi)));
+        }
+        tyg_jump(p, skipb);
+        tyg_block_set(p, skipb);
+    }
+
+    // A run of fields (CodeGen::EmitVerifyFields). `lo` is the packed layout of
+    // a fixed struct or variant, whose offsets may include alignment padding a
+    // sequential walk would miss; bytes layouts have none and pass null.
+    void VFields(const vector<Field> &fields, const vector<TypeExpr *> &ftypes, const CodeGen::Layout *lo, int64_t total,
+                 bool links) {
+        tyg_local start = 0;
+        if (lo) {
+            start = VNew();
+            VS(start, VQ());
+            VNeed(VI(total));
+        }
+        for (size_t i = 0; i < fields.size(); i++) {
+            auto &f = fields[i];
+            if (f.ispad) {
+                if (!lo && f.padsize > 0) VAddQ(VI(f.padsize));
+                continue;
+            }
+            if (lo && !cg.NeedsVerifyWalk(ftypes[i])) continue;
+            if (lo) VSetQ(tyg_bin(p, TYG_ADD, VL(start), VI(lo->offs[i])));
+            VWalk(ftypes[i], links);
+        }
+        if (lo) VSetQ(tyg_bin(p, TYG_ADD, VL(start), VI(total)));
+    }
+
+    // The checks and cursor advance for one value of type t at q
+    // (CodeGen::EmitVerifyWalk).
+    void VWalk(TypeExpr *t, bool links) {
+        if (!cg.NeedsVerifyWalk(t)) {
+            auto sz = cg.FixedSize(t);
+            if (sz > 0) {
+                VNeed(VI(sz));
+                VAddQ(VI(sz));
+            }
+            return;
+        }
+        switch (t->kind) {
+            case TY_BOOL: {
+                VNeed(VI(1));
+                VFailIf(tyg_cmp(p, TYG_UGT, VLoad(tyg_bin(p, TYG_ADD, vP, VQ()), 1, false), VI(1)));
+                VAddQ(VI(1));
+                return;
+            }
+            case TY_INT: {   // a varint field: only its length matters to the walk
+                auto uc = UlebCheck(tyg_bin(p, TYG_ADD, vP, VQ()), vE);
+                VFailIf(tyg_cmp(p, TYG_EQ, VL(uc.k), VI(0)));
+                VAddQ(VL(uc.k));
+                return;
+            }
+            case TY_REF: {
+                auto w = (IntStorage)t->ref->lenstorage;
+                auto off = VNew(), k = VNew();
+                if (w == IS_VARINT) {
+                    auto uc = UlebCheck(tyg_bin(p, TYG_ADD, vP, VQ()), vE);
+                    VFailIf(tyg_cmp(p, TYG_EQ, VL(uc.k), VI(0)));
+                    VS(k, VL(uc.k));
+                    if (links) {   // gs_zig_check
+                        auto u = VL(uc.v);
+                        VS(off, tyg_bin(p, TYG_XOR, tyg_bin(p, TYG_LSHR, u, VI(1)),
+                                        tyg_un(p, TYG_NEG, tyg_bin(p, TYG_AND, u, VI(1)))));
+                    }
+                } else {
+                    VNeed(VI(CodeGen::IntSize(w)));
+                    VS(k, VI(CodeGen::IntSize(w)));
+                    if (links) VS(off, VLoad(tyg_bin(p, TYG_ADD, vP, VQ()), CodeGen::IntSize(w), !t->ref->pool));
+                }
+                if (links) VLink(t, VL(off));
+                VAddQ(VL(k));
+                return;
+            }
+            case TY_ARRAY: {
+                auto &a = *t->arr;
+                switch (a.akind) {
+                    case A_FIXED:
+                        VLoop(VI(cg.ArrSize(t->arr)), [&] { VWalk(a.sub, links); });
+                        return;
+                    case A_VAR: {
+                        auto ls = cg.LenStore(t->arr);
+                        auto nl = VNew();
+                        if (ls == IS_VARINT) {
+                            auto uc = UlebCheck(tyg_bin(p, TYG_ADD, vP, VQ()), vE);
+                            VFailIf(tyg_cmp(p, TYG_EQ, VL(uc.k), VI(0)));
+                            VFailIf(tyg_cmp(p, TYG_SLT, VL(uc.v), VI(0)));   // above INT64_MAX
+                            VS(nl, VL(uc.v));
+                            VAddQ(VL(uc.k));
+                        } else {
+                            VNeed(VI(CodeGen::IntSize(ls)));
+                            VS(nl, VLoad(tyg_bin(p, TYG_ADD, vP, VQ()), CodeGen::IntSize(ls), false));
+                            VAddQ(VI(CodeGen::IntSize(ls)));
+                        }
+                        VFailIf(tyg_cmp(p, TYG_SLT, VL(nl), VI(0)));
+                        VFailIf(tyg_cmp(p, TYG_SGT, VL(nl),
+                                        tyg_bin(p, TYG_SDIV, tyg_bin(p, TYG_SUB, vN, VQ()),
+                                                VI(std::max<int64_t>(cg.MinBytes(a.sub), 1)))));
+                        if (!cg.NeedsVerifyWalk(a.sub)) VAddQ(tyg_bin(p, TYG_MUL, VL(nl), VI(cg.FixedSize(a.sub))));
+                        else VLoop(VL(nl), [&] { VWalk(a.sub, links); });
+                        return;
+                    }
+                    case A_LIMITED: {
+                        // Slots past the length were never written, so only the
+                        // live ones are walked; the cursor skips the capacity.
+                        auto s = VNew(), nl = VNew(), cap = VNew();
+                        auto esz = std::max<int64_t>(cg.FixedSize(a.sub), 1);
+                        auto stat = cg.IsFix(t);
+                        VS(s, VQ());
+                        if (stat) {
+                            auto ls = cg.LenStore(t->arr);
+                            VNeed(VI(cg.FixedSize(t)));
+                            VS(nl, VLoad(tyg_bin(p, TYG_ADD, vP, VQ()), CodeGen::IntSize(ls), false));
+                            VFailIf(tyg_cmp(p, TYG_SLT, VL(nl), VI(0)));
+                            VFailIf(tyg_cmp(p, TYG_SGT, VL(nl), VI(cg.ArrSize(t->arr))));
+                            VAddQ(VI(CodeGen::IntSize(ls)));
+                        } else {
+                            VNeed(VI(8));
+                            VS(cap, VLoad(tyg_bin(p, TYG_ADD, vP, VQ()), 4, false));
+                            VS(nl, VLoad(tyg_bin(p, TYG_ADD, tyg_bin(p, TYG_ADD, vP, VQ()), VI(4)), 4, false));
+                            VFailIf(tyg_cmp(p, TYG_SGT, VL(nl), VL(cap)));
+                            VFailIf(tyg_cmp(p, TYG_SGT, VL(cap),
+                                            tyg_bin(p, TYG_SDIV, tyg_bin(p, TYG_SUB, tyg_bin(p, TYG_SUB, vN, VQ()), VI(8)),
+                                                    VI(esz))));
+                            VAddQ(VI(8));
+                        }
+                        if (cg.NeedsVerifyWalk(a.sub)) VLoop(VL(nl), [&] { VWalk(a.sub, links); });
+                        if (stat) VSetQ(tyg_bin(p, TYG_ADD, VL(s), VI(cg.FixedSize(t))));
+                        else
+                            VSetQ(tyg_bin(p, TYG_ADD, tyg_bin(p, TYG_ADD, VL(s), VI(8)),
+                                          tyg_bin(p, TYG_MUL, VL(cap), VI(cg.FixedSize(a.sub)))));
+                        return;
+                    }
+                    default: No(Line {}, "verifier of this array");
+                }
+                return;
+            }
+            case TY_STRUCT: {
+                auto si = cg.SI(t);
+                auto fix = cg.IsFix(t);
+                VFields(si->st->fields, si->ftypes, fix ? &cg.StructLayout(si) : nullptr, fix ? cg.FixedSize(t) : 0,
+                        links);
+                return;
+            }
+            case TY_VARIANT: {
+                auto ei = cg.EIVar(t);
+                auto vi = ei->en->VariantIndex(t->var->variant);
+                auto fix = cg.IsFix(t);
+                VFields(ei->en->variants[vi].fields, ei->vftypes[vi], fix ? &cg.VariantLayout(ei, vi) : nullptr,
+                        fix ? cg.FixedSize(t) : 0, links);
+                return;
+            }
+            case TY_ENUM: {
+                // The tag is range-checked in both modes (a match has no default).
+                auto ei = cg.EIOf(t);
+                auto ts = cg.TagStore(ei->en);
+                auto nv = (int64_t)ei->en->variants.size();
+                auto fix = !t->enu->varmode;
+                auto s = VNew(), tag = VNew();
+                if (fix) VS(s, VQ());
+                VNeed(VI(fix ? cg.FixedSize(t) : CodeGen::IntSize(ts)));
+                VS(tag, VLoad(tyg_bin(p, TYG_ADD, vP, VQ()), CodeGen::IntSize(ts), false));
+                VFailIf(tyg_cmp(p, TYG_UGE, VL(tag), VI(nv)));
+                VAddQ(VI(CodeGen::IntSize(ts)));
+                auto after = tyg_block_new(p);
+                for (int64_t i = 0; i < nv; i++) {
+                    auto vt = cg.VariantType(t, (int)i);
+                    auto arm = tyg_block_new(p), next = tyg_block_new(p);
+                    tyg_branch(p, tyg_cmp(p, TYG_EQ, VL(tag), VI(i)), arm, next);
+                    tyg_block_set(p, arm);
+                    if (!fix || cg.NeedsVerifyWalk(vt)) VWalk(vt, links);
+                    tyg_jump(p, after);
+                    tyg_block_set(p, next);
+                }
+                tyg_jump(p, vfail);
+                tyg_block_set(p, after);
+                if (fix) VSetQ(tyg_bin(p, TYG_ADD, VL(s), VI(cg.FixedSize(t))));
+                return;
+            }
+            default: No(Line {}, "verifier of this type");
+        }
+    }
+
+    void EmitVerify(const string &name, TypeExpr *elem) {
+        auto i64t = IT(TYG_I64);
+        const tyg_type *pts[3] = { i64t, i64t, i64t };
+        p = tyg_proc_begin(m, M.Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL), tyg_sig_new(m, i64t, pts, 3, 0));
+        if (!p) No(Line {}, cat("tyg_proc_begin: ", tyg_error(m) ? tyg_error(m) : "?"));
+        gblk = tyg_block_new(p);
+        gstart = tyg_block_new(p);
+        tyg_jump(p, gblk);
+        tyg_block_set(p, gstart);
+        velem = elem;
+        vP = tyg_param(p, 0);
+        vN = tyg_param(p, 1);
+        vBM = tyg_param(p, 2);
+        vE = tyg_bin(p, TYG_ADD, vP, vN);
+        vfail = tyg_block_new(p);
+        // A type whose values can occupy no bytes has no recoverable element
+        // count: only the empty image is one of its arrays.
+        if (cg.MinBytes(elem) <= 0) {
+            tyg_ret(p, tyg_select(p, tyg_cmp(p, TYG_EQ, vN, VI(0)), VI(0), VI(-1)));
+        } else {
+            auto fixed = cg.IsFix(elem);
+            auto rel = cg.HasRelRefAny(elem);
+            vq = VNew();
+            auto cnt = VNew();
+            VSetQ(VI(0));
+            VS(cnt, VI(0));
+            auto head = tyg_block_new(p), body = tyg_block_new(p), done = tyg_block_new(p);
+            tyg_jump(p, head);
+            tyg_block_set(p, head);
+            tyg_branch(p, tyg_cmp(p, TYG_SLT, VQ(), vN), body, done);
+            tyg_block_set(p, body);
+            if (!fixed && rel) {   // GS_BM_SET(bm, q)
+                auto at = tyg_bin(p, TYG_ADD, vBM, tyg_bin(p, TYG_LSHR, VQ(), VI(3)));
+                auto bit = tyg_bin(p, TYG_SHL, VI(1), tyg_bin(p, TYG_AND, VQ(), VI(7)));
+                auto old = VLoad(at, 1, false);
+                tyg_store(p, TYG_I8, tyg_at_val(at, 0),
+                          tyg_convert(p, TYG_TRUNC, TYG_I8, tyg_bin(p, TYG_OR, old, bit)), 0);
+            }
+            VWalk(elem, fixed && rel);
+            VS(cnt, tyg_bin(p, TYG_ADD, VL(cnt), VI(1)));
+            tyg_jump(p, head);
+            tyg_block_set(p, done);
+            VFailIf(tyg_cmp(p, TYG_NE, VQ(), vN));
+            if (!fixed && rel) {
+                // The link pass, now that every element start is known.
+                VSetQ(VI(0));
+                auto h2 = tyg_block_new(p), b2 = tyg_block_new(p), d2 = tyg_block_new(p);
+                tyg_jump(p, h2);
+                tyg_block_set(p, h2);
+                tyg_branch(p, tyg_cmp(p, TYG_SLT, VQ(), vN), b2, d2);
+                tyg_block_set(p, b2);
+                VWalk(elem, true);
+                tyg_jump(p, h2);
+                tyg_block_set(p, d2);
+            }
+            tyg_ret(p, VL(cnt));
+        }
+        tyg_block_set(p, vfail);
+        tyg_ret(p, VI(-1));
+        Finish(Line {});
+    }
+
     // The entry's block (gblk): the addresses of the globals the body
     // names, and the stack block, then on to the body (gstart).
     void Finish(Line line) {
@@ -7819,7 +8221,8 @@ struct TinyGenBackend : CodeGen::SpecBackend {
             auto [name, t] = mod->renderq[i];
             TgFn fn(*mod, nullptr);
             try {
-                fn.EmitRender(name, t);
+                if (name.rfind("gs_tg_verify_", 0) == 0) fn.EmitVerify(name, t);
+                else fn.EmitRender(name, t);
             } catch (TgUnsupported &u) {
                 if (fn.p) tyg_proc_abort(fn.p);
                 throw CompileError { cat("tinygen: ", name, ": ", u.why) };
