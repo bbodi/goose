@@ -303,6 +303,62 @@ struct TgModule {
             default: return false;
         }
     }
+    // Why TypeOk refuses a type, as a class: what -v says beside the
+    // type, so the reasons a sweep collects rank by what blocks them.
+    string Blocker(TypeExpr *t, int depth = 0) {
+        if (!t || depth > 32) return "unknown type";
+        switch (t->kind) {
+            case TY_INT: return t->intstorage == IS_VARINT ? "varint" : "";
+            case TY_FLT: case TY_BOOL: return "";
+            case TY_REF:
+                if (t->ref->optional) return "optional";
+                if (!IsPlainRef(t)) return "relative reference";
+                if (RzOk(t->ref->sub, depth + 1)) return "";
+                return Blocker(t->ref->sub, depth + 1);
+            case TY_SLICE:
+                return cg.IsFix(t->sub) ? Blocker(t->sub, depth + 1) : "variable-size elements";
+            case TY_ARRAY:
+                switch (t->arr->akind) {
+                    case A_LIMITED: return "limited array";
+                    case A_FIXED:
+                        if (cg.IsFix(t) && cg.IsLargeFixed(t)) return "large fixed value";
+                        break;
+                    case A_VAR:
+                        if (LenWidth(t) == 0) return "varint or signed length";
+                        break;
+                    default: break;
+                }
+                if (!cg.IsFix(t->arr->sub)) return "variable-size elements";
+                {
+                    auto b = Blocker(t->arr->sub, depth + 1);
+                    if (!b.empty()) return b;
+                }
+                return t->arr->akind == A_FIXED ? "" : "variable-size value";
+            case TY_STRUCT: {
+                if (Name(t).rfind("dictionary", 0) == 0) return "dictionary";
+                if (Name(t).rfind("vec", 0) == 0) return "SIMD vector";
+                if (!cg.IsFix(t)) return "variable-size struct";
+                if (cg.IsLargeFixed(t)) return "large fixed value";
+                auto si = cg.SI(t);
+                if (!si || EmptyLayout(si->st->fields)) return "empty struct";
+                for (size_t i = 0; i < si->st->fields.size(); i++) {
+                    if (si->st->fields[i].ispad) continue;
+                    auto b = Blocker(si->ftypes[i], depth + 1);
+                    if (!b.empty()) return cat("struct with ", b);
+                }
+                return "";
+            }
+            case TY_ENUM: case TY_VARIANT: return "ADT";
+            case TY_FN: return "function type";
+            default: return "unknown type";
+        }
+    }
+    // A type's name with its Blocker class, for -v.
+    string NameWhy(TypeExpr *t) {
+        if (!t) return "?";
+        auto b = Blocker(t);
+        return b.empty() ? Name(t) : cat(Name(t), " [", b, "]");
+    }
     bool IsScalar(TypeExpr *t) {
         return t && (t->kind == TY_INT || t->kind == TY_FLT || t->kind == TY_BOOL ||
                      (t->kind == TY_REF && !cg.IsFatRef(t)));
@@ -680,15 +736,15 @@ struct TgModule {
         auto &si = cg.sinfo[sp];
         if (sp->sf->isextern) { why = "extern"; return false; }
         for (auto fv : si.freevars)
-            if (!FvOk(fv)) { why = cat("free variable of type ", fv->type ? Name(fv->type) : "?"); return false; }
+            if (!FvOk(fv)) { why = cat("free variable of type ", fv->type ? NameWhy(fv->type) : "?"); return false; }
         if (define && cg.fromids.count(sp))
             for (auto r : sp->rets)
-                if (!TypeOk(r)) { why = cat("return from target with result type ", Name(r)); return false; }
+                if (!TypeOk(r)) { why = cat("return from target with result type ", NameWhy(r)); return false; }
         for (auto r : sp->rets)
-            if (!RetOk(r)) { why = cat("result type ", Name(r)); return false; }
+            if (!RetOk(r)) { why = cat("result type ", NameWhy(r)); return false; }
         for (size_t i = 0; i < sp->argtypes.size(); i++)
             if (cg.IsPoolParam(sp, i) || !(TypeOk(sp->argtypes[i]) || RzParam(sp->argtypes[i]))) {
-                why = cat("parameter type ", Name(sp->argtypes[i]));
+                why = cat("parameter type ", NameWhy(sp->argtypes[i]));
                 return false;
             }
         return true;
@@ -1220,7 +1276,7 @@ struct TgFn {
     }
 
     P GlobalPlace(VarDef *d, Line l) {
-        if (!M.GlobalOk(d)) No(l, "global of this kind");
+        if (!M.GlobalOk(d)) No(l, cat("global of type ", M.NameWhy(d->type)));
         auto s = M.TypeOk(d->type) ? M.StaticGlobal(d) : TYG_NO_SYM;
         if (s != TYG_NO_SYM) return P { tyg_at_sym(s, 0), d->type };
         // The shims now, so that an abandoned body takes them back.
@@ -1365,7 +1421,10 @@ struct TgFn {
             case NK_IncDec: case NK_While: case NK_ForLoop: case NK_LoopExpr:
                 Stmt(n);
                 return Dummy(n->exprtype && n->exprtype->kind != TY_VOID ? n->exprtype : nullptr);
-            default: No(n->line, cat("expression kind ", (int)n->nkind));
+            default:
+                No(n->line, n->nkind == NK_MatchExpr ? string("match expression")
+                            : n->nkind == NK_EarlyBlock ? string("block expression")
+                            : cat("expression kind ", (int)n->nkind));
         }
     }
 
@@ -1486,7 +1545,7 @@ struct TgFn {
             if (arr(b->left->exprtype) && arr(b->right->exprtype)) return GenArrayEq(b);
         }
         auto lt = cg.OperandT(b->left->exprtype);
-        if (!M.IsScalar(lt) || lt->kind == TY_REF) No(b->line, cat("operand type ", M.Name(lt)));
+        if (!M.IsScalar(lt) || lt->kind == TY_REF) No(b->line, cat("operand type ", M.NameWhy(lt)));
         auto isflt = lt->kind == TY_FLT;
         auto sgn = TgModule::IsSigned(lt);
         if (op == T_SHL || op == T_SHR) {
@@ -2482,7 +2541,7 @@ struct TgFn {
                 outs.push_back({ "gs_out_bytes", { v.elems, v.len }, { tyg_type_ptr(m), IT(TYG_I64) } });
                 continue;
             }
-            if (!ot || !M.IsScalar(ot) || ot->kind == TY_REF) No(a->line, "print of this type");
+            if (!ot || !M.IsScalar(ot) || ot->kind == TY_REF) No(a->line, cat("print of type ", M.NameWhy(ot)));
             if (ot->kind == TY_INT && ot->intstorage == IS_U64) {
                 outs.push_back({ "gs_out_uint", { GenAs(a, ot).v }, { IT(TYG_I64, false) } });
             } else if (ot->kind == TY_INT) {
@@ -2861,7 +2920,7 @@ struct TgFn {
                           M.File(d->line.fileidx), d->line.line);
             return;
         }
-        if (!M.TypeOk(d->type) || cg.PrefVar(d)) No(l, cat("variable type of ", d->name, ": ", M.Name(d->type)));
+        if (!M.TypeOk(d->type) || cg.PrefVar(d)) No(l, cat("variable type of ", d->name, ": ", M.NameWhy(d->type)));
         auto loc = Temp(d->type);
         locals[d] = loc;
         tyg_debug_var(p, string(d->name).c_str(), M.DT(d->type), tyg_at_local(loc, 0),
