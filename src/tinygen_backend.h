@@ -2862,6 +2862,44 @@ struct TgFn {
             tyg_zero(p, x.a, M.Size(t));
             return x;
         }
+        if (c->builtin == B_DEFAULT && c->rettypes.size() == 1 && cg.IsFix(c->rettypes[0]) &&
+            M.TypeOk(c->rettypes[0])) {
+            // A fixed value from its type's defaults (CodeGen's B_DEFAULT):
+            // the default initializer, per element for a fixed array.
+            auto t = c->rettypes[0];
+            auto tmp = Temp(t);
+            P pl { tyg_at_local(tmp, 0), t };
+            tyg_zero(p, pl.a, M.Size(t));
+            if (c->defaultinit && t->kind == TY_ARRAY && t->arr->akind == A_FIXED) {
+                auto et = t->arr->sub;
+                auto il = tyg_local_new(p, 8, 8);
+                tyg_store(p, TYG_I64, tyg_at_local(il, 0), tyg_iconst(p, TYG_I64, 0), 0);
+                auto head = tyg_block_new(p), body = tyg_block_new(p), done = tyg_block_new(p);
+                tyg_jump(p, head);
+                tyg_block_set(p, head);
+                auto i = tyg_load(p, TYG_I64, tyg_at_local(il, 0), 0);
+                tyg_branch(p, tyg_cmp(p, TYG_SLT, i, tyg_iconst(p, TYG_I64, cg.ArrSize(t->arr))), body, done);
+                tyg_block_set(p, body);
+                auto at = tyg_bin(p, TYG_ADD, tyg_addr_of(p, pl.a),
+                                  tyg_bin(p, TYG_MUL, i, tyg_iconst(p, TYG_I64, cg.FixedSize(et))));
+                Into(P { tyg_at_val(at, 0), et }, c->defaultinit);
+                if (!Ended()) {
+                    auto i2 = tyg_load(p, TYG_I64, tyg_at_local(il, 0), 0);
+                    tyg_store(p, TYG_I64, tyg_at_local(il, 0), tyg_bin(p, TYG_ADD, i2, tyg_iconst(p, TYG_I64, 1)), 0);
+                    tyg_jump(p, head);
+                }
+                tyg_block_set(p, done);
+            } else if (c->defaultinit) {
+                Into(pl, c->defaultinit);
+            }
+            if (Ended()) return Dummy(t);
+            if (M.IsScalar(t)) return Load(pl, c->line);
+            V x;
+            x.t = t;
+            x.mem = true;
+            x.a = pl.a;
+            return x;
+        }
         if (c->builtin >= 0) No(c->line, cat("builtin ", BuiltinByKind(c->builtin).name));
         if (c->fvbody) return GenFvCall(c);
         if (!c->dispatch.empty()) return GenDispatch(c);
