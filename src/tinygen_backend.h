@@ -280,8 +280,10 @@ struct TgModule {
                 // An address of a fixed value, or of a variable-size or
                 // resizable array it reads in place (RzOk): a fat reference
                 // { hdr, stk } for a resizable one (gs_rref).
-                return IsPlainRef(t) && ((cg.IsFix(t->ref->sub) && TypeOk(t->ref->sub, depth + 1)) ||
-                                         RzOk(t->ref->sub, depth + 1));
+                // An optional one is the same address, null where empty.
+                return (IsPlainRef(t) || OptRef(t)) &&
+                       ((cg.IsFix(t->ref->sub) && TypeOk(t->ref->sub, depth + 1)) ||
+                        RzOk(t->ref->sub, depth + 1));
             case TY_ARRAY:
                 // T[k]: k elements, packed. A static-capacity T[..k] (a
                 // length beside them) is not held yet.
@@ -294,6 +296,8 @@ struct TgModule {
                 if (!cg.IsFix(t) || cg.IsLargeFixed(t)) return false;
                 auto si = cg.SI(t);
                 if (!si || EmptyLayout(si->st->fields)) return false;
+                if (Reentered(t)) return true;   // Through an optional (OptRef).
+                Open open { this, t };
                 for (size_t i = 0; i < si->st->fields.size(); i++) {
                     if (si->st->fields[i].ispad) continue;
                     if (!TypeOk(si->ftypes[i], depth + 1)) return false;
@@ -311,8 +315,8 @@ struct TgModule {
             case TY_INT: return t->intstorage == IS_VARINT ? "varint" : "";
             case TY_FLT: case TY_BOOL: return "";
             case TY_REF:
-                if (t->ref->optional) return "optional";
-                if (!IsPlainRef(t)) return "relative reference";
+                if (!IsPlainRef(t) && !OptRef(t))
+                    return t->ref->optional ? "optional relative reference" : "relative reference";
                 if (RzOk(t->ref->sub, depth + 1)) return "";
                 return Blocker(t->ref->sub, depth + 1);
             case TY_SLICE:
@@ -341,6 +345,8 @@ struct TgModule {
                 if (cg.IsLargeFixed(t)) return "large fixed value";
                 auto si = cg.SI(t);
                 if (!si || EmptyLayout(si->st->fields)) return "empty struct";
+                if (Reentered(t)) return "";
+                Open open { this, t };
                 for (size_t i = 0; i < si->st->fields.size(); i++) {
                     if (si->st->fields[i].ispad) continue;
                     auto b = Blocker(si->ftypes[i], depth + 1);
@@ -508,6 +514,10 @@ struct TgModule {
                 break;
             case TY_BOOL: d = scalar("_Bool", TYG_DT_BOOL); break;
             case TY_REF: {
+                if (OptRef(t) && !cg.IsFatRef(t)) {
+                    d = OptDT(t, name);
+                    break;
+                }
                 if (!cg.IsFatRef(t)) {
                     d = tyg_dt_pointer(m, DT(t->ref->sub));
                     break;
@@ -578,6 +588,57 @@ struct TgModule {
         tyg_dt_member(m, rec, "top", tyg_dt_pointer(m, DT(ast.inttypes[IS_U8])), 0);
         tyg_dt_record_complete(m, rec, 8, 1);
         return rec;
+    }
+
+    // ---- Optionals ---------------------------------------------------------
+
+    // An optional reference T? (§3.8) as the C backend has it: the address
+    // a plain T& would be, 0 for null; for a resizable, the fat reference
+    // gs_rref { hdr, stk } with a null hdr. Relative optionals stay in C.
+    static bool OptRef(const TypeExpr *t) { return IsOptional(t) && t->ref->lenstorage < 0; }
+    // The structs TypeOk and Blocker are inside of: a struct reached again
+    // (through an optional link, `struct Node { next: Node? }`) holds if
+    // the rest of it does.
+    vector<TypeExpr *> tyopen;
+    bool Reentered(TypeExpr *t) {
+        for (auto o : tyopen)
+            if (cg.TEq(o, t)) return true;
+        return false;
+    }
+    struct Open {
+        TgModule *mod;
+        Open(TgModule *_mod, TypeExpr *t) : mod(_mod) { mod->tyopen.push_back(t); }
+        ~Open() { mod->tyopen.pop_back(); }
+    };
+    // The debug type of a T?: a typedef under its Goose name over the
+    // pointer the C half has (`Node *`), so lldb shows `(Node?) n`.
+    const tyg_dtype *OptDT(TypeExpr *t, const string &name) {
+        return tyg_dt_typedef(m, name.c_str(), tyg_dt_pointer(m, DT(t->ref->sub)), File(0), 0);
+    }
+    // Whether a struct reaches a value of its own type through its fields
+    // (an optional link): its text would recurse, which the C half's
+    // render functions do at run time.
+    bool Recursive(TypeExpr *t) {
+        set<string> seen;
+        function<bool(TypeExpr *, int)> walk = [&](TypeExpr *x, int depth) -> bool {
+            if (!x || depth > 32) return true;
+            switch (x->kind) {
+                case TY_REF: return walk(x->ref->sub, depth + 1);
+                case TY_SLICE: return walk(x->sub, depth + 1);
+                case TY_ARRAY: return walk(x->arr->sub, depth + 1);
+                case TY_STRUCT: {
+                    if (depth > 0 && cg.TEq(x, t)) return true;
+                    if (!seen.insert(cg.Mangle(x)).second) return false;
+                    auto si = cg.SI(x);
+                    if (!si) return false;
+                    for (size_t i = 0; i < si->st->fields.size(); i++)
+                        if (!si->st->fields[i].ispad && walk(si->ftypes[i], depth + 1)) return true;
+                    return false;
+                }
+                default: return false;
+            }
+        };
+        return walk(t, 0);
     }
 
     // ---- Globals -----------------------------------------------------------
@@ -1153,7 +1214,7 @@ struct TgFn {
     // wanted (reference transparency, §3.8), a scalar converted.
     V Fit(V x, TypeExpr *want, Line l) {
         if (!want || want->kind == TY_VOID || !x.t) return x;
-        while (IsPlainRef(x.t) && want->kind != TY_REF) x = Load(RefTarget(x), l);
+        while (IsAddrRef(x.t) && want->kind != TY_REF) x = Load(RefTarget(x), l);
         if (M.IsScalar(x.t) && M.IsScalar(want)) {
             if (x.t->kind == TY_REF || want->kind == TY_REF) {
                 if (x.t->kind != want->kind) No(l, "reference conversion");
@@ -1164,6 +1225,7 @@ struct TgFn {
             x.t = want;
             return x;
         }
+        if (OptFit(x, want)) return x;
         if (M.IsScalar(x.t) != M.IsScalar(want) || !cg.TEq(x.t, want)) {
             string a, b;
             x.t->Dump(a);
@@ -1221,8 +1283,10 @@ struct TgFn {
         }
         return r;
     }
+    // Through references to what they refer to: an optional one is
+    // narrowed wherever the checker lets a path through it (§3.8).
     P Deref(P pl) {
-        while (IsPlainRef(pl.t)) pl = Step(pl);
+        while (IsAddrRef(pl.t)) pl = Step(pl);
         return pl;
     }
     // What a reference value refers to.
@@ -1324,6 +1388,7 @@ struct TgFn {
     }
     V GenAs(Node *n, TypeExpr *t) {
         if (t && t->kind == TY_SLICE) return GenSliceAs(n, t);
+        if (t && t->kind == TY_REF && Is<NullLit>(n)) return Null(t, n->line);
         if (t && t->kind == TY_REF && cg.IsFatRef(t) && n->exprtype && IsGrow(n->exprtype)) {
             // A resizable where a reference to one is wanted: gs_rref, its
             // header's address and its stack.
@@ -1339,7 +1404,7 @@ struct TgFn {
             x.a = tyg_at_local(tmp, 0);
             return x;
         }
-        if (t && IsPlainRef(t) && n->exprtype && IsVarArr(n->exprtype) && M.RzOk(t->ref->sub)) {
+        if (t && IsAddrRef(t) && n->exprtype && IsVarArr(n->exprtype) && M.RzOk(t->ref->sub)) {
             // A T[] where a reference to one is wanted: its image's address.
             auto pl = Deref(Place(n));
             V x;
@@ -1350,6 +1415,7 @@ struct TgFn {
         return Fit(Gen(n), t, n->line);
     }
     tyg_val Truth(Node *n) {
+        if (OptCond(n)) return OptTest(n);
         auto x = GenAs(n, M.ast.booltype);
         return x.v;
     }
@@ -1385,6 +1451,7 @@ struct TgFn {
                 x.v = tyg_fconst(p, M.Scal(x.t), static_cast<FltLit *>(n)->val);
                 return x;
             }
+            case NK_NullLit: return Null(n->exprtype, n->line);
             case NK_BoolLit: {
                 V x;
                 x.t = M.ast.booltype;
@@ -1457,7 +1524,7 @@ struct TgFn {
                 return x;
             }
             if (et && et->kind == TY_REF) {
-                if (!IsPlainRef(et)) No(u->line, "reference kind");
+                if (!IsPlainRef(et) && !M.OptRef(et)) No(u->line, "reference kind");
                 auto pl = Deref(Place(u->child));
                 V x;
                 x.t = et;
@@ -1465,6 +1532,12 @@ struct TgFn {
                 return x;
             }
             return Load(Deref(Place(u->child)), u->line);
+        }
+        if (u->op == T_NOT && OptCond(u->child)) {
+            V x;
+            x.t = M.ast.booltype;
+            x.v = tyg_cmp(p, TYG_EQ, OptTest(u->child), tyg_iconst(p, TYG_I8, 0));
+            return x;
         }
         auto ot = cg.OperandT(u->child->exprtype);
         if (!M.IsScalar(ot) || ot->kind == TY_REF) No(u->line, "unary operand type");
@@ -1547,8 +1620,11 @@ struct TgFn {
             x.v = tyg_load(p, TYG_I8, tyg_at_local(t, 0), 0);
             return x;
         }
-        if (op == T_DOTEQ || op == T_DOTNEQ) No(b->line, "reference identity");
-        if (Is<NullLit>(b->left) || Is<NullLit>(b->right)) No(b->line, "null test");
+        if (op == T_DOTEQ || op == T_DOTNEQ) return GenRefEq(b);
+        if (Is<NullLit>(b->left) || Is<NullLit>(b->right)) {
+            if (op != T_EQ && op != T_NEQ) No(b->line, "null operand");
+            return GenRefEq(b);
+        }
         if (op == T_EQ || op == T_NEQ) {
             auto arr = [](TypeExpr *t) {
                 while (t && IsPlainRef(t)) t = t->ref->sub;
@@ -1847,7 +1923,7 @@ struct TgFn {
     // .len and len(): a fixed array's is its type's; a slice's is read.
     V GenLen(Node *obj, Node *n) {
         auto ot = obj->exprtype;
-        while (ot && IsPlainRef(ot)) ot = ot->ref->sub;
+        while (ot && IsAddrRef(ot)) ot = ot->ref->sub;
         if (!ot || !(M.TypeOk(ot) || M.RzOk(ot)) || (ot->kind != TY_ARRAY && ot->kind != TY_SLICE))
             No(n->line, "len of this type");
         tyg_val len;
@@ -2019,7 +2095,8 @@ struct TgFn {
         auto c = Is<Call>(n);
         if (!c || c->builtin != B_DEFAULT || c->rettypes.size() != 1) return false;
         auto t = c->rettypes[0];
-        if (!c->defaultinit) return t->kind == TY_INT || t->kind == TY_FLT || t->kind == TY_BOOL;
+        if (!c->defaultinit)
+            return t->kind == TY_INT || t->kind == TY_FLT || t->kind == TY_BOOL || TgModule::OptRef(t);
         return t->kind == TY_ARRAY && t->arr->akind == A_FIXED && ZeroDefault(c->defaultinit);
     }
     V GenCall(Call *c) {
@@ -2354,8 +2431,12 @@ struct TgFn {
     // through references, so no render functions are needed.
     void RenderInto(tyg_val stk, tyg_addr len, P pl, bool nested, Line l, int depth = 0) {
         if (depth > 32) No(l, "text of a type this deep");
-        pl = Deref(pl);
+        while (IsPlainRef(pl.t)) pl = Step(pl);
         auto t = pl.t;
+        if (M.OptRef(t)) {
+            RenderOpt(stk, len, pl, nested, l, depth);
+            return;
+        }
         switch (t->kind) {
             case TY_INT:
                 if (t->intstorage == IS_VARINT) break;
@@ -2681,6 +2762,91 @@ struct TgFn {
         for (auto &o : outs) CallC(o.fn, o.types, o.args, nullptr);
         CallC("gs_out_nl", {}, {}, nullptr);
         return V {};
+    }
+
+    // ---- Optionals -----------------------------------------------------------
+
+    // Optionals (§3.8) as the C backend lowers them: a T? is the address a
+    // T& would be, 0 for null (a resizable's fat reference with a null
+    // hdr), so a narrowed one is used as that reference, and a test reads
+    // the address alone (Binary::CgX, GenTruth).
+
+    // A reference that is an address: a plain one, or an optional one
+    // used where the checker has narrowed it (a path through it, a value
+    // read through it), which is the same address.
+    static bool IsAddrRef(const TypeExpr *t) { return IsPlainRef(t) || TgModule::OptRef(t); }
+    // A fat reference where one differing only in optionality is wanted
+    // (T& to T?, a narrowed T? to T&): the same two words.
+    bool OptFit(V &x, TypeExpr *want) {
+        if (x.t->kind != TY_REF || want->kind != TY_REF || !cg.IsFatRef(x.t) || !cg.IsFatRef(want) ||
+            x.t->ref->lenstorage >= 0 || want->ref->lenstorage >= 0 || !cg.TEq(x.t->ref->sub, want->ref->sub))
+            return false;
+        x.t = want;
+        return true;
+    }
+    // The null of an optional (or of the checker's bare null type).
+    V Null(TypeExpr *t, Line l) {
+        V x;
+        x.t = t;
+        if (t && t->kind == TY_REF && cg.IsFatRef(t)) {
+            auto tmp = tyg_local_new(p, 16, 8);
+            tyg_zero(p, tyg_at_local(tmp, 0), 16);
+            x.mem = true;
+            x.a = tyg_at_local(tmp, 0);
+            return x;
+        }
+        if (!t || t->kind != TY_REF || t->ref->lenstorage >= 0) No(l, "null of this type");
+        x.v = tyg_iconst(p, TYG_I64, 0);
+        return x;
+    }
+    // A reference value's address: a fat reference's hdr.
+    tyg_val Addr(const V &x, Line l) {
+        if (!x.t || x.t->kind != TY_REF || x.t->ref->lenstorage >= 0) No(l, "address of this value");
+        if (x.mem) return tyg_load(p, TYG_I64, x.a, 0);
+        return x.v;
+    }
+    // A reference as a test or identity sees it: a variable's own value,
+    // even where it is narrowed; null; anything else's value.
+    tyg_val RefAddr(Node *n) {
+        if (Is<NullLit>(n)) return tyg_iconst(p, TYG_I64, 0);
+        if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->type && id->vdef->type->kind == TY_REF) {
+            auto x = Load(VarPlace(id->vdef, n->line), n->line);
+            return Ended() ? tyg_iconst(p, TYG_I64, 0) : Addr(x, n->line);
+        }
+        auto x = Gen(n);
+        return Ended() ? tyg_iconst(p, TYG_I64, 0) : Addr(x, n->line);
+    }
+    // Whether a condition is an optional's null test: an optional
+    // variable (narrowed already or not), or a value of an optional type.
+    bool OptCond(Node *n) {
+        if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->type && IsOptional(id->vdef->type)) return true;
+        return n->exprtype && IsOptional(n->exprtype);
+    }
+    tyg_val OptTest(Node *n) { return tyg_cmp(p, TYG_NE, RefAddr(n), tyg_iconst(p, TYG_I64, 0)); }
+    // `a == null`, `a != null`, and identity `a .== b`, `a .!= b`: the
+    // addresses, left first.
+    V GenRefEq(Binary *b) {
+        auto l = RefAddr(b->left);
+        auto r = RefAddr(b->right);
+        V x;
+        x.t = M.ast.booltype;
+        x.v = tyg_cmp(p, b->op == T_EQ || b->op == T_DOTEQ ? TYG_EQ : TYG_NE, l, r);
+        return x;
+    }
+    // An optional's text (CodeGen::RenderLoc): `null`, or its pointee's.
+    // A pointee that reaches its own type (a list) is rendered by the C
+    // half's recursive render functions; its function stays in C.
+    void RenderOpt(tyg_val stk, tyg_addr len, const P &pl, bool nested, Line l, int depth) {
+        if (M.Recursive(pl.t->ref->sub)) No(l, cat("text of type ", M.Name(pl.t), " [recursive]"));
+        auto none = tyg_block_new(p), some = tyg_block_new(p), done = tyg_block_new(p);
+        tyg_branch(p, tyg_cmp(p, TYG_EQ, tyg_load(p, TYG_I64, pl.a, 0), tyg_iconst(p, TYG_I64, 0)), none, some);
+        tyg_block_set(p, none);
+        TextLit(stk, len, "null");
+        tyg_jump(p, done);
+        tyg_block_set(p, some);
+        RenderInto(stk, len, Step(pl), nested, l, depth + 1);
+        Jump(done);
+        tyg_block_set(p, done);
     }
 
     // ---- Control -----------------------------------------------------------
@@ -3215,9 +3381,10 @@ struct TgFn {
         if (a->pointee) pl = Deref(pl);
         if (a->op == T_DOTASSIGN) {
             // A reference re-pointed (CodeGen::GenRebind): the slot holding
-            // it takes the new address. Optional and relative references,
-            // and pooled ones, are not held.
-            if (!IsPlainRef(pl.t) || !M.TypeOk(pl.t)) No(a->line, cat("rebind of type ", M.NameWhy(pl.t)));
+            // it takes the new address, an optional's null too. Relative
+            // references and pooled ones are not held.
+            if (!(IsPlainRef(pl.t) || M.OptRef(pl.t)) || !M.TypeOk(pl.t))
+                No(a->line, cat("rebind of type ", M.NameWhy(pl.t)));
             auto x = GenAs(a->rhs, pl.t);
             if (!M.IsScalar(pl.t) && !x.mem && !Ended()) No(a->line, "aggregate value");
             Store(pl, x);
