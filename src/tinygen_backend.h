@@ -3052,8 +3052,10 @@ struct TgFn {
     // from it (a T[], a resizable): its result where it lies, to copy from.
     bool LimCallResult(Node *n) {
         auto c = Is<Call>(n);
-        if (!c || c->builtin >= 0 || !c->spec || c->spec->rets.empty() || !n->exprtype) return false;
-        auto rt = c->spec->rets[0];
+        if (!c || c->builtin >= 0 || !n->exprtype) return false;
+        auto sp = c->spec ? c->spec : !c->dispatch.empty() ? c->dispatch[0] : nullptr;
+        if (!sp || sp->rets.empty()) return false;
+        auto rt = sp->rets[0];
         return ((rt->kind == TY_ARRAY &&
                  (rt->arr->akind == A_LIMITED || rt->arr->akind == A_FIXED || IsVarArr(rt) || IsGrow(rt))) ||
                 rt->kind == TY_SLICE) &&
@@ -3465,7 +3467,7 @@ struct TgFn {
         }
         if (c->builtin >= 0) No(c->line, cat("builtin ", BuiltinByKind(c->builtin).name));
         if (c->fvbody) return GenFvCall(c);
-        if (!c->dispatch.empty()) return GenDispatch(c);
+        if (!c->dispatch.empty()) return GenDispatch(c, idst, dst);
         if (!c->spec) No(c->line, "call kind");
         auto callee = c->spec;
         auto an = c->ArgNodes();
@@ -3514,6 +3516,30 @@ struct TgFn {
         // resizable's destination stack -- a temporary's, or the one this
         // call builds at -- and the count's address; a temporary's address
         // for a fixed result the C does not return.
+        auto rets = RetChans(callee, ci, idst, dst, args, c->line);
+        if (ci.needssp) {
+            tyg_arg s {};
+            s.val = CalleeSp(callee, c->line);
+            args.push_back(s);
+        }
+        auto sym = M.Sym(ci.cname, TYG_SYM_FUNC | TYG_SYM_GLOBAL);
+        auto x = Result(callee, ci.cret, M.Sig(callee), tyg_direct(sym), args);
+        RfCheck(callee);
+        for (size_t i = 0; i < rets.size(); i++) {
+            if ((int)i == ci.cret) lastrets.push_back(x);
+            else if (M.IsScalar(rets[i].t)) lastrets.push_back(Load(P { rets[i].a, rets[i].t }, c->line));
+            else lastrets.push_back(rets[i]);
+        }
+        return lastrets.empty() ? V {} : lastrets[0];
+    }
+
+    // A channel per result after the declared arguments (C.3), appended
+    // to args: a resizable's destination stack -- a temporary's, or dst --
+    // and the count's address; a T[]'s stack -- a temporary's, or idst;
+    // a temporary's address for a fixed result the C does not return.
+    // Where each result will be.
+    vector<V> RetChans(FnSpec *callee, CodeGen::SpecInfo &ci, tyg_val idst, const RzDst *dst,
+                       vector<tyg_arg> &args, Line l) {
         vector<V> rets(callee->rets.size());
         for (size_t i = 0; i < callee->rets.size(); i++) {
             auto &r = rets[i];
@@ -3521,7 +3547,7 @@ struct TgFn {
             if (IsImg(r.t)) {
                 // A T[]: built whole at the top of a temporary's stack, or
                 // of the one this call builds at.
-                auto stk = i == 0 && idst ? idst : Stk(AllocStk(false, c->line), c->line);
+                auto stk = i == 0 && idst ? idst : Stk(AllocStk(false, l), l);
                 r.mem = true;
                 r.a = tyg_at_val(Top(stk), 0);
                 tyg_arg s {};
@@ -3535,7 +3561,7 @@ struct TgFn {
                     r.stk = dst->stk;
                     r.a = dst->hdr;
                 } else {
-                    r = RzTemp(r.t, c->line);
+                    r = RzTemp(r.t, l);
                 }
                 auto len = r.a;
                 len.offset += 8;
@@ -3556,20 +3582,7 @@ struct TgFn {
             args.push_back(a);
             if (!M.IsScalar(r.t)) r.mem = true;
         }
-        if (ci.needssp) {
-            tyg_arg s {};
-            s.val = CalleeSp(callee, c->line);
-            args.push_back(s);
-        }
-        auto sym = M.Sym(ci.cname, TYG_SYM_FUNC | TYG_SYM_GLOBAL);
-        auto x = Result(callee, ci.cret, M.Sig(callee), tyg_direct(sym), args);
-        RfCheck(callee);
-        for (size_t i = 0; i < rets.size(); i++) {
-            if ((int)i == ci.cret) lastrets.push_back(x);
-            else if (M.IsScalar(rets[i].t)) lastrets.push_back(Load(P { rets[i].a, rets[i].t }, c->line));
-            else lastrets.push_back(rets[i]);
-        }
-        return lastrets.empty() ? V {} : lastrets[0];
+        return rets;
     }
 
     void FvArgs(Call *c, CodeGen::SpecInfo &ci, vector<tyg_arg> &args) {
@@ -4897,7 +4910,7 @@ struct TgFn {
     // A case-function call dispatched on its ADT argument's tag (§8.2):
     // every argument evaluated once, in order, then the variant's case
     // called with its payload by value and the others shared.
-    V GenDispatch(Call *c) {
+    V GenDispatch(Call *c, tyg_val idst, const RzDst *dst) {
         auto sp0 = c->dispatch[0];
         auto pos = c->dispatcharg;
         auto an = c->ArgNodes();
@@ -4908,8 +4921,10 @@ struct TgFn {
         for (auto sp : c->dispatch) {
             string why;
             if (!M.SigOk(sp, false, why)) No(c->line, cat("call to ", sp->sf->name, ": ", why));
-            if (sp->rets.size() > 1 || (sp->rets.size() == 1 && cg.sinfo[sp].cret != 0))
-                No(c->line, "dispatch with results through out-pointers");
+            if (sp->rets.size() != sp0->rets.size() || cg.sinfo[sp].cret != cg.sinfo[sp0].cret)
+                No(c->line, "dispatch with results of different kinds");
+            for (size_t i = 0; i < sp->rets.size(); i++)
+                if (cg.Mangle(sp->rets[i]) != cg.Mangle(sp0->rets[i])) No(c->line, "dispatch with results of different types");
             for (size_t i = 0; i < sp->argtypes.size(); i++)
                 if (M.RzParam(sp->argtypes[i])) No(c->line, "dispatch with an array by value");
         }
@@ -4930,13 +4945,17 @@ struct TgFn {
             if (M.IsScalar(pt)) tyg_store(p, M.Scal(pt), tyg_at_local(shared[i], 0), x.v, 0);
             else tyg_copy(p, tyg_at_local(shared[i], 0), x.a, M.Size(pt));
         }
-        auto rt = sp0->rets.empty() ? nullptr : sp0->rets[0];
+        auto cret = cg.sinfo[sp0].cret;
+        auto rt = cret >= 0 ? sp0->rets[(size_t)cret] : nullptr;
         tyg_local res = rt ? Temp(rt) : 0;
         lastrets.clear();
         if (Ended()) {
-            if (rt) lastrets.push_back(Dummy(rt));
-            return Dummy(rt);
+            for (auto r : sp0->rets) lastrets.push_back(Dummy(r));
+            return lastrets.empty() ? V {} : lastrets[0];
         }
+        // The results' channels, the same for every case.
+        vector<tyg_arg> chanargs;
+        auto rets = RetChans(sp0, cg.sinfo[sp0], idst, dst, chanargs, c->line);
         auto done = tyg_block_new(p);
         auto &variants = adt->enu->en->variants;
         vector<tyg_block> arms;
@@ -4966,6 +4985,7 @@ struct TgFn {
                 args.push_back(a);
             }
             FvArgs(c, ci, args);
+            args.insert(args.end(), chanargs.begin(), chanargs.end());
             if (ci.needssp) {
                 tyg_arg sa {};
                 sa.val = CalleeSp(sp, c->line);
@@ -4978,10 +4998,12 @@ struct TgFn {
             Jump(done);
         }
         tyg_block_set(p, done);
-        if (!rt) return V {};
-        auto x = Load(P { tyg_at_local(res, 0), rt }, c->line);
-        lastrets.push_back(x);
-        return x;
+        for (size_t i = 0; i < rets.size(); i++) {
+            if ((int)i == cret) lastrets.push_back(Load(P { tyg_at_local(res, 0), rt }, c->line));
+            else if (M.IsScalar(rets[i].t)) lastrets.push_back(Load(P { rets[i].a, rets[i].t }, c->line));
+            else lastrets.push_back(rets[i]);
+        }
+        return lastrets.empty() ? V {} : lastrets[0];
     }
 
     // ---- Statements ----------------------------------------------------------
