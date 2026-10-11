@@ -540,7 +540,7 @@ struct TgModule {
     }
     // A by-value parameter of a type RzOk or VsOk holds.
     bool RzParam(TypeExpr *t) {
-        return (t->kind == TY_ARRAY && (RzOk(t) || VarImgOk(t) || RcOk(t))) || VsOk(t) || VrOk(t) || VmOk(t) || VvOk(t) ||
+        return (t->kind == TY_ARRAY && (RzOk(t) || VarImgOk(t) || RcOk(t) || VeOk(t))) || VsOk(t) || VrOk(t) || VmOk(t) || VvOk(t) ||
                FoOk(t) || RsOk(t);
     }
     tyg_scalar Scal(TypeExpr *t) {
