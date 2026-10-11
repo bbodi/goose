@@ -151,6 +151,7 @@ PROGRAMS += [
     ("samples/05_shapes.goose", False, []),
 ]
 WHOLE_PROGRAM |= {"tinygen_adts", "cnames"}   # cnames: its enum now held
+WHOLE_PROGRAM |= {"wider_slot_operations"}   # its varint references now held
 
 
 # Limited arrays T[..k]: the fixture whole, plain and --debug, then with
