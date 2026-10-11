@@ -1705,7 +1705,7 @@ struct TgFn {
                                                          tyg_bin(p, TYG_MUL, cap, tyg_iconst(p, TYG_I64, esz)))));
             return;
         }
-        if (n && !from && !al && n->exprtype && cg.TEq(n->exprtype, t)) {
+        if (n && !from && !al && !Is<StrLit>(n) && !LimCallResult(n) && n->exprtype && cg.TEq(n->exprtype, t)) {
             auto src = Deref(Place(n));
             if (Ended()) return;
             ImgCopy(stk, tyg_addr_of(p, src.a), t);
@@ -1722,10 +1722,11 @@ struct TgFn {
         if (from) {
             if (cg.Mangle(from->elem) != cg.Mangle(et)) No(l, "array of another element type");
             CopyRun(stk, len, et, from->elems, from->len);
-        } else if (al) {
+        } else if (al || Is<StrLit>(n)) {
             GenRz(n, stk, hdr, t, l);
         } else if (n) {
-            auto v = ViewOf(Place(n), l);
+            if (auto c = Is<Call>(n); c && c->builtin == B_COPY) n = c->ArgNodes()[0];
+            auto v = ViewOf(LimCallResult(n) ? LimCallPlace(n) : Place(n), l);
             if (Ended()) return;
             if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
             CopyRun(stk, len, et, v.elems, v.len);
@@ -2989,13 +2990,17 @@ struct TgFn {
     // from it (a T[], a resizable): its result where it lies, to copy from.
     bool LimCallResult(Node *n) {
         auto c = Is<Call>(n);
-        return c && c->builtin < 0 && c->spec && !c->spec->rets.empty() &&
-               TgModule::IsLim(c->spec->rets[0]) && n->exprtype && !cg.TEq(n->exprtype, c->spec->rets[0]);
+        if (!c || c->builtin >= 0 || !c->spec || c->spec->rets.empty() || !n->exprtype) return false;
+        auto rt = c->spec->rets[0];
+        return ((rt->kind == TY_ARRAY &&
+                 (rt->arr->akind == A_LIMITED || rt->arr->akind == A_FIXED || IsVarArr(rt) || IsGrow(rt))) ||
+                rt->kind == TY_SLICE) &&
+               !cg.TEq(n->exprtype, rt);
     }
     P LimCallPlace(Node *n) {
         auto x = Gen1(n);
         if (Ended()) return P { x.a, x.t };
-        if (!x.mem || !TgModule::IsLim(x.t)) No(n->line, "array result of this kind");
+        if (!x.mem || !x.t || (x.t->kind != TY_ARRAY && x.t->kind != TY_SLICE)) No(n->line, "array result of this kind");
         return P { x.a, x.t };
     }
     // v.push(x) (EmitPush): the receiver, then the element, then the
@@ -5328,6 +5333,33 @@ struct TgFn {
             if (!M.RzOk(pl.t) || !pl.stk) No(a->line, "assignment to an array of this kind");
             SetTop(pl.stk, tyg_load(p, TYG_I64, pl.a, 0));
             GenRz(a->rhs, pl.stk, pl.a, pl.t, a->line);
+            return;
+        }
+        if (a->op == T_ASSIGN && IsAddrRef(pl.t) && M.IsRc(Deref(pl).t)) pl = Deref(pl);
+        if (a->op == T_ASSIGN && M.IsRc(pl.t)) {
+            // A T[..] (Assign::CgStmt): the value as one, then its length
+            // and elements copied in under the destination's capacity.
+            if (!M.RcOk(pl.t)) No(a->line, "assignment to an array of this kind");
+            // A place's elements are read where they lie, as any array's
+            // or slice's the checker typed as the destination's type.
+            View v;
+            auto rhs = a->rhs;
+            if (auto c = Is<Call>(rhs); c && c->builtin == B_COPY) rhs = c->ArgNodes()[0];
+            if (Is<Ident>(rhs) || Is<Dot>(rhs) || Is<Index>(rhs)) {
+                v = ViewOf(Place(rhs), a->line);
+            } else {
+                auto stk = Stk(AllocStk(false, a->line), a->line);
+                v = LimView(P { tyg_at_val(GenImg(a->rhs, stk, pl.t, a->line), 0), pl.t });
+            }
+            if (Ended()) return;
+            if (cg.Mangle(v.elem) != cg.Mangle(pl.t->arr->sub)) No(a->line, "array of another element type");
+            auto nl = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(nl, 0), v.len, 0);
+            auto n = [&] { return tyg_load(p, TYG_I64, tyg_at_local(nl, 0), 0); };
+            AbortUnless(tyg_cmp(p, TYG_SLE, n(), LimCapOf(pl)), "CAPACITY", a->line);
+            auto esz = tyg_iconst(p, TYG_I64, cg.FixedSize(pl.t->arr->sub));
+            tyg_move_dyn(p, LimView(pl).elems, v.elems, tyg_bin(p, TYG_MUL, n(), esz));
+            LimSetLen(pl, n());
             return;
         }
         if (a->op == T_ASSIGN) {
