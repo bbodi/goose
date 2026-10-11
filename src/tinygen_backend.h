@@ -1327,7 +1327,7 @@ struct TgFn {
             if (arr(b->left->exprtype) && arr(b->right->exprtype)) return GenArrayEq(b);
         }
         auto lt = cg.OperandT(b->left->exprtype);
-        if (!M.IsScalar(lt) || lt->kind == TY_REF) No(b->line, "operand type");
+        if (!M.IsScalar(lt) || lt->kind == TY_REF) No(b->line, cat("operand type ", M.Name(lt)));
         auto isflt = lt->kind == TY_FLT;
         auto sgn = TgModule::IsSigned(lt);
         if (op == T_SHL || op == T_SHR) {
