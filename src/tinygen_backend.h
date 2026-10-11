@@ -2272,8 +2272,8 @@ struct TgFn {
     // The text of an[from..] appended at the top of stk to the u8
     // resizable whose count is at len (EmitStr, EmitFormatInto), each
     // argument evaluated and written in turn: a scalar formatted by the
-    // runtime's gs_fmt_* straight at the top, a u8 array or slice copied.
-    // Anything else renders structurally in the C half (not yet here).
+    // runtime's gs_fmt_* straight at the top, a u8 array or slice copied,
+    // anything else rendered structurally (RenderInto).
     void TextInto(tyg_val stk, tyg_addr len, Call *c, const vector<Node *> &an, size_t from) {
         if (!c->fmtspecs.empty()) No(c->line, "text with format overloads");
         for (size_t i = from; i < an.size(); i++) {
@@ -2293,35 +2293,119 @@ struct TgFn {
                 continue;
             }
             auto ot = cg.OperandT(a->exprtype);
-            if (!ot || !M.IsScalar(ot) || ot->kind == TY_REF) No(a->line, "text of this type");
-            tyg_val n;
-            if (ot->kind == TY_INT && ot->intstorage == IS_U64) {
-                auto x = GenAs(a, ot).v;
+            if (!ot || !M.IsScalar(ot) || ot->kind == TY_REF) {
+                auto pl = Place(a);
                 if (Ended()) return;
-                n = CallC("gs_fmt_u64", { tyg_type_ptr(m), IT(TYG_I64, false) }, { Top(stk), x }, IT(TYG_I64));
-            } else if (ot->kind == TY_INT) {
-                auto x = GenAs(a, M.ast.inttypes[IS_I64]).v;
-                if (Ended()) return;
-                n = CallC("gs_fmt_i64", { tyg_type_ptr(m), IT(TYG_I64) }, { Top(stk), x }, IT(TYG_I64));
-            } else if (ot->kind == TY_FLT && M.Scal(ot) == TYG_F32) {
-                auto x = GenAs(a, ot).v;
-                if (Ended()) return;
-                n = CallC("gs_fmt_f32", { tyg_type_ptr(m), tyg_type_scalar(m, TYG_F32) }, { Top(stk), x },
-                          IT(TYG_I64));
-            } else if (ot->kind == TY_FLT) {
-                auto x = GenAs(a, ot).v;
-                if (Ended()) return;
-                n = CallC("gs_fmt_f64", { tyg_type_ptr(m), tyg_type_scalar(m, TYG_F64) }, { Top(stk), x },
-                          IT(TYG_I64));
-            } else {
-                auto x = GenAs(a, ot).v;
-                if (Ended()) return;
-                n = CallC("gs_fmt_bool", { tyg_type_ptr(m), IT(TYG_I64) },
-                          { Top(stk), tyg_convert(p, TYG_ZEXT, TYG_I64, x) }, IT(TYG_I64));
+                RenderInto(stk, len, pl, false, a->line);
+                continue;
             }
-            SetTop(stk, tyg_bin(p, TYG_ADD, Top(stk), n));
-            tyg_store(p, TYG_I64, len, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, len, 0), n), 0);
+            auto x = GenAs(a, ot).v;
+            if (Ended()) return;
+            FmtScalar(stk, len, ot, x);
         }
+    }
+
+    // A scalar x of type t formatted at the top of stk by the runtime's
+    // gs_fmt_*, its bytes added to the count at len.
+    void FmtScalar(tyg_val stk, tyg_addr len, TypeExpr *t, tyg_val x) {
+        tyg_val n;
+        if (t->kind == TY_INT && t->intstorage == IS_U64) {
+            n = CallC("gs_fmt_u64", { tyg_type_ptr(m), IT(TYG_I64, false) }, { Top(stk), x }, IT(TYG_I64));
+        } else if (t->kind == TY_INT) {
+            x = Conv(x, t, M.ast.inttypes[IS_I64], Line {});
+            n = CallC("gs_fmt_i64", { tyg_type_ptr(m), IT(TYG_I64) }, { Top(stk), x }, IT(TYG_I64));
+        } else if (t->kind == TY_FLT && M.Scal(t) == TYG_F32) {
+            n = CallC("gs_fmt_f32", { tyg_type_ptr(m), tyg_type_scalar(m, TYG_F32) }, { Top(stk), x },
+                      IT(TYG_I64));
+        } else if (t->kind == TY_FLT) {
+            n = CallC("gs_fmt_f64", { tyg_type_ptr(m), tyg_type_scalar(m, TYG_F64) }, { Top(stk), x },
+                      IT(TYG_I64));
+        } else {
+            n = CallC("gs_fmt_bool", { tyg_type_ptr(m), IT(TYG_I64) },
+                      { Top(stk), tyg_convert(p, TYG_ZEXT, TYG_I64, x) }, IT(TYG_I64));
+        }
+        SetTop(stk, tyg_bin(p, TYG_ADD, Top(stk), n));
+        tyg_store(p, TYG_I64, len, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, len, 0), n), 0);
+    }
+    // Literal text appended as FmtScalar appends.
+    void TextLit(tyg_val stk, tyg_addr len, const string &text) {
+        CopyRun(stk, len, M.ast.inttypes[IS_U8], tyg_addr_of(p, tyg_at_sym(M.Bytes(text), 0)),
+                tyg_iconst(p, TYG_I64, (int64_t)text.size()));
+    }
+
+    // The value at pl rendered structurally, as CodeGen::RenderLoc renders
+    // it: through references to what they refer to, a scalar by gs_fmt_*,
+    // u8 elements as their bytes (gs_fmt_quoted's quoted form when nested
+    // in a larger value), other arrays and slices as `[a, b]` with their
+    // elements and count read once, a struct as `Name { a, b }`. The types
+    // held are fixed or arrays of fixed elements, none reaching itself
+    // through references, so no render functions are needed.
+    void RenderInto(tyg_val stk, tyg_addr len, P pl, bool nested, Line l, int depth = 0) {
+        if (depth > 32) No(l, "text of a type this deep");
+        pl = Deref(pl);
+        auto t = pl.t;
+        switch (t->kind) {
+            case TY_INT:
+                if (t->intstorage == IS_VARINT) break;
+                [[fallthrough]];
+            case TY_FLT: case TY_BOOL:
+                FmtScalar(stk, len, t, Load(pl, l).v);
+                return;
+            case TY_STRUCT: {
+                if (!M.TypeOk(t)) break;
+                auto si = cg.SI(t);
+                auto &lay = cg.StructLayout(si);
+                TextLit(stk, len, cat(M.Name(t), " { "));
+                auto first = true;
+                for (size_t i = 0; i < si->st->fields.size(); i++) {
+                    if (si->st->fields[i].ispad) continue;
+                    if (!first) TextLit(stk, len, ", ");
+                    first = false;
+                    auto a = pl.a;
+                    a.offset += lay.offs[i];
+                    RenderInto(stk, len, P { a, si->ftypes[i] }, true, l, depth + 1);
+                }
+                TextLit(stk, len, " }");
+                return;
+            }
+            case TY_ARRAY: case TY_SLICE: {
+                auto v = ViewOf(pl, l);
+                if (IsU8(v.elem)) {
+                    if (!nested) {
+                        CopyRun(stk, len, v.elem, v.elems, v.len);
+                        return;
+                    }
+                    auto n = CallC("gs_fmt_quoted", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64) },
+                                   { Top(stk), v.elems, v.len }, IT(TYG_I64));
+                    SetTop(stk, tyg_bin(p, TYG_ADD, Top(stk), n));
+                    tyg_store(p, TYG_I64, len, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, len, 0), n), 0);
+                    return;
+                }
+                TextLit(stk, len, "[");
+                auto il = tyg_local_new(p, 8, 8);
+                auto i = [&] { return tyg_load(p, TYG_I64, tyg_at_local(il, 0), 0); };
+                tyg_store(p, TYG_I64, tyg_at_local(il, 0), tyg_iconst(p, TYG_I64, 0), 0);
+                auto head = tyg_block_new(p), body = tyg_block_new(p), sep = tyg_block_new(p),
+                     elem = tyg_block_new(p), out = tyg_block_new(p);
+                tyg_jump(p, head);
+                tyg_block_set(p, head);
+                tyg_branch(p, tyg_cmp(p, TYG_SLT, i(), v.len), body, out);
+                tyg_block_set(p, body);
+                tyg_branch(p, tyg_cmp(p, TYG_NE, i(), tyg_iconst(p, TYG_I64, 0)), sep, elem);
+                tyg_block_set(p, sep);
+                TextLit(stk, len, ", ");
+                tyg_jump(p, elem);
+                tyg_block_set(p, elem);
+                RenderInto(stk, len, P { tyg_at_val(ElemAddr(v, i()), 0), v.elem }, true, l, depth + 1);
+                tyg_store(p, TYG_I64, tyg_at_local(il, 0), tyg_bin(p, TYG_ADD, i(), tyg_iconst(p, TYG_I64, 1)), 0);
+                tyg_jump(p, head);
+                tyg_block_set(p, out);
+                TextLit(stk, len, "]");
+                return;
+            }
+            default: break;
+        }
+        No(l, cat("text of type ", M.NameWhy(t)));
     }
 
     // gs_abort(GS_E_<what>) with the Goose file and line, through a shim
@@ -2517,6 +2601,32 @@ struct TgFn {
     // written, as the C backend renders the whole line first.
     V GenPrint(Call *c) {
         if (!c->fmtspecs.empty()) No(c->line, "print with format overloads");
+        // A value rendered structurally: the whole line is rendered into a
+        // builder on a stack of the statement's and written at once, as
+        // the C backend writes every line (B_PRINT).
+        auto simple = [&](Node *a) {
+            if (Is<StrLit>(a)) return true;
+            auto bt = a->exprtype;
+            while (bt && IsPlainRef(bt)) bt = bt->ref->sub;
+            if (bt && ((bt->kind == TY_ARRAY && IsU8(bt->arr->sub)) || (bt->kind == TY_SLICE && IsU8(bt->sub))))
+                return true;
+            auto ot = cg.OperandT(a->exprtype);
+            return ot && M.IsScalar(ot) && ot->kind != TY_REF;
+        };
+        auto an = c->ArgNodes();
+        if (!std::all_of(an.begin(), an.end(), simple)) {
+            auto b = RzTemp(cg.GrowU8(), c->line);
+            auto len = b.a;
+            len.offset += 8;
+            tyg_store(p, TYG_I64, b.a, Top(b.stk), 0);
+            tyg_store(p, TYG_I64, len, tyg_iconst(p, TYG_I64, 0), 0);
+            TextInto(b.stk, len, c, an, 0);
+            if (Ended()) return V {};
+            CallC("gs_out_bytes", { tyg_type_ptr(m), IT(TYG_I64) },
+                  { tyg_load(p, TYG_I64, b.a, 0), tyg_load(p, TYG_I64, len, 0) }, nullptr);
+            CallC("gs_out_nl", {}, {}, nullptr);
+            return V {};
+        }
         struct Out {
             string fn;
             vector<tyg_val> args;

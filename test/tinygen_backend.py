@@ -10,7 +10,7 @@ halves in both directions (structs, arrays and slices, multiple results,
 strings and resizable arrays handed in, and built at a destination,
 u8[] values, arrays shrunk and resized, free variables of nested
 functions, function values, globals on dedicated stacks, `return from`
-through frames of both halves);
+through frames of both halves, values rendered by print and str);
 the other programs are ones the backend covers in part. A program
 tinygen covers whole that needs nothing of a C half (WHOLE_PROGRAM) must
 build without the C compiler compiling any C of its own, and again on the
@@ -57,9 +57,9 @@ PROGRAMS = [
     ("test/tinygen/tinygen_globals.goose", False, ["--tinygen-skip=main"]),
     ("test/tinygen/tinygen_globals.goose", False,
      ["--tinygen-skip=start_seed,divmod,bump,next,move_to,sum_primes"]),
-    # main builds strings and resizable arrays, which stays in C so far.
-    ("test/tinygen/tinygen_strings.goose", False, []),
-    ("test/tinygen/tinygen_strings.goose", False, ["--debug"]),
+    ("test/tinygen/tinygen_strings.goose", True, []),
+    ("test/tinygen/tinygen_strings.goose", True, ["--debug"]),
+    ("test/tinygen/tinygen_strings.goose", False, ["--tinygen-skip=main"]),
     ("test/tinygen/tinygen_strings.goose", False,
      ["--tinygen-skip=count,first_last,total,sum_view,addto,own"]),
     ("test/tinygen/tinygen_strings.goose", False, ["--tinygen-skip=walk,shout,far"]),
@@ -110,6 +110,10 @@ PROGRAMS = [
      ["--tinygen-skip=dig,bad,split_fail,forward,inner_leave,deep2,each,leave_nest"]),
     ("test/tinygen/tinygen_retfrom.goose", False,
      ["--tinygen-skip=deep,outer,after_owner,give,nest,point"]),
+    ("test/tinygen/tinygen_render.goose", True, []),
+    ("test/tinygen/tinygen_render.goose", True, ["--debug"]),
+    ("test/tinygen/tinygen_render.goose", False, ["--tinygen-skip=main"]),
+    ("test/tinygen/tinygen_render.goose", False, ["--tinygen-skip=show,label,points,link"]),
     ("test/codegen/loop_invariant_divisors.goose", False, []),
     ("test/codegen/cnames.goose", False, []),
     ("test/codegen/wider_slot_operations.goose", False, []),
@@ -124,6 +128,7 @@ WHOLE_PROGRAM = {
     "tinygen_slicefail", "tinygen_results", "tinygen_build", "tinygen_text",
     "tinygen_shrink", "tinygen_nested", "tinygen_funvals", "20_life",
     "loop_invariant_divisors", "tinygen_globals", "tinygen_gstacks", "tinygen_retfrom",
+    "tinygen_render", "tinygen_strings",
 }
 
 
