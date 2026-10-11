@@ -202,6 +202,22 @@ def check_lldb_varsize(exe, base, lldb, ok, fail):
         return
     ok("tinygen debug info under lldb: a variable-size struct")
 
+# Optionals (T?, the address a T& would be, null where empty): every kind
+# of slot, made, tested, narrowed, rebound and printed, whole, and with
+# chosen functions left to C so that optionals cross the two halves both
+# ways (as parameters, results, fields, free variables, globals and
+# `return from` values).
+PROGRAMS += [
+    ("test/tinygen/tinygen_optionals.goose", True, []),
+    ("test/tinygen/tinygen_optionals.goose", True, ["--debug"]),
+    ("test/tinygen/tinygen_optionals.goose", False, ["--tinygen-skip=main"]),
+    ("test/tinygen/tinygen_optionals.goose", False,
+     ["--tinygen-skip=first_big,bump,count,shift,pick,grow,search,label,see"]),
+    ("test/tinygen/tinygen_optionals.goose", False,
+     ["--tinygen-skip=or_zero,sum,longer,same,total,walk,look,find,positive,counted"]),
+]
+WHOLE_PROGRAM |= {"tinygen_optionals"}
+
 
 def expected(source):
     """The blessed stdout of a program, whether its run aborts, and the
@@ -278,6 +294,7 @@ def check_tinygen_backend(exe, base, ok, fail, say):
     check_lldb(exe, base, ok, fail, say)
     check_lldb_limited(exe, base, ok, fail)
     check_lldb_adts(exe, base, ok, fail)
+    check_lldb_optionals(exe, base, ok, fail)
 
 
 def check_lldb_limited(exe, base, ok, fail):
@@ -536,6 +553,38 @@ def check_lldb_whole(exe, base, lldb, ok, fail):
         fail("tinygen whole program debug info under lldb", f"missing {missing}:\n{text}")
         return
     ok("tinygen debug info under lldb: a whole program's main and its caller")
+
+
+def check_lldb_optionals(exe, base, ok, fail):
+    """Optionals by their Goose types: a T? parameter and local as the
+    address the C half's T * is (0 when null), and what one refers to
+    through it, a struct with an optional field."""
+    lldb = shutil.which("lldb")
+    if not lldb:
+        return
+    source = HERE / "tinygen" / "tinygen_optionals.goose"
+    out = base / f"lldb-optionals{tc.EXE_SUFFIX}"
+    good, log, _, _ = build(exe, source, out, [])
+    if not good:
+        fail("tinygen lldb optionals build", log)
+        return
+    # or_zero(big), then or_zero(none); then sum's loop.
+    code, o, e = tc.run_capture([lldb, "-b", "-o", "b or_zero", "-o", "run", "-o", "continue",
+                                 "-o", "frame variable", "-o", "br del 1",
+                                 "-o", "b tinygen_optionals.goose:41", "-o", "continue",
+                                 "-o", "frame variable", "-o", "p *n", "-o", "kill", out])
+    text = o + e
+    wants = [
+        r"\(Link\?\) head = 0x[0-9a-f]+",
+        r"\(Link\?\) n = 0x[0-9a-f]+\s*\(i64\) s = 0",
+        r"\(Link\) \{\s*val = 1\s*next = 0x[0-9a-f]+",
+        r"\(i64\?\) o = 0x0+\s",
+    ]
+    missing = [w for w in wants if not re.search(w, text)]
+    if missing:
+        fail("tinygen optional debug info under lldb", f"missing {missing}:\n{text}")
+        return
+    ok("tinygen debug info under lldb: optionals by their Goose types, null and not")
 
 
 if __name__ == "__main__":
