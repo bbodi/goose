@@ -1242,7 +1242,8 @@ struct TgModule {
     // a T[] image of fixed elements, built at the caller's destination
     // stack.
     bool RetOk(TypeExpr *t) {
-        return TypeOk(t) || ((IsGrow(t) || IsVarArr(t)) && RzOk(t)) || VsOk(t) || VmOk(t) || VvOk(t);
+        return TypeOk(t) || ((IsGrow(t) || IsVarArr(t)) && RzOk(t)) || VsOk(t) || VmOk(t) || VvOk(t) ||
+               VarImgOk(t) || VeOk(t);
     }
     // A free variable of a nested function (§7.5), as SigParams passes it:
     // a fixed variable by its address, a T[] by its image's address, and
@@ -1251,7 +1252,7 @@ struct TgModule {
     bool FvOk(const VarDef *fv) {
         if (!fv->type || fv->reusable || cg.PrefVar(fv)) return false;
         return TypeOk(fv->type) || ((IsGrow(fv->type) || IsVarArr(fv->type)) && RzOk(fv->type)) || VsOk(fv->type) ||
-               VmOk(fv->type) || VvOk(fv->type);
+               VmOk(fv->type) || VvOk(fv->type) || VarImgOk(fv->type) || VeOk(fv->type);
     }
 
     tyg_sig *Sig(FnSpec *sp) {
