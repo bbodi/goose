@@ -51,6 +51,10 @@ struct TgModule {
         auto t = tyg_host_target();
         t.debug_info = 1;
         m = tyg_module_new(t, source.c_str());
+        // C11, the C half's: lldb formats the same under every code
+        // tinygen offers (docs/design/tinygen_backend.md), and the two
+        // halves' units then read alike.
+        if (m) tyg_module_language(m, TYG_LANG_C11);
     }
     ~TgModule() { if (m) tyg_module_free(m); }
 
@@ -297,6 +301,9 @@ struct TgFn {
         tyg_block brk, cnt;
     };
     vector<LoopTargets> loops;
+    // The specializations taking gs_sp this body calls, which it may only
+    // while they are tinygen's too (TinyGenBackend::Choose).
+    set<FnSpec *> relied;
 
     TgFn(TgModule &_M, FnSpec *_sp) : M(_M), cg(_M.cg), sp(_sp), m(_M.m) {}
 
@@ -882,6 +889,7 @@ struct TgFn {
         for (size_t i = 0; i < an.size(); i++) args.push_back(Arg(an[i], callee->argtypes[i]));
         if (Ended()) return Dummy(callee->rets.empty() ? nullptr : callee->rets[0]);
         if (cg.sinfo[callee].needssp) {
+            relied.insert(callee);
             tyg_arg sp0 {};
             sp0.val = tyg_iconst(p, TYG_I64, 0);
             args.push_back(sp0);
@@ -1299,30 +1307,36 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     TinyGenBackend(Ast &_ast, bool _checks, const string &_source, string_view _ext)
         : ast(_ast), checks(_checks), source(_source), runtime_ext_text(_ext) {}
 
-    // Whether sp compiles, with the specializations in `ours` callable:
-    // into a module of its own that is thrown away, so that a construct
-    // this backend does not support anywhere in a body sends the whole body
-    // to C. "" when it does, else why not.
-    string Try(CodeGen &cg, FnSpec *sp, const set<FnSpec *> &ours) {
-        TgModule scratch(ast, cg, checks, source);
-        if (!scratch.m) return "tinygen has no module for this target";
-        scratch.ours = &ours;
+    // Builds sp into the module, with the specializations in `ours`
+    // callable. A construct this backend does not support anywhere in the
+    // body abandons the procedure (tyg_proc_abort), and what it asked of the
+    // module for the C half (shims, trampolines) is taken back, so that the
+    // whole body goes to C. "" when it compiled, else why not.
+    string Build(FnSpec *sp, set<FnSpec *> &relied) {
         string why;
         if (sp->sf->issimd) return "simd function";
-        if (!scratch.SigOk(sp, true, why)) return cat("interface: ", why);
+        if (!mod->SigOk(sp, true, why)) return cat("interface: ", why);
+        auto nshims = mod->shims.size(), nexterns = mod->externs.size();
+        TgFn fn(*mod, sp);
         try {
-            TgFn fn(scratch, sp);
             fn.Emit();
         } catch (TgUnsupported &u) {
+            if (fn.p) tyg_proc_abort(fn.p);
+            mod->shims.resize(nshims);
+            mod->externs.resize(nexterns);
             return u.line.line > 0 ? cat(u.why, " (line ", u.line.line, ")") : u.why;
         }
+        relied.insert(fn.relied.begin(), fn.relied.end());
         return "";
     }
 
     // The specializations this backend takes: the largest set each of
     // whose bodies compiles while calling into the set. Every candidate
-    // starts in it; one that does not compile leaves it, and the others are
-    // tried again without it, until none leaves.
+    // starts in it and is built straight into the module; one that does
+    // not compile leaves it. A body may call a specialization that takes
+    // gs_sp only while that one is in the set: where one that left was
+    // called so, the module is built again from scratch without it, until
+    // nothing that was called leaves.
     set<FnSpec *> Choose(CodeGen &cg, const vector<FnSpec *> &specs) override {
         set<FnSpec *> ours;
         map<FnSpec *, string> why;
@@ -1332,16 +1346,26 @@ struct TinyGenBackend : CodeGen::SpecBackend {
             else
                 ours.insert(sp);
         }
-        for (auto changed = true; changed;) {
-            changed = false;
+        for (;;) {
+            mod = make_unique<TgModule>(ast, cg, checks, source);
+            if (!mod->m) {
+                for (auto sp : specs) left.emplace_back(sp, "tinygen has no module for this target");
+                mod.reset();
+                return {};
+            }
+            mod->ours = &ours;
+            set<FnSpec *> relied, gone;
             for (auto sp : specs) {
                 if (!ours.count(sp)) continue;
-                auto w = Try(cg, sp, ours);
+                auto w = Build(sp, relied);
                 if (w.empty()) continue;
                 why[sp] = w;
                 ours.erase(sp);
-                changed = true;
+                gone.insert(sp);
             }
+            auto again = false;
+            for (auto sp : gone) again = again || relied.count(sp);
+            if (!again) break;
         }
         for (auto sp : specs) {
             if (ours.count(sp)) taken.push_back(sp);
@@ -1350,27 +1374,14 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         return ours;
     }
 
-    // Compiles what Choose took into the module, after CodeGen has made
-    // the C half. Throws a CompileError on a failure, which is the
-    // backend's: Choose already compiled each of them once.
+    // After CodeGen has made the C half: the extern fns the object calls
+    // are used, so the C half declares them and their packages link.
     set<FnSpec *> declared;   // Extern fns the C half declares already.
 
     void Compile(CodeGen &cg) {
-        declared.insert(cg.usedexterns.begin(), cg.usedexterns.end());
-        mod = make_unique<TgModule>(ast, cg, checks, source);
-        if (!mod->m) throw CompileError { "tinygen: no module for this target" };
+        if (!mod) return;
         mod->ours = &cg.foreign;
-        auto before = cg.tdecls.size();
-        for (auto sp : taken) {
-            try {
-                TgFn fn(*mod, sp);
-                fn.Emit();
-            } catch (TgUnsupported &u) {
-                throw CompileError { cat("tinygen backend, internal: ", sp->sf->name, ": ", u.why) };
-            }
-        }
-        if (cg.tdecls.size() != before)
-            throw CompileError { "tinygen backend, internal: a C type was declared too late" };
+        declared.insert(cg.usedexterns.begin(), cg.usedexterns.end());
         for (auto sp : mod->externs)
             if (std::find(cg.usedexterns.begin(), cg.usedexterns.end(), sp) == cg.usedexterns.end())
                 cg.usedexterns.push_back(sp);
@@ -1379,6 +1390,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     // The C the object calls into: the shims, and a trampoline per extern
     // fn called. Appended to the C half, after everything it names.
     string Shims(CodeGen &cg) {
+        if (!mod) return "";
         string s = "\n/* ---- for the tinygen object (docs/design/tinygen_backend.md) ---- */\n";
         for (auto &sh : mod->shims) s += sh.second;
         for (auto sp : mod->externs) {

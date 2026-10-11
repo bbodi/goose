@@ -80,12 +80,15 @@ program using anything tinygen does not support goes through C. With the C
 half always present, the per-function choice costs nothing more and covers
 far more code in the first stages, so that is what this does: a
 specialization whose interface or body holds anything unsupported anywhere is
-left to C whole (no partial bodies). `Choose` compiles each candidate into a
-throwaway tinygen module (`TinyGenBackend::Try`); one that fails leaves the
-set, and the others are tried again until none leaves, since a body may call
-a specialization that takes `gs_sp` only if that one is tinygen's too (it then
-never uses the stacks it is handed, and is passed 0). The final module is then
-built once more from the same bodies. `-v` lists what stayed in C and why
+left to C whole (no partial bodies). `Choose` builds each candidate straight
+into the module; one that meets something unsupported is abandoned
+(`tyg_proc_abort`), the shims and trampolines it asked for are taken back, and
+it leaves the set. A body may call a specialization that takes `gs_sp` only
+if that one is tinygen's too (it then never uses the stacks it is handed, and
+is passed 0): where one that left was called so by a body already built, the
+module is built again from scratch without it, until nothing called leaves
+(rare: such callees mostly use data stacks and leave on the first pass).
+`-v` lists what stayed in C and why
 (`tinygen: main_g (prog.goose:13) left to C: builtin push (line 17)`).
 
 **The runtime.** Everything the runtime object exports (`GS_API`: printing,
@@ -204,12 +207,8 @@ frame and its caller, and a parameter and a local with Goose types.
 
 Recorded here rather than changed in tinygen, which other work is changing:
 
-1. **No way to abandon a procedure.** A front end that finds out mid-body that
-   it cannot compile a function has to leave the module consistent; tinygen
-   has `tyg_proc_begin`/`tyg_proc_end` but no `tyg_proc_abort`. The backend
-   compiles each candidate into a throwaway module instead (`Try`), which
-   doubles the work for the taken functions. A `tyg_proc_abort(p)` (or
-   `tyg_proc_end` discarding on request) would remove that.
+1. ~~No way to abandon a procedure.~~ tinygen now has `tyg_proc_abort`,
+   which `Choose` uses; the throwaway module per candidate is gone.
 2. **No in-memory loading.** `goose run` runs programs in-process; tinygen
    writes an object (`tyg_module_emit` gives its bytes) but has no loader
    that maps and relocates code and resolves symbols in the running process,
@@ -221,12 +220,22 @@ Recorded here rather than changed in tinygen, which other work is changing:
    another member (DWARF `DW_AT_count` as a location expression, CodeView's
    equivalent through natvis). tinygen's `tyg_dt_array` takes a constant
    count or none.
-4. **The source language.** The compile unit says `DW_LANG_C99`, so lldb
-   formats with C rules: an `i8` or `u8` shows as a character (`'\xfd'`),
-   and backtraces print the linkage name (`fib_g`). A way to name the
-   language (or at least to leave the linkage name out where the symbol is
-   only the C half's convention) would help; Goose has no DWARF language
-   code, so this may stay a formatter matter on the debugger's side.
+4. **The source language, and lldb's formatters.** tinygen now names the
+   unit's language (`tyg_module_language`); the backend says C11, as the C
+   half's unit does. Tried under lldb (Xcode's, macOS arm64) with C99, C11,
+   C++, Rust, D and Pascal: no difference at all. lldb reads every one of
+   them through clang's type system, which turns any 8-bit integer base type
+   into a character type whatever its name or encoding, so an `i8` or `u8`
+   still shows as `'\xfd'` although the backend gives them `DW_ATE_signed` /
+   `DW_ATE_unsigned` (gdb goes by the encoding and prints numbers); and the
+   `objc` formatter category, enabled for every language, matches Carbon's
+   `Rect` and `Point` by name (`Point` prints as `(v=2, h=1)`, a `Rect`
+   without `top`/`left` fields as a summary error). Neither is fixable in
+   the DWARF tinygen can write: the way out is formatters shipped with the
+   compiler (`type format add -f d i8 u8`, a `goose` category overriding
+   those names), or a namespace for Goose's record types, which tinygen's
+   debug types cannot express (no `DW_TAG_namespace`). Backtraces still
+   print the linkage name (`fib_g`).
 5. **Packed records on x86-64.** The records here are aligned to 1 with
    fields at packed offsets. On arm64 (checked here, by-value structs of 12,
    16 and 33 bytes across both halves) tinygen classifies them as clang does.
