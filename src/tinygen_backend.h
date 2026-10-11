@@ -2662,6 +2662,41 @@ struct TgFn {
             return V {};
         }
         if (c->builtin == B_FORMAT && c->ArgNodes().size() >= 1) return GenFormat(c);
+        if (c->builtin == B_COPY && c->ArgNodes().size() == 1 && cg.IsFix(c->rettypes[0]) &&
+            M.TypeOk(c->rettypes[0])) {
+            // A fresh copy of a fixed value; at a slice destination, a view
+            // of the copy, not of its source (CodeGen's B_COPY).
+            auto rt = c->rettypes[0];
+            auto x = GenAs(c->ArgNodes()[0], rt);
+            if (Ended()) return Dummy(c->exprtype);
+            if (M.IsScalar(rt)) return x;
+            auto tmp = Temp(rt);
+            tyg_copy(p, tyg_at_local(tmp, 0), x.a, M.Size(rt));
+            if (c->exprtype->kind == TY_SLICE) {
+                auto v = ViewOf(P { tyg_at_local(tmp, 0), rt }, c->line);
+                return SliceValue(c->exprtype, v.elems, v.len);
+            }
+            V y;
+            y.t = rt;
+            y.mem = true;
+            y.a = tyg_at_local(tmp, 0);
+            return y;
+        }
+        if (c->builtin == B_BYTES_OF && c->ArgNodes().size() == 1) {
+            // The element region of an array or slice as a u8[:]
+            // (CodeGen::PayloadOf), for fixed elements their count times
+            // their size.
+            auto a = c->ArgNodes()[0];
+            auto rt = a->exprtype;
+            while (rt && IsAddrRef(rt)) rt = rt->ref->sub;
+            if (!rt || (rt->kind != TY_ARRAY && rt->kind != TY_SLICE)) No(c->line, "bytes_of of this type");
+            auto elem = rt->kind == TY_SLICE ? rt->sub : rt->arr->sub;
+            if (!cg.IsFix(elem)) No(c->line, "bytes_of of variable-size elements");
+            auto v = ViewOf(Place(a), c->line);
+            if (Ended()) return Dummy(c->exprtype);
+            auto n = tyg_bin(p, TYG_MUL, v.len, tyg_iconst(p, TYG_I64, cg.FixedSize(elem)));
+            return SliceValue(c->exprtype, v.elems, n);
+        }
         if (ZeroDefault(c) && M.TypeOk(c->rettypes[0])) {
             // Zero bytes (CodeGen::EmitDefaultInto).
             auto t = c->rettypes[0];
@@ -2898,12 +2933,100 @@ struct TgFn {
     // argument evaluated and written in turn: a scalar formatted by the
     // runtime's gs_fmt_* straight at the top, a u8 array or slice copied,
     // anything else rendered structurally (RenderInto).
+    // The call whose user format overloads the value being rendered uses
+    // (CodeGen::FmtContext), or none.
+    Call *fmtc = nullptr;
+
+    // A type's name as text renders it: the checked type the C renders is
+    // the value's, which a `const` variable's place does not drop.
+    static string TextName(TypeExpr *t) {
+        auto s = TgModule::Name(t);
+        if (t->cq && s.rfind("const ", 0) == 0) s = s.substr(6);
+        return s;
+    }
+
+    // A user `format` overload rendering the value at pl (EmitUserFormat):
+    // handed the builder as a gs_rref -- its header, the { base, len } that
+    // len is in, and its stack -- and the value as the overload takes it.
+    void UserFormat(tyg_val stk, tyg_addr len, P pl, FnSpec *sp, Line l) {
+        string why;
+        if (!M.SigOk(sp, false, why)) No(l, cat("format overload: ", why));
+        auto &ci = cg.sinfo[sp];
+        if (!ci.freevars.empty()) No(l, "format overload with free variables");
+        auto pt = sp->argtypes[1];
+        if (cg.IsLargeFixed(pt)) No(l, "format overload of a large value");
+        auto hdr = len;
+        hdr.offset -= 8;
+        auto r = tyg_local_new(p, 16, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(r, 0), tyg_addr_of(p, hdr), 0);
+        tyg_store(p, TYG_I64, tyg_at_local(r, 8), stk, 0);
+        vector<tyg_arg> args;
+        tyg_arg out {};
+        out.mem = tyg_at_local(r, 0);
+        args.push_back(out);
+        tyg_arg v {};
+        if (pt->kind == TY_REF && cg.IsFatRef(pt)) {
+            // A resizable by reference: gs_rref, its header's address and
+            // its stack.
+            if (!pl.stk) No(l, "format overload taking a resizable without its stack");
+            auto fr = tyg_local_new(p, 16, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(fr, 0), tyg_addr_of(p, pl.a), 0);
+            tyg_store(p, TYG_I64, tyg_at_local(fr, 8), pl.stk, 0);
+            v.mem = tyg_at_local(fr, 0);
+        } else if (pt->kind == TY_REF) {
+            v.val = tyg_addr_of(p, pl.a);
+        } else if (M.IsScalar(pt)) {
+            v.val = Load(P { pl.a, pt }, l).v;
+        } else if (M.RzParam(pt)) {
+            No(l, "format overload taking a variable-size value");
+        } else {
+            v.mem = pl.a;
+        }
+        args.push_back(v);
+        if (ci.needssp) {
+            tyg_arg s {};
+            s.val = CalleeSp(sp, l);
+            args.push_back(s);
+        }
+        auto sym = M.Sym(ci.cname, TYG_SYM_FUNC | TYG_SYM_GLOBAL);
+        Result(sp, ci.cret, M.Sig(sp), tyg_direct(sym), args);
+        RfCheck(sp);
+    }
+
     void TextInto(tyg_val stk, tyg_addr len, Call *c, const vector<Node *> &an, size_t from) {
-        if (!c->fmtspecs.empty()) No(c->line, "text with format overloads");
+        auto outer = fmtc;
+        struct Restore {
+            Call *&at, *was;
+            ~Restore() { at = was; }
+        } restore { fmtc, outer };
         for (size_t i = from; i < an.size(); i++) {
             auto a = an[i];
+            fmtc = c->fmtspecs.empty() ? nullptr : cg.FmtContext(c, a);
             auto bt = a->exprtype;
             while (bt && IsPlainRef(bt)) bt = bt->ref->sub;
+            if (fmtc && bt && cg.FmtSpecFor(fmtc, bt)) {
+                // The overload renders it, whatever its type. A function
+                // value's reference result is spliced in as a value, where
+                // the overload must get the storage it names.
+                if (auto fc = Is<Call>(a); fc && fc->fvbody && a->exprtype && a->exprtype->kind == TY_REF)
+                    No(a->line, "format overload of a function value's reference result");
+                // A call's reference result is rendered where it points, as
+                // a reference variable is, not as the value the checker
+                // decayed it to.
+                P pl;
+                auto fc = Is<Call>(a);
+                if (fc && fc->builtin < 0 && fc->spec && !fc->spec->rets.empty() &&
+                    fc->spec->rets[0]->kind == TY_REF && IsPlainRef(fc->spec->rets[0])) {
+                    auto x = Gen1(a);
+                    if (Ended()) return;
+                    pl = RefTarget(x);
+                } else {
+                    pl = Place(a);
+                }
+                if (Ended()) return;
+                RenderInto(stk, len, pl, false, a->line);
+                continue;
+            }
             if (bt && ((bt->kind == TY_ARRAY && IsU8(bt->arr->sub)) || (bt->kind == TY_SLICE && IsU8(bt->sub)))) {
                 if (auto s = Is<StrLit>(a)) {
                     CopyRun(stk, len, bt->kind == TY_ARRAY ? bt->arr->sub : bt->sub,
@@ -2968,6 +3091,12 @@ struct TgFn {
         if (depth > 32) No(l, "text of a type this deep");
         while (IsPlainRef(pl.t)) pl = Step(pl);
         auto t = pl.t;
+        if (fmtc) {
+            if (auto sp = cg.FmtSpecFor(fmtc, t)) {
+                UserFormat(stk, len, pl, sp, l);
+                return;
+            }
+        }
         if (M.OptRef(t)) {
             RenderOpt(stk, len, pl, nested, l, depth);
             return;
@@ -2987,7 +3116,7 @@ struct TgFn {
                 if (!M.TypeOk(t)) break;
                 auto si = cg.SI(t);
                 auto &lay = cg.StructLayout(si);
-                TextLit(stk, len, cat(M.Name(t), " { "));
+                TextLit(stk, len, cat(TextName(t), " { "));
                 auto first = true;
                 for (size_t i = 0; i < si->st->fields.size(); i++) {
                     if (si->st->fields[i].ispad) continue;
@@ -3233,7 +3362,6 @@ struct TgFn {
     // print(...) (§3.7): every argument is evaluated before any text is
     // written, as the C backend renders the whole line first.
     V GenPrint(Call *c) {
-        if (!c->fmtspecs.empty()) No(c->line, "print with format overloads");
         // A value rendered structurally: the whole line is rendered into a
         // builder on a stack of the statement's and written at once, as
         // the C backend writes every line (B_PRINT).
@@ -3241,6 +3369,7 @@ struct TgFn {
             if (Is<StrLit>(a)) return true;
             auto bt = a->exprtype;
             while (bt && IsPlainRef(bt)) bt = bt->ref->sub;
+            if (!c->fmtspecs.empty() && bt && cg.FmtSpecFor(cg.FmtContext(c, a), bt)) return false;
             if (bt && ((bt->kind == TY_ARRAY && IsU8(bt->arr->sub)) || (bt->kind == TY_SLICE && IsU8(bt->sub))))
                 return true;
             auto ot = cg.OperandT(a->exprtype);
@@ -4491,7 +4620,7 @@ struct TgFn {
     // it.
     void VsRender(tyg_val stk, tyg_addr len, const P &pl, Line l, int depth) {
         auto si = cg.SI(pl.t);
-        TextLit(stk, len, cat(M.Name(pl.t), " { "));
+        TextLit(stk, len, cat(TextName(pl.t), " { "));
         auto first = true;
         for (size_t i = 0; i < si->st->fields.size(); i++) {
             if (si->st->fields[i].ispad) continue;
