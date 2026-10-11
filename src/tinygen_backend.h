@@ -506,15 +506,18 @@ struct TgModule {
     // (`gs_stack *gs_dst<i>, int64_t *gs_rl<i>`) for a resizable one, and
     // a destination stack alone for a T[] image (built there whole) --
     // then gs_sp, where the C gives it one. Free variables of a type it
-    // holds (FvOk) come after the declared parameters; no `return from`
-    // channel.
+    // holds (FvOk) come after the declared parameters. A `return from`
+    // travels outside the signature, in the C half's thread-locals; this
+    // backend defines a target of one whose results are all fixed (their
+    // channels are plain thread-locals, no destination stacks).
     bool SigOk(FnSpec *sp, bool define, string &why) {
-        (void)define;
         auto &si = cg.sinfo[sp];
         if (sp->sf->isextern) { why = "extern"; return false; }
         for (auto fv : si.freevars)
             if (!FvOk(fv)) { why = cat("free variable of type ", fv->type ? Name(fv->type) : "?"); return false; }
-        if (si.hasrf || cg.fromids.count(sp)) { why = "return from"; return false; }
+        if (define && cg.fromids.count(sp))
+            for (auto r : sp->rets)
+                if (!TypeOk(r)) { why = cat("return from target with result type ", Name(r)); return false; }
         for (auto r : sp->rets)
             if (!RetOk(r)) { why = cat("result type ", Name(r)); return false; }
         for (size_t i = 0; i < sp->argtypes.size(); i++)
@@ -1938,6 +1941,7 @@ struct TgFn {
         }
         auto sym = M.Sym(ci.cname, TYG_SYM_FUNC | TYG_SYM_GLOBAL);
         auto x = Result(callee, ci.cret, M.Sig(callee), tyg_direct(sym), args);
+        RfCheck(callee);
         for (size_t i = 0; i < rets.size(); i++) {
             if ((int)i == ci.cret) lastrets.push_back(x);
             else if (M.IsScalar(rets[i].t)) lastrets.push_back(Load(P { rets[i].a, rets[i].t }, c->line));
@@ -2453,7 +2457,7 @@ struct TgFn {
             case NK_ForLoop: return StmtFor(static_cast<ForLoop *>(n));
             case NK_Return: {
                 auto r = static_cast<Return *>(n);
-                if (r->target != sp->sf) No(n->line, "return from");
+                if (r->target != sp->sf) return GenFromReturn(r);
                 return DoReturn(r->vals, r->line);
             }
             case NK_Break: {
@@ -2553,6 +2557,106 @@ struct TgFn {
         if (cret < 0) tyg_ret(p, 0);
         else if (M.IsScalar(rets[cret])) tyg_ret(p, tyg_load(p, M.Scal(rets[cret]), first.a, 0));
         else tyg_ret_mem(p, first.a);
+    }
+
+    // ---- return from (§7.9) ---------------------------------------------------
+    //
+    // As the C half does it (CodeGen::GenFromReturn, EmitRfCheck), so that
+    // a return passes through frames of both halves: the values go into
+    // the target's thread-local channels (gs_lret_<tid>_<i>), the
+    // discriminant gs_rf is set to the target's id, and every frame on
+    // the way returns at once, its stacks restored; after a call that can
+    // propagate one, a nonzero gs_rf is caught by its target (cleared, the
+    // values returned as its own) or passed on. Both thread-locals are the
+    // C half's, reached through accessors it exports (gap 6), read once
+    // per invocation as the globals' are.
+    tyg_val RfAddr() {
+        M.NeedShim("gs_tg_rf", "void *gs_tg_rf(void) { return &gs_rf; }\n");
+        return tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal("gs_tg_rf"), 0), 0);
+    }
+    tyg_addr LretAt(FnSpec *t, size_t i) {
+        cg.EnsureFromChannels(t);
+        auto tid = cg.fromids[t];
+        auto name = cat("gs_tg_lret_", tid, "_", i);
+        M.NeedShim(name, cat("void *", name, "(void) { return &gs_lret_", tid, "_", i, "; }\n"));
+        return tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(name), 0), 0), 0);
+    }
+    // Every frame on a propagation's way out returns at once: its stacks
+    // restored, a dummy C return value (CodeGen::PropagateReturn).
+    void Propagate() {
+        RestoreFrom(0);
+        auto cret = cg.sinfo[sp].cret;
+        if (cret < 0) {
+            tyg_ret(p, 0);
+        } else if (M.IsScalar(sp->rets[cret])) {
+            tyg_ret(p, Dummy(sp->rets[cret]).v);
+        } else {
+            auto t = Temp(sp->rets[cret]);
+            tyg_zero(p, tyg_at_local(t, 0), M.Size(sp->rets[cret]));
+            tyg_ret_mem(p, tyg_at_local(t, 0));
+        }
+    }
+    void GenFromReturn(Return *r) {
+        auto t = r->targetspec;
+        auto l = r->line;
+        if (!t || !cg.fromids.count(t) || !cg.sinfo[sp].hasrf) No(l, "return from");
+        auto &rets = t->rets;
+        for (auto rt : rets)
+            if (!M.TypeOk(rt)) No(l, cat("return from with a result of type ", M.Name(rt)));
+        auto &vals = r->vals;
+        vector<V> xs;
+        if (vals.size() == 1 && rets.size() > 1) xs = GenCallAll(vals[0], rets.size());
+        else if (vals.size() != rets.size()) No(l, "result count");
+        for (size_t i = 0; i < rets.size(); i++) {
+            auto x = xs.empty() ? GenAs(vals[i], rets[i]) : Fit(xs[i], rets[i], l);
+            if (Ended()) return;
+            if (!M.IsScalar(rets[i]) && !x.mem) No(l, "aggregate value");
+            Store(P { LretAt(t, i), rets[i] }, x);
+        }
+        tyg_store(p, TYG_I32, tyg_at_val(RfAddr(), 0), tyg_iconst(p, TYG_I32, cg.fromids[t]), 0);
+        Propagate();
+    }
+    // After a call that can propagate a return (CodeGen::EmitRfCheck).
+    void RfCheck(FnSpec *callee) {
+        if (!cg.sinfo[callee].hasrf || cg.norfcheck || Ended()) return;
+        auto rfa = RfAddr();
+        auto rf = tyg_load(p, TYG_I32, tyg_at_val(rfa, 0), 0);
+        auto on = tyg_block_new(p), cont = tyg_block_new(p);
+        tyg_branch(p, tyg_cmp(p, TYG_NE, rf, tyg_iconst(p, TYG_I32, 0)), on, cont);
+        tyg_block_set(p, on);
+        auto elsewhere = [&] {
+            if (cg.sinfo[sp].hasrf) {
+                Propagate();
+            } else {
+                M.NeedShim("gs_tg_rfpanic",
+                           "void gs_tg_rfpanic(void) { gs_panic(\"unexpected long-distance return\"); }\n");
+                CallC("gs_tg_rfpanic", {}, {}, nullptr);
+                tyg_unreachable(p);
+            }
+        };
+        if (callee->needs.count(sp)) {
+            auto tid = cg.fromids[sp];
+            auto here = tyg_block_new(p), other = tyg_block_new(p);
+            tyg_branch(p, tyg_cmp(p, TYG_EQ, rf, tyg_iconst(p, TYG_I32, tid)), here, other);
+            tyg_block_set(p, here);
+            // The propagation ends here: "nothing in flight" again, and
+            // the values in the channels returned as this frame's own.
+            tyg_store(p, TYG_I32, tyg_at_val(rfa, 0), tyg_iconst(p, TYG_I32, 0), 0);
+            auto &rets = sp->rets;
+            auto cret = cg.sinfo[sp].cret;
+            for (size_t i = 0; i < rets.size(); i++) {
+                if ((int)i == cret) continue;
+                auto ptr = tyg_load(p, TYG_I64, tyg_at_local(chans[i].a, 0), 0);
+                Store(P { tyg_at_val(ptr, 0), rets[i] }, Load(P { LretAt(sp, i), rets[i] }, Line {}));
+            }
+            RestoreFrom(0);
+            if (cret < 0) tyg_ret(p, 0);
+            else if (M.IsScalar(rets[cret])) tyg_ret(p, Load(P { LretAt(sp, cret), rets[cret] }, Line {}).v);
+            else tyg_ret_mem(p, LretAt(sp, cret));
+            tyg_block_set(p, other);
+        }
+        elsewhere();
+        tyg_block_set(p, cont);
     }
 
     void Declare(VarDef *d, Line l) {
