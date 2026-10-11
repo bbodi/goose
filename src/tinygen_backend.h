@@ -4439,6 +4439,41 @@ struct TgFn {
             return;
         }
         switch (t->kind) {
+            case TY_VARIANT:
+                RenderVariant(stk, len, pl, l, depth);
+                return;
+            case TY_ENUM: {
+                // The variant the tag says, as its literal (CodeGen::RenderLoc).
+                if (!M.TypeOk(t) && !M.VmOk(t)) break;
+                auto ei = cg.EIOf(t);
+                auto varmode = M.IsVm(t);
+                auto tag = tyg_local_new(p, 8, 8);
+                tyg_store(p, TYG_I64, tyg_at_local(tag, 0), LoadTag(pl.a, t), 0);
+                auto done = tyg_block_new(p);
+                for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
+                    auto hit = tyg_block_new(p), next = tyg_block_new(p);
+                    tyg_branch(p, tyg_cmp(p, TYG_EQ, tyg_load(p, TYG_I64, tyg_at_local(tag, 0), 0),
+                                          tyg_iconst(p, TYG_I64, (int64_t)vi)), hit, next);
+                    tyg_block_set(p, hit);
+                    auto vt = cg.VariantType(t, (int)vi);
+                    auto pa = pl.a;
+                    pa.offset += M.TagSize(t);
+                    P vp { pa, vt };
+                    if (!varmode && fmtc && !fmtc->fmtspecs.empty() && cg.FixedSize(vt)) {
+                        // An overload may overwrite the value: its parts
+                        // rendered from a copy.
+                        auto cp = Temp(vt);
+                        tyg_copy(p, tyg_at_local(cp, 0), pa, cg.FixedSize(vt));
+                        vp.a = tyg_at_local(cp, 0);
+                    }
+                    RenderVariant(stk, len, vp, l, depth);
+                    tyg_jump(p, done);
+                    tyg_block_set(p, next);
+                }
+                tyg_jump(p, done);
+                tyg_block_set(p, done);
+                return;
+            }
             case TY_INT:
                 if (t->intstorage == IS_VARINT) {
                     FmtScalar(stk, len, M.ast.inttypes[IS_I64], Load(pl, l).v);
@@ -4525,6 +4560,39 @@ struct TgFn {
             default: break;
         }
         No(l, cat("text of type ", M.NameWhy(t)));
+    }
+
+    // A variant's positional literal (CodeGen::RenderVariant): `E.V` for
+    // one without fields, else `V { a, b }`.
+    void RenderVariant(tyg_val stk, tyg_addr len, const P &pl, Line l, int depth) {
+        auto t = pl.t;
+        auto ei = cg.EIVar(t);
+        auto vi = (size_t)ei->en->VariantIndex(t->var->variant);
+        auto &v = ei->en->variants[vi];
+        if (v.fields.empty()) {
+            TextLit(stk, len, cat(ei->en->name, ".", v.name));
+            return;
+        }
+        auto fixed = cg.IsFix(t);
+        if (fixed && !M.TypeOk(t)) No(l, cat("text of type ", M.NameWhy(t)));
+        if (!fixed && !M.VvOk(t)) No(l, cat("text of type ", M.NameWhy(t)));
+        TextLit(stk, len, cat(v.name, " { "));
+        auto first = true;
+        for (size_t i = 0; i < v.fields.size(); i++) {
+            if (v.fields[i].ispad) continue;
+            if (!first) TextLit(stk, len, ", ");
+            first = false;
+            auto ft = ei->vftypes[vi][i];
+            P fp;
+            if (fixed) {
+                fp = VariantField(pl, (int)i);
+            } else {
+                fp = P { tyg_at_val(VvField(t, tyg_addr_of(p, pl.a), (int)i), 0), ft };
+                fp.enc = TgModule::IsVarint(ft);
+            }
+            RenderInto(stk, len, fp, true, l, depth + 1);
+        }
+        TextLit(stk, len, " }");
     }
 
     // gs_abort(GS_E_<what>) with the Goose file and line, through a shim
