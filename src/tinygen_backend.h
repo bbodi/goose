@@ -101,6 +101,11 @@ struct TgModule {
 
     // ---- Types -------------------------------------------------------------
 
+    static string Name(TypeExpr *t) {
+        string s;
+        t->Dump(s);
+        return s;
+    }
     static bool IsSigned(TypeExpr *t) { return t->kind == TY_INT && !IsUnsigned(t->intstorage); }
 
     // A type this backend holds: a machine integer, a float, a bool, a plain
@@ -498,7 +503,7 @@ struct TgModule {
             return false;
         }
         for (auto r : sp->rets)
-            if (!TypeOk(r)) { why = "result type"; return false; }
+            if (!TypeOk(r)) { why = cat("result type ", Name(r)); return false; }
         // A result this backend holds is fixed and not large, so the C
         // returns the first one (CodeGen::CollectSpecs).
         if (!sp->rets.empty() && si.cret != 0) {
@@ -507,7 +512,7 @@ struct TgModule {
         }
         for (size_t i = 0; i < sp->argtypes.size(); i++)
             if (cg.IsPoolParam(sp, i) || !(TypeOk(sp->argtypes[i]) || RzParam(sp->argtypes[i]))) {
-                why = "parameter type";
+                why = cat("parameter type ", Name(sp->argtypes[i]));
                 return false;
             }
         return true;
@@ -1764,7 +1769,7 @@ struct TgFn {
     }
 
     void Declare(VarDef *d, Line l) {
-        if (!M.TypeOk(d->type) || cg.PrefVar(d)) No(l, cat("variable type of ", d->name));
+        if (!M.TypeOk(d->type) || cg.PrefVar(d)) No(l, cat("variable type of ", d->name, ": ", M.Name(d->type)));
         auto loc = Temp(d->type);
         locals[d] = loc;
         tyg_debug_var(p, string(d->name).c_str(), M.DT(d->type), tyg_at_local(loc, 0),
