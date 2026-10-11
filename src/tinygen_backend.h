@@ -4986,7 +4986,7 @@ struct TgFn {
         tyg_block_set(p, tb);
         auto arm = [&](Node *n) {
             auto x = GenArm(n, !valued);
-            if (valued && !Ended()) Store(P { tyg_at_local(res, 0), et }, Fit(x, et, n->line));
+            if (valued && !Ended() && x.t) Store(P { tyg_at_local(res, 0), et }, Fit(x, et, n->line));
             Jump(done);
         };
         arm(i->thenb);
