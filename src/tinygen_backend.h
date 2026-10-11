@@ -3971,8 +3971,9 @@ struct TgFn {
         r.t = c->exprtype && c->exprtype->kind == TY_REF ? c->exprtype : nullptr;
         if (r.t) r.v = at;
         // The element itself, as a value, where one is wanted.
-        else if (c->exprtype && c->exprtype->kind != TY_VOID && M.TypeOk(et))
-            return Load(P { tyg_at_val(at, 0), et }, c->line);
+        pushed = P { tyg_at_val(at, 0), et };
+        if (!r.t && c->exprtype && c->exprtype->kind != TY_VOID && M.TypeOk(et))
+            return Load(*pushed, c->line);
         return r;
     }
     // A reusable pool's array, its freelist's header and the freelist's
@@ -4901,6 +4902,9 @@ struct TgFn {
     // element, which may grow the array itself, then its slot claimed at
     // the stack's top, where the elements end, and the count raised. Its
     // value is the element's address.
+    // The element the last push added, where it lies: what print renders
+    // of a push's value (a reference, §3.3), read there.
+    std::optional<P> pushed;
     V GenPush(Call *c) {
         auto an = c->ArgNodes();
         auto pl = Deref(Place(an[0]));
@@ -4954,8 +4958,9 @@ struct TgFn {
         r.t = c->exprtype && c->exprtype->kind == TY_REF ? c->exprtype : nullptr;
         if (r.t) r.v = top;
         // The element itself, as a value, where one is wanted.
-        else if (c->exprtype && c->exprtype->kind != TY_VOID && M.TypeOk(et))
-            return Load(P { tyg_at_val(top, 0), et }, c->line);
+        pushed = P { tyg_at_val(top, 0), et };
+        if (!r.t && c->exprtype && c->exprtype->kind != TY_VOID && M.TypeOk(et))
+            return Load(*pushed, c->line);
         return r;
     }
 
@@ -5124,6 +5129,33 @@ struct TgFn {
         RfCheck(sp);
     }
 
+    // Where an argument of print, str or format is rendered from: a call's
+    // reference result where it points, as a reference variable is, not as
+    // the value the checker decayed it to; anything else its place.
+    P RenderPlace(Node *a) {
+        auto fc = Is<Call>(a);
+        if (fc && fc->builtin == B_PUSH) {
+            pushed.reset();
+            auto x = Gen1(a);
+            if (Ended()) return P {};
+            if (pushed) return *pushed;
+            if (x.mem) return P { x.a, x.t, x.stk };
+            if (!x.t || x.t->kind == TY_VOID) No(a->line, "place of no value");
+            auto tmp = Temp(x.t);
+            P pl { tyg_at_local(tmp, 0), x.t };
+            Store(pl, x);
+            return pl;
+        }
+        auto rs = !fc ? nullptr : fc->spec ? fc->spec : !fc->dispatch.empty() ? fc->dispatch[0] : nullptr;
+        if (fc && fc->builtin < 0 && rs && !rs->rets.empty() && rs->rets[0]->kind == TY_REF &&
+            IsPlainRef(rs->rets[0])) {
+            auto x = Gen1(a);
+            if (Ended()) return P {};
+            return RefTarget(x);
+        }
+        return Place(a);
+    }
+
     void TextInto(tyg_val stk, tyg_addr len, Call *c, const vector<Node *> &an, size_t from) {
         auto outer = fmtc;
         struct Restore {
@@ -5157,16 +5189,7 @@ struct TgFn {
                 // A call's reference result is rendered where it points, as
                 // a reference variable is, not as the value the checker
                 // decayed it to.
-                P pl;
-                auto fc = Is<Call>(a);
-                if (fc && fc->builtin < 0 && fc->spec && !fc->spec->rets.empty() &&
-                    fc->spec->rets[0]->kind == TY_REF && IsPlainRef(fc->spec->rets[0])) {
-                    auto x = Gen1(a);
-                    if (Ended()) return;
-                    pl = RefTarget(x);
-                } else {
-                    pl = Place(a);
-                }
+                auto pl = RenderPlace(a);
                 if (Ended()) return;
                 if (IsAddrRef(pl.t)) {
                     // A reference to a varint renders what it refers to.
@@ -5196,7 +5219,7 @@ struct TgFn {
             }
             auto ot = cg.OperandT(a->exprtype);
             if (!ot || !M.IsScalar(ot) || ot->kind == TY_REF) {
-                auto pl = Place(a);
+                auto pl = RenderPlace(a);
                 if (Ended()) return;
                 RenderInto(stk, len, pl, false, a->line);
                 continue;
