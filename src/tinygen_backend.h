@@ -6111,10 +6111,51 @@ struct TgFn {
     bool QueueOk(TypeExpr *t) {
         if (!t || t->kind == TY_REF) return false;
         if (cg.IsFix(t)) return M.TypeOk(t);
+        // A resizable, or a frame object, crosses as a flat image (RzImage).
+        if (M.Resz(t)) return (IsGrow(t) && (M.RzOk(t) || M.VeOk(t))) || M.FoOk(t);
         return (M.IsRc(t) && M.RcOk(t)) || (IsVarArr(t) && M.RzOk(t)) || (M.IsVs(t) && M.VsOk(t));
     }
     // node's value bytes follow its gs_qnode header (next, size).
     static constexpr int64_t QNODE = 16;
+
+    // The resizable (or frame object) n of type t built in a temporary of
+    // its own: its header, or the frame object, and its stack.
+    P RzValue(Node *n, TypeExpr *t, Line l) {
+        if (M.FoOk(t)) {
+            P x { tyg_at_local(tyg_local_new(p, M.Size(t), 8), 0), t, Stk(AllocStk(false, l), l) };
+            GenFo(n, x, l);
+            return x;
+        }
+        auto x = RzTemp(t, l);
+        GenRz(n, x.stk, x.a, t, l);
+        return P { x.a, t, x.stk };
+    }
+    // The flat image of the resizable or frame object at src, at the top
+    // of stk: [int64 count][a frame object's fixed fields][tail elements]
+    // (CodeGen::EmitRzImage); its address.
+    tyg_val RzImage(tyg_val stk, const P &src, TypeExpr *t) {
+        auto start = Top(stk);
+        auto cnt = tyg_at_val(start, 0);
+        tyg_store(p, TYG_I64, cnt, tyg_iconst(p, TYG_I64, 0), 0);
+        SetTop(stk, tyg_bin(p, TYG_ADD, start, tyg_iconst(p, TYG_I64, 8)));
+        auto h = src.a;
+        TypeExpr *et;
+        if (M.FoOk(t)) {
+            auto pre = M.FoHdrOff(t);
+            auto top = Top(stk);
+            if (pre) tyg_copy(p, tyg_at_val(top, 0), src.a, pre);
+            SetTop(stk, tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, pre)));
+            h.offset += pre;
+            et = cg.FoTailArr(t)->arr->sub;
+        } else {
+            et = t->arr->sub;
+        }
+        auto hl = h;
+        hl.offset += 8;
+        View v { tyg_load(p, TYG_I64, h, 0), tyg_load(p, TYG_I64, hl, 0), et, -1 };
+        CopyView(stk, cnt, et, v);
+        return start;
+    }
 
     V GenThreadWait(Call *c) {
         auto an = c->ArgNodes();
@@ -6196,7 +6237,14 @@ struct TgFn {
             return V {};
         }
         tyg_val ptr, size;
-        if (!cg.IsFix(t)) {
+        if (M.Resz(t)) {
+            // Flat: the count, the fixed fields, the elements.
+            auto src = RzValue(an[0], t, c->line);
+            if (Ended()) return V {};
+            auto stk = Stk(AllocStk(false, c->line), c->line);
+            ptr = RzImage(stk, src, t);
+            size = tyg_bin(p, TYG_SUB, Top(stk), ptr);
+        } else if (!cg.IsFix(t)) {
             // An image, built on a stack of the statement's.
             auto stk = Stk(AllocStk(false, c->line), c->line);
             ptr = GenImg(an[0], stk, t, c->line);
@@ -6222,12 +6270,58 @@ struct TgFn {
     V GenQget(Call *c, tyg_val idst) {
         auto t = c->rettypes[0];
         auto poll = c->builtin == B_QPOLL;
-        if (!QueueOk(t) || (poll && !cg.IsFix(t))) No(c->line, cat("queue element of type ", M.NameWhy(t)));
+        if (!QueueOk(t) || (poll && !cg.IsFix(t) && !M.Resz(t))) No(c->line, cat("queue element of type ", M.NameWhy(t)));
         auto node = CallC(poll ? "gs_qpoll" : "gs_qget", { tyg_type_ptr(m) }, { QueueAddr(t) }, IT(TYG_I64));
         auto freenode = [&] { CallC("free", { tyg_type_ptr(m) }, { node }, nullptr); };
         auto src = [&] { return tyg_at_val(tyg_bin(p, TYG_ADD, node, tyg_iconst(p, TYG_I64, QNODE)), 0); };
         V x;
         x.t = t;
+        if (M.Resz(t)) {
+            // Rebuilt from the image on a stack of the statement's: the
+            // zero value until a node is read (a missed poll leaves it).
+            auto stk = Stk(AllocStk(false, c->line), c->line);
+            auto fo = M.FoOk(t);
+            auto pre = fo ? M.FoHdrOff(t) : 0;
+            auto obj = tyg_at_local(tyg_local_new(p, fo ? M.Size(t) : 16, 8), 0);
+            tyg_zero(p, obj, fo ? M.Size(t) : 16);
+            auto hdr = obj;
+            hdr.offset += pre;
+            auto hlen = hdr;
+            hlen.offset += 8;
+            tyg_store(p, TYG_I64, hdr, Top(stk), 0);
+            tyg_block have = 0, done = 0;
+            if (poll) {
+                have = tyg_block_new(p);
+                done = tyg_block_new(p);
+                tyg_branch(p, tyg_cmp(p, TYG_NE, node, tyg_iconst(p, TYG_I64, 0)), have, done);
+                tyg_block_set(p, have);
+            }
+            auto image = tyg_bin(p, TYG_ADD, node, tyg_iconst(p, TYG_I64, QNODE + 8));
+            auto size = tyg_load(p, TYG_I64, tyg_at_val(node, 8), 0);
+            tyg_store(p, TYG_I64, hlen, tyg_load(p, TYG_I64, tyg_at_val(node, QNODE), 0), 0);
+            if (pre) tyg_copy(p, obj, tyg_at_val(image, 0), pre);
+            auto n = tyg_bin(p, TYG_SUB, size, tyg_iconst(p, TYG_I64, 8 + pre));
+            auto top = Top(stk);
+            tyg_move_dyn(p, top, tyg_bin(p, TYG_ADD, image, tyg_iconst(p, TYG_I64, pre)), n);
+            SetTop(stk, tyg_bin(p, TYG_ADD, top, n));
+            freenode();
+            if (poll) {
+                tyg_jump(p, done);
+                tyg_block_set(p, done);
+            }
+            x.mem = true;
+            x.a = obj;
+            x.stk = stk;
+            lastrets.clear();
+            lastrets.push_back(x);
+            if (poll) {
+                V got;
+                got.t = M.ast.booltype;
+                got.v = tyg_cmp(p, TYG_NE, node, tyg_iconst(p, TYG_I64, 0));
+                lastrets.push_back(got);
+            }
+            return x;
+        }
         if (!cg.IsFix(t)) {
             auto stk = idst ? idst : Stk(AllocStk(false, c->line), c->line);
             auto top = Top(stk);
