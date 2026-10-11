@@ -1758,6 +1758,29 @@ struct TgFn {
         if (c->builtin == B_PUSH && c->ArgNodes().size() == 2) return GenPush(c);
         if (c->builtin == B_APPEND && c->ArgNodes().size() == 2) return GenAppend(c);
         if (c->builtin == B_STR) return GenStr(c);
+        if (c->builtin == B_POP || c->builtin == B_POP_N || c->builtin == B_RESIZE || c->builtin == B_CLEAR)
+            return GenShrink(c);
+        if (c->builtin == B_ASSERT && c->ArgNodes().size() == 1) {
+            auto ok = tyg_block_new(p), bad = tyg_block_new(p);
+            tyg_branch(p, Truth(c->ArgNodes()[0]), ok, bad);
+            tyg_block_set(p, bad);
+            Abort("ASSERT", c->line);
+            tyg_block_set(p, ok);
+            return V {};
+        }
+        if (c->builtin == B_ABORT && c->ArgNodes().size() == 1) {
+            auto v = ViewOf(Place(c->ArgNodes()[0]), c->line);
+            if (Ended()) return V {};
+            CallC("gs_abort_msg", { tyg_type_ptr(m), IT(TYG_I64), tyg_type_ptr(m), IT(TYG_I32) },
+                  { v.elems, v.len, FileArg(c->line), LineArg(c->line) }, nullptr);
+            return V {};
+        }
+        if (c->builtin == B_EXIT && c->ArgNodes().size() == 1) {
+            auto x = GenAs(c->ArgNodes()[0], M.ast.inttypes[IS_I64]);
+            if (Ended()) return V {};
+            CallC("gs_exit", { IT(TYG_I64) }, { x.v }, nullptr);
+            return V {};
+        }
         if (c->builtin == B_FORMAT && c->ArgNodes().size() >= 1) return GenFormat(c);
         if (c->builtin >= 0) No(c->line, cat("builtin ", BuiltinByKind(c->builtin).name));
         if (c->fvbody || !c->dispatch.empty() || !c->fvremap.empty() || !c->spec)
@@ -1978,6 +2001,114 @@ struct TgFn {
             SetTop(stk, tyg_bin(p, TYG_ADD, Top(stk), n));
             tyg_store(p, TYG_I64, len, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, len, 0), n), 0);
         }
+    }
+
+    // gs_abort(GS_E_<what>) with the Goose file and line, through a shim
+    // (the codes are the C half's enum); the block ends there.
+    void Abort(const string &what, Line l) {
+        auto name = cat("gs_tg_abort_", what);
+        M.NeedShim(name, cat("void ", name, "(const char *f, int l) { gs_abort(GS_E_", what, ", f, l); }\n"));
+        CallC(name, { tyg_type_ptr(m), IT(TYG_I32) }, { FileArg(l), LineArg(l) }, nullptr);
+        tyg_unreachable(p);
+    }
+    // An abort unless `cond`, then on.
+    void AbortUnless(tyg_val cond, const string &what, Line l) {
+        auto ok = tyg_block_new(p), bad = tyg_block_new(p);
+        tyg_branch(p, cond, ok, bad);
+        tyg_block_set(p, bad);
+        Abort(what, l);
+        tyg_block_set(p, ok);
+    }
+
+    // pop, pop_n, resize and clear of a resizable (codegen_builtins.h): the
+    // receiver, then the arguments, then the checks; the elements end at
+    // the stack's top, which moves with the count.
+    V GenShrink(Call *c) {
+        auto an = c->ArgNodes();
+        auto pl = Deref(Place(an[0]));
+        if (!IsGrow(pl.t) || !M.RzOk(pl.t) || !pl.stk)
+            No(c->line, cat(BuiltinByKind(c->builtin).name, " of an array of this kind"));
+        auto et = pl.t->arr->sub;
+        auto esz = cg.FixedSize(et);
+        auto len = pl.a;
+        len.offset += 8;
+        auto i64 = [&](int64_t v) { return tyg_iconst(p, TYG_I64, v); };
+        auto setlen = [&](tyg_val n) { tyg_store(p, TYG_I64, len, n, 0); };
+        auto at = [&](tyg_val n) {   // The address of element n.
+            return tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, pl.a, 0), tyg_bin(p, TYG_MUL, n, i64(esz)));
+        };
+        switch (c->builtin) {
+            case B_POP: {
+                auto nl = tyg_bin(p, TYG_SUB, tyg_load(p, TYG_I64, len, 0), i64(1));
+                AbortUnless(tyg_cmp(p, TYG_SGE, nl, i64(0)), "POP", c->line);
+                setlen(nl);
+                auto top = tyg_bin(p, TYG_SUB, Top(pl.stk), i64(esz));
+                SetTop(pl.stk, top);
+                return Load(P { tyg_at_val(top, 0), et }, c->line);
+            }
+            case B_POP_N: {
+                auto nn = Index64(an[1]);
+                if (Ended()) return V {};
+                auto ol = tyg_load(p, TYG_I64, len, 0);
+                AbortUnless(tyg_cmp(p, TYG_ULE, nn, ol), "POPN", c->line);
+                setlen(tyg_bin(p, TYG_SUB, ol, nn));
+                SetTop(pl.stk, tyg_bin(p, TYG_SUB, Top(pl.stk), tyg_bin(p, TYG_MUL, nn, i64(esz))));
+                return V {};
+            }
+            case B_CLEAR:
+                SetTop(pl.stk, tyg_load(p, TYG_I64, pl.a, 0));
+                setlen(i64(0));
+                return V {};
+            default: break;
+        }
+        // resize(n) / resize(n, fill): shrink to n, or grow by copies of
+        // fill, which is evaluated before the length is read.
+        auto nn = Index64(an[1]);
+        V fv;
+        if (an.size() > 2) {
+            fv = GenAs(an[2], et);
+            if (!M.IsScalar(et) && !fv.mem && !Ended()) No(c->line, "aggregate value");
+        }
+        if (Ended()) return V {};
+        auto nl = tyg_local_new(p, 8, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(nl, 0), nn, 0);
+        auto n = [&] { return tyg_load(p, TYG_I64, tyg_at_local(nl, 0), 0); };
+        auto ol = tyg_local_new(p, 8, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(ol, 0), tyg_load(p, TYG_I64, len, 0), 0);
+        auto o = [&] { return tyg_load(p, TYG_I64, tyg_at_local(ol, 0), 0); };
+        AbortUnless(tyg_cmp(p, TYG_SGE, n(), i64(0)), "RESIZENEG", c->line);
+        auto shrink = tyg_block_new(p), notshrink = tyg_block_new(p), grow = tyg_block_new(p),
+             done = tyg_block_new(p);
+        tyg_branch(p, tyg_cmp(p, TYG_SLT, n(), o()), shrink, notshrink);
+        tyg_block_set(p, shrink);
+        setlen(n());
+        SetTop(pl.stk, at(n()));
+        tyg_jump(p, done);
+        tyg_block_set(p, notshrink);
+        tyg_branch(p, tyg_cmp(p, TYG_SGT, n(), o()), grow, done);
+        tyg_block_set(p, grow);
+        if (an.size() <= 2) {
+            Abort("RESIZEFILL", c->line);
+        } else {
+            // The new slots through a cursor, the top written once after.
+            auto cur = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(cur, 0), Top(pl.stk), 0);
+            auto head = tyg_block_new(p), body = tyg_block_new(p), out = tyg_block_new(p);
+            tyg_jump(p, head);
+            tyg_block_set(p, head);
+            auto cv = tyg_load(p, TYG_I64, tyg_at_local(cur, 0), 0);
+            tyg_branch(p, tyg_cmp(p, TYG_ULT, cv, at(n())), body, out);
+            tyg_block_set(p, body);
+            Store(P { tyg_at_val(cv, 0), et }, fv);
+            tyg_store(p, TYG_I64, tyg_at_local(cur, 0), tyg_bin(p, TYG_ADD, cv, i64(esz)), 0);
+            tyg_jump(p, head);
+            tyg_block_set(p, out);
+            SetTop(pl.stk, tyg_load(p, TYG_I64, tyg_at_local(cur, 0), 0));
+            setlen(n());
+            tyg_jump(p, done);
+        }
+        tyg_block_set(p, done);
+        return V {};
     }
 
     // str(a, b, ...): a fresh u8[>..] on a stack of the statement's (or
