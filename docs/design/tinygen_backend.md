@@ -569,15 +569,15 @@ the linker driver.
   is `main` at `fn main()`'s line, so a backtrace ends in Goose source.
 * **Fallback**: the whole path is taken only when tinygen compiled every
   live specialization and the C half would hold nothing program-specific
-  (`TinyGenBackend::WholeProgram`): no globals to initialize or reach
-  (`CodeGen::noglobalinit`, no `gs_tg_g<i>` accessors), no `return from`
-  channels (`gs_lret_*`, which the C half declares per target), no extern
-  fns but the runtime's, no threads or queues, no `export fn`, no
-  `--include`, no `-D` but `GS_DEBUG`, not `--standalone`. Anything else
-  takes the mixed path as before. `-v` says which, and why:
+  (`TinyGenBackend::WholeProgram`): globals the object can hold and
+  initialize itself (next section), `return from` channels of fixed types
+  (likewise), no extern fns but the runtime's, no threads or queues, no
+  `export fn`, no `--include`, no `-D` but `GS_DEBUG`, not
+  `--standalone`. Anything else takes the mixed path as before. `-v` says
+  which, and why:
 
       tinygen: whole program: no C compiled for it
-      tinygen: mixed: the C half compiled by the C compiler (globals to initialize)
+      tinygen: mixed: the C half compiled by the C compiler (global initializer: builtin default (line 17))
 
   `--tinygen-mixed` (hidden) forces the mixed path, for comparisons.
 
@@ -585,16 +585,69 @@ Over the sweep (the 291 programs, built `goose build -O0` and with
 `--backend=tinygen`, plain and `--debug`; the 290 that build without
 flags of their own, all but `samples/24_call_c`, which needs its
 `--include` header, print the same and exit alike in all 580 pairs, the
-timings samples print to stderr aside), 36 programs take the whole path,
-with and without `--debug`:
-Goose-in-Goose, `samples/20_life`, eleven of the `test/tinygen/` fixtures
-(all but the globals, global-stacks, `return from`, strings and
-extern-with-C-of-its-own ones) and a run of small `codegen/`, `typing/` and
-`optimizer/` fixtures. Goose-in-Goose built so, plain and `--debug`,
-compiles itself to the same C, byte for byte, as the C backend's build.
-What keeps the others on the mixed path, by count: functions left to C
-(238), globals to initialize (13), `return from` channels
-(2), `export fn` (1).
+timings samples print to stderr aside), 36 programs took the whole path,
+with and without `--debug`, before the object held globals; 50 do since
+(next section). Beside them Goose-in-Goose and fourteen of the sixteen
+`test/tinygen/` fixtures (all but the strings one, whose `main` stays in
+C, and the extern one with C of its own) build whole. Goose-in-Goose
+built so, plain and `--debug`, compiles itself to the same C, byte for
+byte, as the C backend's build.
+
+### Globals and `return from` channels in the object
+
+What kept 13 of the sweep's programs on the mixed path was only their
+globals (`gs_globals_t`, `gs_init_globals`), and 2 more only the
+channels of their `return from` targets. A whole program build now
+gives the object both (`TinyGenBackend::WholeProgram`, after every
+function is built):
+
+* **Storage.** Each member of the C's instance block is a zero-filled
+  data symbol of its own (`gs_g_<name>`, local), a resizable's or
+  `u8[]`'s dedicated stack another (`gs_g_gs_gstk_<name>`). A whole
+  program has no threads, so main's instance is the only one, as `GS_GL`
+  is `&gs_globals_main` in the C; the per-thread layout matters only with
+  workers, which keep the mixed path. The static data the C makes of a
+  `let` with a compile-time initializer was the object's already
+  (`StaticGlobal`, `tyg_data` in rodata); those initializers are flat
+  (no references, slices or relative references, `StaticInitX`), so
+  `tyg_data_reloc` is not needed.
+* **Reached the same way.** The functions were compiled before the path
+  is chosen and call the accessors `gs_tg_g<i>`/`gs_tg_gs<i>` once per
+  invocation, as in a mixed build; the object now defines them, each
+  returning its symbol's address. (Reading the symbols directly would
+  save the calls; it needs the decision before the functions are built.)
+* **Initialization.** `gs_init_globals` is a tinygen procedure
+  (`TgFn::EmitInit`), which `main` calls after `gs_tg_start`, as
+  `gs_program_init` does: each initializer in declaration order with
+  `gs_sp` fixed at 0, a resizable or `u8[]` global built on its
+  dedicated stack after `gs_stack_init` (a support-object shim,
+  `gs_tg_stack_init`). It is used only if every initializer compiles and
+  needs no more data stacks than the C's (`stackneed[nullptr]`, which
+  `gs_rt_init`'s counts were made with); else the program stays mixed,
+  and the procedure stays in the object unreferenced -- which is why the
+  shims now go to the C half after the decision.
+* **Debug info.** Each global is described under its Goose name
+  (`tyg_debug_global` on its own symbol): lldb's `target variable
+  counter hist last` shows them with their Goose types. Gap 7 (a global
+  at an offset in a symbol) no longer applies to a whole program; it
+  still does to a mixed one, whose globals the C half holds.
+* **`return from` channels** (`gs_lret_<tid>_<i>`, thread-locals in the
+  C half) are plain zero-filled data of the object, with the accessors
+  `gs_tg_lret_<tid>_<i>` it defines: one thread, so no TLS (gap 6).
+  `gs_rf` stays in the support object.
+
+`default<T>()` of zero bytes (a scalar, or a fixed array of them) now
+compiles in tinygen as well: it is how a global without an initializer
+is initialized, and sent such programs' initializers, and functions
+using it, to C.
+
+Over the sweep, plain and `--debug` alike (0 of 580 runs differ but
+for the timings samples' stderr), the whole path goes from 36 programs
+to 50: `samples/11_maze`, the twelve programs only their globals kept
+mixed and the two only their channels did. What keeps the other 240 on
+the mixed path: functions left to C (238), `export fn` (1), and a global
+initializer tinygen does not compile (1: a `block` expression,
+`typing/for_end_local_names`).
 
 **Build time.** `goose build` end to end, median of three, macOS arm64
 (Apple clang 21 for `cc`), with a Release build of the compiler; "cold"
@@ -689,11 +742,15 @@ a resizable array's fat reference, header and elements, and one for a
 resizable local and a `u8[]` local built in a tinygen function, and one
 for a nested function's free variables shown as the variables.
 The fixtures it builds whole with no C half (`WHOLE_PROGRAM`, with
-`samples/20_life` and `codegen/loop_invariant_divisors`) must say so on
-the `-v` path line and run no compile of their own C, one is built again
-with `--tinygen-mixed` to the same output, and under lldb a whole
-program's backtrace ends in `main` at `fn main()`'s line with the Goose
-`main`'s locals by name.
+`samples/20_life` and `codegen/loop_invariant_divisors`; the globals,
+global-stacks and `return from` ones among them, whose builds with
+functions left to C stay mixed) must say so on the `-v` path line and
+run no compile of their own C, one is built again with `--tinygen-mixed`
+to the same output, under lldb a whole program's backtrace ends in
+`main` at `fn main()`'s line with the Goose `main`'s locals by name,
+and the globals fixture, built whole, shows its mutable globals (a
+scalar, a fixed array, a struct) by their Goose names and types beside
+the static data.
 
 ## What tinygen lacks for Goose
 
@@ -752,7 +809,10 @@ Recorded here rather than changed in tinygen, which other work is changing:
    channels through accessors of their own (`gs_tg_rf`,
    `gs_tg_lret_<tid>_<i>`). Direct `TYG_SYM_TLS` access would save the
    calls; tinygen's recent work names ELF thread-locals, and Mach-O's TLV
-   access should be checked first.
+   access should be checked first. A whole program (one thread) holds
+   its globals and channels as plain data of the object instead, still
+   through accessors; only `gs_stks`, `gs_gl` and `gs_rf` stay
+   thread-local there, in the support object.
 
 7. **Debug info for a member of a data symbol.** `tyg_debug_global` takes a
    symbol, and the variable is at its start. A global that lives in the C
@@ -761,7 +821,10 @@ Recorded here rather than changed in tinygen, which other work is changing:
    address: describing it under its Goose name needs a symbol and offset
    (or a DWARF location expression: the TLS block, a load, an offset),
    which tinygen's debug calls cannot express. Until then lldb shows such
-   a global as `gs_globals_main.counter_g`.
+   a global as `gs_globals_main.counter_g`. This holds for the mixed path
+   only: in a whole program each global is a symbol of its own, described
+   under its Goose name. It returns if whole programs gain threads, whose
+   workers each have an instance of their own.
 8. ~~Debug info for a variable behind a pointer.~~ tinygen now has
    `tyg_debug_var_ref`, a local holding the variable's address, and the
    backend describes each free variable so: lldb shows `n` as the
@@ -806,12 +869,13 @@ Recorded here rather than changed in tinygen, which other work is changing:
 5. **Whole program**: done for programs whose C half would hold only
    `main` and program-independent helpers (B1, above): `main` in the
    object, the helpers in a support object compiled once, no C of the
-   program compiled, measured against `cc -O0`. Next: globals (their
-   storage as a data symbol of the object and `gs_init_globals` as a
-   tinygen procedure; the accessors then become addresses), `return
-   from` channels as data of the object (they are thread-locals: gap 6),
-   threads (the worker thunks), and extern fns of packages called
-   directly when their C is a library's plain symbol.
+   program compiled, measured against `cc -O0`; globals and `return
+   from` channels held by the object, `gs_init_globals` a tinygen
+   procedure. Next: the globals' symbols read directly instead of through
+   accessors (choosing the path before the functions are built), global
+   initializers of several results and of `block` expressions, threads
+   (the worker thunks, and per-thread instances: gap 7), and extern fns
+   of packages called directly when their C is a library's plain symbol.
 
 ## Decisions
 
