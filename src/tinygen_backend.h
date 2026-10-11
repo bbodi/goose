@@ -1086,7 +1086,8 @@ struct TgModule {
     // gives (StackAccessor): its header, or its image's address, in the
     // instance, and that stack beside it.
     bool GlobalOk(VarDef *d) {
-        if (!d->isglobal || d->reusable || cg.PrefVar(d) || !cg.gnames.count(d)) return false;
+        if (!d->isglobal || cg.PrefVar(d) || !cg.gnames.count(d)) return false;
+        if (d->reusable) return IsGrow(d->type) && RzOk(d->type) && cg.gstks.count(d) && cg.gpools.count(d);
         if (TypeOk(d->type)) return true;
         return (IsGrow(d->type) || IsVarArr(d->type)) && RzOk(d->type) && cg.gstks.count(d);
     }
@@ -1101,6 +1102,17 @@ struct TgModule {
     }
 
     map<const VarDef *, string> stkaccessors;
+    // A global pool's freelist accessors: its header's, its stack's.
+    map<const VarDef *, pair<string, string>> flaccessors;
+    pair<string, string> PoolAccessors(VarDef *d) {
+        auto it = flaccessors.find(d);
+        auto n = flaccessors.size();
+        auto r = it != flaccessors.end() ? it->second
+                                         : (flaccessors[d] = { cat("gs_tg_gf", n), cat("gs_tg_gfs", n) });
+        NeedShim(r.first, cat("void *", r.first, "(void) { return (void *)&(", cg.gpools[d].first, "); }\n"));
+        NeedShim(r.second, cat("void *", r.second, "(void) { return (void *)", cg.gpools[d].second, "; }\n"));
+        return r;
+    }
     // The `return from` channels' accessors (gs_tg_lret_<tid>_<i>, and
     // gs_tg_fdst_, gs_tg_fval_), with the size of each channel.
     map<string, int64_t> channels;
@@ -1972,6 +1984,12 @@ struct TgFn {
             if (init && TgModule::IsRel(ft) && !ft->ref->pool && !Is<NullLit>(init)) return true;
         }
         return false;
+    }
+    // A struct literal SelfRelInto can build.
+    bool SelfRelLitOk(Node *n) {
+        auto sl = Is<StructLit>(n);
+        return sl && sl->sinst && !sl->variant && sl->exprtype && sl->exprtype->kind == TY_STRUCT &&
+               M.TypeOk(sl->exprtype);
     }
     // The value a literal being built in place starts at, which `self` in
     // its fields refers to (§3.9), or 0.
@@ -2923,13 +2941,21 @@ struct TgFn {
         auto recv = an[0];
         if (auto u = Is<Unary>(recv); u && u->op == T_BITAND) recv = u->child;
         auto id = Is<Ident>(recv);
-        if (!id || !id->vdef || !poolfl.count(id->vdef)) No(c->line, "pool of this kind");
-        auto vd = id->vdef;
+        auto vd = id ? id->vdef : nullptr;
+        if (!vd || !(poolfl.count(vd) || (vd->isglobal && vd->reusable))) No(c->line, "pool of this kind");
         auto pl = VarPlace(vd, c->line);
-        auto fl = tyg_at_local(poolfl[vd].first, 0);
+        tyg_addr fl;
+        tyg_val flstk;
+        if (vd->isglobal) {
+            auto [h, st] = M.PoolAccessors(vd);
+            fl = tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(h), 0), 0), 0);
+            flstk = tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(st), 0), 0);
+        } else {
+            fl = tyg_at_local(poolfl[vd].first, 0);
+            flstk = tyg_load(p, TYG_I64, tyg_at_local(poolfl[vd].second, 0), 0);
+        }
         auto fllen = fl;
         fllen.offset += 8;
-        auto flstk = tyg_load(p, TYG_I64, tyg_at_local(poolfl[vd].second, 0), 0);
         auto len = pl.a;
         len.offset += 8;
         auto elem = pl.t->arr->sub;
@@ -2947,7 +2973,8 @@ struct TgFn {
         // The value first, then the slot (the checker keeps the array from
         // growing into a fresh one meanwhile); a literal with a self-relative
         // link is built once the slot is known (CodeGen's atslot).
-        auto atslot = SelfRelLit(an[1]) && cg.TEq(an[1]->exprtype, elem);
+        auto atslot = Is<StructLit>(an[1]) && cg.HasRelRef(elem) && SelfRelLitOk(an[1]) &&
+                      cg.TEq(an[1]->exprtype, elem);
         V x;
         if (!atslot) {
             x = GenAs(an[1], elem);
@@ -5898,6 +5925,15 @@ struct TgFn {
                         tyg_store(p, TYG_I64, tyg_at_val(at, 0), Top(stk), 0);
                         tyg_store(p, TYG_I64, tyg_at_val(at, 8), tyg_iconst(p, TYG_I64, 0), 0);
                         GenRz(init, stk, tyg_at_val(at, 0), d->type, init->line);
+                        if (d->reusable && !Ended()) {
+                            // Its freelist, empty, on a stack of its own.
+                            auto [h, st] = M.PoolAccessors(d);
+                            auto fl = tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(h), 0), 0);
+                            auto flstk = tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(st), 0), 0);
+                            CallC("gs_tg_stack_init", { tyg_type_ptr(m) }, { flstk }, nullptr);
+                            tyg_store(p, TYG_I64, tyg_at_val(fl, 0), Top(flstk), 0);
+                            tyg_store(p, TYG_I64, tyg_at_val(fl, 8), tyg_iconst(p, TYG_I64, 0), 0);
+                        }
                     } else {
                         auto img = GenImg(init, stk, d->type, init->line);
                         if (!Ended()) tyg_store(p, TYG_I64, tyg_at_val(at, 0), img, 0);
@@ -6085,7 +6121,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                     if (mod->accessors.count(d)) return why = cat("global ", d->name, " as static data"), false;
                     continue;
                 }
-                if (!mod->GlobalOk(d) || cg.IsFrameObj(d->type) || cg.gpools.count(d) ||
+                if (!mod->GlobalOk(d) || cg.IsFrameObj(d->type) ||
                     (d->type->kind == TY_REF && d->type->ref->lenstorage >= 0))
                     return why = cat("global ", d->name, " of this kind"), false;
             }
@@ -6101,6 +6137,8 @@ struct TinyGenBackend : CodeGen::SpecBackend {
             if (n == name) return true;
         for (auto &[d, n] : mod->stkaccessors)
             if (n == name) return true;
+        for (auto &[d, n] : mod->flaccessors)
+            if (n.first == name || n.second == name) return true;
         return false;
     }
 
@@ -6149,6 +6187,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     void EmitGlobalStorage(CodeGen &cg) {
         auto m = mod->m;
         map<const VarDef *, tyg_sym> gsyms, ssyms;
+        map<const VarDef *, pair<tyg_sym, tyg_sym>> flsyms;
         auto def = [&](const string &name, int64_t size, int64_t align, VarDef *d, const tyg_dtype *dt) {
             auto sym = tyg_symbol(m, cat("gs_g_", name).c_str(), 0);
             tyg_data(m, sym, TYG_SECTION_BSS, nullptr, std::max<int64_t>(size, 1), align);
@@ -6170,6 +6209,10 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                     gsyms[d] = def(name, sz, align, d, mod->DT(d->type));
                 }
                 if (cg.gstks.count(d)) ssyms[d] = def(cat("gs_gstk_", name), 8, 8, d, nullptr);
+                if (cg.gpools.count(d)) {
+                    flsyms[d] = { def(cat(name, "_fl"), 16, 8, d, nullptr),
+                                  def(cat("gs_gstk_", name, "_fl"), 8, 8, d, nullptr) };
+                }
             }
         auto accessor = [&](const string &name, tyg_sym target) {
             auto p = tyg_proc_begin(m, mod->Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL),
@@ -6180,6 +6223,10 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         };
         for (auto &[d, n] : mod->accessors) accessor(n, gsyms.at(d));
         for (auto &[d, n] : mod->stkaccessors) accessor(n, ssyms.at(d));
+        for (auto &[d, n] : mod->flaccessors) {
+            accessor(n.first, flsyms.at(d).first);
+            accessor(n.second, flsyms.at(d).second);
+        }
         // The `return from` channels, which the C half keeps thread-local:
         // a whole program has one thread, so plain data (gap 6).
         for (auto &sh : mod->shims) {
