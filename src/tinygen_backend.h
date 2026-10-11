@@ -830,6 +830,8 @@ struct TgModule {
     // fixed elements (RzOk), or such structs; no relative references.
     bool VsOk(TypeExpr *t, int depth = 0) {
         if (!IsVs(t) || depth > 32 || cg.SI(t)->sclass != SC_VARIABLE) return false;
+        if (Reentered(t)) return true;   // Through an optional reference.
+        Open open { this, t };
         auto si = cg.SI(t);
         for (size_t i = 0; i < si->st->fields.size(); i++) {
             if (si->st->fields[i].ispad) continue;
@@ -848,6 +850,7 @@ struct TgModule {
         if (cg.IsFix(t)) return cg.FixedSize(t);
         if (IsVarint(t)) return 1;
         if (IsVarArr(t)) return PrefixBytes(t);
+        if (IsVm(t)) return TagSize(t);
         auto si = cg.SI(t);
         int64_t off = 0;
         for (size_t i = 0; i < si->st->fields.size(); i++) {
@@ -899,6 +902,8 @@ struct TgModule {
     bool AdtOk(TypeExpr *t, int depth) {
         if (t->kind == TY_ENUM && t->enu->varmode) return false;
         if (!cg.IsFix(t)) return false;
+        if (Reentered(t)) return true;   // Through a reference or a slice.
+        Open open { this, t };
         auto ei = EI(t);
         auto ok = [&](int vi) {
             for (size_t i = 0; i < ei->en->variants[vi].fields.size(); i++)
@@ -914,6 +919,8 @@ struct TgModule {
     string AdtBlocker(TypeExpr *t, int depth) {
         if (t->kind == TY_ENUM && t->enu->varmode) return VmOk(t, depth) ? "" : "variable-mode ADT";
         if (!cg.IsFix(t)) return VvOk(t, depth) ? "" : "variable-size ADT";
+        if (Reentered(t)) return "";
+        Open open { this, t };
         auto ei = EI(t);
         for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
             if (t->kind == TY_VARIANT && (int)vi != VariantIdx(t)) continue;
@@ -1023,6 +1030,8 @@ struct TgModule {
     }
     bool VmOk(TypeExpr *t, int depth = 0) {
         if (!IsVm(t) || depth > 32) return false;
+        if (Reentered(t)) return true;   // Through an optional reference.
+        Open open { this, t };
         auto ei = cg.EIOf(t);
         for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
             if (!FieldsOk(ei->en->variants[vi].fields, ei->vftypes[vi], depth + 1)) return false;
@@ -1047,6 +1056,8 @@ struct TgModule {
     bool IsVv(TypeExpr *t) { return t && t->kind == TY_VARIANT && !cg.IsFix(t); }
     bool VvOk(TypeExpr *t, int depth = 0) {
         if (!IsVv(t) || depth > 32) return false;
+        if (Reentered(t)) return true;   // Through an optional reference.
+        Open open { this, t };
         auto ei = cg.EIVar(t);
         auto vi = ei->en->VariantIndex(t->var->variant);
         return FieldsOk(ei->en->variants[(size_t)vi].fields, ei->vftypes[(size_t)vi], depth + 1);
@@ -1104,8 +1115,8 @@ struct TgModule {
     const tyg_dtype *OptDT(TypeExpr *t, const string &name) {
         return tyg_dt_typedef(m, name.c_str(), tyg_dt_pointer(m, DT(t->ref->sub)), File(0), 0);
     }
-    // Whether a struct reaches a value of its own type through its fields
-    // (an optional link): its text would recurse, which the C half's
+    // Whether a struct or ADT reaches a value of its own type through its
+    // fields (an optional link, a slice): its text would recurse, which the C half's
     // render functions do at run time.
     bool Recursive(TypeExpr *t) {
         set<string> seen;
@@ -1124,10 +1135,46 @@ struct TgModule {
                         if (!si->st->fields[i].ispad && walk(si->ftypes[i], depth + 1)) return true;
                     return false;
                 }
+                case TY_ENUM: case TY_VARIANT: {
+                    if (depth > 0 && cg.TEq(x, t)) return true;
+                    if (!seen.insert(cg.Mangle(x)).second) return false;
+                    auto ei = EI(x);
+                    for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
+                        if (x->kind == TY_VARIANT && (int)vi != VariantIdx(x)) continue;
+                        auto &v = ei->en->variants[vi];
+                        for (size_t i = 0; i < v.fields.size(); i++)
+                            if (!v.fields[i].ispad && walk(ei->vftypes[vi][i], depth + 1)) return true;
+                    }
+                    return false;
+                }
                 default: return false;
             }
         };
         return walk(t, 0);
+    }
+
+    // The render procedures of types that reach themselves, one per type
+    // (CodeGen::RenderFn): named by the type's mangled name, queued as they
+    // are asked for and built once the function asking is done, as only one
+    // procedure is built at a time (TinyGenBackend::BuildRenders).
+    map<string, string> renderfns;
+    vector<pair<string, TypeExpr *>> renderq;
+    string RenderFn(TypeExpr *t) {
+        auto k = cg.Mangle(t);
+        auto it = renderfns.find(k);
+        if (it != renderfns.end()) return it->second;
+        auto name = cat("gs_tg_render_", k);
+        renderfns[k] = name;
+        renderq.emplace_back(name, t);
+        return name;
+    }
+    // Whether a render procedure can take the type: a fixed struct or ADT
+    // whose parts are all held (TypeOk), or an image of one (a variable-size
+    // struct, a variable-mode ADT), handed the address of its value.
+    bool RenderFnOk(TypeExpr *t) {
+        if (t->kind == TY_ENUM && IsVm(t)) return VmOk(t);
+        if (t->kind == TY_STRUCT && VsOk(t)) return true;
+        return (t->kind == TY_STRUCT || t->kind == TY_ENUM) && cg.IsFix(t) && !FoOk(t) && TypeOk(t);
     }
 
     // ---- Globals -----------------------------------------------------------
@@ -4594,6 +4641,7 @@ struct TgFn {
     // The call whose user format overloads the value being rendered uses
     // (CodeGen::FmtContext), or none.
     Call *fmtc = nullptr;
+    TypeExpr *inlinet = nullptr;   // The type a render procedure's body renders inline.
 
     // A type's name as text renders it: the checked type the C renders is
     // the value's, which a `const` variable's place does not drop.
@@ -4791,9 +4839,24 @@ struct TgFn {
                 return;
             }
         }
-        if (M.OptRef(t)) {
+        if (M.OptRef(t) || (IsOptional(t) && M.RelOk(t))) {
             RenderOpt(stk, len, pl, nested, l, depth);
             return;
+        }
+        // A struct that reaches itself is rendered by a procedure of its
+        // own, which calls itself for the next level (CodeGen::EmitRenderCall).
+        // It runs no overloads: the checker leaves none in such a type
+        // (CheckPrintable's OverloadedPart). The procedure's own body
+        // renders the first level here (inlinet).
+        if ((t->kind == TY_STRUCT || t->kind == TY_ENUM) && M.Recursive(t)) {
+            if (inlinet && cg.TEq(inlinet, t)) {
+                inlinet = nullptr;
+            } else {
+                if (pl.stk || pl.enc || !M.RenderFnOk(t)) No(l, cat("text of type ", M.Name(t), " [recursive]"));
+                auto ptr = tyg_type_ptr(m);
+                CallC(M.RenderFn(t), { ptr, ptr, ptr }, { stk, tyg_addr_of(p, len), tyg_addr_of(p, pl.a) }, nullptr);
+                return;
+            }
         }
         switch (t->kind) {
             case TY_VARIANT:
@@ -5316,12 +5379,13 @@ struct TgFn {
         return x;
     }
     // An optional's text (CodeGen::RenderLoc): `null`, or its pointee's.
-    // A pointee that reaches its own type (a list) is rendered by the C
-    // half's recursive render functions; its function stays in C.
+    // A pointee that reaches its own type (a list) is rendered by a render
+    // procedure (RenderInto).
     void RenderOpt(tyg_val stk, tyg_addr len, const P &pl, bool nested, Line l, int depth) {
-        if (M.Recursive(pl.t->ref->sub)) No(l, cat("text of type ", M.Name(pl.t), " [recursive]"));
         auto none = tyg_block_new(p), some = tyg_block_new(p), done = tyg_block_new(p);
-        tyg_branch(p, tyg_cmp(p, TYG_EQ, tyg_load(p, TYG_I64, pl.a, 0), tyg_iconst(p, TYG_I64, 0)), none, some);
+        // A relative link's offset decodes to its address, null for 0.
+        auto at = TgModule::IsRel(pl.t) ? RelLoad(pl, l) : tyg_load(p, TYG_I64, pl.a, 0);
+        tyg_branch(p, tyg_cmp(p, TYG_EQ, at, tyg_iconst(p, TYG_I64, 0)), none, some);
         tyg_block_set(p, none);
         TextLit(stk, len, "null");
         tyg_jump(p, done);
@@ -7301,6 +7365,25 @@ struct TgFn {
         Finish(sp->sf->line);
     }
 
+    // The render procedure of t (CodeGen::EmitRenderFn): void(stk, &len,
+    // &value), the value rendered as a nested part of a larger one.
+    void EmitRender(const string &name, TypeExpr *t) {
+        auto ptr = tyg_type_ptr(m);
+        const tyg_type *pts[3] = { ptr, ptr, ptr };
+        p = tyg_proc_begin(m, M.Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL), tyg_sig_new(m, nullptr, pts, 3, 0));
+        if (!p) No(Line {}, cat("tyg_proc_begin: ", tyg_error(m) ? tyg_error(m) : "?"));
+        // The entry block as a function's, for the globals a link reads
+        // (a pool's base).
+        gblk = tyg_block_new(p);
+        gstart = tyg_block_new(p);
+        tyg_jump(p, gblk);
+        tyg_block_set(p, gstart);
+        inlinet = t;
+        RenderInto(tyg_param(p, 0), tyg_at_val(tyg_param(p, 1), 0), P { tyg_at_val(tyg_param(p, 2), 0), t }, true, Line {});
+        if (!Ended()) tyg_ret(p, 0);
+        Finish(Line {});
+    }
+
     // The entry's block (gblk): the addresses of the globals the body
     // names, and the stack block, then on to the body (gstart).
     void Finish(Line line) {
@@ -7464,7 +7547,24 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                 left.emplace_back(sp, w);
             }
         }
+        BuildRenders();
         return ours;
+    }
+
+    // The render procedures the functions asked for (TgModule::RenderFn),
+    // each possibly asking for others.
+    void BuildRenders() {
+        for (size_t i = 0; mod && i < mod->renderq.size(); i++) {
+            auto [name, t] = mod->renderq[i];
+            TgFn fn(*mod, nullptr);
+            try {
+                fn.EmitRender(name, t);
+            } catch (TgUnsupported &u) {
+                if (fn.p) tyg_proc_abort(fn.p);
+                throw CompileError { cat("tinygen: ", name, ": ", u.why) };
+            }
+        }
+        if (mod) mod->renderq.clear();
     }
 
     // After CodeGen has made the C half: the extern fns the object calls
@@ -7532,6 +7632,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         // A gs_init_globals built but not used stays in the object,
         // unreferenced, with what it asked of the C half.
         if (!cg.noglobalinit && !BuildInit(cg, why)) return false;
+        BuildRenders();
         for (auto &sh : mod->shims)
             if (TgFixedShim(sh.first).empty() && !OwnAccessor(sh.first)) {
                 initsym = TYG_NO_SYM;
