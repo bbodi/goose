@@ -405,6 +405,16 @@ struct TgModule {
     }
     // A variable-size struct (VsOk) is an image too, read where it lies.
     bool ImgOk(TypeExpr *t, int depth = 0) { return RzOk(t, depth) || VsOk(t, depth); }
+    // A resizable array whose elements are images (strings, variable-size
+    // structs): their bytes back to back on its stack, each walked by its
+    // size (CodeGen::SizeFn). The checker never lets one be indexed; it is
+    // built by push and read by `for`, len and text.
+    bool VeOk(TypeExpr *t, int depth = 0) {
+        if (!t || t->kind != TY_ARRAY || depth > 32) return false;
+        if (t->arr->akind != A_GROW && t->arr->akind != A_GROWSHRINK) return false;
+        auto e = t->arr->sub;
+        return e && !cg.IsFix(e) && ImgOk(e, depth + 1);
+    }
     static bool IsGrow(TypeExpr *t) {
         return t && t->kind == TY_ARRAY && (t->arr->akind == A_GROW || t->arr->akind == A_GROWSHRINK);
     }
@@ -2129,6 +2139,12 @@ struct TgFn {
             return { tyg_load(p, TYG_I64, pl.a, 0), tyg_load(p, TYG_I64, a8, 0), elem, -1 };
         }
         if (TgModule::IsLim(pl.t) && M.TypeOk(pl.t)) return LimView(pl);
+        if (IsGrow(pl.t) && M.VeOk(pl.t)) {
+            // Elements of variable size: walked from the first (StepElem).
+            auto a8 = pl.a;
+            a8.offset += 8;
+            return { tyg_load(p, TYG_I64, pl.a, 0), tyg_load(p, TYG_I64, a8, 0), pl.t->arr->sub, -1 };
+        }
         if (IsArrayKind(pl.t, A_VAR) && M.RzOk(pl.t)) {
             // A T[] image: the length prefix, the elements behind it.
             auto w = TgModule::LenWidth(pl.t);
@@ -2141,9 +2157,17 @@ struct TgFn {
         No(l, "array of this kind");
     }
     tyg_val ElemAddr(const View &v, tyg_val i) {
+        if (!cg.IsFix(v.elem)) No(Line {}, "an element of variable size by its index");
         auto esz = cg.FixedSize(v.elem);
         auto off = tyg_bin(p, TYG_MUL, i, tyg_iconst(p, TYG_I64, esz));
         return tyg_bin(p, TYG_ADD, v.elems, off);
+    }
+
+    // The element after the one at `at`: a fixed size on, or past its
+    // image's bytes.
+    tyg_val StepElem(const View &v, tyg_val at) {
+        if (cg.IsFix(v.elem)) return tyg_bin(p, TYG_ADD, at, tyg_iconst(p, TYG_I64, cg.FixedSize(v.elem)));
+        return tyg_bin(p, TYG_ADD, at, ImgSize(v.elem, at));
     }
 
     // An index as the i64 the checks and the address arithmetic take.
@@ -2182,7 +2206,7 @@ struct TgFn {
     V GenLen(Node *obj, Node *n) {
         auto ot = obj->exprtype;
         while (ot && IsAddrRef(ot)) ot = ot->ref->sub;
-        if (!ot || !(M.TypeOk(ot) || M.RzOk(ot)) || (ot->kind != TY_ARRAY && ot->kind != TY_SLICE))
+        if (!ot || !(M.TypeOk(ot) || M.RzOk(ot) || M.VeOk(ot)) || (ot->kind != TY_ARRAY && ot->kind != TY_SLICE))
             No(n->line, "len of this type");
         tyg_val len;
         if (ot->kind == TY_ARRAY && ot->arr->akind == A_FIXED) {
@@ -2871,6 +2895,19 @@ struct TgFn {
         auto an = c->ArgNodes();
         auto pl = Deref(Place(an[0]));
         if (TgModule::IsLim(pl.t)) return LimPush(c, pl);
+        if (IsGrow(pl.t) && M.VeOk(pl.t) && pl.stk) {
+            // An image element: built straight at the top of the array's own
+            // stack, behind the elements before it, then counted.
+            auto la = pl.a;
+            la.offset += 8;
+            auto at = GenImg(an[1], pl.stk, pl.t->arr->sub, c->line);
+            if (Ended()) return Dummy(c->exprtype);
+            tyg_store(p, TYG_I64, la, tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, la, 0), tyg_iconst(p, TYG_I64, 1)), 0);
+            V r;
+            r.t = c->exprtype && c->exprtype->kind == TY_REF ? c->exprtype : nullptr;
+            if (r.t) r.v = at;
+            return r;
+        }
         if (!IsGrow(pl.t) || !M.RzOk(pl.t) || !pl.stk) No(c->line, "push to an array of this kind");
         auto et = pl.t->arr->sub;
         auto x = GenAs(an[1], et);
@@ -3146,6 +3183,10 @@ struct TgFn {
                 auto il = tyg_local_new(p, 8, 8);
                 auto i = [&] { return tyg_load(p, TYG_I64, tyg_at_local(il, 0), 0); };
                 tyg_store(p, TYG_I64, tyg_at_local(il, 0), tyg_iconst(p, TYG_I64, 0), 0);
+                // The element's address, walked on from the first.
+                auto cl = tyg_local_new(p, 8, 8);
+                auto cur = [&] { return tyg_load(p, TYG_I64, tyg_at_local(cl, 0), 0); };
+                tyg_store(p, TYG_I64, tyg_at_local(cl, 0), v.elems, 0);
                 auto head = tyg_block_new(p), body = tyg_block_new(p), sep = tyg_block_new(p),
                      elem = tyg_block_new(p), out = tyg_block_new(p);
                 tyg_jump(p, head);
@@ -3157,7 +3198,8 @@ struct TgFn {
                 TextLit(stk, len, ", ");
                 tyg_jump(p, elem);
                 tyg_block_set(p, elem);
-                RenderInto(stk, len, P { tyg_at_val(ElemAddr(v, i()), 0), v.elem }, true, l, depth + 1);
+                RenderInto(stk, len, P { tyg_at_val(cur(), 0), v.elem }, true, l, depth + 1);
+                tyg_store(p, TYG_I64, tyg_at_local(cl, 0), StepElem(v, cur()), 0);
                 tyg_store(p, TYG_I64, tyg_at_local(il, 0), tyg_bin(p, TYG_ADD, i(), tyg_iconst(p, TYG_I64, 1)), 0);
                 tyg_jump(p, head);
                 tyg_block_set(p, out);
@@ -3295,6 +3337,26 @@ struct TgFn {
     V GenFormat(Call *c) {
         auto an = c->ArgNodes();
         auto pl = Deref(Place(an[0]));
+        if (TgModule::IsLim(pl.t) && M.TypeOk(pl.t) && IsU8(pl.t->arr->sub)) {
+            // Into a static-capacity u8[..k] (CodeGen::AppendBytes): the
+            // text rendered into a builder of the statement's, then its
+            // bytes appended under the capacity check.
+            auto b = RzTemp(cg.GrowU8(), c->line);
+            auto blen = b.a;
+            blen.offset += 8;
+            tyg_store(p, TYG_I64, b.a, Top(b.stk), 0);
+            tyg_store(p, TYG_I64, blen, tyg_iconst(p, TYG_I64, 0), 0);
+            TextInto(b.stk, blen, c, an, 1);
+            if (Ended()) return V {};
+            auto n = tyg_load(p, TYG_I64, blen, 0);
+            auto ol = LimLen(pl);
+            AbortUnless(tyg_cmp(p, TYG_SLE, tyg_bin(p, TYG_ADD, ol, n), tyg_iconst(p, TYG_I64, LimCap(pl.t))),
+                        "CAPACITY", c->line);
+            auto v = LimView(pl);
+            tyg_copy_dyn(p, tyg_bin(p, TYG_ADD, v.elems, LimLen(pl)), tyg_load(p, TYG_I64, b.a, 0), n);
+            LimSetLen(pl, tyg_bin(p, TYG_ADD, LimLen(pl), n));
+            return V {};
+        }
         if (!IsGrow(pl.t) || !M.RzOk(pl.t) || !pl.stk || !IsU8(pl.t->arr->sub))
             No(c->line, "format into an array of this kind");
         auto len = pl.a;
@@ -4209,7 +4271,7 @@ struct TgFn {
     }
 
     void Declare(VarDef *d, Line l) {
-        if (IsGrow(d->type) && M.RzOk(d->type) && !cg.PrefVar(d)) {
+        if (IsGrow(d->type) && (M.RzOk(d->type) || M.VeOk(d->type)) && !cg.PrefVar(d)) {
             // A resizable local: its header, and a stack of its own, empty.
             auto stk = Stk(AllocStk(true, l), l);
             auto hdr = tyg_local_new(p, 16, 8);
@@ -4457,11 +4519,34 @@ struct TgFn {
         auto at = [&]() { return path ? Place(f->iter) : once; };
         auto gi = tyg_local_new(p, 8, 8);
         tyg_store(p, TYG_I64, tyg_at_local(gi, 0), tyg_iconst(p, TYG_I64, 0), 0);
+        // Elements of variable size are walked with a cursor, each one's
+        // bytes on from the last (StepElem); the loop variable is the
+        // element's address, as a T[] local is its image's.
+        auto itt = f->iter->exprtype;
+        while (itt && IsAddrRef(itt)) itt = itt->ref->sub;
+        TypeExpr *ielem = !itt ? nullptr : itt->kind == TY_ARRAY ? itt->arr->sub
+                        : itt->kind == TY_SLICE ? itt->sub : nullptr;
+        auto walk = ielem && !cg.IsFix(ielem);
+        tyg_local cl = 0;
         tyg_scope_begin(p);
-        if (f->vdef) Declare(f->vdef, f->line);
+        if (f->vdef && walk) {
+            auto loc = tyg_local_new(p, 8, 8);
+            locals[f->vdef] = loc;
+            // A reference variable holds the address itself; a value one is
+            // read through it, as a T[] local is.
+            if (!IsAddrRef(f->vdef->type)) indirect.insert(f->vdef);
+            tyg_debug_var(p, string(f->vdef->name).c_str(), tyg_dt_pointer(m, M.DT(ielem)), tyg_at_local(loc, 0),
+                          M.File(f->vdef->line.fileidx), f->vdef->line.line);
+        } else if (f->vdef) {
+            Declare(f->vdef, f->line);
+        }
         if (f->idxdef) Declare(f->idxdef, f->line);
         auto head = tyg_block_new(p), body = tyg_block_new(p), step = tyg_block_new(p),
              done = tyg_block_new(p);
+        if (walk) {
+            cl = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(cl, 0), ViewOf(at(), f->line).elems, 0);
+        }
         tyg_jump(p, head);
         tyg_block_set(p, head);
         Loc(f->line);
@@ -4469,8 +4554,10 @@ struct TgFn {
         auto i = tyg_load(p, TYG_I64, tyg_at_local(gi, 0), 0);
         tyg_branch(p, tyg_cmp(p, TYG_SLT, i, v.len), body, done);
         tyg_block_set(p, body);
-        auto ea = ElemAddr(v, i);
-        if (f->vdef) {
+        auto ea = walk ? tyg_load(p, TYG_I64, tyg_at_local(cl, 0), 0) : ElemAddr(v, i);
+        if (f->vdef && walk) {
+            tyg_store(p, TYG_I64, tyg_at_local(locals[f->vdef], 0), ea, 0);
+        } else if (f->vdef) {
             auto vt = f->vdef->type;
             P dst { tyg_at_local(locals[f->vdef], 0), vt };
             if (vt->kind == TY_REF && v.elem->kind != TY_REF) {
@@ -4491,6 +4578,10 @@ struct TgFn {
         Loc(f->line);
         auto i2 = tyg_load(p, TYG_I64, tyg_at_local(gi, 0), 0);
         tyg_store(p, TYG_I64, tyg_at_local(gi, 0), tyg_bin(p, TYG_ADD, i2, tyg_iconst(p, TYG_I64, 1)), 0);
+        if (walk) {
+            auto c0 = tyg_load(p, TYG_I64, tyg_at_local(cl, 0), 0);
+            tyg_store(p, TYG_I64, tyg_at_local(cl, 0), tyg_bin(p, TYG_ADD, c0, ImgSize(ielem, c0)), 0);
+        }
         tyg_jump(p, head);
         tyg_block_set(p, done);
         tyg_scope_end(p);
