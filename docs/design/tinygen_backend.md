@@ -110,8 +110,9 @@ directly. The externs called count as used (`CodeGen::usedexterns`), so the
 native parts of the packages they come from are built and linked as for C
 (`NativePackagesUsed`).
 
-**Data stacks** (§6.2) stay entirely in C for now: a tinygen function builds
-nothing on a stack, and calls no C function that takes `gs_sp`. The stack
+**Data stacks** (§6.2) stay in C for now: a tinygen function allocates
+nothing on a stack of its own (it grows only arrays it was handed, see the
+third stage), and calls no C function that takes `gs_sp`. The stack
 accounting (`codegen_stacks.h`) counts what C functions use; a tinygen
 function counts as owning none.
 
@@ -255,6 +256,7 @@ backend compiles:
 | first (scalars, structs, control flow) | 542 of 3811 (14%) | 0 of 172 |
 | second, so far (fixed arrays, slices) | 952 of 3811 (25%) | 1 of 172 |
 | second, so far (+ multiple results, globals) | 1099 of 3811 (29%) | 1 of 172 |
+| third, so far (strings and resizable arrays handed in) | 1241 of 3811 (33%) | 53 of 172 |
 
 (The first stage's own write-up counted 394 of 3331 over 284 programs, an
 older sweep; the rows above come from the same one.) The step that added
@@ -272,13 +274,76 @@ than `print` and `len` (108), calls to functions using data stacks (95), and
 globals of the types above (51). Goose-in-Goose passes strings and resizable
 arrays nearly everywhere, which is stage 3.
 
+## What the third stage adds so far: strings and resizable arrays handed in
+
+A function that receives a string or a resizable array, reads it, and
+grows it, compiles through tinygen; one that builds one of its own (a
+local, a result, `str`, a literal) stays in C. The representations are the
+C backend's (§6.1, C.3), so either half calls the other:
+
+* **types**: a variable array `T[]` / `T[uN]` of fixed elements (a `u8[]`
+  string), an image of its length prefix and its elements that a
+  `uint8_t *` points at; a resizable `T[>..]` / `T[>..<]` of fixed
+  elements, a `gs_rhdr { base, len }` with the elements on a data stack,
+  ending at its top. Never as a local or a result: behind a reference, or
+  as a by-value parameter. A plain reference to a `T[]` is that pointer; to
+  a resizable, a fat reference `gs_rref { hdr, stk }`, which tinygen is
+  given as a record of two pointers (C passes its members as two
+  parameters, `ParamFields`; the same registers on arm64 and SysV x86-64).
+  A by-value `T[]` parameter is the address of the caller's copy; a
+  by-value `T[>..]` its header (as a slice's record), then its
+  `gs_stack *`, as `SigParams` spells them. Such a function takes `gs_sp`,
+  which it does not use; calling one, whose argument must be copied onto a
+  stack, stays in C.
+* **reading**: `len`, indexing (with the bounds check), slicing, `for`
+  over them (by value, by reference, with an index), a view as a slice
+  argument (`const u8[:]`), and `print` of any `u8` array or slice as its
+  bytes (`gs_out_bytes`), as the C prints one (`SimpleText`).
+* **passing on**: a fat reference to another function (an existing one, or
+  `&v` of a by-value parameter, its header's address and its stack), a
+  `u8[]&` as its pointer.
+* **growing**: `v.push(x)` of a fixed element through a fat reference or
+  on a by-value parameter: the receiver, then the element (which may grow
+  the same array), then the slot at the stack's top, the top and the count
+  raised (`EmitPush`); its value is the element's address. No check, as in
+  the C: the stack's reservation guards it.
+
+Debug info names them by their Goose types as the C half's structs: a
+`T[]` as a record `u8[]` of its `len` (the prefix's type) and `data` (an
+array of unknown size), a by-value one as a pointer to it; a resizable as
+`i64[>..]` with `base` and `len` (`gs_rhdr`); a fat reference as `i64[>..]&`
+with `hdr` and `stk` (a pointer to a `gs_stack` record with its `top`):
+
+```
+(lldb) p *s
+(u8[])  (len = 5, data = u8[] @ 0x000000769cf7ce84)
+(lldb) frame variable v
+(i64[>..]&) v = { hdr = 0x000000016fdfe830  stk = 0x0000000100610fa0 }
+(lldb) parray 3 v.hdr->base
+```
+
+What still sends a function to C, by count over the sweep: a parameter of
+a type the backend does not hold (462: variable-size elements, frame
+objects such as a `Compiler&`, ADTs, pools), a local of such a type (390:
+mostly `var s: u8[>..] = []` builders), a result of such a type (385),
+free variables (329 and 32 calls), builtins other than `print`, `len` and
+`push` (184: `append`, `str`, `format`, `copy`), calls through function
+values and dispatch (174), `return from` (158), globals (129), and calls to
+functions using data stacks (103). Next: locals and results, which need a
+tinygen function to own stack indices (`AllocStk`, `SpTop`, the stack
+accounting of `codegen_stacks.h` counting it), scope-exit restores, and the
+destination-stack result convention (`gs_dst`, `gs_rl`); then `append`,
+and `str`/`format` through the C half's render functions.
+
 ## Testing
 
 `test/tinygen/` holds fixtures the backend covers whole: scalars,
 structs, extern calls with C of their own (a sidecar), a division by zero
 that must abort with the Goose line, arrays and slices (ending in a failed
-bounds check), a slice whose bounds fail, multiple results, and globals
-(mutable ones, static data, and one whose initializer calls a function). They are ordinary fixtures, run by the
+bounds check), a slice whose bounds fail, multiple results, globals
+(mutable ones, static data, and one whose initializer calls a function),
+and strings and resizable arrays handed to functions (whose `main`, which
+builds them, stays in C). They are ordinary fixtures, run by the
 main suite through both C backends against `test/expected/`.
 `test/tinygen_backend.py` (the "tinygen backend" section of `run_tests.py`)
 builds them with `--backend=tinygen`, requires every function to go through
@@ -292,7 +357,8 @@ with the same expected output. Where `lldb` is installed it runs one program
 under it and requires a breakpoint by Goose function name, Goose lines in the
 frame and its caller, and a parameter and a local with Goose types; and one
 more for a slice parameter's `data` and `len` and a fixed array's elements,
-and one for a static global by its Goose name.
+one for a static global by its Goose name, and one for a `u8[]` image and
+a resizable array's fat reference, header and elements.
 
 ## What tinygen lacks for Goose
 
@@ -313,7 +379,10 @@ Recorded here rather than changed in tinygen, which other work is changing:
    count or none, so the backend describes a slice as a plain record of
    `data` and `len` (see the second stage); a `tyg_dt_array` whose count is
    a member of the enclosing record (or a location expression) would let
-   lldb and gdb show its elements directly.
+   lldb and gdb show its elements directly. The same holds for a
+   resizable array's header (`base` and `len`) and a `u8[]` image, whose
+   `data` is an array of unknown size, so a debugger shows only its
+   address.
 4. **The source language, and lldb's formatters.** tinygen now names the
    unit's language (`tyg_module_language`); the backend says C11, as the C
    half's unit does. Tried under lldb (Xcode's, macOS arm64) with C99, C11,
@@ -367,7 +436,9 @@ Recorded here rather than changed in tinygen, which other work is changing:
    Next: static-capacity `T[..k]`, fixed-mode enums and `match`, optional references and null
    tests, `block`/`break` with values, and `InlineBlock`, so that `-O1` and
    `-O2` builds stay in tinygen.
-3. **Data stacks**: resizable and variable-size values, `gs_sp` and the stack
+3. **Data stacks**: done so far: strings and resizable arrays of fixed
+   elements as reference and by-value parameters, read, passed on and
+   pushed to. Next: resizable and variable-size values, `gs_sp` and the stack
    accounting (`CodeGen` exposing `NoteStackCall`/`stackown` to the second
    backend), `push`/`append`/`str`/`format`, rendering composites through the
    C half's render functions (given external linkage), free variables of
