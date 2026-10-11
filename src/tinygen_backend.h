@@ -541,8 +541,8 @@ struct TgModule {
     }
     // A by-value parameter of a type RzOk or VsOk holds.
     bool RzParam(TypeExpr *t) {
-        return (t->kind == TY_ARRAY && (RzOk(t) || VarImgOk(t) || RcOk(t))) || VsOk(t) || VrOk(t) || VmOk(t) || VvOk(t) ||
-               FoOk(t) || RsOk(t) || RbOk(t);
+        return (t->kind == TY_ARRAY && (RzOk(t) || VarImgOk(t) || RcOk(t) || VeOk(t))) || VsOk(t) || VrOk(t) || VmOk(t) ||
+               VvOk(t) || FoOk(t) || RsOk(t) || RbOk(t);
     }
     tyg_scalar Scal(TypeExpr *t) {
         switch (t->kind) {
@@ -2125,7 +2125,7 @@ struct TgFn {
                     tyg_iconst(p, TYG_I64, (int64_t)s->val.size()));
             return;
         }
-        auto pl = LimCallResult(n) ? LimCallPlace(n) : Place(n);
+        auto pl = ElemsSource(n, l);
         if (Ended()) return;
         auto v = ViewOf(pl, l);
         if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
@@ -2447,6 +2447,27 @@ struct TgFn {
         return P { tyg_at_val(tyg_load(p, TYG_I64, base.a, 0), sh.offs[(size_t)fi]), ei->vftypes[(size_t)vi][(size_t)fi] };
     }
 
+    // Where the elements an array is built from lie: the place of n.
+    // The checker types a popped or default fixed array as the T[] it is
+    // adapted to, but a fixed array is what lies there: its elements are
+    // copied from it (CodeGen::EmitPop, B_DEFAULT).
+    static bool IsStrCall(Node *n) {
+        auto c = Is<Call>(n);
+        return c && c->builtin == B_STR;
+    }
+    static bool FixedTyped(Node *n) {
+        auto pc = Is<Call>(n);
+        return pc && (pc->builtin == B_POP || pc->builtin == B_DEFAULT);
+    }
+    P ElemsSource(Node *n, Line l) {
+        if (FixedTyped(n)) {
+            auto x = Gen1(n);
+            if (Ended()) return P {};
+            if (!x.mem) No(l, "popped value in no memory");
+            return P { x.a, x.t, x.stk };
+        }
+        return LimCallResult(n) ? LimCallPlace(n) : Place(n);
+    }
     // The function a call to it builds its first result at a destination
     // for (CodeGen's in-place construction): its own, or a dispatch's
     // first case, whose results all the cases share.
@@ -2635,7 +2656,8 @@ struct TgFn {
                                                          tyg_bin(p, TYG_MUL, cap, tyg_iconst(p, TYG_I64, esz)))));
             return;
         }
-        if (n && !from && !al && !Is<StrLit>(n) && !LimCallResult(n) && n->exprtype && cg.TEq(n->exprtype, t)) {
+        if (n && !from && !al && !Is<StrLit>(n) && !LimCallResult(n) && !FixedTyped(n) && !IsStrCall(n) && n->exprtype &&
+            cg.TEq(n->exprtype, t)) {
             auto src = Deref(Place(n));
             if (Ended()) return;
             ImgCopy(stk, tyg_addr_of(p, src.a), t);
@@ -2652,12 +2674,13 @@ struct TgFn {
         if (from) {
             if (cg.Mangle(from->elem) != cg.Mangle(et)) No(l, "array of another element type");
             CopyView(stk, len, et, *from);
-        } else if (al || Is<StrLit>(n)) {
+        } else if (al || Is<StrLit>(n) || IsStrCall(n)) {
             GenRz(n, stk, hdr, t, l);
         } else if (n) {
             if (auto c = Is<Call>(n); c && c->builtin == B_COPY) n = c->ArgNodes()[0];
-            auto v = ViewOf(LimCallResult(n) ? LimCallPlace(n) : Place(n), l);
+            auto pl = ElemsSource(n, l);
             if (Ended()) return;
+            auto v = ViewOf(pl, l);
             if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
             CopyView(stk, len, et, v);
         }
@@ -4631,6 +4654,24 @@ struct TgFn {
             auto x = RzTemp(t, al->line);
             GenRz(al, x.stk, x.a, t, al->line);
             return x;
+        }
+        if (t && t->kind == TY_SLICE && M.TypeOk(t) && !al->capexpr && cg.IsFix(t->sub)) {
+            // A literal in slice position: a temporary fixed array, sliced
+            // whole (CodeGen::GenFixedArrayLit).
+            auto count = al->fillval ? (Is<IntLit>(al->fillcount) ? Is<IntLit>(al->fillcount)->val : -1)
+                                     : (int64_t)al->elems.size();
+            if (count < 0) No(al->line, "fill count");
+            auto at = M.ast.ArrayOf(t->sub, A_FIXED, al->line, count);
+            // Put back even when the literal is left to C.
+            struct Restore {
+                ArrayLit *al;
+                TypeExpr *t;
+                ~Restore() { al->exprtype = t; }
+            } restore { al, t };
+            al->exprtype = at;
+            auto av = GenArrayLit(al);
+            if (Ended() || !av.mem) return Dummy(t);
+            return SliceValue(t, tyg_addr_of(p, av.a), tyg_iconst(p, TYG_I64, count));
         }
         if (!t || t->kind != TY_ARRAY || t->arr->akind != A_FIXED || !M.TypeOk(t) || al->capexpr)
             No(al->line, cat("array literal of type ", t ? M.NameWhy(t) : "?"));
@@ -6663,7 +6704,18 @@ struct TgFn {
     V GenStr(Call *c) {
         auto t = c->exprtype;
         auto slice = t && t->kind == TY_SLICE && IsU8(t->sub);
-        if (t && TgModule::IsLim(t) && M.LimHeld(t) && IsU8(t->arr->sub)) {
+        if (t && M.RcOk(t) && IsU8(t->arr->sub)) {
+            // Typed as a runtime-capacity u8[..]: its image, the text
+            // its elements (GenRc).
+            auto stk = Stk(AllocStk(false, c->line), c->line);
+            auto at = GenImg(c, stk, t, c->line);
+            V r;
+            r.t = t;
+            r.mem = true;
+            r.a = tyg_at_val(at, 0);
+            return r;
+        }
+        if (t && TgModule::IsLim(t) && M.TypeOk(t) && IsU8(t->arr->sub)) {
             // Typed as a static-capacity u8[..k]: the text rendered as a
             // resizable's, then copied under the capacity check.
             auto r = RzTemp(cg.GrowU8(), c->line);
@@ -10984,6 +11036,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     // need no more data stacks than the C's (stackneed[nullptr], which
     // gs_rt_init's counts were made with). Else why not.
     tyg_sym initsym = TYG_NO_SYM;
+    int64_t initstacks = 0;   // The data stacks gs_tg_init_globals uses at once.
     bool BuildInit(CodeGen &cg, string &why) {
         auto nshims = mod->shims.size(), nexterns = mod->externs.size(), ndirect = mod->direct.size();
         auto sym = mod->Sym("gs_tg_init_globals", TYG_SYM_FUNC);
@@ -11009,7 +11062,12 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         }
         int64_t need = fn.maxown;
         for (auto &c : fn.stackcalls) need = std::max(need, c.offset + cg.stackneed[c.callee]);
-        if (need > cg.stackneed[nullptr]) return why = "global initializers' data stacks", false;
+        // The C's count for it is what its own code needs; this one's
+        // temporaries (a dispatch's result before it is re-prefixed) may
+        // need more, which the program's main asks the runtime for.
+        if (need > cg.rtinit[0] && cg.maxstacks > 0 && need > cg.maxstacks)
+            return why = "global initializers' data stacks", false;
+        initstacks = need;
         // Extern fns: as for any function of a whole program.
         for (auto sp : mod->externs)
             if (!ExternHeld(sp)) return why = cat("extern ", sp->sf->cname), false;
@@ -11110,9 +11168,13 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                      (int)as.size(), nullptr, nullptr);
         };
         const tyg_type *sps[] = { i32, ptr, i64, i64, i64 };
+        // The main program's stacks, or what the initializers use if more
+        // (the global regions follow them).
+        auto mainstacks = std::max(cg.rtinit[0], initstacks);
         call(tyg_sig_new(m, nullptr, sps, 5, 0), "gs_tg_start",
-             { tyg_param(p, 0), tyg_param(p, 1), tyg_iconst(p, TYG_I64, cg.rtinit[0]),
-               tyg_iconst(p, TYG_I64, cg.rtinit[1]), tyg_iconst(p, TYG_I64, cg.rtinit[2]) });
+             { tyg_param(p, 0), tyg_param(p, 1), tyg_iconst(p, TYG_I64, mainstacks),
+               tyg_iconst(p, TYG_I64, cg.rtinit[1] + mainstacks - cg.rtinit[0]),
+               tyg_iconst(p, TYG_I64, cg.rtinit[2]) });
         // The queues, before anything that could use one runs.
         for (auto &[acc, q] : mod->queueacc) {
             auto addr = tyg_call(p, tyg_sig_new(m, ptr, nullptr, 0, 0), tyg_direct(mod->Sym(acc, TYG_SYM_FUNC | TYG_SYM_GLOBAL)),
