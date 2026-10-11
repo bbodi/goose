@@ -556,6 +556,9 @@ struct TgModule {
     }
 
     map<const VarDef *, string> stkaccessors;
+    // The `return from` channels' accessors (gs_tg_lret_<tid>_<i>), with
+    // the target and result each gives.
+    map<string, pair<FnSpec *, size_t>> channels;
     string StackAccessor(VarDef *d) {
         auto it = stkaccessors.find(d);
         auto name = it != stkaccessors.end() ? it->second
@@ -2748,6 +2751,7 @@ struct TgFn {
         auto tid = cg.fromids[t];
         auto name = cat("gs_tg_lret_", tid, "_", i);
         M.NeedShim(name, cat("void *", name, "(void) { return &gs_lret_", tid, "_", i, "; }\n"));
+        M.channels[name] = { t, i };
         return tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(name), 0), 0), 0);
     }
     // Every frame on a propagation's way out returns at once: its stacks
@@ -3398,7 +3402,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     // live specialization compiled, nothing asked of the C half that the
     // support object (TgSupportBody) or the object itself does not hold --
     // globals it can lay out and initialize (gs_init_globals built here),
-    // no `return from` channels, extern fns the runtime
+    // `return from` channels of fixed types, extern fns the runtime
     // exports or the support object has trampolines for -- and a plain
     // main without threads. Else why not.
     bool WholeProgram(CodeGen &cg, string &why) {
@@ -3463,8 +3467,10 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     }
 
     // Whether a program-specific shim is one the object defines itself:
-    // a global's accessor.
+    // a global's accessor, or a `return from` channel's of a fixed type.
     bool OwnAccessor(const string &name) {
+        if (auto it = mod->channels.find(name); it != mod->channels.end())
+            return mod->TypeOk(it->second.first->rets[it->second.second]);
         for (auto &[d, n] : mod->accessors)
             if (n == name) return true;
         for (auto &[d, n] : mod->stkaccessors)
@@ -3548,6 +3554,16 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         };
         for (auto &[d, n] : mod->accessors) accessor(n, gsyms.at(d));
         for (auto &[d, n] : mod->stkaccessors) accessor(n, ssyms.at(d));
+        // The `return from` channels, which the C half keeps thread-local:
+        // a whole program has one thread, so plain data (gap 6).
+        for (auto &sh : mod->shims) {
+            auto it = mod->channels.find(sh.first);
+            if (it == mod->channels.end()) continue;
+            auto t = it->second.first->rets[it->second.second];
+            auto sym = tyg_symbol(m, cat("gs_", sh.first.substr(6)).c_str(), 0);   // gs_lret_<tid>_<i>
+            tyg_data(m, sym, TYG_SECTION_BSS, nullptr, std::max<int64_t>(mod->Size(t), 1), 8);
+            accessor(sh.first, sym);
+        }
     }
 
     // The C main of a whole program build, which the C half otherwise
