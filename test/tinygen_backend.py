@@ -6,7 +6,8 @@ of its own and the rest in the C, and run; its output must be the blessed
 one the C backends are held to. The test/tinygen/ fixtures must go through
 tinygen whole (every function compiled by it), and some are also built
 with chosen functions left to C, so that calls cross between the two
-halves in both directions (structs, arrays and slices, multiple results);
+halves in both directions (structs, arrays and slices, multiple results,
+strings and resizable arrays);
 the other programs are ones the backend covers in part. Where lldb is installed, one program is run under it to see
 that the debugger finds a Goose function by name and shows its Goose source
 line, its parameters and its locals with their Goose types.
@@ -50,6 +51,12 @@ PROGRAMS = [
     ("test/tinygen/tinygen_globals.goose", False, ["--tinygen-skip=main"]),
     ("test/tinygen/tinygen_globals.goose", False,
      ["--tinygen-skip=start_seed,divmod,bump,next,move_to,sum_primes"]),
+    # main builds strings and resizable arrays, which stays in C so far.
+    ("test/tinygen/tinygen_strings.goose", False, []),
+    ("test/tinygen/tinygen_strings.goose", False, ["--debug"]),
+    ("test/tinygen/tinygen_strings.goose", False,
+     ["--tinygen-skip=count,first_last,total,sum_view,addto,own"]),
+    ("test/tinygen/tinygen_strings.goose", False, ["--tinygen-skip=walk,shout,far"]),
     ("test/codegen/loop_invariant_divisors.goose", False, []),
     ("test/codegen/cnames.goose", False, []),
     ("test/codegen/wider_slot_operations.goose", False, []),
@@ -197,6 +204,35 @@ def check_lldb_globals(exe, base, lldb, ok, fail):
         fail("tinygen global debug info under lldb", f"missing {want}:\n{text}")
         return
     ok("tinygen debug info under lldb: a global")
+    check_lldb_strings(exe, base, lldb, ok, fail)
+
+
+def check_lldb_strings(exe, base, lldb, ok, fail):
+    """A by-value u8[] as the image it points at, and a resizable array's
+    fat reference as its header and stack, the header's elements reached
+    through its base, by their Goose types."""
+    source = HERE / "tinygen" / "tinygen_strings.goose"
+    out = base / f"lldb-strings{tc.EXE_SUFFIX}"
+    good, log, _, _ = build(exe, source, out, [])
+    if not good:
+        fail("tinygen lldb strings build", log)
+        return
+    code, o, e = tc.run_capture([lldb, "-b", "-o", "b first_last", "-o", "b total", "-o", "run",
+                                 "-o", "p *s", "-o", "continue", "-o", "frame variable v",
+                                 "-o", "p *v.hdr", "-o", "parray 3 v.hdr->base", "-o", "kill",
+                                 out])
+    text = o + e
+    wants = [
+        r"\(u8\[\]\)\s*\(len = 5, data = ",
+        r"\(i64\[>\.\.\]&\) v = \{\s*hdr = 0x[0-9a-f]+\s*stk = 0x[0-9a-f]+",
+        r"\(i64\[>\.\.\]\) \{\s*base = 0x[0-9a-f]+\s*len = 3",
+        r"\[0\] = 1\s*\[1\] = 2\s*\[2\] = 3",
+    ]
+    missing = [w for w in wants if not re.search(w, text)]
+    if missing:
+        fail("tinygen string debug info under lldb", f"missing {missing}:\n{text}")
+        return
+    ok("tinygen debug info under lldb: a string and a resizable array")
 
 
 if __name__ == "__main__":
