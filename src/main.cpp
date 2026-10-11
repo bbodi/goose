@@ -1015,8 +1015,6 @@ int Main(int argc, char **argv) {
         if (stacks) cg.StackReport(msgs, stackcfg);
         #if GOOSE_HAVE_TINYGEN
             if (tgb) {
-                tgb->Compile(cg);
-                cg.result += tgb->Shims(cg);
                 fprintf(msgs, "tinygen: %d of %d function(s) compiled, %d left to C\n",
                         (int)tgb->taken.size(), (int)cg.livespecs.size(), (int)tgb->left.size());
                 if (verbose)
@@ -1038,6 +1036,10 @@ int Main(int argc, char **argv) {
                 tgwhole = whynot.empty() && tgb->WholeProgram(cg, whynot);
                 tgchecks = tgb->checks;
                 if (tgwhole) tgb->EmitMain(cg);
+                // After WholeProgram, which may have built gs_init_globals
+                // into the object and asked the C half for more.
+                tgb->Compile(cg);
+                cg.result += tgb->Shims(cg);
                 if (verbose)
                     fprintf(msgs, tgwhole ? "tinygen: whole program: no C compiled for it\n"
                                           : "tinygen: mixed: the C half compiled by the C compiler (%s)\n",

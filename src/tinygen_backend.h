@@ -48,6 +48,8 @@ inline string TgFixedShim(const string &name) {
                        "_", sfx, "(a, b, f, l); }\n");
         }
     if (name == "gs_tg_stks") return "void *gs_tg_stks(void) { return gs_stks; }\n";
+    if (name == "gs_tg_stack_init")
+        return "void gs_tg_stack_init(void *s) { gs_stack_init((gs_stack *)s); }\n";
     if (name == "gs_tg_rf") return "void *gs_tg_rf(void) { return &gs_rf; }\n";
     if (name == "gs_tg_rfpanic")
         return "void gs_tg_rfpanic(void) { gs_panic(\"unexpected long-distance return\"); }\n";
@@ -132,7 +134,7 @@ inline string TgSupportBody(string_view runtimeh) {
             if (IsUnsigned(is) && string(op) != "div" && string(op) != "mod") continue;
             s += TgFixedShim(cat("gs_tg_", op, "_", CodeGen::IntSfx(is)));
         }
-    for (auto n : { "gs_tg_stks", "gs_tg_rf", "gs_tg_rfpanic", "gs_tg_f2iwrap", "gs_tg_f2u", "gs_tg_f2i",
+    for (auto n : { "gs_tg_stks", "gs_tg_stack_init", "gs_tg_rf", "gs_tg_rfpanic", "gs_tg_f2iwrap", "gs_tg_f2u", "gs_tg_f2i",
                     "gs_tg_range_u", "gs_tg_range", "gs_tg_slicefail" })
         s += TgFixedShim(n);
     // The codes of the runtime's error enum, one per line: "    GS_E_POP,".
@@ -525,10 +527,12 @@ struct TgModule {
     // ---- Globals -----------------------------------------------------------
 
     // A global this backend reaches: a fixed value it holds, not a pool's.
-    // Every global stays the C half's (gs_globals_t, initialized by
-    // gs_init_globals as for any build), and is reached through an
-    // accessor the C half exports, which returns its address in the
-    // running thread's instance (GS_GL; Global). A `let` of a const type
+    // In a mixed build every global stays the C half's (gs_globals_t,
+    // initialized by gs_init_globals as for any build), and is reached
+    // through an accessor the C half exports, which returns its address in
+    // the running thread's instance (GS_GL; Global); a whole program's
+    // object defines the accessors and the globals itself
+    // (TinyGenBackend::EmitGlobalStorage). A `let` of a const type
     // with a compile-time initializer, which the C makes static data
     // (CodeGen::EmitGlobalDecls), is static data in this object too, read
     // where it lies (StaticGlobal).
@@ -902,7 +906,7 @@ struct TgFn {
             while (s->cyclelink) s = s->cyclelink;
             return s;
         };
-        if (live && sp->incycle && callee->incycle && cycle(sp) == cycle(callee))
+        if (live && sp && sp->incycle && callee->incycle && cycle(sp) == cycle(callee))
             No(l, "data stack held across a call into the recursive cycle");
         stackcalls.push_back({ callee, live, l });
         return tyg_bin(p, TYG_ADD, SpVal(l), tyg_iconst(p, TYG_I64, live));
@@ -2621,6 +2625,7 @@ struct TgFn {
             case NK_ForLoop: return StmtFor(static_cast<ForLoop *>(n));
             case NK_Return: {
                 auto r = static_cast<Return *>(n);
+                if (!sp) No(n->line, "return in a global initializer");
                 if (r->target != sp->sf) return GenFromReturn(r);
                 return DoReturn(r->vals, r->line);
             }
@@ -2763,7 +2768,7 @@ struct TgFn {
     void GenFromReturn(Return *r) {
         auto t = r->targetspec;
         auto l = r->line;
-        if (!t || !cg.fromids.count(t) || !cg.sinfo[sp].hasrf) No(l, "return from");
+        if (!sp || !t || !cg.fromids.count(t) || !cg.sinfo[sp].hasrf) No(l, "return from");
         auto &rets = t->rets;
         for (auto rt : rets)
             if (!M.TypeOk(rt)) No(l, cat("return from with a result of type ", M.Name(rt)));
@@ -2789,7 +2794,7 @@ struct TgFn {
         tyg_branch(p, tyg_cmp(p, TYG_NE, rf, tyg_iconst(p, TYG_I32, 0)), on, cont);
         tyg_block_set(p, on);
         auto elsewhere = [&] {
-            if (cg.sinfo[sp].hasrf) {
+            if (sp && cg.sinfo[sp].hasrf) {
                 Propagate();
             } else {
                 M.NeedShim("gs_tg_rfpanic");
@@ -2797,7 +2802,7 @@ struct TgFn {
                 tyg_unreachable(p);
             }
         };
-        if (callee->needs.count(sp)) {
+        if (sp && callee->needs.count(sp)) {
             auto tid = cg.fromids[sp];
             auto here = tyg_block_new(p), other = tyg_block_new(p);
             tyg_branch(p, tyg_cmp(p, TYG_EQ, rf, tyg_iconst(p, TYG_I32, tid)), here, other);
@@ -3203,18 +3208,79 @@ struct TgFn {
             if (sp->rets.empty()) tyg_ret(p, 0);
             else tyg_trap(p);
         }
-        // The addresses of the globals the body names, and the stack block.
+        Finish(sp->sf->line);
+    }
+
+    // The entry's block (gblk): the addresses of the globals the body
+    // names, and the stack block, then on to the body (gstart).
+    void Finish(Line line) {
         tyg_block_set(p, gblk);
-        Loc(sp->sf->line);
+        Loc(line);
         if (stksl) tyg_store(p, TYG_I64, tyg_at_local(stksl, 0), CallC("gs_tg_stks", {}, {}, tyg_type_ptr(m)), 0);
         for (auto &[acc, loc] : gaddrs)
             tyg_store(p, TYG_I64, tyg_at_local(loc, 0), CallC(acc, {}, {}, tyg_type_ptr(m)), 0);
         tyg_jump(p, gstart);
         if (tyg_proc_end(p) != 0) {
             p = nullptr;
-            No(sp->sf->line, cat("tinygen: ", tyg_error(m) ? tyg_error(m) : "?"));
+            No(line, cat("tinygen: ", tyg_error(m) ? tyg_error(m) : "?"));
         }
         p = nullptr;
+    }
+
+    // gs_init_globals as a procedure of the object, for a whole program
+    // build (CodeGen::EmitGlobalInit): each initializer in declaration
+    // order with gs_sp fixed at 0, a resizable or T[] global built on its
+    // dedicated stack, reserved first (gs_stack_init). No sp: what refers
+    // to the function's own results (return, return from) is unsupported.
+    void EmitInit(tyg_sym sym, Line line) {
+        p = tyg_proc_begin(m, sym, tyg_sig_new(m, nullptr, nullptr, 0, 0));
+        if (!p) No(line, cat("tyg_proc_begin: ", tyg_error(m) ? tyg_error(m) : "?"));
+        tyg_debug_proc(p, "gs_init_globals", M.File(line.fileidx), line.line,
+                       tyg_dt_func(m, tyg_dt_void(m), nullptr, 0, 0));
+        Loc(line);
+        spl = tyg_local_new(p, 8, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(spl, 0), tyg_iconst(p, TYG_I64, 0), 0);
+        gblk = tyg_block_new(p);
+        gstart = tyg_block_new(p);
+        tyg_jump(p, gblk);
+        tyg_block_set(p, gstart);
+        OpenScope(false);
+        for (auto g : M.ast.globals) {
+            if (g->inits.empty()) continue;
+            if (g->defs.size() != g->inits.size()) No(g->line, "global initializer of several results");
+            OpenScope(true);
+            for (size_t i = 0; i < g->defs.size() && !Ended(); i++) {
+                auto d = g->defs[i];
+                auto init = g->inits[i];
+                if (cg.gstatic.count(d)) continue;   // Static data.
+                Loc(init->line);
+                if (!M.GlobalOk(d) || cg.IsFrameObj(d->type) ||
+                    (d->type->kind == TY_REF && d->type->ref->lenstorage >= 0))
+                    No(d->line, "global of this kind");
+                if (IsGrow(d->type) || IsVarArr(d->type)) {
+                    auto at = tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(M.Accessor(d)), 0), 0);
+                    auto stk = tyg_load(p, TYG_I64, tyg_at_local(AccessorLocal(M.StackAccessor(d)), 0), 0);
+                    M.NeedShim("gs_tg_stack_init");
+                    CallC("gs_tg_stack_init", { tyg_type_ptr(m) }, { stk }, nullptr);
+                    if (IsGrow(d->type)) {
+                        // CodeGen::InitGlobalStack: an empty array, then
+                        // its elements.
+                        tyg_store(p, TYG_I64, tyg_at_val(at, 0), Top(stk), 0);
+                        tyg_store(p, TYG_I64, tyg_at_val(at, 8), tyg_iconst(p, TYG_I64, 0), 0);
+                        GenRz(init, stk, tyg_at_val(at, 0), d->type, init->line);
+                    } else {
+                        auto img = GenImg(init, stk, d->type, init->line);
+                        if (!Ended()) tyg_store(p, TYG_I64, tyg_at_val(at, 0), img, 0);
+                    }
+                    continue;
+                }
+                Into(GlobalPlace(d, init->line), init);
+            }
+            CloseScope();
+        }
+        CloseScope();
+        if (!Ended()) tyg_ret(p, 0);
+        Finish(line);
     }
 };
 
@@ -3330,10 +3396,11 @@ struct TinyGenBackend : CodeGen::SpecBackend {
 
     // Whether the object can be the whole program, with no C half: every
     // live specialization compiled, nothing asked of the C half that the
-    // support object (TgSupportBody) does not hold -- no globals to
-    // initialize or reach, no `return from` channels, extern fns the
-    // runtime exports or the support object has trampolines for -- and a
-    // plain main without threads. Else why not.
+    // support object (TgSupportBody) or the object itself does not hold --
+    // globals it can lay out and initialize (gs_init_globals built here),
+    // no `return from` channels, extern fns the runtime
+    // exports or the support object has trampolines for -- and a plain
+    // main without threads. Else why not.
     bool WholeProgram(CodeGen &cg, string &why) {
         auto mainsf = ast.MainFunction();
         auto mainsp = mainsf && !mainsf->specs.empty() ? mainsf->specs[0] : nullptr;
@@ -3344,23 +3411,149 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                  !cg.sinfo[mainsp].freevars.empty())
             why = "no plain main";
         else if (cg.usesthreads || !cg.queues.empty()) why = "threads";
-        else if (!cg.noglobalinit) why = "globals to initialize";
         if (!why.empty()) return false;
         for (auto sf : ast.functions)
             if (sf->isexport) return why = "export fns", false;
-        for (auto &sh : mod->shims)
-            if (TgFixedShim(sh.first).empty()) return why = cat("C half's ", sh.first), false;
         for (auto sp : mod->externs) {
             auto found = false;
             for (auto &x : TgSupportExterns()) found = found || sp->sf->cname == x.name;
             if (!found) return why = cat("extern ", sp->sf->cname), false;
         }
+        if (!GlobalsOk(cg, why)) return false;
+        // A gs_init_globals built but not used stays in the object,
+        // unreferenced, with what it asked of the C half.
+        if (!cg.noglobalinit && !BuildInit(cg, why)) return false;
+        for (auto &sh : mod->shims)
+            if (TgFixedShim(sh.first).empty() && !OwnAccessor(sh.first)) {
+                initsym = TYG_NO_SYM;
+                return why = cat("C half's ", sh.first), false;
+            }
+        EmitGlobalStorage(cg);
         return true;
+    }
+
+    // ---- Globals of a whole program ------------------------------------------
+    //
+    // With no C half the object holds the globals: each member of the C's
+    // instance block (gs_globals_t) a zero-filled data symbol of its own,
+    // under its Goose name for the debugger, a resizable's or T[]'s
+    // dedicated stack another beside it; the static data the C makes of a
+    // `let` is the object's already (TgModule::StaticGlobal). A whole
+    // program has no threads, so main's instance is the only one, as
+    // GS_GL is &gs_globals_main in the C. The functions compiled reach a
+    // global through its accessor (gs_tg_g<i>, gs_tg_gs<i>) as in a mixed
+    // build, which the object now defines, and gs_init_globals is a
+    // procedure of the object (TgFn::EmitInit) that main calls.
+
+    // Whether every global is one the object can hold: else why not.
+    bool GlobalsOk(CodeGen &cg, string &why) {
+        for (auto g : ast.globals)
+            for (auto d : g->defs) {
+                if (cg.gstatic.count(d)) {
+                    // Static data reached through an accessor: its bytes
+                    // were not laid out (StaticBytes).
+                    if (mod->accessors.count(d)) return why = cat("global ", d->name, " as static data"), false;
+                    continue;
+                }
+                if (!mod->GlobalOk(d) || cg.IsFrameObj(d->type) || cg.gpools.count(d) ||
+                    (d->type->kind == TY_REF && d->type->ref->lenstorage >= 0))
+                    return why = cat("global ", d->name, " of this kind"), false;
+            }
+        return true;
+    }
+
+    // Whether a program-specific shim is one the object defines itself:
+    // a global's accessor.
+    bool OwnAccessor(const string &name) {
+        for (auto &[d, n] : mod->accessors)
+            if (n == name) return true;
+        for (auto &[d, n] : mod->stkaccessors)
+            if (n == name) return true;
+        return false;
+    }
+
+    // gs_init_globals into the object, if its initializers compile and
+    // need no more data stacks than the C's (stackneed[nullptr], which
+    // gs_rt_init's counts were made with). Else why not.
+    tyg_sym initsym = TYG_NO_SYM;
+    bool BuildInit(CodeGen &cg, string &why) {
+        auto nshims = mod->shims.size(), nexterns = mod->externs.size(), ndirect = mod->direct.size();
+        auto sym = mod->Sym("gs_tg_init_globals", TYG_SYM_FUNC);
+        TgFn fn(*mod, nullptr);
+        auto undo = [&](const string &w) {
+            if (fn.p) tyg_proc_abort(fn.p);
+            mod->shims.resize(nshims);
+            mod->externs.resize(nexterns);
+            mod->direct.resize(ndirect);
+            why = w;
+            return false;
+        };
+        Line line;
+        for (auto g : ast.globals)
+            if (!g->inits.empty()) {
+                line = g->line;
+                break;
+            }
+        try {
+            fn.EmitInit(sym, line);
+        } catch (TgUnsupported &u) {
+            return undo(cat("global initializer: ", u.why, u.line.line > 0 ? cat(" (line ", u.line.line, ")") : ""));
+        }
+        int64_t need = fn.maxown;
+        for (auto &c : fn.stackcalls) need = std::max(need, c.offset + cg.stackneed[c.callee]);
+        if (need > cg.stackneed[nullptr]) return why = "global initializers' data stacks", false;
+        // Extern fns: as for any function of a whole program.
+        for (auto sp : mod->externs) {
+            auto found = false;
+            for (auto &x : TgSupportExterns()) found = found || sp->sf->cname == x.name;
+            if (!found) return why = cat("extern ", sp->sf->cname), false;
+        }
+        initsym = sym;
+        return true;
+    }
+
+    // The globals' storage, their debug entries, and the accessors the
+    // functions call, each returning its global's address.
+    void EmitGlobalStorage(CodeGen &cg) {
+        auto m = mod->m;
+        map<const VarDef *, tyg_sym> gsyms, ssyms;
+        auto def = [&](const string &name, int64_t size, int64_t align, VarDef *d, const tyg_dtype *dt) {
+            auto sym = tyg_symbol(m, cat("gs_g_", name).c_str(), 0);
+            tyg_data(m, sym, TYG_SECTION_BSS, nullptr, std::max<int64_t>(size, 1), align);
+            if (dt) tyg_debug_global(m, string(d->name).c_str(), dt, sym, mod->File(d->line.fileidx), d->line.line);
+            return sym;
+        };
+        for (auto g : ast.globals)
+            for (auto d : g->defs) {
+                if (cg.gstatic.count(d)) continue;
+                auto name = cg.gnames[d].substr(7);   // "GS_GL->name"
+                if (TgModule::IsGrow(d->type)) {
+                    gsyms[d] = def(name, 16, 8, d, mod->DT(d->type));
+                } else if (TgModule::IsVarArr(d->type)) {
+                    gsyms[d] = def(name, 8, 8, d, tyg_dt_pointer(m, mod->DT(d->type)));
+                } else {
+                    auto sz = mod->Size(d->type);
+                    int64_t align = 1;
+                    while (align < 8 && align * 2 <= sz) align *= 2;
+                    gsyms[d] = def(name, sz, align, d, mod->DT(d->type));
+                }
+                if (cg.gstks.count(d)) ssyms[d] = def(cat("gs_gstk_", name), 8, 8, d, nullptr);
+            }
+        auto accessor = [&](const string &name, tyg_sym target) {
+            auto p = tyg_proc_begin(m, mod->Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL),
+                                    tyg_sig_new(m, tyg_type_ptr(m), nullptr, 0, 0));
+            tyg_ret(p, tyg_addr_of(p, tyg_at_sym(target, 0)));
+            if (tyg_proc_end(p) != 0)
+                throw CompileError { cat("tinygen: ", name, ": ", tyg_error(m) ? tyg_error(m) : "?") };
+        };
+        for (auto &[d, n] : mod->accessors) accessor(n, gsyms.at(d));
+        for (auto &[d, n] : mod->stkaccessors) accessor(n, ssyms.at(d));
     }
 
     // The C main of a whole program build, which the C half otherwise
     // writes (CodeGen::EmitProgramInit, EmitMain): the runtime started
-    // with the program's stack counts, fn main() run, the stack report.
+    // with the program's stack counts, the globals initialized, fn main()
+    // run, the stack report.
     // In the debugger it is `main` at fn main()'s line.
     void EmitMain(CodeGen &cg) {
         auto m = mod->m;
@@ -3390,6 +3583,10 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         call(tyg_sig_new(m, nullptr, sps, 5, 0), "gs_tg_start",
              { tyg_param(p, 0), tyg_param(p, 1), tyg_iconst(p, TYG_I64, cg.rtinit[0]),
                tyg_iconst(p, TYG_I64, cg.rtinit[1]), tyg_iconst(p, TYG_I64, cg.rtinit[2]) });
+        if (initsym != TYG_NO_SYM) {
+            tyg_call(p, tyg_sig_new(m, nullptr, nullptr, 0, 0), tyg_direct(initsym), nullptr, 0, nullptr,
+                     nullptr);
+        }
         vector<tyg_val> margs;
         if (cg.sinfo[mainsp].needssp) margs.push_back(tyg_iconst(p, TYG_I64, 0));
         call(mod->Sig(mainsp), cg.sinfo[mainsp].cname, margs);
