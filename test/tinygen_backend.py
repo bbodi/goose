@@ -123,7 +123,7 @@ WHOLE_PROGRAM = {
     "tinygen_scalars", "tinygen_structs", "tinygen_divzero", "tinygen_arrays",
     "tinygen_slicefail", "tinygen_results", "tinygen_build", "tinygen_text",
     "tinygen_shrink", "tinygen_nested", "tinygen_funvals", "20_life",
-    "loop_invariant_divisors",
+    "loop_invariant_divisors", "tinygen_globals", "tinygen_gstacks", "tinygen_retfrom",
 }
 
 
@@ -262,7 +262,8 @@ def check_lldb_arrays(exe, base, lldb, ok, fail):
 
 
 def check_lldb_globals(exe, base, lldb, ok, fail):
-    """The static data tinygen holds a copy of, by its Goose name and type."""
+    """The static data tinygen holds a copy of, and in a whole program the
+    globals it holds, by their Goose names and types."""
     source = HERE / "tinygen" / "tinygen_globals.goose"
     out = base / f"lldb-globals{tc.EXE_SUFFIX}"
     good, log, _, _ = build(exe, source, out, [])
@@ -270,13 +271,17 @@ def check_lldb_globals(exe, base, lldb, ok, fail):
         fail("tinygen lldb globals build", log)
         return
     code, o, e = tc.run_capture([lldb, "-b", "-o", "b sum_primes", "-o", "run",
-                                 "-o", "target variable PRIMES", "-o", "kill", out])
+                                 "-o", "target variable PRIMES counter seed hist last",
+                                 "-o", "kill", out])
     text = o + e
-    want = r"\(i32\[6\]\) PRIMES = \(\[0\] = 2, \[1\] = 3, \[2\] = 5"
-    if not re.search(want, text):
-        fail("tinygen global debug info under lldb", f"missing {want}:\n{text}")
+    wants = [r"\(i32\[6\]\) PRIMES = \(\[0\] = 2, \[1\] = 3, \[2\] = 5",
+             r"\(i64\) counter = 1005", r"\(i64\) seed = -?\d+",
+             r"\(u16\[4\]\) hist = \(\[0\] = \d+", r"\(Vec2\) last = \(x = "]
+    missing = [w for w in wants if not re.search(w, text)]
+    if missing:
+        fail("tinygen global debug info under lldb", f"missing {missing}:\n{text}")
         return
-    ok("tinygen debug info under lldb: a global")
+    ok("tinygen debug info under lldb: static data and a whole program's globals")
     check_lldb_strings(exe, base, lldb, ok, fail)
 
 

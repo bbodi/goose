@@ -1,9 +1,9 @@
-// The tinygen backend: globals. Every one stays the C half's, initialized
-// before main as in any build, and is read and written from tinygen code
-// through an address the C half gives; a const `let` with a compile-time
-// initializer is static data, which the object holds a copy of. A global
-// whose initializer calls a function runs that function (here compiled by
-// tinygen) from the C half's initialization.
+// The tinygen backend: globals, read and written from tinygen code through
+// an accessor giving each one's address: the C half's, or built whole with
+// no C half, the object's own storage and its gs_init_globals. A const
+// `let` with a compile-time initializer is static data, which the object
+// holds a copy of. A global whose initializer calls a function runs that
+// function (compiled by tinygen) from the globals' initialization.
 
 struct Vec2 { x: f64, y: f64 }
 
