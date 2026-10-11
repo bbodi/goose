@@ -1119,8 +1119,8 @@ struct TgModule {
     const tyg_dtype *OptDT(TypeExpr *t, const string &name) {
         return tyg_dt_typedef(m, name.c_str(), tyg_dt_pointer(m, DT(t->ref->sub)), File(0), 0);
     }
-    // Whether a struct reaches a value of its own type through its fields
-    // (an optional link): its text would recurse, which the C half's
+    // Whether a struct or ADT reaches a value of its own type through its
+    // fields (an optional link, a slice): its text would recurse, which the C half's
     // render functions do at run time.
     bool Recursive(TypeExpr *t) {
         set<string> seen;
@@ -1137,6 +1137,18 @@ struct TgModule {
                     if (!si) return false;
                     for (size_t i = 0; i < si->st->fields.size(); i++)
                         if (!si->st->fields[i].ispad && walk(si->ftypes[i], depth + 1)) return true;
+                    return false;
+                }
+                case TY_ENUM: case TY_VARIANT: {
+                    if (depth > 0 && cg.TEq(x, t)) return true;
+                    if (!seen.insert(cg.Mangle(x)).second) return false;
+                    auto ei = EI(x);
+                    for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
+                        if (x->kind == TY_VARIANT && (int)vi != VariantIdx(x)) continue;
+                        auto &v = ei->en->variants[vi];
+                        for (size_t i = 0; i < v.fields.size(); i++)
+                            if (!v.fields[i].ispad && walk(ei->vftypes[vi][i], depth + 1)) return true;
+                    }
                     return false;
                 }
                 default: return false;
@@ -1160,10 +1172,13 @@ struct TgModule {
         renderq.emplace_back(name, t);
         return name;
     }
-    // Whether a render procedure can take the type: a fixed struct whose
-    // parts are all held (TypeOk), handed the address of its value.
+    // Whether a render procedure can take the type: a fixed struct or ADT
+    // whose parts are all held (TypeOk), or an image of one (a variable-size
+    // struct, a variable-mode ADT), handed the address of its value.
     bool RenderFnOk(TypeExpr *t) {
-        return t->kind == TY_STRUCT && cg.IsFix(t) && !VsOk(t) && !FoOk(t) && TypeOk(t);
+        if (t->kind == TY_ENUM && IsVm(t)) return VmOk(t);
+        if (t->kind == TY_STRUCT && VsOk(t)) return true;
+        return (t->kind == TY_STRUCT || t->kind == TY_ENUM) && cg.IsFix(t) && !FoOk(t) && TypeOk(t);
     }
 
     // ---- Globals -----------------------------------------------------------
@@ -4810,7 +4825,7 @@ struct TgFn {
                 return;
             }
         }
-        if (M.OptRef(t)) {
+        if (M.OptRef(t) || (IsOptional(t) && M.RelOk(t))) {
             RenderOpt(stk, len, pl, nested, l, depth);
             return;
         }
@@ -4819,7 +4834,7 @@ struct TgFn {
         // It runs no overloads: the checker leaves none in such a type
         // (CheckPrintable's OverloadedPart). The procedure's own body
         // renders the first level here (inlinet).
-        if (t->kind == TY_STRUCT && M.Recursive(t)) {
+        if ((t->kind == TY_STRUCT || t->kind == TY_ENUM) && M.Recursive(t)) {
             if (inlinet && cg.TEq(inlinet, t)) {
                 inlinet = nullptr;
             } else {
@@ -5354,7 +5369,9 @@ struct TgFn {
     // procedure (RenderInto).
     void RenderOpt(tyg_val stk, tyg_addr len, const P &pl, bool nested, Line l, int depth) {
         auto none = tyg_block_new(p), some = tyg_block_new(p), done = tyg_block_new(p);
-        tyg_branch(p, tyg_cmp(p, TYG_EQ, tyg_load(p, TYG_I64, pl.a, 0), tyg_iconst(p, TYG_I64, 0)), none, some);
+        // A relative link's offset decodes to its address, null for 0.
+        auto at = TgModule::IsRel(pl.t) ? RelLoad(pl, l) : tyg_load(p, TYG_I64, pl.a, 0);
+        tyg_branch(p, tyg_cmp(p, TYG_EQ, at, tyg_iconst(p, TYG_I64, 0)), none, some);
         tyg_block_set(p, none);
         TextLit(stk, len, "null");
         tyg_jump(p, done);
@@ -7327,14 +7344,16 @@ struct TgFn {
         const tyg_type *pts[3] = { ptr, ptr, ptr };
         p = tyg_proc_begin(m, M.Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL), tyg_sig_new(m, nullptr, pts, 3, 0));
         if (!p) No(Line {}, cat("tyg_proc_begin: ", tyg_error(m) ? tyg_error(m) : "?"));
+        // The entry block as a function's, for the globals a link reads
+        // (a pool's base).
+        gblk = tyg_block_new(p);
+        gstart = tyg_block_new(p);
+        tyg_jump(p, gblk);
+        tyg_block_set(p, gstart);
         inlinet = t;
         RenderInto(tyg_param(p, 0), tyg_at_val(tyg_param(p, 1), 0), P { tyg_at_val(tyg_param(p, 2), 0), t }, true, Line {});
         if (!Ended()) tyg_ret(p, 0);
-        if (tyg_proc_end(p) != 0) {
-            p = nullptr;
-            No(Line {}, cat("tinygen: ", tyg_error(m) ? tyg_error(m) : "?"));
-        }
-        p = nullptr;
+        Finish(Line {});
     }
 
     // The entry's block (gblk): the addresses of the globals the body
