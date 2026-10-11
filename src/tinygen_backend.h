@@ -5481,21 +5481,12 @@ struct TgFn {
     V GenFvCall(Call *c) {
         auto et = c->fvbody->exprtype;
         auto wantsval = !cg.IsVoidT(et);
-        if (wantsval && !M.TypeOk(et) && IsImg(et) && M.ImgOk(et)) {
-            // An image: built at the top of a temporary's stack.
-            auto stk = Stk(AllocStk(false, c->line), c->line);
+        if (wantsval && !M.TypeOk(et)) {
+            // An image, a resizable: built at the top of a temporary's stack.
             V x;
-            x.t = et;
-            x.mem = true;
-            x.a = tyg_at_val(GenImg(c, stk, et, c->line), 0);
-            return x;
+            if (InPlaceValue(c, et, c->line, x)) return x;
+            No(c->line, cat("function value of type ", M.Name(et)));
         }
-        if (wantsval && !M.TypeOk(et) && IsGrow(et) && M.RzOk(et)) {
-            auto x = RzTemp(et, c->line);
-            GenRz(c, x.stk, x.a, et, c->line);
-            return x;
-        }
-        if (wantsval && !M.TypeOk(et)) No(c->line, cat("function value of type ", M.Name(et)));
         if (c->fvparams.size() > c->args.size()) No(c->line, "function value parameters");
         if (Ended()) return Dummy(et);
         tyg_scope_begin(p);
