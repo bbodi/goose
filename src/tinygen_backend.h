@@ -289,11 +289,12 @@ struct TgModule {
                 if (IsRel(t)) return RelOk(t, depth);
                 return (IsPlainRef(t) || OptRef(t)) &&
                        ((cg.IsFix(t->ref->sub) && TypeOk(t->ref->sub, depth + 1)) || IsVarint(t->ref->sub) ||
-                        ImgOk(t->ref->sub, depth + 1) ||
+                        ImgOk(t->ref->sub, depth + 1) || ZeroOk(t->ref->sub, depth + 1) ||
                         (IsPlainRef(t) && (FoOk(t->ref->sub, depth + 1) || VeOk(t->ref->sub, depth + 1))));
             case TY_ARRAY:
                 // T[k]: k elements, packed; a static-capacity T[..k], a
                 // length beside them (LimOk).
+                if (ZeroArr(t)) return depth == 0 && ZeroOk(t, depth);
                 if (t->arr->akind == A_LIMITED) return LimOk(t, depth);
                 return t->arr->akind == A_FIXED && cg.IsFix(t) && !cg.IsLargeFixed(t) &&
                        cg.ArrSize(t->arr) > 0 && TypeOk(t->arr->sub, depth + 1);
@@ -338,7 +339,6 @@ struct TgModule {
                     case A_LIMITED:
                         if (cg.ArrSize(t->arr) < 0) return RcOk(t, depth) ? "" : "runtime-capacity limited array";
                         if (cg.IsLargeFixed(t)) return "large fixed value";
-                        if (cg.ArrSize(t->arr) == 0) return "limited array of capacity 0";
                         break;
                     case A_FIXED:
                         if (cg.IsFix(t) && cg.IsLargeFixed(t)) return "large fixed value";
@@ -489,6 +489,7 @@ struct TgModule {
         if (IsScalar(t)) return ScalSize(Scal(t));
         // A payload-less variant as a value of its own: the gs_empty byte.
         if (t->kind == TY_VARIANT && !cg.FixedSize(t)) return 1;
+        if (ZeroArr(t)) return cg.FixedSize(t) + cg.FixedSize(t->arr->sub);
         if (FoOk(t)) return FoLayout(t).tail + FoTailSize(t);
         return cg.FixedSize(t);
     }
@@ -533,8 +534,8 @@ struct TgModule {
         }
         if (t->kind == TY_ARRAY) {
             // The C half's struct { T e[k]; }, packed.
-            tyg_field f { tyg_type_array(m, AT(t->arr->sub), cg.ArrSize(t->arr)), 0 };
-            return atypes[key] = tyg_type_record(m, cg.FixedSize(t), 1, &f, 1);
+            tyg_field f { tyg_type_array(m, AT(t->arr->sub), std::max<int64_t>(cg.ArrSize(t->arr), 1)), 0 };
+            return atypes[key] = tyg_type_record(m, Size(t), 1, &f, 1);
         }
         vector<tyg_field> fs;
         for (auto &f : Fields(t)) fs.push_back({ AT(f.t), f.off });
@@ -632,7 +633,7 @@ struct TgModule {
             }
             case TY_ARRAY: {
                 if (t->arr->akind == A_FIXED) {
-                    d = tyg_dt_array(m, DT(t->arr->sub), cg.ArrSize(t->arr));
+                    d = tyg_dt_array(m, DT(t->arr->sub), std::max<int64_t>(cg.ArrSize(t->arr), 1));
                     break;
                 }
                 auto rec = tyg_dt_record(m, TYG_DT_STRUCT, name.c_str(), File(0), 0);
@@ -698,6 +699,17 @@ struct TgModule {
     }
     // A limited array this backend holds, of either kind.
     bool LimHeld(TypeExpr *t) { return TypeOk(t) || RcOk(t); }
+    // A T[0] or T[..0] (§3.4): C gives the one element its struct needs, so
+    // as a value of its own it is a slot's worth bigger than its layout, and
+    // only that (a parameter, a result, a local, a global, behind a
+    // reference) is held: a field or an element's layout has no such slot.
+    bool ZeroArr(TypeExpr *t) {
+        return t && t->kind == TY_ARRAY && (t->arr->akind == A_FIXED || cg.IsStaticLimited(t)) &&
+               cg.ArrSize(t->arr) == 0;
+    }
+    bool ZeroOk(TypeExpr *t, int depth) {
+        return ZeroArr(t) && cg.IsFix(t) && depth <= 32 && TypeOk(t->arr->sub, depth + 1);
+    }
     bool LimOk(TypeExpr *t, int depth) {
         return cg.IsStaticLimited(t) && !cg.IsLargeFixed(t) && cg.ArrSize(t->arr) > 0 &&
                TypeOk(t->arr->sub, depth + 1);
@@ -719,8 +731,8 @@ struct TgModule {
         if (auto it = atypes.find(key); it != atypes.end()) return it->second;
         auto w = LimWidth(t);
         tyg_field fs[2] = { { tyg_type_int(m, LimLenScal(t), 0), 0 },
-                            { tyg_type_array(m, AT(t->arr->sub), cg.ArrSize(t->arr)), w } };
-        return atypes[key] = tyg_type_record(m, cg.FixedSize(t), 1, fs, 2);
+                            { tyg_type_array(m, AT(t->arr->sub), std::max<int64_t>(cg.ArrSize(t->arr), 1)), w } };
+        return atypes[key] = tyg_type_record(m, Size(t), 1, fs, 2);
     }
     // For the debugger: the C half's layout under the Goose type's name,
     // `len` and the slots `e` (all k of them: tinygen has no array whose
@@ -736,8 +748,8 @@ struct TgModule {
         auto w = LimWidth(t);
         auto lt = ast.inttypes[w == 1 ? IS_U8 : w == 2 ? IS_U16 : w == 4 ? IS_U32 : IS_U64];
         tyg_dt_member(m, rec, "len", DT(lt), 0);
-        tyg_dt_member(m, rec, "e", tyg_dt_array(m, DT(t->arr->sub), cg.ArrSize(t->arr)), w);
-        tyg_dt_record_complete(m, rec, cg.FixedSize(t), 1);
+        tyg_dt_member(m, rec, "e", tyg_dt_array(m, DT(t->arr->sub), std::max<int64_t>(cg.ArrSize(t->arr), 1)), w);
+        tyg_dt_record_complete(m, rec, Size(t), 1);
         return rec;
     }
 
