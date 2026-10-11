@@ -4248,6 +4248,36 @@ struct TgFn {
             }
             return SliceValue(t, tyg_addr_of(p, tyg_at_local(tmp, 0)), tyg_iconst(p, TYG_I64, k));
         }
+        if (auto al = Is<ArrayLit>(n); al && al->fillval && !al->capexpr && cg.IsFix(t->sub)) {
+            // [v; k] at a slice destination: v built once, copied k times
+            // into a temporary of its own, viewed (CodeGen::GenArrayLit).
+            auto fc = Is<IntLit>(al->fillcount);
+            auto et = t->sub;
+            if (!fc || fc->val < 0 || fc->val * cg.FixedSize(et) > (1 << 20)) No(n->line, "fill count");
+            if (SelfRelLit(al->fillval) || (TgModule::IsRel(et) && !et->ref->pool && !Is<NullLit>(al->fillval)))
+                No(n->line, "fill of a value linking to itself");
+            auto esz = cg.FixedSize(et);
+            auto k = fc->val;
+            auto tmp = tyg_local_new(p, std::max<int64_t>(k * esz, 1), 8);
+            auto one = Temp(et);
+            Into(P { tyg_at_local(one, 0), et }, al->fillval);
+            if (Ended()) return Dummy(t);
+            auto il = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(il, 0), tyg_iconst(p, TYG_I64, 0), 0);
+            auto head = tyg_block_new(p), body = tyg_block_new(p), done = tyg_block_new(p);
+            tyg_jump(p, head);
+            tyg_block_set(p, head);
+            auto iv = [&] { return tyg_load(p, TYG_I64, tyg_at_local(il, 0), 0); };
+            tyg_branch(p, tyg_cmp(p, TYG_SLT, iv(), tyg_iconst(p, TYG_I64, k)), body, done);
+            tyg_block_set(p, body);
+            auto at = tyg_bin(p, TYG_ADD, tyg_addr_of(p, tyg_at_local(tmp, 0)),
+                              tyg_bin(p, TYG_MUL, iv(), tyg_iconst(p, TYG_I64, esz)));
+            tyg_copy(p, tyg_at_val(at, 0), tyg_at_local(one, 0), esz);
+            tyg_store(p, TYG_I64, tyg_at_local(il, 0), tyg_bin(p, TYG_ADD, iv(), tyg_iconst(p, TYG_I64, 1)), 0);
+            tyg_jump(p, head);
+            tyg_block_set(p, done);
+            return SliceValue(t, tyg_addr_of(p, tyg_at_local(tmp, 0)), tyg_iconst(p, TYG_I64, k));
+        }
         auto d = Is<Dot>(n);
         P pl;
         if (Is<Ident>(n) || Is<Index>(n) || (d && d->IsField())) {
