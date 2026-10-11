@@ -6157,6 +6157,12 @@ struct TgFn {
         return x;
     }
 
+    // The type a value is carried in between blocks: a relative reference
+    // is an offset from its own slot, so a temporary holds the plain one.
+    TypeExpr *Carry(TypeExpr *t) {
+        if (t && TgModule::IsRel(t) && !TgModule::IsVr(t)) return M.ast.RefTo(t->ref->sub, Line {}, t->ref->optional);
+        return t;
+    }
     // An image or a resizable value of n built on a temporary's stack,
     // each arm or exit building it there (GenImg, GenRz); false if et is
     // neither.
@@ -6185,7 +6191,7 @@ struct TgFn {
     }
 
     V GenIf(IfExpr *i, bool discard) {
-        auto et = i->exprtype;
+        auto et = Carry(i->exprtype);
         auto valued = !discard && et && et->kind != TY_VOID;
         // A varint-width relative reference is carried through a temporary
         // as any value of one is: encoded in it, decoded out.
@@ -6228,7 +6234,7 @@ struct TgFn {
         V w;
         if (!ip && WantInPlace(e, discard, w)) return w;
         auto valued = !ip && Valued(e, discard);
-        auto et = e->exprtype;
+        auto et = Carry(e->exprtype);
         tyg_local res = valued ? Temp(et) : 0;
         auto done = tyg_block_new(p);
         LoopTargets lt { done, done, sscopes.size(), res, valued ? et : nullptr, true };
@@ -6263,7 +6269,7 @@ struct TgFn {
             return w;
         auto valued = !ip && std::any_of(lp->breaks.begin(), lp->breaks.end(), [](Break *b) { return b->val; }) &&
                       Valued(lp, discard);
-        auto et = lp->exprtype;
+        auto et = Carry(lp->exprtype);
         tyg_local res = valued ? Temp(et) : 0;
         auto body = tyg_block_new(p), done = tyg_block_new(p);
         tyg_jump(p, body);
@@ -6294,7 +6300,7 @@ struct TgFn {
         if (!ot || ot->kind != TY_INT || ot->intstorage == IS_VARINT)
             No(me->line, cat("match over type ", ot ? M.NameWhy(ot) : string("?")));
         auto valued = !ip && Valued(me, discard);
-        auto et = me->exprtype;
+        auto et = Carry(me->exprtype);
         tyg_local res = valued ? Temp(et) : 0;
         auto uns = IsUnsigned(ot->intstorage);
         auto x0 = Conv(GenAs(me->scrutinee, ot).v, ot, M.ast.inttypes[IS_I64], me->line);
@@ -6493,7 +6499,7 @@ struct TgFn {
 
     V GenAdtMatch(MatchExpr *me, TypeExpr *adt, bool discard, const InPlace *ip = nullptr) {
         auto valued = !ip && Valued(me, discard);
-        auto et = me->exprtype;
+        auto et = Carry(me->exprtype);
         tyg_local res = valued ? Temp(et) : 0;
         auto s = AdtScrutinee(me->scrutinee, adt);
         auto done = tyg_block_new(p);
