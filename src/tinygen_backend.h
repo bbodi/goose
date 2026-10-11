@@ -1984,10 +1984,15 @@ struct TgFn {
     // where GenRz builds it); format(out, a, b, ...): appended to out.
     V GenStr(Call *c) {
         auto t = c->exprtype;
-        if (!t || !IsGrow(t) || !IsU8(t->arr->sub)) No(c->line, "str of this type");
-        auto x = RzTemp(t, c->line);
-        GenRz(c, x.stk, x.a, t, c->line);
-        return x;
+        auto slice = t && t->kind == TY_SLICE && IsU8(t->sub);
+        if (!slice && (!t || !IsGrow(t) || !IsU8(t->arr->sub))) No(c->line, cat("str of type ", t ? M.Name(t) : "?"));
+        auto x = RzTemp(slice ? cg.GrowU8() : t, c->line);
+        GenRz(c, x.stk, x.a, x.t, c->line);
+        if (!slice || Ended()) return x;
+        // Where the checker typed it as the slice it is passed as: a view.
+        auto len = x.a;
+        len.offset += 8;
+        return SliceValue(t, tyg_load(p, TYG_I64, x.a, 0), tyg_load(p, TYG_I64, len, 0));
     }
     V GenFormat(Call *c) {
         auto an = c->ArgNodes();
