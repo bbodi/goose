@@ -6115,6 +6115,19 @@ struct TgFn {
         if (M.Resz(t)) return (IsGrow(t) && (M.RzOk(t) || M.VeOk(t))) || M.FoOk(t);
         return (M.IsRc(t) && M.RcOk(t)) || (IsVarArr(t) && M.RzOk(t)) || (M.IsVs(t) && M.VsOk(t));
     }
+    // The bytes of one freelist unit of pool d (CodeGen::FlEntrySize,
+    // GS_SPAN_NODE of a slice pool's tree).
+    static int64_t FlEntry(const VarDef *d) { return d->reusable == RU_SLICES ? 512 : 8; }
+    // Whether a thread program's global is one a spawn image carries: a
+    // fixed value, a resizable or frame object (a pool with its
+    // freelist), or a T[] image.
+    bool ThreadGlobalOk(VarDef *d) {
+        if (!M.GlobalOk(d) || cg.PrefVar(d)) return false;
+        auto t = d->type;
+        if (cg.IsFix(t)) return M.TypeOk(t) && !d->reusable;
+        if (M.Resz(t)) return (IsGrow(t) && (M.RzOk(t) || M.VeOk(t)) && (!d->reusable || M.RzOk(t))) || M.FoOk(t);
+        return IsImg(t) && !d->reusable;
+    }
     // node's value bytes follow its gs_qnode header (next, size).
     static constexpr int64_t QNODE = 16;
 
@@ -6182,7 +6195,7 @@ struct TgFn {
         // as [int64 size][bytes]. Fixed values only; a resizable's or a
         // T[]'s image is the C half's to build.
         for (auto d : cg.ThreadGlobals(w))
-            if (!M.GlobalOk(d) || !M.TypeOk(d->type) || !cg.IsFix(d->type) || d->reusable)
+            if (!ThreadGlobalOk(d))
                 No(c->line, cat("thread program with a global of type ", M.NameWhy(d->type)));
         for (size_t i = 0; i < w->argtypes.size(); i++) {
             auto pt = w->argtypes[i];
@@ -6219,6 +6232,35 @@ struct TgFn {
             SetTop(stk, tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, cg.FixedSize(pt))));
         }
         for (auto d : cg.ThreadGlobals(w)) {
+            if (!cg.IsFix(d->type)) {
+                // [int64 size][image]: a resizable's flat image (with a
+                // pool's freelist after it), or a T[]'s bytes.
+                auto szp = Top(stk);
+                SetTop(stk, tyg_bin(p, TYG_ADD, szp, tyg_iconst(p, TYG_I64, 8)));
+                auto pl = VarPlace(d, c->line);
+                if (M.Resz(d->type)) {
+                    RzImage(stk, pl, d->type);
+                    if (d->reusable) {
+                        // The freelist: its count, then its entries.
+                        P hp;
+                        tyg_addr fl;
+                        tyg_val flstk;
+                        PoolAt(d, c->line, hp, fl, flstk);
+                        auto top = Top(stk);
+                        auto flen = tyg_load(p, TYG_I64, tyg_at_val(tyg_addr_of(p, fl), 8), 0);
+                        tyg_store(p, TYG_I64, tyg_at_val(top, 0), flen, 0);
+                        auto bytes = tyg_bin(p, TYG_MUL, flen, tyg_iconst(p, TYG_I64, FlEntry(d)));
+                        auto at = tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, 8));
+                        tyg_move_dyn(p, at, tyg_load(p, TYG_I64, fl, 0), bytes);
+                        SetTop(stk, tyg_bin(p, TYG_ADD, at, bytes));
+                    }
+                } else {
+                    ImgCopy(stk, tyg_addr_of(p, pl.a), d->type);
+                }
+                tyg_store(p, TYG_I64, tyg_at_val(szp, 0),
+                          tyg_bin(p, TYG_SUB, Top(stk), tyg_bin(p, TYG_ADD, szp, tyg_iconst(p, TYG_I64, 8))), 0);
+                continue;
+            }
             auto top = Top(stk);
             auto size = cg.FixedSize(d->type);
             tyg_store(p, TYG_I64, tyg_at_val(top, 0), tyg_iconst(p, TYG_I64, size), 0);
@@ -9742,7 +9784,12 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                 return why = cat("C half's ", sh.first), false;
             }
         for (auto &[acc, sp] : mod->thunkacc)
-            for (auto d : cg.ThreadGlobals(sp)) mod->Accessor(d);
+            for (auto d : cg.ThreadGlobals(sp)) {
+                mod->Accessor(d);
+                if (cg.IsFix(d->type)) continue;
+                mod->StackAccessor(d);
+                if (d->reusable) mod->PoolAccessors(d);
+            }
         EmitGlobalStorage(cg);
         EmitExports(cg);
         ForwardExterns();
@@ -9894,8 +9941,76 @@ struct TinyGenBackend : CodeGen::SpecBackend {
             // The worker's globals, each [int64 size][bytes], into this
             // thread's own instance of them.
             for (auto d : cg.ThreadGlobals(sp)) {
-                auto size = cg.FixedSize(d->type);
                 auto at = tyg_load(p, TYG_I64, tyg_at_local(cur, 0), 0);
+                if (!cg.IsFix(d->type)) {
+                    // [int64 size][image] onto the global's own stack in this
+                    // thread's instance (CodeGen::EmitThreadThunk).
+                    auto acc = [&](const string &name) {
+                        return tyg_call(p, tyg_sig_new(m, ptr, nullptr, 0, 0),
+                                        tyg_direct(mod->Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL)), nullptr, 0,
+                                        nullptr, nullptr);
+                    };
+                    auto stkinit = [&](tyg_val stk) {
+                        tyg_arg sa {};
+                        sa.val = stk;
+                        const tyg_type *sps[] = { ptr };
+                        tyg_call(p, tyg_sig_new(m, nullptr, sps, 1, 0),
+                                 tyg_direct(mod->Sym("gs_tg_stack_init", TYG_SYM_FUNC | TYG_SYM_GLOBAL)), &sa, 1,
+                                 nullptr, nullptr);
+                    };
+                    mod->NeedShim("gs_tg_stack_init");
+                    auto sz = tyg_load(p, TYG_I64, tyg_at_val(at, 0), 0);
+                    auto img = tyg_bin(p, TYG_ADD, at, tyg_iconst(p, TYG_I64, 8));
+                    auto gaddr = acc(mod->accessors.at(d));
+                    auto stk = acc(mod->stkaccessors.at(d));
+                    stkinit(stk);
+                    auto top = tyg_load(p, TYG_I64, tyg_at_val(stk, 0), 0);
+                    auto adv = [&](tyg_val n) { tyg_store(p, TYG_I64, tyg_at_val(stk, 0), tyg_bin(p, TYG_ADD, top, n), 0); };
+                    if (mod->FoOk(d->type)) {
+                        auto pre = mod->FoHdrOff(d->type);
+                        if (pre) tyg_copy(p, tyg_at_val(gaddr, 0), tyg_at_val(img, 8), pre);
+                        tyg_store(p, TYG_I64, tyg_at_val(gaddr, pre), top, 0);
+                        tyg_store(p, TYG_I64, tyg_at_val(gaddr, pre + 8), tyg_load(p, TYG_I64, tyg_at_val(img, 0), 0), 0);
+                        auto n = tyg_bin(p, TYG_SUB, sz, tyg_iconst(p, TYG_I64, 8 + pre));
+                        tyg_move_dyn(p, top, tyg_bin(p, TYG_ADD, img, tyg_iconst(p, TYG_I64, 8 + pre)), n);
+                        adv(n);
+                    } else if (mod->Resz(d->type) && d->reusable) {
+                        // [count][elements][freelist count][entries].
+                        auto ebytes = tyg_bin(p, TYG_MUL, tyg_load(p, TYG_I64, tyg_at_val(img, 0), 0),
+                                              tyg_iconst(p, TYG_I64, cg.FixedSize(d->type->arr->sub)));
+                        tyg_store(p, TYG_I64, tyg_at_val(gaddr, 0), top, 0);
+                        tyg_store(p, TYG_I64, tyg_at_val(gaddr, 8), tyg_load(p, TYG_I64, tyg_at_val(img, 0), 0), 0);
+                        tyg_move_dyn(p, top, tyg_bin(p, TYG_ADD, img, tyg_iconst(p, TYG_I64, 8)), ebytes);
+                        adv(ebytes);
+                        auto [fh, fs] = mod->PoolAccessors(d);
+                        auto fl = acc(fh);
+                        auto flstk = acc(fs);
+                        stkinit(flstk);
+                        auto ftop = tyg_load(p, TYG_I64, tyg_at_val(flstk, 0), 0);
+                        auto fat = tyg_bin(p, TYG_ADD, img, tyg_bin(p, TYG_ADD, ebytes, tyg_iconst(p, TYG_I64, 8)));
+                        auto fcnt = tyg_load(p, TYG_I64, tyg_at_val(fat, 0), 0);
+                        auto fbytes = tyg_bin(p, TYG_MUL, fcnt, tyg_iconst(p, TYG_I64, TgFn::FlEntry(d)));
+                        tyg_store(p, TYG_I64, tyg_at_val(fl, 0), ftop, 0);
+                        tyg_store(p, TYG_I64, tyg_at_val(fl, 8), fcnt, 0);
+                        tyg_move_dyn(p, ftop, tyg_bin(p, TYG_ADD, fat, tyg_iconst(p, TYG_I64, 8)), fbytes);
+                        tyg_store(p, TYG_I64, tyg_at_val(flstk, 0), tyg_bin(p, TYG_ADD, ftop, fbytes), 0);
+                    } else if (mod->Resz(d->type)) {
+                        auto n = tyg_bin(p, TYG_SUB, sz, tyg_iconst(p, TYG_I64, 8));
+                        tyg_store(p, TYG_I64, tyg_at_val(gaddr, 0), top, 0);
+                        tyg_store(p, TYG_I64, tyg_at_val(gaddr, 8), tyg_load(p, TYG_I64, tyg_at_val(img, 0), 0), 0);
+                        tyg_move_dyn(p, top, tyg_bin(p, TYG_ADD, img, tyg_iconst(p, TYG_I64, 8)), n);
+                        adv(n);
+                    } else {
+                        // A T[]: the instance holds its address.
+                        tyg_store(p, TYG_I64, tyg_at_val(gaddr, 0), top, 0);
+                        tyg_move_dyn(p, top, img, sz);
+                        adv(sz);
+                    }
+                    tyg_store(p, TYG_I64, tyg_at_local(cur, 0),
+                              tyg_bin(p, TYG_ADD, img, sz), 0);
+                    continue;
+                }
+                auto size = cg.FixedSize(d->type);
                 if (size) {
                     auto dst = tyg_call(p, tyg_sig_new(m, ptr, nullptr, 0, 0),
                                         tyg_direct(mod->Sym(mod->accessors.at(d), TYG_SYM_FUNC | TYG_SYM_GLOBAL)),
