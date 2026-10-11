@@ -9945,6 +9945,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     // need no more data stacks than the C's (stackneed[nullptr], which
     // gs_rt_init's counts were made with). Else why not.
     tyg_sym initsym = TYG_NO_SYM;
+    int64_t initstacks = 0;   // The data stacks gs_tg_init_globals uses at once.
     bool BuildInit(CodeGen &cg, string &why) {
         auto nshims = mod->shims.size(), nexterns = mod->externs.size(), ndirect = mod->direct.size();
         auto sym = mod->Sym("gs_tg_init_globals", TYG_SYM_FUNC);
@@ -9970,7 +9971,12 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         }
         int64_t need = fn.maxown;
         for (auto &c : fn.stackcalls) need = std::max(need, c.offset + cg.stackneed[c.callee]);
-        if (need > cg.stackneed[nullptr]) return why = "global initializers' data stacks", false;
+        // The C's count for it is what its own code needs; this one's
+        // temporaries (a dispatch's result before it is re-prefixed) may
+        // need more, which the program's main asks the runtime for.
+        if (need > cg.rtinit[0] && cg.maxstacks > 0 && need > cg.maxstacks)
+            return why = "global initializers' data stacks", false;
+        initstacks = need;
         // Extern fns: as for any function of a whole program.
         for (auto sp : mod->externs)
             if (!ExternHeld(sp)) return why = cat("extern ", sp->sf->cname), false;
@@ -10068,9 +10074,13 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                      (int)as.size(), nullptr, nullptr);
         };
         const tyg_type *sps[] = { i32, ptr, i64, i64, i64 };
+        // The main program's stacks, or what the initializers use if more
+        // (the global regions follow them).
+        auto mainstacks = std::max(cg.rtinit[0], initstacks);
         call(tyg_sig_new(m, nullptr, sps, 5, 0), "gs_tg_start",
-             { tyg_param(p, 0), tyg_param(p, 1), tyg_iconst(p, TYG_I64, cg.rtinit[0]),
-               tyg_iconst(p, TYG_I64, cg.rtinit[1]), tyg_iconst(p, TYG_I64, cg.rtinit[2]) });
+             { tyg_param(p, 0), tyg_param(p, 1), tyg_iconst(p, TYG_I64, mainstacks),
+               tyg_iconst(p, TYG_I64, cg.rtinit[1] + mainstacks - cg.rtinit[0]),
+               tyg_iconst(p, TYG_I64, cg.rtinit[2]) });
         // The queues, before anything that could use one runs.
         for (auto &[acc, q] : mod->queueacc) {
             auto addr = tyg_call(p, tyg_sig_new(m, ptr, nullptr, 0, 0), tyg_direct(mod->Sym(acc, TYG_SYM_FUNC | TYG_SYM_GLOBAL)),
