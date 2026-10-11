@@ -285,7 +285,7 @@ struct TgModule {
                 // An optional one is the same address, null where empty.
                 if (IsRel(t)) return depth > 0 && RelOk(t, depth);
                 return (IsPlainRef(t) || OptRef(t)) &&
-                       ((cg.IsFix(t->ref->sub) && TypeOk(t->ref->sub, depth + 1)) ||
+                       ((cg.IsFix(t->ref->sub) && TypeOk(t->ref->sub, depth + 1)) || IsVarint(t->ref->sub) ||
                         ImgOk(t->ref->sub, depth + 1) || (IsPlainRef(t) && FoOk(t->ref->sub, depth + 1)));
             case TY_ARRAY:
                 // T[k]: k elements, packed; a static-capacity T[..k], a
@@ -296,7 +296,7 @@ struct TgModule {
             case TY_SLICE:
                 // { data, len }, over fixed elements (C.3), or over images
                 // walked by their sizes.
-                return cg.IsFix(t->sub) ? TypeOk(t->sub, depth + 1) : ImgOk(t->sub, depth + 1);
+                return cg.IsFix(t->sub) ? TypeOk(t->sub, depth + 1) : ImgOk(t->sub, depth + 1) || IsVarint(t->sub);
             case TY_STRUCT: {
                 if (!cg.IsFix(t) || cg.IsLargeFixed(t)) return false;
                 auto si = cg.SI(t);
@@ -327,7 +327,7 @@ struct TgModule {
                 if (ImgOk(t->ref->sub, depth + 1)) return "";
                 return Blocker(t->ref->sub, depth + 1);
             case TY_SLICE:
-                if (!cg.IsFix(t->sub)) return ImgOk(t->sub, depth + 1) ? "" : "variable-size elements";
+                if (!cg.IsFix(t->sub)) return ImgOk(t->sub, depth + 1) || IsVarint(t->sub) ? "" : "variable-size elements";
                 return Blocker(t->sub, depth + 1);
             case TY_ARRAY:
                 switch (t->arr->akind) {
@@ -419,7 +419,7 @@ struct TgModule {
     bool VarImgOk(TypeExpr *t, int depth = 0) {
         if (!t || t->kind != TY_ARRAY || t->arr->akind != A_VAR || depth > 32) return false;
         auto e = t->arr->sub;
-        return e && !cg.IsFix(e) && ImgOk(e, depth + 1);
+        return e && !cg.IsFix(e) && (ImgOk(e, depth + 1) || IsVarint(e));
     }
     // A resizable array whose elements are images (strings, variable-size
     // structs): their bytes back to back on its stack, each walked by its
@@ -429,7 +429,7 @@ struct TgModule {
         if (!t || t->kind != TY_ARRAY || depth > 32) return false;
         if (t->arr->akind != A_GROW && t->arr->akind != A_GROWSHRINK) return false;
         auto e = t->arr->sub;
-        return e && !cg.IsFix(e) && ImgOk(e, depth + 1);
+        return e && !cg.IsFix(e) && (ImgOk(e, depth + 1) || IsVarint(e));
     }
     static bool IsGrow(TypeExpr *t) {
         return t && t->kind == TY_ARRAY && (t->arr->akind == A_GROW || t->arr->akind == A_GROWSHRINK);
@@ -2008,6 +2008,7 @@ struct TgFn {
         if (TgModule::IsRel(pl.t)) return P { tyg_at_val(RelLoad(pl, Line {}), 0), pl.t->ref->sub };
         auto ptr = tyg_load(p, TYG_I64, pl.a, 0);
         P r { tyg_at_val(ptr, 0), pl.t->ref->sub };
+        r.enc = TgModule::IsVarint(r.t);   // A varint in a bytes value, read-only.
         if (cg.IsFatRef(pl.t)) {
             auto a8 = pl.a;
             a8.offset += 8;
@@ -2070,7 +2071,9 @@ struct TgFn {
     // What a reference value refers to.
     P RefTarget(const V &x) {
         if (x.mem) return Step(P { x.a, x.t });
-        return P { tyg_at_val(x.v, 0), x.t->ref->sub };
+        P r { tyg_at_val(x.v, 0), x.t->ref->sub };
+        r.enc = TgModule::IsVarint(r.t);
+        return r;
     }
 
     P Place(Node *n) {
@@ -3049,6 +3052,12 @@ struct TgFn {
 
     // The element after the one at `at`: a fixed size on, or past its
     // image's bytes.
+    // The element at `at`: a varint one zigzag-encoded there.
+    P ElemPlace(tyg_val at, TypeExpr *et) {
+        P r { tyg_at_val(at, 0), et };
+        r.enc = TgModule::IsVarint(et);
+        return r;
+    }
     tyg_val StepElem(const View &v, tyg_val at) {
         if (cg.IsFix(v.elem)) return tyg_bin(p, TYG_ADD, at, tyg_iconst(p, TYG_I64, cg.FixedSize(v.elem)));
         return tyg_bin(p, TYG_ADD, at, ImgSize(v.elem, at));
@@ -4282,6 +4291,11 @@ struct TgFn {
                     pl = Place(a);
                 }
                 if (Ended()) return;
+                if (IsAddrRef(pl.t)) {
+                    // A reference to a varint renders what it refers to.
+                    auto d = Deref(pl);
+                    if (d.enc) pl = d;
+                }
                 if (pl.enc || TgModule::IsVarint(pl.t)) {
                     // The overload found for the argument's checked type,
                     // an i64, which a varint place's own type is not.
@@ -4441,7 +4455,7 @@ struct TgFn {
                 TextLit(stk, len, ", ");
                 tyg_jump(p, elem);
                 tyg_block_set(p, elem);
-                RenderInto(stk, len, P { tyg_at_val(cur(), 0), v.elem }, true, l, depth + 1);
+                RenderInto(stk, len, ElemPlace(cur(), v.elem), true, l, depth + 1);
                 tyg_store(p, TYG_I64, tyg_at_local(cl, 0), StepElem(v, cur()), 0);
                 tyg_store(p, TYG_I64, tyg_at_local(il, 0), tyg_bin(p, TYG_ADD, i(), tyg_iconst(p, TYG_I64, 1)), 0);
                 tyg_jump(p, head);
@@ -6113,9 +6127,11 @@ struct TgFn {
         TypeExpr *ielem = !itt ? nullptr : itt->kind == TY_ARRAY ? itt->arr->sub
                         : itt->kind == TY_SLICE ? itt->sub : nullptr;
         auto walk = ielem && !cg.IsFix(ielem);
+        // A varint element is bound by its value, decoded.
+        auto bindptr = walk && !TgModule::IsVarint(ielem);
         tyg_local cl = 0;
         tyg_scope_begin(p);
-        if (f->vdef && walk) {
+        if (f->vdef && bindptr) {
             auto loc = tyg_local_new(p, 8, 8);
             locals[f->vdef] = loc;
             // A reference variable holds the address itself; a value one is
@@ -6141,7 +6157,7 @@ struct TgFn {
         tyg_branch(p, tyg_cmp(p, TYG_SLT, i, v.len), body, done);
         tyg_block_set(p, body);
         auto ea = walk ? tyg_load(p, TYG_I64, tyg_at_local(cl, 0), 0) : ElemAddr(v, i);
-        if (f->vdef && walk) {
+        if (f->vdef && bindptr) {
             tyg_store(p, TYG_I64, tyg_at_local(locals[f->vdef], 0), ea, 0);
         } else if (f->vdef) {
             auto vt = f->vdef->type;
@@ -6150,7 +6166,7 @@ struct TgFn {
                 if (!IsPlainRef(vt)) No(f->line, "binding kind");
                 tyg_store(p, TYG_I64, dst.a, ea, 0);
             } else {
-                Store(dst, Fit(Load(P { tyg_at_val(ea, 0), v.elem }, f->line), vt, f->line));
+                Store(dst, Fit(Load(ElemPlace(ea, v.elem), f->line), vt, f->line));
             }
         }
         if (f->idxdef)
