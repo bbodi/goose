@@ -2540,11 +2540,6 @@ struct TgFn {
         return x;
     }
 
-    // An integer operation at t's width: unsigned and release-build signed
-    // arithmetic wraps, a debug build's signed arithmetic checks (runtime.h),
-    // and division and modulo check in every build (§6.2).
-    // a == b of arrays or slices (GenRangeEq, §4.5): the lengths, then
-    // the elements' bytes where that is their equality (integers, bools).
     // Structural equality (§4.5; CodeGen::EqX): on the first difference
     // a jump to fail, else on past. Fixed values field by field, element
     // by element, an ADT's tag then its variant's payload; floats as
@@ -2698,6 +2693,8 @@ struct TgFn {
         return x;
     }
 
+    // a == b of arrays or slices (GenRangeEq, §4.5): the lengths, then
+    // the elements' bytes where that is their equality (integers, bools).
     V GenArrayEq(Binary *b) {
         auto l = ViewOf(Place(b->left), b->line);
         auto r = ViewOf(Place(b->right), b->line);
@@ -2741,6 +2738,9 @@ struct TgFn {
         return x;
     }
 
+    // An integer operation at t's width: unsigned and release-build signed
+    // arithmetic wraps, a debug build's signed arithmetic checks (runtime.h),
+    // and division and modulo check in every build (§6.2).
     tyg_val IntOp(TType op, TypeExpr *t, tyg_val l, tyg_val r, Line ln) {
         auto sgn = TgModule::IsSigned(t);
         switch (op) {
@@ -6617,7 +6617,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     // its callees, as one the C backend emits does.
     string Build(CodeGen &cg, FnSpec *sp) {
         string why;
-        if (sp->sf->issimd) return "simd function";
+        // A simd function is its baseline version here, which §7.12 allows.
         if (!mod->SigOk(sp, true, why)) return cat("interface: ", why);
         auto nshims = mod->shims.size(), nexterns = mod->externs.size(), ndirect = mod->direct.size();
         TgFn fn(*mod, sp);
