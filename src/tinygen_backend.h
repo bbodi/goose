@@ -2449,6 +2449,7 @@ struct TgFn {
         tyg_store(p, TYG_I64, tyg_at_local(th, 8), tyg_load(p, TYG_I64, hl, 0), 0);
         P r { tyg_at_local(th, 0), ft, base.stk };
         r.tmphdr = true;
+        r.ohdr = base.tmphdr ? base.ohdr : base.a;   // The struct's own header, whose count it is.
         return r;
     }
     // A field of a resizable variant's payload, where it lies.
@@ -8847,6 +8848,20 @@ struct TgFn {
             hb.offset += M.FoHdrOff(pl.t);
             SetTop(pl.stk, tyg_load(p, TYG_I64, hb, 0));
             GenFo(a->rhs, pl, a->line);
+            return;
+        }
+        if (a->op == T_ASSIGN && pl.tmphdr && pl.stk && M.RbOk(pl.t)) {
+            // The tail of a resizable struct, a resizable ADT (Assign::CgStmt):
+            // the stack's top back to where the tail starts, the new one built
+            // there, its count the struct's.
+            SetTop(pl.stk, tyg_load(p, TYG_I64, pl.a, 0));
+            GenRb(a->rhs, pl.stk, pl.a, pl.t, a->line);
+            if (Ended()) return;
+            auto tl = pl.a;
+            tl.offset += 8;
+            auto ol = pl.ohdr;
+            ol.offset += 8;
+            tyg_store(p, TYG_I64, ol, tyg_load(p, TYG_I64, tl, 0), 0);
             return;
         }
         if (a->op == T_ASSIGN && pl.tmphdr) No(a->line, "assignment to the tail of a resizable struct");
