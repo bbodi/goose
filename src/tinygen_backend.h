@@ -1630,6 +1630,34 @@ struct TgFn {
             }
             return;
         }
+        if (auto al = Is<ArrayLit>(n); al && al->fillval && !al->capexpr && cg.IsFix(et)) {
+            // [v; k] (CodeGen::GenArrayLit): v built once, then copied k
+            // times behind the top; k is a constant (§4.2).
+            auto fc = Is<IntLit>(al->fillcount);
+            if (!fc || fc->val < 0) No(l, "fill count");
+            auto esz = cg.FixedSize(et);
+            auto one = Temp(et);
+            Into(P { tyg_at_local(one, 0), et }, al->fillval);
+            if (Ended()) return;
+            begin();
+            auto top = Top(stk);
+            auto i = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(i, 0), tyg_iconst(p, TYG_I64, 0), 0);
+            auto head = tyg_block_new(p), body = tyg_block_new(p), done = tyg_block_new(p);
+            tyg_jump(p, head);
+            tyg_block_set(p, head);
+            auto iv = [&] { return tyg_load(p, TYG_I64, tyg_at_local(i, 0), 0); };
+            tyg_branch(p, tyg_cmp(p, TYG_SLT, iv(), tyg_iconst(p, TYG_I64, fc->val)), body, done);
+            tyg_block_set(p, body);
+            auto at = tyg_bin(p, TYG_ADD, top, tyg_bin(p, TYG_MUL, iv(), tyg_iconst(p, TYG_I64, esz)));
+            tyg_copy(p, tyg_at_val(at, 0), tyg_at_local(one, 0), esz);
+            tyg_store(p, TYG_I64, tyg_at_local(i, 0), tyg_bin(p, TYG_ADD, iv(), tyg_iconst(p, TYG_I64, 1)), 0);
+            tyg_jump(p, head);
+            tyg_block_set(p, done);
+            SetTop(stk, tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, fc->val * esz)));
+            tyg_store(p, TYG_I64, len, tyg_iconst(p, TYG_I64, fc->val), 0);
+            return;
+        }
         if (auto al = Is<ArrayLit>(n)) {
             if (al->fillval || al->capexpr) No(l, "array literal of this kind");
             begin();
