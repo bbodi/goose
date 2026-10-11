@@ -1481,8 +1481,33 @@ struct TgFn {
         tyg_local res = 0;        // Where a break's value goes, if wanted,
         TypeExpr *rt = nullptr;   // of this type.
         bool block = false;       // A block, which continue passes by.
+        // A value built in place (an image or a resizable) rather than
+        // stored in res: each break builds it at the same top of dstk.
+        int inplace = 0;          // 1 an image, 2 a resizable.
+        tyg_val dstk = 0;
+        TypeExpr *dt = nullptr;
+        tyg_addr hdr {};
+        tyg_local top0 = 0;       // dstk's top where the value starts.
     };
     vector<LoopTargets> loops;
+    // A value a match, a block or a loop delivers, built in place at the
+    // top of a stack (GenImg for mode 1, GenRz for mode 2).
+    struct InPlace {
+        int mode = 0;
+        tyg_val stk = 0;
+        TypeExpr *t = nullptr;
+        tyg_addr hdr {};
+    };
+    void BuildTo(Node *v, const InPlace &ip, Line l) {
+        if (ip.mode == 1) GenImg(v, ip.stk, ip.t, l);
+        else GenRz(v, ip.stk, ip.hdr, ip.t, l);
+    }
+    // A match, block or loop expression built in place.
+    void BuildExpr(Node *n, const InPlace &ip, Line l) {
+        if (auto me = Is<MatchExpr>(n)) GenMatch(me, false, &ip);
+        else if (auto e = Is<EarlyBlock>(n)) GenEarly(e, false, &ip);
+        else GenLoopX(static_cast<LoopExpr *>(n), false, &ip);
+    }
     // Each result's channel (CodeGen::SigParams), its parameters kept in
     // locals: an out-pointer in `a` for a fixed result other than the C
     // return value; a destination stack in `a` and the count's
@@ -1700,6 +1725,10 @@ struct TgFn {
             BuildArm(b, l, [&](Node *v) { GenRz(v, stk, hdr, t, l); });
             return;
         }
+        if (Is<MatchExpr>(n) || Is<EarlyBlock>(n) || Is<LoopExpr>(n)) {
+            BuildExpr(n, InPlace { 2, stk, t, hdr }, l);
+            return;
+        }
         if (auto c = Is<Call>(n); c && c->fvbody && c->fvbody->tail) {
             BuildFv(c, l, [&](Node *v) { GenRz(v, stk, hdr, t, l); });
             return;
@@ -1884,6 +1913,12 @@ struct TgFn {
             auto start = tyg_local_new(p, 8, 8);
             tyg_store(p, TYG_I64, tyg_at_local(start, 0), Top(stk), 0);
             BuildArm(b, l, [&](Node *v) { GenImg(v, stk, t, l); });
+            return tyg_load(p, TYG_I64, tyg_at_local(start, 0), 0);
+        }
+        if (n && !from && (Is<MatchExpr>(n) || Is<EarlyBlock>(n) || Is<LoopExpr>(n))) {
+            auto start = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(start, 0), Top(stk), 0);
+            BuildExpr(n, InPlace { 1, stk, t, {} }, l);
             return tyg_load(p, TYG_I64, tyg_at_local(start, 0), 0);
         }
         if (auto c = n && !from ? Is<Call>(n) : nullptr; c && c->fvbody && c->fvbody->tail) {
@@ -5841,27 +5876,41 @@ struct TgFn {
         return x;
     }
 
+    // An image or a resizable value of n built on a temporary's stack,
+    // each arm or exit building it there (GenImg, GenRz); false if et is
+    // neither.
+    bool InPlaceValue(Node *n, TypeExpr *et, Line l, V &x) {
+        if (IsImg(et) && M.ImgOk(et)) {
+            auto stk = Stk(AllocStk(false, l), l);
+            x = V {};
+            x.t = et;
+            x.mem = true;
+            x.a = tyg_at_val(GenImg(n, stk, et, l), 0);
+            return true;
+        }
+        if (IsGrow(et) && (M.RzOk(et) || M.VeOk(et))) {
+            x = RzTemp(et, l);
+            GenRz(n, x.stk, x.a, et, l);
+            return true;
+        }
+        return false;
+    }
+    // A value wanted of a type neither scalar nor held in a register: in
+    // place if an image or a resizable.
+    bool WantInPlace(Node *n, bool discard, V &x) {
+        auto et = n->exprtype;
+        if (discard || !et || et->kind == TY_VOID || M.TypeOk(et) || M.VrOk(et)) return false;
+        return InPlaceValue(n, et, n->line, x);
+    }
+
     V GenIf(IfExpr *i, bool discard) {
         auto et = i->exprtype;
         auto valued = !discard && et && et->kind != TY_VOID;
         // A varint-width relative reference is carried through a temporary
         // as any value of one is: encoded in it, decoded out.
         if (valued && i->elseb && !M.TypeOk(et) && !M.VrOk(et)) {
-            // An image or a resizable: each arm builds it on a temporary's
-            // stack (GenImg, GenRz).
-            if (IsImg(et) && M.ImgOk(et)) {
-                auto stk = Stk(AllocStk(false, i->line), i->line);
-                V x;
-                x.t = et;
-                x.mem = true;
-                x.a = tyg_at_val(GenImg(i, stk, et, i->line), 0);
-                return x;
-            }
-            if (IsGrow(et) && (M.RzOk(et) || M.VeOk(et))) {
-                auto x = RzTemp(et, i->line);
-                GenRz(i, x.stk, x.a, et, i->line);
-                return x;
-            }
+            V x;
+            if (InPlaceValue(i, et, i->line, x)) return x;
         }
         if (valued && !M.TypeOk(et) && !M.VrOk(et)) No(i->line, "if value type");
         tyg_local res = 0;
@@ -5894,12 +5943,27 @@ struct TgFn {
     }
 
     // `block { ... }` (EarlyBlock::CgAny): its tail's value, or a break's.
-    V GenEarly(EarlyBlock *e, bool discard) {
-        auto valued = Valued(e, discard);
+    V GenEarly(EarlyBlock *e, bool discard, const InPlace *ip = nullptr) {
+        V w;
+        if (!ip && WantInPlace(e, discard, w)) return w;
+        auto valued = !ip && Valued(e, discard);
         auto et = e->exprtype;
         tyg_local res = valued ? Temp(et) : 0;
         auto done = tyg_block_new(p);
-        loops.push_back({ done, done, sscopes.size(), res, valued ? et : nullptr, true });
+        LoopTargets lt { done, done, sscopes.size(), res, valued ? et : nullptr, true };
+        if (ip) {
+            lt.inplace = ip->mode, lt.dstk = ip->stk, lt.dt = ip->t, lt.hdr = ip->hdr;
+            lt.top0 = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(lt.top0, 0), Top(ip->stk), 0);
+        }
+        loops.push_back(lt);
+        if (ip) {
+            BuildArm(e->body, e->line, [&](Node *v) { BuildTo(v, *ip, e->line); });
+            loops.pop_back();
+            Jump(done);
+            tyg_block_set(p, done);
+            return V {};
+        }
         armwant = valued && et->kind == TY_SLICE ? et : nullptr;
         auto x = GenBlock(e->body, !valued);
         loops.pop_back();
@@ -5911,15 +5975,25 @@ struct TgFn {
     }
 
     // `loop { ... }`, its value a break's.
-    V GenLoopX(LoopExpr *lp, bool discard) {
-        auto valued = std::any_of(lp->breaks.begin(), lp->breaks.end(), [](Break *b) { return b->val; }) &&
+    V GenLoopX(LoopExpr *lp, bool discard, const InPlace *ip = nullptr) {
+        V w;
+        if (!ip && std::any_of(lp->breaks.begin(), lp->breaks.end(), [](Break *b) { return b->val; }) &&
+            WantInPlace(lp, discard, w))
+            return w;
+        auto valued = !ip && std::any_of(lp->breaks.begin(), lp->breaks.end(), [](Break *b) { return b->val; }) &&
                       Valued(lp, discard);
         auto et = lp->exprtype;
         tyg_local res = valued ? Temp(et) : 0;
         auto body = tyg_block_new(p), done = tyg_block_new(p);
         tyg_jump(p, body);
         tyg_block_set(p, body);
-        loops.push_back({ done, body, sscopes.size(), res, valued ? et : nullptr });
+        LoopTargets lt { done, body, sscopes.size(), res, valued ? et : nullptr };
+        if (ip) {
+            lt.inplace = ip->mode, lt.dstk = ip->stk, lt.dt = ip->t, lt.hdr = ip->hdr;
+            lt.top0 = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(lt.top0, 0), Top(ip->stk), 0);
+        }
+        loops.push_back(lt);
         GenBlock(lp->body, true);
         loops.pop_back();
         Jump(body);
@@ -5931,12 +6005,14 @@ struct TgFn {
     // An integer match (MatchExpr::CgAny): the scrutinee evaluated once,
     // then the arms tested in order, each listed value or range at the
     // scrutinee's type, unsigned for an unsigned one. ADTs are not held.
-    V GenMatch(MatchExpr *me, bool discard) {
-        if (auto adt = AdtOf(me->scrutinee->exprtype)) return GenAdtMatch(me, adt, discard);
+    V GenMatch(MatchExpr *me, bool discard, const InPlace *ip = nullptr) {
+        V w;
+        if (!ip && WantInPlace(me, discard, w)) return w;
+        if (auto adt = AdtOf(me->scrutinee->exprtype)) return GenAdtMatch(me, adt, discard, ip);
         auto ot = cg.OperandT(me->scrutinee->exprtype);
         if (!ot || ot->kind != TY_INT || ot->intstorage == IS_VARINT)
             No(me->line, cat("match over type ", ot ? M.NameWhy(ot) : string("?")));
-        auto valued = Valued(me, discard);
+        auto valued = !ip && Valued(me, discard);
         auto et = me->exprtype;
         tyg_local res = valued ? Temp(et) : 0;
         auto uns = IsUnsigned(ot->intstorage);
@@ -5948,6 +6024,11 @@ struct TgFn {
         auto k = [&](int64_t v) { return tyg_iconst(p, TYG_I64, v); };
         auto done = tyg_block_new(p);
         auto arm = [&](Node *body) {
+            if (ip) {
+                BuildArm(body, me->line, [&](Node *v) { BuildTo(v, *ip, me->line); });
+                Jump(done);
+                return;
+            }
             auto v = GenArm(body, !valued, valued ? et : nullptr);
             if (valued && !Ended() && v.t) Store(P { tyg_at_local(res, 0), et }, Fit(v, et, body->line));
             Jump(done);
@@ -6129,8 +6210,8 @@ struct TgFn {
         tyg_copy(p, to, from, sz);
     }
 
-    V GenAdtMatch(MatchExpr *me, TypeExpr *adt, bool discard) {
-        auto valued = Valued(me, discard);
+    V GenAdtMatch(MatchExpr *me, TypeExpr *adt, bool discard, const InPlace *ip = nullptr) {
+        auto valued = !ip && Valued(me, discard);
         auto et = me->exprtype;
         tyg_local res = valued ? Temp(et) : 0;
         auto s = AdtScrutinee(me->scrutinee, adt);
@@ -6174,8 +6255,12 @@ struct TgFn {
                 }
             }
             Loc(a.body->line);   // A breakpoint on the arm's line stops here, bound.
-            auto v = GenArm(a.body, !valued, valued ? et : nullptr);
-            if (valued && !Ended() && v.t) Store(P { tyg_at_local(res, 0), et }, Fit(v, et, a.body->line));
+            if (ip) {
+                BuildArm(a.body, me->line, [&](Node *v) { BuildTo(v, *ip, me->line); });
+            } else {
+                auto v = GenArm(a.body, !valued, valued ? et : nullptr);
+                if (valued && !Ended() && v.t) Store(P { tyg_at_local(res, 0), et }, Fit(v, et, a.body->line));
+            }
             CloseScope();
             tyg_scope_end(p);
             Jump(done);
@@ -6376,7 +6461,29 @@ struct TgFn {
                 if (loops.empty()) No(n->line, "break target");
                 auto t = loops.back();
                 if (b->val) {
-                    if (t.rt) {
+                    if (t.inplace) {
+                        // Built at the top, which something under
+                        // construction may have moved up: the value then
+                        // moves down to where the exit's value starts
+                        // (CodeGen::GenExitValue, LandValue).
+                        InPlace ip { t.inplace, t.dstk, t.dt, t.hdr };
+                        auto st = tyg_local_new(p, 8, 8);
+                        tyg_store(p, TYG_I64, tyg_at_local(st, 0), Top(t.dstk), 0);
+                        BuildTo(b->val, ip, b->line);
+                        if (!Ended()) {
+                            auto start = tyg_load(p, TYG_I64, tyg_at_local(st, 0), 0);
+                            auto top0 = tyg_load(p, TYG_I64, tyg_at_local(t.top0, 0), 0);
+                            auto mv = tyg_block_new(p), skip = tyg_block_new(p);
+                            tyg_branch(p, tyg_cmp(p, TYG_NE, start, top0), mv, skip);
+                            tyg_block_set(p, mv);
+                            auto n = tyg_bin(p, TYG_SUB, Top(t.dstk), start);
+                            tyg_move_dyn(p, top0, start, n);
+                            SetTop(t.dstk, tyg_bin(p, TYG_ADD, top0, n));
+                            if (t.inplace == 2) tyg_store(p, TYG_I64, t.hdr, top0, 0);
+                            tyg_jump(p, skip);
+                            tyg_block_set(p, skip);
+                        }
+                    } else if (t.rt) {
                         auto x = GenAs(b->val, t.rt);
                         if (!M.IsScalar(t.rt) && !x.mem && !Ended()) No(n->line, "aggregate value");
                         Store(P { tyg_at_local(t.res, 0), t.rt }, x);
@@ -7336,7 +7443,47 @@ struct TgFn {
         }
         auto pl = Deref(Place(n));
         if (Ended()) return at();
-        if (!cg.TEq(pl.t, t)) No(l, cat("value of type ", M.NameWhy(t)));
+        if (!cg.TEq(pl.t, t)) {
+            // A variant or a fixed-mode ADT of this one's variants, adapted
+            // (CodeGen::GenVarEnumFromLoc): the tag, then the payload.
+            if (M.EI(pl.t) != M.EI(t) || (pl.t->kind != TY_VARIANT && !(pl.t->kind == TY_ENUM && !pl.t->enu->varmode)))
+                No(l, cat("value of type ", M.NameWhy(t)));
+            auto base = at();
+            auto ts = M.TagSize(t);
+            SetTop(stk, tyg_bin(p, TYG_ADD, base, tyg_iconst(p, TYG_I64, ts)));
+            auto ei = M.EI(t);
+            auto copyfix = [&](int64_t sz, tyg_addr from) {
+                if (!sz) return;
+                auto top = Top(stk);
+                tyg_copy(p, tyg_at_val(top, 0), from, sz);
+                SetTop(stk, tyg_bin(p, TYG_ADD, top, tyg_iconst(p, TYG_I64, sz)));
+            };
+            if (pl.t->kind == TY_VARIANT) {
+                StoreTag(tyg_at_val(base, 0), t, M.VariantIdx(pl.t));
+                if (cg.IsFix(pl.t)) copyfix(cg.FixedSize(pl.t), pl.a);
+                else ImgCopy(stk, tyg_addr_of(p, pl.a), pl.t);
+                return at();
+            }
+            auto tag = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(tag, 0), LoadTag(pl.a, pl.t), 0);
+            tyg_store(p, M.TagScal(t), tyg_at_val(base, 0),
+                      tyg_convert(p, TYG_TRUNC, M.TagScal(t), tyg_load(p, TYG_I64, tyg_at_local(tag, 0), 0)), 0);
+            auto done = tyg_block_new(p);
+            for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
+                auto psz = cg.VariantLayout(ei, (int)vi).size;
+                auto hit = tyg_block_new(p), next = tyg_block_new(p);
+                tyg_branch(p, tyg_cmp(p, TYG_EQ, tyg_load(p, TYG_I64, tyg_at_local(tag, 0), 0), tyg_iconst(p, TYG_I64, (int64_t)vi)), hit, next);
+                tyg_block_set(p, hit);
+                auto from = pl.a;
+                from.offset += ts;
+                copyfix(psz, from);
+                tyg_jump(p, done);
+                tyg_block_set(p, next);
+            }
+            tyg_jump(p, done);
+            tyg_block_set(p, done);
+            return at();
+        }
         return ImgCopy(stk, tyg_addr_of(p, pl.a), t);
     }
 
