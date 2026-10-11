@@ -2168,6 +2168,13 @@ struct TgFn {
             return r;
         }
         if (OptFit(x, want)) return x;
+        if (x.mem && x.t->kind == TY_ARRAY && want->kind == TY_SLICE && M.TypeOk(want) &&
+            (IsGrow(x.t) || IsVarArr(x.t)) && cg.Mangle(x.t->arr->sub) == cg.Mangle(want->sub)) {
+            // An array temporary (a call's result) where a slice is wanted:
+            // a view of it (§6.4).
+            auto v = ViewOf(P { x.a, x.t, x.stk }, l);
+            return SliceValue(want, v.elems, v.len);
+        }
         if (M.IsScalar(x.t) != M.IsScalar(want) || !cg.TEq(x.t, want)) {
             string a, b;
             x.t->Dump(a);
@@ -4819,7 +4826,9 @@ struct TgFn {
         if (auto cc = Is<Call>(src); cc && cc->builtin == B_COPY && cc->ArgNodes().size() == 1)
             src = cc->ArgNodes()[0];
         auto st = src->exprtype;
-        if (Is<Call>(src) && st && IsGrow(st) && Is<Call>(src)->builtin < 0 && !DestSpec(Is<Call>(src)))
+        // A function value's call builds it in place as well (GenRz).
+        auto fvcall = Is<Call>(src) && Is<Call>(src)->fvbody && Is<Call>(src)->fvbody->tail;
+        if (Is<Call>(src) && st && IsGrow(st) && Is<Call>(src)->builtin < 0 && !DestSpec(Is<Call>(src)) && !fvcall)
             No(l, "append of this call");
         if (auto cc = Is<Call>(src); cc && cc->builtin < 0 && st && IsGrow(st)) {
             auto tmp = tyg_local_new(p, 16, 8);
