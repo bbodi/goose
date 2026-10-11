@@ -1151,6 +1151,7 @@ struct TgModule {
         if (d->reusable) return IsGrow(d->type) && RzOk(d->type) && cg.gstks.count(d) && cg.gpools.count(d);
         if (TypeOk(d->type)) return true;
         return ((IsGrow(d->type) || IsVarArr(d->type)) && RzOk(d->type) && cg.gstks.count(d)) ||
+               (VarImgOk(d->type) && cg.gstks.count(d)) ||
                (IsGrow(d->type) && VeOk(d->type) && cg.gstks.count(d)) || (FoOk(d->type) && cg.gstks.count(d));
     }
 
@@ -5460,8 +5461,8 @@ struct TgFn {
                           M.File(d->line.fileidx), d->line.line);
             return;
         }
-        if (((IsVarArr(d->type) && M.RzOk(d->type)) || M.VsOk(d->type) || M.VmOk(d->type) || M.VvOk(d->type) ||
-             M.RcOk(d->type)) &&
+        if (((IsVarArr(d->type) && (M.RzOk(d->type) || M.VarImgOk(d->type))) || M.VsOk(d->type) || M.VmOk(d->type) ||
+             M.VvOk(d->type) || M.RcOk(d->type)) &&
             !cg.PrefVar(d)) {
             // A T[] local: its image's address, the image on a stack of its
             // own (built by StmtVarDecl).
