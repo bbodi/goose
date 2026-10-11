@@ -6581,6 +6581,18 @@ struct TgFn {
         tyg_local copied = 0;
         auto havecopy = false;
         vector<tyg_local> shared(an.size());
+        auto copyval = [&] {
+            if (!Ended() && M.IsVm(adt) && std::any_of(c->dispatch.begin(), c->dispatch.end(),
+                                        [&](FnSpec *k) { return k->argtypes[(size_t)pos]->kind != TY_REF; })) {
+                // The whole value copied before the later arguments
+                // run (CodeGen::EmitDispatch's `copied`).
+                auto stk = Stk(AllocStk(false, c->line), c->line);
+                copied = tyg_local_new(p, 8, 8);
+                tyg_store(p, TYG_I64, tyg_at_local(copied, 0), ImgCopy(stk, tyg_addr_of(p, s.v.a), adt), 0);
+                havecopy = true;
+            }
+        };
+
         vector<vector<tyg_arg>> valargs(an.size());   // By-value arrays', built once.
         for (size_t i = 0; i < an.size(); i++) {
             if ((int)i == pos && sp0->argtypes[i]->kind == TY_REF) {
@@ -6593,19 +6605,12 @@ struct TgFn {
                 s.v.a = pl.a;
                 if (Ended()) s.v.a = tyg_at_local(Temp(M.ast.inttypes[IS_I64]), 0);
                 tyg_store(p, TYG_I64, tyg_at_local(s.tag, 0), LoadTag(s.v.a, adt), 0);
+                copyval();
                 continue;
             }
             if ((int)i == pos) {
                 s = AdtScrutinee(an[i], adt);
-                if (!Ended() && M.IsVm(adt) && std::any_of(c->dispatch.begin(), c->dispatch.end(),
-                                            [&](FnSpec *k) { return k->argtypes[(size_t)pos]->kind != TY_REF; })) {
-                    // The whole value copied before the later arguments
-                    // run (CodeGen::EmitDispatch's `copied`).
-                    auto stk = Stk(AllocStk(false, c->line), c->line);
-                    copied = tyg_local_new(p, 8, 8);
-                    tyg_store(p, TYG_I64, tyg_at_local(copied, 0), ImgCopy(stk, tyg_addr_of(p, s.v.a), adt), 0);
-                    havecopy = true;
-                }
+                copyval();
                 continue;
             }
             auto pt = sp0->argtypes[i];
