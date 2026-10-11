@@ -1544,6 +1544,10 @@ struct TgFn {
             BuildArm(b, l, [&](Node *v) { GenRz(v, stk, hdr, t, l); });
             return;
         }
+        if (auto c = Is<Call>(n); c && c->fvbody && c->fvbody->tail) {
+            BuildFv(c, l, [&](Node *v) { GenRz(v, stk, hdr, t, l); });
+            return;
+        }
         if (auto al = Is<ArrayLit>(n)) {
             if (al->fillval || al->capexpr) No(l, "array literal of this kind");
             begin();
@@ -1644,6 +1648,12 @@ struct TgFn {
             auto start = tyg_local_new(p, 8, 8);
             tyg_store(p, TYG_I64, tyg_at_local(start, 0), Top(stk), 0);
             BuildArm(b, l, [&](Node *v) { GenImg(v, stk, t, l); });
+            return tyg_load(p, TYG_I64, tyg_at_local(start, 0), 0);
+        }
+        if (auto c = n && !from ? Is<Call>(n) : nullptr; c && c->fvbody && c->fvbody->tail) {
+            auto start = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(start, 0), Top(stk), 0);
+            BuildFv(c, l, [&](Node *v) { GenImg(v, stk, t, l); });
             return tyg_load(p, TYG_I64, tyg_at_local(start, 0), 0);
         }
         if (M.IsVm(t)) {
@@ -3540,8 +3550,23 @@ struct TgFn {
     V GenFvCall(Call *c) {
         auto et = c->fvbody->exprtype;
         auto wantsval = !cg.IsVoidT(et);
+        if (wantsval && !M.TypeOk(et) && IsImg(et) && M.ImgOk(et)) {
+            // An image: built at the top of a temporary's stack.
+            auto stk = Stk(AllocStk(false, c->line), c->line);
+            V x;
+            x.t = et;
+            x.mem = true;
+            x.a = tyg_at_val(GenImg(c, stk, et, c->line), 0);
+            return x;
+        }
+        if (wantsval && !M.TypeOk(et) && IsGrow(et) && M.RzOk(et)) {
+            auto x = RzTemp(et, c->line);
+            GenRz(c, x.stk, x.a, et, c->line);
+            return x;
+        }
         if (wantsval && !M.TypeOk(et)) No(c->line, cat("function value of type ", M.Name(et)));
         if (c->fvparams.size() > c->args.size()) No(c->line, "function value parameters");
+        if (Ended()) return Dummy(et);
         tyg_scope_begin(p);
         OpenScope(false);
         for (size_t i = 0; i < c->fvparams.size(); i++) {
@@ -4458,6 +4483,20 @@ struct TgFn {
         OpenScope(true);
         build(n);
         CloseScope();
+    }
+    // A function value's call whose value is built in place: its
+    // parameters bound in a scope of its own, then its body as an arm.
+    template <class F> void BuildFv(Call *c, Line l, F build) {
+        if (c->fvparams.size() > c->args.size()) No(c->line, "function value parameters");
+        tyg_scope_begin(p);
+        OpenScope(false);
+        for (size_t i = 0; i < c->fvparams.size(); i++) {
+            Declare(c->fvparams[i], c->args[i]->line);
+            Init(c->fvparams[i], c->args[i], c->args[i]->line);
+        }
+        if (!Ended()) BuildArm(c->fvbody, l, build);
+        CloseScope();
+        tyg_scope_end(p);
     }
     // An if with an else whose arms each build a value in place.
     template <class F> void BuildIf(IfExpr *ie, Line l, F build) {
