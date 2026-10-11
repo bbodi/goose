@@ -3101,9 +3101,9 @@ struct TgFn {
         tyg_debug_proc(p, string(sp->sf->qname).c_str(), file, sp->sf->line.line, fdt);
         Loc(sp->sf->line);
         // The C parameter: a by-value T[>..] takes two. The free variables
-        // follow the declared parameters; they are stored first, so that
-        // their entries are in place where the prologue ends for the
-        // debugger, after the last declared parameter's (tyg_debug_param).
+        // follow the declared parameters; their entries end the prologue
+        // for the debugger as the parameters' do (tyg_debug_var_ref,
+        // tyg_debug_param).
         int pi = 0;
         for (auto t : sp->argtypes) pi += M.RzParam(t) && IsGrow(t) ? 2 : 1;
         auto param = [&] {

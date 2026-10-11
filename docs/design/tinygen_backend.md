@@ -9,7 +9,8 @@ what the first stage covers, and the plan from here.
 
     goose build --backend=tinygen prog.goose        # debug build, -O0
     goose build --backend=tinygen --debug prog.goose  # with GS_DEBUG's checks
-    goose build --backend=tinygen -v prog.goose     # also says what stayed in C
+    goose build --backend=tinygen -v prog.goose     # also says what stayed in C,
+                                                    # and whether any C was compiled
 
 ## Why
 
@@ -61,7 +62,9 @@ their call interfaces are known (`Choose`).
 ## Two halves, one program
 
 Decision: **the C backend still runs for every program**, and tinygen takes
-over function bodies one at a time. The build links three objects:
+over function bodies one at a time. (A program it takes whole, with
+nothing program-specific left for the C half, skips the C half; see
+Whole programs below.) The build links three objects:
 
 | Object | Holds |
 |---|---|
@@ -102,8 +105,9 @@ Goose file and line, which the object passes as a string of its own.
 **Extern fns** (§7.10) are called through a trampoline per extern
 (`gs_tg_x_<cname>`) that the C half defines, because the C function may be a
 `static` one (an `--include` header's, `runtime_ext.h`'s) or a macro. The
-trampoline adds a call; a later stage can call plain library symbols
-directly. The externs called count as used (`CodeGen::usedexterns`), so the
+trampoline adds a call. A function the runtime object exports (declared
+`GS_API` in `runtime.h` or `runtime_ext.h`: the OS layer, `gs_scan_any`) is
+a plain symbol and is called directly (`TgModule::RuntimeApi`). The externs called count as used (`CodeGen::usedexterns`), so the
 native parts of the packages they come from are built and linked as for C
 (`NativePackagesUsed`).
 
@@ -531,6 +535,120 @@ optionals, frame objects and limited arrays as parameters and results.
 Next: composites rendered through C render functions, `default`,
 `match` over fixed-mode enums, `return from` with `u8[]` results.
 
+## Whole programs: no C compiled (B1)
+
+Once every function of a program goes through tinygen, what the C half
+still holds is `main` and `gs_program_init`, `gs_globals_t` and
+`gs_init_globals`, and the shims, trampolines and thread-locals the
+object calls into. For a program where that is all program-independent,
+`goose build --backend=tinygen` now writes no C and runs the C compiler on
+nothing of the program's: it links three objects with the C compiler as
+the linker driver.
+
+| Object | Holds |
+|---|---|
+| `<stem>.tg.o`, written by tinygen | every specialization, and `main` (`TinyGenBackend::EmitMain`) |
+| the support object (`goose_tgsupport[_checks]-<hash>.o`) | every program-independent shim (`TgFixedShim`), the trampolines of `runtime_ext.h`'s static externs (`gs_find_any`, `gs_sqrt`, the libm wrappers, `gs_bld_append`), the thread-locals `gs_stks`, `gs_gl`, `gs_rf`, and `gs_tg_start`/`gs_tg_end` |
+| the runtime object (`goose_runtime.o`) | as for any build |
+
+* **The support object** is C that depends on the runtime alone:
+  `runtime.h`, the core types, `runtime_ext.h`, then `TgSupportBody`
+  (`TinygenSupportSource` in `main.cpp`). It is compiled once per runtime
+  version, toolchain and configuration, beside the runtime object and
+  through the same cache (`CachedObject` in `build.h`: a lock, a
+  temporary, an atomic rename, so concurrent first builds share one), in
+  two flavours: plain, and with `GS_DEBUG` for `--debug`, which is where
+  the checked arithmetic's meaning lives. Its name carries a hash of its
+  source, so a compiler whose shims change builds a new one.
+* **`main`** is a tinygen procedure: `gs_tg_start(argc, argv, ...)` with
+  the stack counts `gs_program_init` would hand `gs_rt_init`
+  (`CodeGen::rtinit`), the Goose `main` (with `gs_sp` 0 where it takes
+  one), `gs_tg_end()` (`gs_rt_stats`), `return 0`. The thread-locals it
+  sets up live in the support object, whose shims (`gs_tg_stks`, ...)
+  are what the object reads them through anyway (gap 6). Its debug entry
+  is `main` at `fn main()`'s line, so a backtrace ends in Goose source.
+* **Fallback**: the whole path is taken only when tinygen compiled every
+  live specialization and the C half would hold nothing program-specific
+  (`TinyGenBackend::WholeProgram`): no globals to initialize or reach
+  (`CodeGen::noglobalinit`, no `gs_tg_g<i>` accessors), no `return from`
+  channels (`gs_lret_*`, which the C half declares per target), no extern
+  fns but the runtime's, no threads or queues, no `export fn`, no
+  `--include`, no `-D` but `GS_DEBUG`, not `--standalone`. Anything else
+  takes the mixed path as before. `-v` says which, and why:
+
+      tinygen: whole program: no C compiled for it
+      tinygen: mixed: the C half compiled by the C compiler (globals to initialize)
+
+  `--tinygen-mixed` (hidden) forces the mixed path, for comparisons.
+
+Over the sweep (the 291 programs, built `goose build -O0` and with
+`--backend=tinygen`, plain and `--debug`; the 290 that build without
+flags of their own, all but `samples/24_call_c`, which needs its
+`--include` header, print the same and exit alike in all 580 pairs, the
+timings samples print to stderr aside), 36 programs take the whole path,
+with and without `--debug`:
+Goose-in-Goose, `samples/20_life`, eleven of the `test/tinygen/` fixtures
+(all but the globals, global-stacks, `return from`, strings and
+extern-with-C-of-its-own ones) and a run of small `codegen/`, `typing/` and
+`optimizer/` fixtures. Goose-in-Goose built so, plain and `--debug`,
+compiles itself to the same C, byte for byte, as the C backend's build.
+What keeps the others on the mixed path, by count: functions left to C
+(238), globals to initialize (13), `return from` channels
+(2), `export fn` (1).
+
+**Build time.** `goose build` end to end, median of three, macOS arm64
+(Apple clang 21 for `cc`), with a Release build of the compiler; "cold"
+deletes `GOOSE_HOME/build/runtime` first (the runtime object, and the
+support object for the whole path, compiled again), "warm" finds them.
+"goose" is the compiler's own share (`--dry-run`: front end, optimizer,
+BCE, and the backends' code generation, no C compiler, no link). The C
+backend's `-O0` is Goose's optimizer level; its C is compiled `cc -O2`, or
+`cc -O0 -g` with `--debug` (which also defines `GS_DEBUG`). tinygen builds
+compile their C half, if any, `-O0 -g`; with or without `--debug` they
+took the same time to within a millisecond, so one row each.
+
+| Program (functions) | Build | cold ms | warm ms | goose ms |
+|---|---|---|---|---|
+| Goose-in-Goose (172) | C `-O0` (`cc -O2`) | 3483 | 3081 | 328 |
+| | C `-O0 --debug` (`cc -O0 -g`) | 1170 | 1068 | 319 |
+| | tinygen, mixed | 526 | 423 | 332 |
+| | tinygen, whole program | 529 | 375 | 336 |
+| `samples/20_life` (7) | C `-O0` (`cc -O2`) | 555 | 153 | 34 |
+| | C `-O0 --debug` (`cc -O0 -g`) | 233 | 132 | 34 |
+| | tinygen, mixed | 222 | 121 | 34 |
+| | tinygen, whole program | 229 | 76 | 35 |
+| `tinygen_text` (15) | C `-O0` (`cc -O2`) | 570 | 164 | 30 |
+| | C `-O0 --debug` (`cc -O0 -g`) | 232 | 133 | 30 |
+| | tinygen, mixed | 217 | 116 | 31 |
+| | tinygen, whole program | 225 | 74 | 31 |
+| `tinygen_arrays` (10) | C `-O0 --debug` (`cc -O0 -g`) | 226 | 127 | 30 |
+| | tinygen, mixed | 212 | 116 | 31 |
+| | tinygen, whole program | 225 | 73 | 31 |
+| `codegen/view_aliases` | C `-O0 --debug` (`cc -O0 -g`) | 222 | 123 | 30 |
+| | tinygen, mixed | 214 | 115 | 30 |
+| | tinygen, whole program | 226 | 73 | 31 |
+
+What this says:
+
+* **Warm, the whole path is the compiler plus a link.** Every warm
+  whole-program build is "goose" plus about 40 ms, which is the C
+  compiler driver linking three objects. The mixed path adds about 45 ms
+  over that for the C half (a few thousand lines, nearly all of them the
+  runtime's header, at `-O0`), and the C backend at `-O0 -g` adds 90 to
+  750 ms, growing with the program: for Goose-in-Goose the whole path is
+  2.8x faster than `cc -O0 -g` and 8x faster than the default `cc -O2`.
+* **Cold, the runtime dominates small programs.** The runtime object is
+  compiled once per configuration (about 100 ms at `-O0 -g`, 400 ms at
+  `-O2`), and the support object takes 5 to 10 ms more; after that
+  every build is warm.
+* **The compile phase alone**: of Goose-in-Goose's 336 ms in the
+  compiler, about 260 ms is the front end (`goose -O0 --check`: parse,
+  check, BCE), about 20 ms the C backend's code generation (which still
+  runs on the whole path: `CodeGen` makes the call interfaces and layouts
+  tinygen reads, and the C text is then dropped), and about 50 ms
+  tinygen building and writing 172 functions. What remains to win is in
+  the front end and the link, not in code generation.
+
 ## Testing
 
 `test/tinygen/` holds fixtures the backend covers whole: scalars,
@@ -570,6 +688,12 @@ one for a static global by its Goose name, one for a `u8[]` image and
 a resizable array's fat reference, header and elements, and one for a
 resizable local and a `u8[]` local built in a tinygen function, and one
 for a nested function's free variables shown as the variables.
+The fixtures it builds whole with no C half (`WHOLE_PROGRAM`, with
+`samples/20_life` and `codegen/loop_invariant_divisors`) must say so on
+the `-v` path line and run no compile of their own C, one is built again
+with `--tinygen-mixed` to the same output, and under lldb a whole
+program's backtrace ends in `main` at `fn main()`'s line with the Goose
+`main`'s locals by name.
 
 ## What tinygen lacks for Goose
 
@@ -641,13 +765,13 @@ Recorded here rather than changed in tinygen, which other work is changing:
 8. ~~Debug info for a variable behind a pointer.~~ tinygen now has
    `tyg_debug_var_ref`, a local holding the variable's address, and the
    backend describes each free variable so: lldb shows `n` as the
-   variable, not a pointer. One thing remains: unlike `tyg_debug_param`
-   it does not end the prologue for the debugger, so in a nested
-   function without declared parameters a breakpoint on the function
-   stops before the addresses are stored and shows garbage until the
-   first line (the backend stores the free variables before the
-   declared parameters, so that with any of those they are in place).
-   A flag to count such an entry as a parameter would close it.
+   variable, not a pointer. It now also ends the prologue in the entry
+   block as a parameter does, so a breakpoint on a nested function
+   without declared parameters stops after the addresses are stored.
+9. **Aliases on Mach-O.** `tyg_alias` works on ELF only. With it, a
+   whole program build could name a runtime function under its
+   trampoline's name instead of a forwarding call; not needed so far,
+   since the backend calls exported runtime functions directly.
 
 ## Plan
 
@@ -679,11 +803,15 @@ Recorded here rather than changed in tinygen, which other work is changing:
    or an in-memory loader, see above); Linux and Windows (CodeView) in CI; the
    x86-64 ABI checks; lldb/gdb formatters for Goose arrays shipped with the
    compiler. `#line` in the C half for what remains in C.
-5. **Whole program**: once nearly everything goes through tinygen, the C half
-   shrinks to `main` and the runtime's inline helpers, which can then move
-   into the runtime object behind exported names, and a debug build needs no
-   C compiler for the program at all — which is where the build-time win is.
-   Measure compile time against `cc -O0` then.
+5. **Whole program**: done for programs whose C half would hold only
+   `main` and program-independent helpers (B1, above): `main` in the
+   object, the helpers in a support object compiled once, no C of the
+   program compiled, measured against `cc -O0`. Next: globals (their
+   storage as a data symbol of the object and `gs_init_globals` as a
+   tinygen procedure; the accessors then become addresses), `return
+   from` channels as data of the object (they are thread-locals: gap 6),
+   threads (the worker thunks), and extern fns of packages called
+   directly when their C is a library's plain symbol.
 
 ## Decisions
 
