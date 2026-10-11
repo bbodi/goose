@@ -304,6 +304,33 @@ def check_lldb_built(exe, base, lldb, ok, fail):
             fail("tinygen built-array debug info under lldb", f"missing {missing}:\n{o + e}")
             return
     ok("tinygen debug info under lldb: a resizable and a u8[] local built in place")
+    check_lldb_freevars(exe, base, lldb, ok, fail)
+
+
+def check_lldb_freevars(exe, base, lldb, ok, fail):
+    """A nested function's free variables as the variables themselves,
+    reached through the addresses it is handed: scalars at a breakpoint
+    on the function, a struct and a fixed array at a line."""
+    source = HERE / "tinygen" / "tinygen_nested.goose"
+    out = base / f"lldb-nested{tc.EXE_SUFFIX}"
+    good, log, _, _ = build(exe, source, out, [])
+    if not good:
+        fail("tinygen lldb nested build", log)
+        return
+    code, o, e = tc.run_capture([lldb, "-b", "-o", "b bump", "-o", "run", "-o", "frame variable",
+                                 "-o", "br del 1", "-o", "b tinygen_nested.goose:28",
+                                 "-o", "continue", "-o", "frame variable", "-o", "kill", out])
+    text = o + e
+    wants = [
+        r"\(i64\) n = 5\s*\(i32\) calls = 0\s*\(i64\) by = 3",
+        r"\(P2\) p = \(x = 3, y = 2\)",
+        r"\(i64\[3\]\) w = \(\[0\] = 5, \[1\] = 6, \[2\] = 7\)",
+    ]
+    missing = [w for w in wants if not re.search(w, text)]
+    if missing:
+        fail("tinygen free-variable debug info under lldb", f"missing {missing}:\n{text}")
+        return
+    ok("tinygen debug info under lldb: free variables through their addresses")
 
 
 if __name__ == "__main__":

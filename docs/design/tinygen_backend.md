@@ -467,9 +467,10 @@ render functions given external linkage, `default`, then free variables.
   the elements start, the new ones built there. Not yet: assigning a
   new image to a `T[]` variable.
 
-Free variables are described to the debugger as the C has them, as
-pointers under the variables' names (`p *n`); describing the variable
-itself needs a location through a pointer, which tinygen lacks (gap 8).
+Free variables are described to the debugger as the variables
+themselves, under their names, through the addresses the function is
+handed (`tyg_debug_var_ref`: `DW_OP_fbreg`, `DW_OP_deref`), where the
+C half shows pointers (`p *n`); see gap 8.
 
 Coverage after this step is the last table row (0 of 582 runs differ).
 Goose-in-Goose now goes through tinygen whole: **172 of 172** functions,
@@ -521,7 +522,8 @@ frame and its caller, and a parameter and a local with Goose types; and one
 more for a slice parameter's `data` and `len` and a fixed array's elements,
 one for a static global by its Goose name, one for a `u8[]` image and
 a resizable array's fat reference, header and elements, and one for a
-resizable local and a `u8[]` local built in a tinygen function.
+resizable local and a `u8[]` local built in a tinygen function, and one
+for a nested function's free variables shown as the variables.
 
 ## What tinygen lacks for Goose
 
@@ -589,14 +591,16 @@ Recorded here rather than changed in tinygen, which other work is changing:
    (or a DWARF location expression: the TLS block, a load, an offset),
    which tinygen's debug calls cannot express. Until then lldb shows such
    a global as `gs_globals_main.counter_g`.
-8. **Debug info for a variable behind a pointer.** A nested function
-   reaches its free variables through addresses it is handed (§7.5), and
-   `tyg_debug_var`/`tyg_debug_param` take an address that holds the
-   value itself (a local, a symbol, a parameter's copy). Describing the
-   captured variable under its name needs a location that loads a
-   pointer first (DWARF `DW_OP_fbreg`, `DW_OP_deref`; CodeView's
-   `S_REGREL32` with an indirection), so lldb shows `n` as a pointer
-   and `*n` as the variable, as for the C half's `int64_t *n_g`.
+8. ~~Debug info for a variable behind a pointer.~~ tinygen now has
+   `tyg_debug_var_ref`, a local holding the variable's address, and the
+   backend describes each free variable so: lldb shows `n` as the
+   variable, not a pointer. One thing remains: unlike `tyg_debug_param`
+   it does not end the prologue for the debugger, so in a nested
+   function without declared parameters a breakpoint on the function
+   stops before the addresses are stored and shows garbage until the
+   first line (the backend stores the free variables before the
+   declared parameters, so that with any of those they are in place).
+   A flag to count such an entry as a parameter would close it.
 
 ## Plan
 

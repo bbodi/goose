@@ -2853,7 +2853,32 @@ struct TgFn {
                                (int)pdt.size(), 0);
         tyg_debug_proc(p, string(sp->sf->qname).c_str(), file, sp->sf->line.line, fdt);
         Loc(sp->sf->line);
-        int pi = 0;   // The C parameter: a by-value T[>..] takes two.
+        // The C parameter: a by-value T[>..] takes two. The free variables
+        // follow the declared parameters; they are stored first, so that
+        // their entries are in place where the prologue ends for the
+        // debugger, after the last declared parameter's (tyg_debug_param).
+        int pi = 0;
+        for (auto t : sp->argtypes) pi += M.RzParam(t) && IsGrow(t) ? 2 : 1;
+        auto param = [&] {
+            auto loc = tyg_local_new(p, 8, 8);
+            tyg_store(p, TYG_I64, tyg_at_local(loc, 0), tyg_param(p, pi++), 0);
+            return loc;
+        };
+        // Free variables (§7.5), each the address of the variable in the
+        // frame it lives in (a T[]'s image, a resizable's header, with its
+        // stack), read through as a by-value T[] parameter is. The debugger
+        // sees the variable itself under its name, reached through the
+        // address (tyg_debug_var_ref), where the C half shows a pointer.
+        for (auto fv : cg.sinfo[sp].freevars) {
+            auto loc = param();
+            locals[fv] = loc;
+            indirect.insert(fv);
+            tyg_debug_var_ref(p, string(fv->name).c_str(), M.DT(fv->type), tyg_at_local(loc, 0),
+                              M.File(fv->line.fileidx), fv->line.line);
+            if (IsGrow(fv->type)) rzstk[fv] = param();
+        }
+        int afterfv = pi;
+        pi = 0;
         for (size_t i = 0; i < sp->params.size(); i++) {
             auto vd = sp->params[i];
             auto t = sp->argtypes[i];
@@ -2882,23 +2907,7 @@ struct TgFn {
                 rzstk[vd] = sl;
             }
         }
-        auto param = [&] {
-            auto loc = tyg_local_new(p, 8, 8);
-            tyg_store(p, TYG_I64, tyg_at_local(loc, 0), tyg_param(p, pi++), 0);
-            return loc;
-        };
-        // Free variables (§7.5), each the address of the variable in the
-        // frame it lives in (a T[]'s image, a resizable's header, with its
-        // stack), read through as a by-value T[] parameter is. The debugger
-        // sees each as a pointer under the variable's name, as the C has it.
-        for (auto fv : cg.sinfo[sp].freevars) {
-            auto loc = param();
-            locals[fv] = loc;
-            indirect.insert(fv);
-            tyg_debug_param(p, string(fv->name).c_str(), tyg_dt_pointer(m, M.DT(fv->type)),
-                            tyg_at_local(loc, 0), M.File(fv->line.fileidx), fv->line.line);
-            if (IsGrow(fv->type)) rzstk[fv] = param();
-        }
+        pi = afterfv;
         chans.resize(sp->rets.size());
         for (size_t i = 0; i < sp->rets.size(); i++) {
             if (IsGrow(sp->rets[i])) {
