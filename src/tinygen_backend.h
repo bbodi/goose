@@ -1223,7 +1223,8 @@ struct TgModule {
     // gives (StackAccessor): its header, or its image's address, in the
     // instance, and that stack beside it.
     bool GlobalOk(VarDef *d) {
-        if (!d->isglobal || cg.PrefVar(d) || !cg.gnames.count(d)) return false;
+        if (!d->isglobal || !cg.gnames.count(d)) return false;
+        if (cg.PrefVar(d)) return cg.IsFatRef(d->type) && TypeOk(d->type);   // A gs_pref.
         if (d->reusable) return IsGrow(d->type) && RzOk(d->type) && cg.gstks.count(d) && cg.gpools.count(d);
         if (TypeOk(d->type)) return true;
         return ((IsGrow(d->type) || IsVarArr(d->type)) && RzOk(d->type) && cg.gstks.count(d)) ||
@@ -1405,10 +1406,11 @@ struct TgModule {
     }
     // A free variable of a nested function (§7.5), as SigParams passes it:
     // a fixed variable by its address, a T[] by its image's address, and
-    // a resizable by its header's address and then its stack. Pools and
-    // frame objects are not held.
+    // a resizable by its header's address and then its stack. A pool
+    // reference by its gs_pref's address.
     bool FvOk(const VarDef *fv) {
-        if (!fv->type || cg.PrefVar(fv)) return false;
+        if (!fv->type) return false;
+        if (cg.PrefVar(fv)) return cg.IsFatRef(fv->type) && TypeOk(fv->type);   // A gs_pref's address.
         if (fv->reusable) return IsGrow(fv->type) && RzOk(fv->type);   // A gs_pref.
         return TypeOk(fv->type) || ((IsGrow(fv->type) || IsVarArr(fv->type)) && RzOk(fv->type)) || VsOk(fv->type) ||
                VrOk(fv->type) || RcOk(fv->type) || FoOk(fv->type) ||
@@ -1481,6 +1483,7 @@ struct TgFn {
         tyg_local res = 0;        // Where a break's value goes, if wanted,
         TypeExpr *rt = nullptr;   // of this type.
         bool block = false;       // A block, which continue passes by.
+        bool pref = false;        // Its value is a pool reference (GenPref).
     };
     vector<LoopTargets> loops;
     // Each result's channel (CodeGen::SigParams), its parameters kept in
@@ -3742,6 +3745,18 @@ struct TgFn {
             flstk = tyg_load(p, TYG_I64, tyg_at_local(loc, 24), 0);
             return;
         }
+        if (vd && cg.PrefVar(vd)) {
+            // A pool reference variable: gs_pref { hdr, stk, fl, flstk } where
+            // it lies, a local's, a global's, or a free variable's.
+            pl = VarPlace(vd, l);
+            auto at = pl.a;
+            if (IsAddrRef(pl.t)) pl = Deref(pl);
+            at.offset += 16;
+            fl = tyg_at_val(tyg_load(p, TYG_I64, at, 0), 0);
+            at.offset += 8;
+            flstk = tyg_load(p, TYG_I64, at, 0);
+            return;
+        }
         if (!vd || !(poolfl.count(vd) || (vd->isglobal && vd->reusable))) No(l, "pool of this kind");
         pl = VarPlace(vd, l);
         if (vd->isglobal) {
@@ -4504,24 +4519,85 @@ struct TgFn {
         return rets;
     }
 
-    // A pool reference argument (CodeGen::GenPrefVal): &pool, or a pool
-    // reference parameter handed on, as gs_pref's four members.
+    // A pool reference argument (CodeGen::GenPrefVal): the pool reference
+    // value as gs_pref's four members.
     void PrefArg(Node *n, vector<tyg_arg> &args) {
+        auto at = GenPref(n);
+        for (int k = 0; k < 4; k++) {
+            tyg_arg a {};
+            auto x = at;
+            x.offset += 8 * k;
+            a.val = Ended() ? tyg_iconst(p, TYG_I64, 0) : tyg_load(p, TYG_I64, x, 0);
+            args.push_back(a);
+        }
+    }
+
+    // Whether a variable holds a gs_pref: a pool reference variable, or a
+    // parameter handed a pool.
+    bool IsPrefStore(const VarDef *vd) { return cg.PrefVar(vd) || (prefs.count(vd) && !vd->reusable); }
+    // The pool reference a node gives (CodeGen::GenPrefVal), the address of
+    // its 32 bytes: a pool's (&pool), another pool reference variable's, or
+    // what a construct choosing among pools builds, each arm into one
+    // temporary.
+    bool prefctl = false;      // Set for the construct to be evaluated, which
+    tyg_local prefloc = 0;     // builds its value into this temporary.
+    bool TakePref(tyg_local &res) {
+        auto was = prefctl;
+        prefctl = false;
+        res = prefloc;
+        return was;
+    }
+    tyg_addr GenPref(Node *n) {
+        if (cg.IsCtl(n)) {
+            auto res = tyg_local_new(p, 32, 8);
+            if (Is<Block>(n)) {
+                BuildArm(n, n->line, [&](Node *v) { PrefInto(tyg_at_local(res, 0), v); });
+            } else if (Is<IfExpr>(n) || Is<MatchExpr>(n) || Is<EarlyBlock>(n) || Is<LoopExpr>(n)) {
+                prefctl = true;
+                prefloc = res;
+                Gen(n);
+                if (prefctl) {
+                    prefctl = false;
+                    No(n->line, "pool reference from this construct");
+                }
+            } else {
+                No(n->line, "pool reference from this construct");
+            }
+            return tyg_at_local(res, 0);
+        }
         auto c = n;
         if (auto u = Is<Unary>(n); u && u->op == T_BITAND) c = u->child;
         auto id = Is<Ident>(c);
         auto vd = id ? id->vdef : nullptr;
         if (!vd) No(n->line, "pool reference argument of this kind");
+        if (IsPrefStore(vd)) return VarPlace(vd, n->line).a;
         P pl;
         tyg_addr fl;
         tyg_val flstk;
         PoolAt(vd, n->line, pl, fl, flstk);
         if (!pl.stk) No(n->line, "pool without its stack");
-        for (auto v : { tyg_addr_of(p, pl.a), pl.stk, tyg_addr_of(p, fl), flstk }) {
-            tyg_arg a {};
-            a.val = v;
-            args.push_back(a);
+        auto res = tyg_local_new(p, 32, 8);
+        auto put = [&](int off, tyg_val v) { tyg_store(p, TYG_I64, tyg_at_local(res, off), v, 0); };
+        put(0, tyg_addr_of(p, pl.a));
+        put(8, pl.stk);
+        put(16, tyg_addr_of(p, fl));
+        put(24, flstk);
+        return tyg_at_local(res, 0);
+    }
+    // A pool reference built into the 32 bytes at dst.
+    void PrefInto(tyg_addr dst, Node *n) {
+        auto src = GenPref(n);
+        if (!Ended()) tyg_copy(p, dst, src, 32);
+    }
+    // An arm of a control construct, its value stored in the construct's
+    // temporary: as the type, or as a pool reference where `pr`.
+    void ArmVal(Node *n, bool valued, bool pr, TypeExpr *et, tyg_local res) {
+        if (valued && pr) {
+            BuildArm(n, n->line, [&](Node *v) { PrefInto(tyg_at_local(res, 0), v); });
+            return;
         }
+        auto x = GenArm(n, !valued, valued ? et : nullptr);
+        if (valued && !Ended() && x.t) Store(P { tyg_at_local(res, 0), et }, Fit(x, et, n->line));
     }
 
     // A by-value array, image or frame object argument: a copy of its own,
@@ -5842,6 +5918,8 @@ struct TgFn {
     }
 
     V GenIf(IfExpr *i, bool discard) {
+        tyg_local res = 0;
+        auto pr = TakePref(res);
         auto et = i->exprtype;
         auto valued = !discard && et && et->kind != TY_VOID;
         // A varint-width relative reference is carried through a temporary
@@ -5864,15 +5942,13 @@ struct TgFn {
             }
         }
         if (valued && !M.TypeOk(et) && !M.VrOk(et)) No(i->line, "if value type");
-        tyg_local res = 0;
-        if (valued) res = Temp(et);
+        if (valued && !pr) res = Temp(et);
         auto c = Truth(i->cond);
         auto tb = tyg_block_new(p), eb = tyg_block_new(p), done = tyg_block_new(p);
         tyg_branch(p, c, tb, i->elseb ? eb : done);
         tyg_block_set(p, tb);
         auto arm = [&](Node *n) {
-            auto x = GenArm(n, !valued, valued ? et : nullptr);
-            if (valued && !Ended() && x.t) Store(P { tyg_at_local(res, 0), et }, Fit(x, et, n->line));
+            ArmVal(n, valued, pr, et, res);
             Jump(done);
         };
         arm(i->thenb);
@@ -5895,15 +5971,19 @@ struct TgFn {
 
     // `block { ... }` (EarlyBlock::CgAny): its tail's value, or a break's.
     V GenEarly(EarlyBlock *e, bool discard) {
+        tyg_local res = 0;
+        auto pr = TakePref(res);
         auto valued = Valued(e, discard);
         auto et = e->exprtype;
-        tyg_local res = valued ? Temp(et) : 0;
+        if (valued && !pr) res = Temp(et);
         auto done = tyg_block_new(p);
-        loops.push_back({ done, done, sscopes.size(), res, valued ? et : nullptr, true });
+        loops.push_back({ done, done, sscopes.size(), res, valued ? et : nullptr, true, valued && pr });
         armwant = valued && et->kind == TY_SLICE ? et : nullptr;
-        auto x = GenBlock(e->body, !valued);
+        V x;
+        if (valued && pr) BuildArm(e->body, e->line, [&](Node *v) { PrefInto(tyg_at_local(res, 0), v); });
+        else x = GenBlock(e->body, !valued);
         loops.pop_back();
-        if (valued && !Ended() && x.t) Store(P { tyg_at_local(res, 0), et }, Fit(x, et, e->line));
+        if (valued && !pr && !Ended() && x.t) Store(P { tyg_at_local(res, 0), et }, Fit(x, et, e->line));
         Jump(done);
         tyg_block_set(p, done);
         if (!valued) return V {};
@@ -5912,14 +5992,16 @@ struct TgFn {
 
     // `loop { ... }`, its value a break's.
     V GenLoopX(LoopExpr *lp, bool discard) {
+        tyg_local res = 0;
+        auto pr = TakePref(res);
         auto valued = std::any_of(lp->breaks.begin(), lp->breaks.end(), [](Break *b) { return b->val; }) &&
                       Valued(lp, discard);
         auto et = lp->exprtype;
-        tyg_local res = valued ? Temp(et) : 0;
+        if (valued && !pr) res = Temp(et);
         auto body = tyg_block_new(p), done = tyg_block_new(p);
         tyg_jump(p, body);
         tyg_block_set(p, body);
-        loops.push_back({ done, body, sscopes.size(), res, valued ? et : nullptr });
+        loops.push_back({ done, body, sscopes.size(), res, valued ? et : nullptr, false, valued && pr });
         GenBlock(lp->body, true);
         loops.pop_back();
         Jump(body);
@@ -5932,13 +6014,21 @@ struct TgFn {
     // then the arms tested in order, each listed value or range at the
     // scrutinee's type, unsigned for an unsigned one. ADTs are not held.
     V GenMatch(MatchExpr *me, bool discard) {
-        if (auto adt = AdtOf(me->scrutinee->exprtype)) return GenAdtMatch(me, adt, discard);
+        tyg_local res = 0;
+        auto pr = TakePref(res);
+        if (auto adt = AdtOf(me->scrutinee->exprtype)) {
+            if (pr) {
+                prefctl = true;
+                prefloc = res;
+            }
+            return GenAdtMatch(me, adt, discard);
+        }
         auto ot = cg.OperandT(me->scrutinee->exprtype);
         if (!ot || ot->kind != TY_INT || ot->intstorage == IS_VARINT)
             No(me->line, cat("match over type ", ot ? M.NameWhy(ot) : string("?")));
         auto valued = Valued(me, discard);
         auto et = me->exprtype;
-        tyg_local res = valued ? Temp(et) : 0;
+        if (valued && !pr) res = Temp(et);
         auto uns = IsUnsigned(ot->intstorage);
         auto x0 = Conv(GenAs(me->scrutinee, ot).v, ot, M.ast.inttypes[IS_I64], me->line);
         if (Ended()) return valued ? Dummy(et) : V {};
@@ -5948,8 +6038,7 @@ struct TgFn {
         auto k = [&](int64_t v) { return tyg_iconst(p, TYG_I64, v); };
         auto done = tyg_block_new(p);
         auto arm = [&](Node *body) {
-            auto v = GenArm(body, !valued, valued ? et : nullptr);
-            if (valued && !Ended() && v.t) Store(P { tyg_at_local(res, 0), et }, Fit(v, et, body->line));
+            ArmVal(body, valued, pr, et, res);
             Jump(done);
         };
         auto wild = false;
@@ -6130,9 +6219,11 @@ struct TgFn {
     }
 
     V GenAdtMatch(MatchExpr *me, TypeExpr *adt, bool discard) {
+        tyg_local res = 0;
+        auto pr = TakePref(res);
         auto valued = Valued(me, discard);
         auto et = me->exprtype;
-        tyg_local res = valued ? Temp(et) : 0;
+        if (valued && !pr) res = Temp(et);
         auto s = AdtScrutinee(me->scrutinee, adt);
         auto done = tyg_block_new(p);
         auto wild = false;
@@ -6174,8 +6265,7 @@ struct TgFn {
                 }
             }
             Loc(a.body->line);   // A breakpoint on the arm's line stops here, bound.
-            auto v = GenArm(a.body, !valued, valued ? et : nullptr);
-            if (valued && !Ended() && v.t) Store(P { tyg_at_local(res, 0), et }, Fit(v, et, a.body->line));
+            ArmVal(a.body, valued, pr, et, res);
             CloseScope();
             tyg_scope_end(p);
             Jump(done);
@@ -6212,7 +6302,7 @@ struct TgFn {
                     No(c->line, "dispatch with arguments of different types");
             if (M.RzParam(sp->argtypes[(size_t)pos])) No(c->line, "dispatch to a case of this kind");
             for (size_t i = 0; i < sp->argtypes.size(); i++)
-                if (cg.IsPoolParam(sp, i)) No(c->line, "dispatch with a pool reference");
+                if (cg.IsPoolParam(sp, i) != cg.IsPoolParam(sp0, i)) No(c->line, "dispatch with a pool reference");
         }
         // The shared arguments, each kept in a local of its own: the arms
         // are blocks of their own.
@@ -6237,6 +6327,12 @@ struct TgFn {
                 continue;
             }
             auto pt = sp0->argtypes[i];
+            if (cg.IsPoolParam(sp0, i)) {
+                // A pool reference, kept as its 32 bytes (GenPrefVal).
+                shared[i] = tyg_local_new(p, 32, 8);
+                PrefInto(tyg_at_local(shared[i], 0), an[i]);
+                continue;
+            }
             if (M.RzParam(pt)) {
                 ValArg(an[i], pt, valargs[i]);
                 continue;
@@ -6283,6 +6379,13 @@ struct TgFn {
                     CopyPayload(s, (int)vi, tyg_at_local(t, 0));
                     if (cg.IsLargeFixed(pt)) a.val = tyg_addr_of(p, tyg_at_local(t, 0));
                     else a.mem = tyg_at_local(t, 0);
+                } else if (cg.IsPoolParam(sp, i)) {
+                    for (int k = 0; k < 4; k++) {
+                        tyg_arg q {};
+                        q.val = tyg_load(p, TYG_I64, tyg_at_local(shared[i], 8 * k), 0);
+                        args.push_back(q);
+                    }
+                    continue;
                 } else if (M.RzParam(pt)) {
                     args.insert(args.end(), valargs[i].begin(), valargs[i].end());
                     continue;
@@ -6376,7 +6479,9 @@ struct TgFn {
                 if (loops.empty()) No(n->line, "break target");
                 auto t = loops.back();
                 if (b->val) {
-                    if (t.rt) {
+                    if (t.pref) {
+                        PrefInto(tyg_at_local(t.res, 0), b->val);
+                    } else if (t.rt) {
                         auto x = GenAs(b->val, t.rt);
                         if (!M.IsScalar(t.rt) && !x.mem && !Ended()) No(n->line, "aggregate value");
                         Store(P { tyg_at_local(t.res, 0), t.rt }, x);
@@ -6701,8 +6806,10 @@ struct TgFn {
                           M.File(d->line.fileidx), d->line.line);
             return;
         }
-        if (!M.TypeOk(d->type) || cg.PrefVar(d)) No(l, cat("variable type of ", d->name, ": ", M.NameWhy(d->type)));
-        auto loc = Temp(d->type);
+        if (!M.TypeOk(d->type)) No(l, cat("variable type of ", d->name, ": ", M.NameWhy(d->type)));
+        // A pool reference: a gs_pref, the fat reference and the pool's
+        // freelist (CodeGen::VarCT).
+        auto loc = cg.PrefVar(d) ? tyg_local_new(p, 32, 8) : Temp(d->type);
         locals[d] = loc;
         tyg_debug_var(p, string(d->name).c_str(), M.DT(d->type), tyg_at_local(loc, 0),
                       M.File(d->line.fileidx), d->line.line);
@@ -6779,6 +6886,11 @@ struct TgFn {
             if (init) GenFo(init, P { pl.a, d->type, tyg_load(p, TYG_I64, tyg_at_local(rzstk[d], 0), 0) }, l);
             return;
         }
+        if (cg.PrefVar(d)) {
+            if (!init) tyg_zero(p, pl.a, 32);
+            else PrefInto(pl.a, init);
+            return;
+        }
         if (!init) tyg_zero(p, pl.a, M.Size(d->type));
         else Into(pl, init);
     }
@@ -6790,6 +6902,11 @@ struct TgFn {
             // A reference re-pointed (CodeGen::GenRebind): the slot holding
             // it takes the new address, an optional's null too. Relative
             // references and pooled ones are not held.
+            if (auto id = Is<Ident>(a->lval); id && id->vdef && !a->pointee && IsPrefStore(id->vdef)) {
+                // A pool reference rebound takes the pool's freelist too.
+                PrefInto(pl.a, a->rhs);
+                return;
+            }
             auto rel = TgModule::IsRel(pl.t) && M.RelOk(pl.t, 1);
             if (!rel && (!(IsPlainRef(pl.t) || M.OptRef(pl.t)) || !M.TypeOk(pl.t)))
                 No(a->line, cat("rebind of type ", M.NameWhy(pl.t)));
@@ -7727,6 +7844,10 @@ struct TgFn {
                     }
                     continue;
                 }
+                if (cg.PrefVar(d)) {
+                    PrefInto(GlobalPlace(d, init->line).a, init);
+                    continue;
+                }
                 Into(GlobalPlace(d, init->line), init);
             }
             CloseScope();
@@ -8008,7 +8129,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                 } else if (mod->IsImg(d->type)) {
                     gsyms[d] = def(name, 8, 8, d, tyg_dt_pointer(m, mod->DT(d->type)));
                 } else {
-                    auto sz = mod->Size(d->type);
+                    auto sz = cg.PrefVar(d) ? 32 : mod->Size(d->type);
                     int64_t align = 1;
                     while (align < 8 && align * 2 <= sz) align *= 2;
                     gsyms[d] = def(name, sz, align, d, mod->DT(d->type));
