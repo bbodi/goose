@@ -274,7 +274,9 @@ struct TgModule {
     bool TypeOk(TypeExpr *t, int depth = 0) {
         if (!t || depth > 32) return false;
         switch (t->kind) {
-            case TY_INT: return t->intstorage != IS_VARINT;
+            // A varint on its own is an i64, as the C holds it; in a bytes
+            // value it is zigzag ULEB128 (FieldsOk, P::enc).
+            case TY_INT: return true;
             case TY_FLT: case TY_BOOL: return true;
             case TY_REF:
                 // An address of a fixed value, or of a variable-size or
@@ -315,7 +317,7 @@ struct TgModule {
     string Blocker(TypeExpr *t, int depth = 0) {
         if (!t || depth > 32) return "unknown type";
         switch (t->kind) {
-            case TY_INT: return t->intstorage == IS_VARINT ? "varint" : "";
+            case TY_INT: return "";
             case TY_FLT: case TY_BOOL: return "";
             case TY_REF:
                 if (!IsPlainRef(t) && !OptRef(t))
@@ -768,6 +770,7 @@ struct TgModule {
         for (size_t i = 0; i < si->st->fields.size(); i++) {
             if (si->st->fields[i].ispad) continue;
             auto ft = si->ftypes[i];
+            if (IsVarint(ft)) continue;
             if (cg.IsFix(ft) ? !TypeOk(ft, depth + 1)
                              : !((IsVarArr(ft) && (RzOk(ft, depth + 1) || VarImgOk(ft, depth + 1))) || VsOk(ft, depth + 1)))
                 return false;
@@ -778,6 +781,7 @@ struct TgModule {
     // variable-size one, and that one's least (a T[]'s prefix).
     int64_t VsMinSize(TypeExpr *t) {
         if (cg.IsFix(t)) return cg.FixedSize(t);
+        if (IsVarint(t)) return 1;
         if (IsVarArr(t)) return LenWidth(t);
         auto si = cg.SI(t);
         int64_t off = 0;
@@ -924,6 +928,7 @@ struct TgModule {
     // value its own variant's size (CodeGen's GenStructLit for TY_ENUM).
     // Held where every variant's payload is a fixed value of fields held.
     static bool IsVm(TypeExpr *t) { return t && t->kind == TY_ENUM && t->enu->varmode; }
+    static bool IsVarint(TypeExpr *t) { return t && t->kind == TY_INT && t->intstorage == IS_VARINT; }
     bool VmOk(TypeExpr *t, int depth = 0) {
         if (!IsVm(t) || depth > 32) return false;
         auto ei = cg.EIOf(t);
@@ -937,6 +942,7 @@ struct TgModule {
         for (size_t i = 0; i < fields.size(); i++) {
             if (fields[i].ispad) continue;
             auto ft = ftypes[i];
+            if (IsVarint(ft)) continue;
             if (cg.IsFix(ft) ? !TypeOk(ft, depth + 1)
                              : !((IsVarArr(ft) && (RzOk(ft, depth + 1) || VarImgOk(ft, depth + 1))) || VsOk(ft, depth + 1)))
                 return false;
@@ -1332,6 +1338,7 @@ struct TgFn {
         tyg_addr a;
         TypeExpr *t;
         tyg_val stk = 0;
+        bool enc = false;   // A varint in a bytes value: zigzag ULEB128 (ZigRead).
     };
 
     // The elements of an array or slice and their count (ViewOf).
@@ -1542,6 +1549,15 @@ struct TgFn {
     // elements (GenRz) behind a prefix patched once they are counted --
     // or the elements of `from`, or none. Its address.
     tyg_val GenImg(Node *n, tyg_val stk, TypeExpr *t, Line l, const View *from = nullptr) {
+        if (TgModule::IsVarint(t)) {
+            // A varint field: its value zigzag ULEB128 at the top.
+            if (!n || from) No(l, "varint without a value");
+            auto top = Top(stk);
+            auto x = GenAs(n, M.ast.inttypes[IS_I64]);
+            if (Ended()) return top;
+            SetTop(stk, tyg_bin(p, TYG_ADD, top, ZigWrite(top, x.v)));
+            return top;
+        }
         if (auto ie = n && !from ? Is<IfExpr>(n) : nullptr; ie && ie->elseb) {
             // Each arm builds its value at the same top (CodeGen's
             // GenConstruct of an if): the image starts where the top was.
@@ -1702,6 +1718,10 @@ struct TgFn {
     V Load(const P &pl, Line l) {
         V x;
         x.t = pl.t;
+        if (pl.enc) {
+            x.v = ZigRead(tyg_addr_of(p, pl.a));
+            return x;
+        }
         if (M.IsScalar(pl.t)) {
             x.v = tyg_load(p, M.Scal(pl.t), pl.a, 0);
             return x;
@@ -1725,6 +1745,7 @@ struct TgFn {
 
     void Store(const P &pl, const V &x) {
         if (Ended()) return;
+        if (pl.enc) No(Line {}, "a store into a varint in a bytes value");
         // A scalar without a value comes from code after a return or break,
         // which tinygen keeps in a block that is never placed.
         if (M.IsScalar(pl.t) && !x.v) return;
@@ -1772,8 +1793,10 @@ struct TgFn {
             if (M.VvOk(base.t)) {
                 auto ei = cg.EIVar(base.t);
                 auto vi = (size_t)ei->en->VariantIndex(base.t->var->variant);
-                return P { tyg_at_val(VvField(base.t, tyg_addr_of(p, base.a), d->fieldidx), 0),
-                           ei->vftypes[vi][(size_t)d->fieldidx] };
+                auto ft = ei->vftypes[vi][(size_t)d->fieldidx];
+                P r { tyg_at_val(VvField(base.t, tyg_addr_of(p, base.a), d->fieldidx), 0), ft };
+                r.enc = TgModule::IsVarint(ft);
+                return r;
             }
             if (base.t->kind == TY_VARIANT && M.TypeOk(base.t)) return VariantField(base, d->fieldidx);
             if (base.t->kind != TY_STRUCT || !M.TypeOk(base.t)) No(n->line, "field of this type");
@@ -3286,6 +3309,14 @@ struct TgFn {
         out.mem = tyg_at_local(r, 0);
         args.push_back(out);
         tyg_arg v {};
+        if (pl.enc || TgModule::IsVarint(pl.t)) {
+            // An i64 read out of varint storage, which holds no i64: the
+            // overload is handed a temporary holding its value (RefArg).
+            auto i64t = M.ast.inttypes[IS_I64];
+            auto tmp = Temp(i64t);
+            tyg_store(p, TYG_I64, tyg_at_local(tmp, 0), Load(pl, l).v, 0);
+            pl = P { tyg_at_local(tmp, 0), i64t };
+        }
         if (pt->kind == TY_REF && cg.IsFatRef(pt)) {
             // A resizable by reference: gs_rref, its header's address and
             // its stack.
@@ -3322,9 +3353,22 @@ struct TgFn {
         } restore { fmtc, outer };
         for (size_t i = from; i < an.size(); i++) {
             auto a = an[i];
-            fmtc = c->fmtspecs.empty() ? nullptr : cg.FmtContext(c, a);
+            fmtc = cg.FmtContext(c, a);
             auto bt = a->exprtype;
             while (bt && IsPlainRef(bt)) bt = bt->ref->sub;
+            if (fmtc && TgModule::IsVarint(bt)) {
+                // A varint read out of its storage is an i64 (§3.6): an i64
+                // overload is handed a temporary holding its value.
+                auto i64t = M.ast.inttypes[IS_I64];
+                if (auto sp = cg.FmtSpecFor(fmtc, i64t)) {
+                    auto x = GenAs(a, i64t);
+                    if (Ended()) return;
+                    auto tmp = Temp(i64t);
+                    tyg_store(p, TYG_I64, tyg_at_local(tmp, 0), x.v, 0);
+                    UserFormat(stk, len, P { tyg_at_local(tmp, 0), i64t }, sp, a->line);
+                    continue;
+                }
+            }
             if (fmtc && bt && cg.FmtSpecFor(fmtc, bt)) {
                 // The overload renders it, whatever its type. A function
                 // value's reference result is spliced in as a value, where
@@ -3345,6 +3389,12 @@ struct TgFn {
                     pl = Place(a);
                 }
                 if (Ended()) return;
+                if (pl.enc || TgModule::IsVarint(pl.t)) {
+                    // The overload found for the argument's checked type,
+                    // an i64, which a varint place's own type is not.
+                    UserFormat(stk, len, pl, cg.FmtSpecFor(fmtc, bt), a->line);
+                    continue;
+                }
                 RenderInto(stk, len, pl, false, a->line);
                 continue;
             }
@@ -3424,7 +3474,10 @@ struct TgFn {
         }
         switch (t->kind) {
             case TY_INT:
-                if (t->intstorage == IS_VARINT) break;
+                if (t->intstorage == IS_VARINT) {
+                    FmtScalar(stk, len, M.ast.inttypes[IS_I64], Load(pl, l).v);
+                    return;
+                }
                 [[fallthrough]];
             case TY_FLT: case TY_BOOL:
                 FmtScalar(stk, len, t, Load(pl, l).v);
@@ -3728,7 +3781,9 @@ struct TgFn {
             if (Is<StrLit>(a)) return true;
             auto bt = a->exprtype;
             while (bt && IsPlainRef(bt)) bt = bt->ref->sub;
-            if (!c->fmtspecs.empty() && bt && cg.FmtSpecFor(cg.FmtContext(c, a), bt)) return false;
+            auto fc = cg.FmtContext(c, a);
+            if (bt && cg.FmtSpecFor(fc, bt)) return false;
+            if (TgModule::IsVarint(bt) && cg.FmtSpecFor(fc, M.ast.inttypes[IS_I64])) return false;
             if (bt && ((bt->kind == TY_ARRAY && IsU8(bt->arr->sub)) || (bt->kind == TY_SLICE && IsU8(bt->sub))))
                 return true;
             auto ot = cg.OperandT(a->exprtype);
@@ -3904,6 +3959,85 @@ struct TgFn {
         CloseScope();
         tyg_scope_end(p);
         return x;
+    }
+
+    // ---- Varints in bytes values (§3.6: ULEB128, values zigzag) --------------
+
+    // The ULEB128 at `at`, unsigned.
+    tyg_val UlebRead(tyg_val at) {
+        auto v = tyg_local_new(p, 8, 8), sh = tyg_local_new(p, 8, 8), q = tyg_local_new(p, 8, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(v, 0), tyg_iconst(p, TYG_I64, 0), 0);
+        tyg_store(p, TYG_I64, tyg_at_local(sh, 0), tyg_iconst(p, TYG_I64, 0), 0);
+        tyg_store(p, TYG_I64, tyg_at_local(q, 0), at, 0);
+        auto head = tyg_block_new(p), more = tyg_block_new(p), done = tyg_block_new(p);
+        tyg_jump(p, head);
+        tyg_block_set(p, head);
+        auto qa = tyg_load(p, TYG_I64, tyg_at_local(q, 0), 0);
+        auto b = tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, TYG_I8, tyg_at_val(qa, 0), 0));
+        auto bits = tyg_bin(p, TYG_SHL, tyg_bin(p, TYG_AND, b, tyg_iconst(p, TYG_I64, 0x7f)),
+                            tyg_load(p, TYG_I64, tyg_at_local(sh, 0), 0));
+        tyg_store(p, TYG_I64, tyg_at_local(v, 0), tyg_bin(p, TYG_OR, tyg_load(p, TYG_I64, tyg_at_local(v, 0), 0), bits), 0);
+        tyg_store(p, TYG_I64, tyg_at_local(q, 0), tyg_bin(p, TYG_ADD, qa, tyg_iconst(p, TYG_I64, 1)), 0);
+        tyg_branch(p, tyg_cmp(p, TYG_NE, tyg_bin(p, TYG_AND, b, tyg_iconst(p, TYG_I64, 0x80)), tyg_iconst(p, TYG_I64, 0)),
+                   more, done);
+        tyg_block_set(p, more);
+        tyg_store(p, TYG_I64, tyg_at_local(sh, 0),
+                  tyg_bin(p, TYG_ADD, tyg_load(p, TYG_I64, tyg_at_local(sh, 0), 0), tyg_iconst(p, TYG_I64, 7)), 0);
+        tyg_jump(p, head);
+        tyg_block_set(p, done);
+        return tyg_load(p, TYG_I64, tyg_at_local(v, 0), 0);
+    }
+    // A varint value: (u >> 1) ^ -(u & 1) (gs_zig_read).
+    tyg_val ZigRead(tyg_val at) {
+        auto u = UlebRead(at);
+        auto half = tyg_bin(p, TYG_LSHR, u, tyg_iconst(p, TYG_I64, 1));
+        auto sign = tyg_un(p, TYG_NEG, tyg_bin(p, TYG_AND, u, tyg_iconst(p, TYG_I64, 1)));
+        return tyg_bin(p, TYG_XOR, half, sign);
+    }
+    // The bytes of the ULEB128 at `at` (gs_uleb_size).
+    tyg_val UlebSize(tyg_val at) {
+        auto q = tyg_local_new(p, 8, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(q, 0), at, 0);
+        auto head = tyg_block_new(p), more = tyg_block_new(p), done = tyg_block_new(p);
+        tyg_jump(p, head);
+        tyg_block_set(p, head);
+        auto qa = tyg_load(p, TYG_I64, tyg_at_local(q, 0), 0);
+        auto b = tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, TYG_I8, tyg_at_val(qa, 0), 0));
+        tyg_store(p, TYG_I64, tyg_at_local(q, 0), tyg_bin(p, TYG_ADD, qa, tyg_iconst(p, TYG_I64, 1)), 0);
+        tyg_branch(p, tyg_cmp(p, TYG_NE, tyg_bin(p, TYG_AND, b, tyg_iconst(p, TYG_I64, 0x80)), tyg_iconst(p, TYG_I64, 0)),
+                   more, done);
+        tyg_block_set(p, more);
+        tyg_jump(p, head);
+        tyg_block_set(p, done);
+        return tyg_bin(p, TYG_SUB, tyg_load(p, TYG_I64, tyg_at_local(q, 0), 0), at);
+    }
+    // Writes the varint value v at `at`, zigzag ULEB128 (gs_zig_write); its
+    // byte count.
+    tyg_val ZigWrite(tyg_val at, tyg_val v) {
+        auto u = tyg_local_new(p, 8, 8), q = tyg_local_new(p, 8, 8);
+        tyg_store(p, TYG_I64, tyg_at_local(u, 0),
+                  tyg_bin(p, TYG_XOR, tyg_bin(p, TYG_SHL, v, tyg_iconst(p, TYG_I64, 1)),
+                          tyg_bin(p, TYG_ASHR, v, tyg_iconst(p, TYG_I64, 63))), 0);
+        tyg_store(p, TYG_I64, tyg_at_local(q, 0), at, 0);
+        auto head = tyg_block_new(p), more = tyg_block_new(p), last = tyg_block_new(p), done = tyg_block_new(p);
+        tyg_jump(p, head);
+        tyg_block_set(p, head);
+        auto uv = tyg_load(p, TYG_I64, tyg_at_local(u, 0), 0);
+        auto b = tyg_bin(p, TYG_AND, uv, tyg_iconst(p, TYG_I64, 0x7f));
+        auto rest = tyg_bin(p, TYG_LSHR, uv, tyg_iconst(p, TYG_I64, 7));
+        tyg_store(p, TYG_I64, tyg_at_local(u, 0), rest, 0);
+        auto qa = tyg_load(p, TYG_I64, tyg_at_local(q, 0), 0);
+        tyg_store(p, TYG_I64, tyg_at_local(q, 0), tyg_bin(p, TYG_ADD, qa, tyg_iconst(p, TYG_I64, 1)), 0);
+        tyg_branch(p, tyg_cmp(p, TYG_NE, rest, tyg_iconst(p, TYG_I64, 0)), more, last);
+        tyg_block_set(p, more);
+        tyg_store(p, TYG_I8, tyg_at_val(qa, 0),
+                  tyg_convert(p, TYG_TRUNC, TYG_I8, tyg_bin(p, TYG_OR, b, tyg_iconst(p, TYG_I64, 0x80))), 0);
+        tyg_jump(p, head);
+        tyg_block_set(p, last);
+        tyg_store(p, TYG_I8, tyg_at_val(qa, 0), tyg_convert(p, TYG_TRUNC, TYG_I8, b), 0);
+        tyg_jump(p, done);
+        tyg_block_set(p, done);
+        return tyg_bin(p, TYG_SUB, tyg_load(p, TYG_I64, tyg_at_local(q, 0), 0), at);
     }
 
     // An arm whose value is an image built at the top of stk: its
@@ -5015,6 +5149,7 @@ struct TgFn {
     // The bytes of the image of type t at `at` (CodeGen::SizeX).
     tyg_val ImgSize(TypeExpr *t, tyg_val at) {
         if (cg.IsFix(t)) return tyg_iconst(p, TYG_I64, cg.FixedSize(t));
+        if (TgModule::IsVarint(t)) return UlebSize(at);
         if (M.IsVv(t)) return tyg_bin(p, TYG_SUB, VvField(t, at, -1), at);
         if (M.IsVm(t)) {
             // The tag, and its variant's payload: a variable one walked,
@@ -5081,7 +5216,10 @@ struct TgFn {
     }
     P VsFieldPlace(const P &base, int fi) {
         auto si = cg.SI(base.t);
-        return P { tyg_at_val(VsField(base.t, tyg_addr_of(p, base.a), fi), 0), si->ftypes[(size_t)fi] };
+        auto ft = si->ftypes[(size_t)fi];
+        P r { tyg_at_val(VsField(base.t, tyg_addr_of(p, base.a), fi), 0), ft };
+        r.enc = TgModule::IsVarint(ft);
+        return r;
     }
 
     // Copies the image of type t at src to the top of stk; its new address.
