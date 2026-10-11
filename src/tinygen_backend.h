@@ -6865,6 +6865,15 @@ struct TgFn {
             tyg_ret(p, 0);
             return;
         }
+        if (rets.size() == 1 && cret == 0 && vals.size() == 1 && SelfRelLit(vals[0]) && cg.TEq(vals[0]->exprtype, rets[0])) {
+            // A literal linking to itself is built where the result lies.
+            auto tmp = tyg_at_local(Temp(rets[0]), 0);
+            SelfRelInto(P { tmp, rets[0] }, vals[0]);
+            if (Ended()) return;
+            Leave();
+            tyg_ret_mem(p, tmp);
+            return;
+        }
         if (rets.size() == 1 && cret == 0) {
             auto x = GenAs(vals.at(0), rets[0]);
             if (Ended()) return;
@@ -6886,6 +6895,16 @@ struct TgFn {
                 auto rl = M.Resz(rets[i]) ? tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(chans[i].b, 0), 0), 0)
                                           : tyg_addr {};
                 BuildAt(xs.empty() ? vals[i] : nullptr, xs.empty() ? nullptr : &xs[i], dst, rets[i], rl, l);
+                if (Ended()) return;
+                continue;
+            }
+            if (xs.empty() && SelfRelLit(vals[i]) && cg.TEq(vals[i]->exprtype, rets[i])) {
+                if ((int)i == cret) {
+                    SelfRelInto(first, vals[i]);
+                } else {
+                    auto ptr = tyg_load(p, TYG_I64, tyg_at_local(chans[i].a, 0), 0);
+                    SelfRelInto(P { tyg_at_val(ptr, 0), rets[i] }, vals[i]);
+                }
                 if (Ended()) return;
                 continue;
             }
@@ -7760,7 +7779,10 @@ struct TgFn {
             auto base = at();
             SetTop(stk, tyg_bin(p, TYG_ADD, base, tyg_iconst(p, TYG_I64, M.TagSize(t))));
             StoreTag(tyg_at_val(base, 0), t, (int)vi);
+            auto outer = selfbase;   // `self` is the value's start (§3.9).
+            selfbase = base;
             RunLit(sl, stk, ei->en->variants[vi].fields, ei->vftypes[vi]);
+            selfbase = outer;
             return at();
         }
         if (auto sl = Is<StructLit>(n); sl && sl->variant) {
@@ -7773,6 +7795,12 @@ struct TgFn {
             SetTop(stk, tyg_bin(p, TYG_ADD, base, tyg_iconst(p, TYG_I64, size)));
             tyg_zero(p, tyg_at_val(base, 0), size);
             StoreTag(tyg_at_val(base, 0), t, vi);
+            auto outer = selfbase;
+            selfbase = base;
+            struct Back {
+                tyg_val &at, was;
+                ~Back() { at = was; }
+            } back { selfbase, outer };
             auto &lay = cg.VariantLayout(ei, vi);
             for (size_t i = 0; i < ei->en->variants[(size_t)vi].fields.size(); i++) {
                 if (ei->en->variants[(size_t)vi].fields[i].ispad) continue;
