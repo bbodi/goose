@@ -5176,8 +5176,124 @@ struct TgFn {
     }
 
     // A call whose every result is wanted: `let a, b = f()`, `return f()`.
+    // gs_uleb_check: the ULEB128 at `at`, bounded by `end`, shortest and
+    // within 64 bits. Its byte count into k, 0 where it is none, and its
+    // value into v.
+    struct Uleb {
+        tyg_local k, v;
+    };
+    Uleb UlebCheck(tyg_val at, tyg_val end) {
+        Uleb r { tyg_local_new(p, 8, 8), tyg_local_new(p, 8, 8) };
+        auto sh = tyg_local_new(p, 8, 8), q = tyg_local_new(p, 8, 8);
+        auto i64 = [&](int64_t x) { return tyg_iconst(p, TYG_I64, x); };
+        auto ld = [&](tyg_local l) { return tyg_load(p, TYG_I64, tyg_at_local(l, 0), 0); };
+        auto st = [&](tyg_local l, tyg_val x) { tyg_store(p, TYG_I64, tyg_at_local(l, 0), x, 0); };
+        st(r.v, i64(0));
+        st(sh, i64(0));
+        st(q, at);
+        auto head = tyg_block_new(p), rd = tyg_block_new(p), top = tyg_block_new(p), chk = tyg_block_new(p),
+             body = tyg_block_new(p), more = tyg_block_new(p), last = tyg_block_new(p), chk2 = tyg_block_new(p),
+             ok = tyg_block_new(p), fail = tyg_block_new(p), done = tyg_block_new(p);
+        tyg_jump(p, head);
+        tyg_block_set(p, head);
+        tyg_branch(p, tyg_cmp(p, TYG_ULT, ld(q), end), rd, fail);
+        tyg_block_set(p, rd);
+        auto qa = ld(q);
+        auto b = tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, TYG_I8, tyg_at_val(qa, 0), 0));
+        auto shv = ld(sh);
+        st(q, tyg_bin(p, TYG_ADD, qa, i64(1)));
+        tyg_branch(p, tyg_cmp(p, TYG_SGT, shv, i64(63)), fail, top);
+        tyg_block_set(p, top);
+        tyg_branch(p, tyg_cmp(p, TYG_EQ, shv, i64(63)), chk, body);
+        tyg_block_set(p, chk);
+        tyg_branch(p, tyg_cmp(p, TYG_NE, tyg_bin(p, TYG_AND, b, i64(0x7e)), i64(0)), fail, body);
+        tyg_block_set(p, body);
+        st(r.v, tyg_bin(p, TYG_OR, ld(r.v), tyg_bin(p, TYG_SHL, tyg_bin(p, TYG_AND, b, i64(0x7f)), shv)));
+        tyg_branch(p, tyg_cmp(p, TYG_NE, tyg_bin(p, TYG_AND, b, i64(0x80)), i64(0)), more, last);
+        tyg_block_set(p, more);
+        st(sh, tyg_bin(p, TYG_ADD, shv, i64(7)));
+        tyg_jump(p, head);
+        tyg_block_set(p, last);
+        // A redundant high zero group is no shortest form.
+        tyg_branch(p, tyg_cmp(p, TYG_NE, shv, i64(0)), chk2, ok);
+        tyg_block_set(p, chk2);
+        tyg_branch(p, tyg_cmp(p, TYG_EQ, b, i64(0)), fail, ok);
+        tyg_block_set(p, ok);
+        st(r.k, tyg_bin(p, TYG_SUB, ld(q), at));
+        tyg_jump(p, done);
+        tyg_block_set(p, fail);
+        st(r.k, i64(0));
+        tyg_jump(p, done);
+        tyg_block_set(p, done);
+        return r;
+    }
+    // from_bytes<T[>..]>(bytes) (CodeGen::EmitFromBytes): the framing
+    // prefix has to count exactly the rest of the slice, and the payload
+    // has to be whole elements; then it is copied as the array's elements.
+    // Only elements whose bytes need no walk (VerifyFn: no bool, enum,
+    // limited array or reference in them) are verified here. The array
+    // result, and whether the bytes were one.
+    vector<V> GenFromBytes(Call *c) {
+        auto t = c->rettypes.empty() ? nullptr : c->rettypes[0];
+        if (!t || !IsGrow(t) || !M.RzOk(t)) No(c->line, "from_bytes of this type");
+        auto et = t->arr->sub;
+        if (!cg.IsFix(et) || cg.NeedsVerifyWalk(et) || cg.FixedSize(et) <= 0) No(c->line, "from_bytes of this type");
+        auto esz = cg.FixedSize(et);
+        auto an = c->ArgNodes();
+        auto v = ViewOf(Place(an[0]), c->line);
+        if (Ended()) return { Dummy(t), Dummy(M.ast.booltype) };
+        if (!IsU8(v.elem)) No(c->line, "from_bytes of this source");
+        auto i64 = [&](int64_t x) { return tyg_iconst(p, TYG_I64, x); };
+        auto ld = [&](tyg_local l) { return tyg_load(p, TYG_I64, tyg_at_local(l, 0), 0); };
+        auto st = [&](tyg_local l, tyg_val x) { tyg_store(p, TYG_I64, tyg_at_local(l, 0), x, 0); };
+        auto r = RzTemp(t, c->line);
+        auto rlen = r.a;
+        rlen.offset += 8;
+        auto src = tyg_local_new(p, 8, 8), len = tyg_local_new(p, 8, 8), pay = tyg_local_new(p, 8, 8),
+             pn = tyg_local_new(p, 8, 8), okl = tyg_local_new(p, 8, 8), cnt = tyg_local_new(p, 8, 8);
+        st(src, v.elems);
+        st(len, v.len);
+        st(pay, ld(src));
+        st(pn, i64(0));
+        st(okl, i64(0));
+        st(cnt, i64(0));
+        auto uc = UlebCheck(ld(src), tyg_bin(p, TYG_ADD, ld(src), ld(len)));
+        auto c1 = tyg_block_new(p), c2 = tyg_block_new(p), good = tyg_block_new(p), whole = tyg_block_new(p),
+             framed = tyg_block_new(p);
+        tyg_branch(p, tyg_cmp(p, TYG_NE, ld(uc.k), i64(0)), c1, framed);
+        tyg_block_set(p, c1);
+        tyg_branch(p, tyg_cmp(p, TYG_SGE, ld(uc.v), i64(0)), c2, framed);
+        tyg_block_set(p, c2);
+        tyg_branch(p, tyg_cmp(p, TYG_EQ, ld(uc.v), tyg_bin(p, TYG_SUB, ld(len), ld(uc.k))), good, framed);
+        tyg_block_set(p, good);
+        st(pay, tyg_bin(p, TYG_ADD, ld(src), ld(uc.k)));
+        st(pn, ld(uc.v));
+        // Whole elements: their count, else not an image.
+        tyg_branch(p, tyg_cmp(p, TYG_EQ, tyg_bin(p, TYG_SREM, ld(pn), i64(esz)), i64(0)), whole, framed);
+        tyg_block_set(p, whole);
+        st(okl, i64(1));
+        st(cnt, tyg_bin(p, TYG_SDIV, ld(pn), i64(esz)));
+        tyg_jump(p, framed);
+        tyg_block_set(p, framed);
+        tyg_store(p, TYG_I64, r.a, Top(r.stk), 0);
+        tyg_store(p, TYG_I64, rlen, i64(0), 0);
+        auto copy = tyg_block_new(p), out = tyg_block_new(p);
+        tyg_branch(p, tyg_cmp(p, TYG_NE, ld(okl), i64(0)), copy, out);
+        tyg_block_set(p, copy);
+        auto top = Top(r.stk);
+        tyg_move_dyn(p, top, ld(pay), ld(pn));
+        SetTop(r.stk, tyg_bin(p, TYG_ADD, top, ld(pn)));
+        tyg_store(p, TYG_I64, rlen, ld(cnt), 0);
+        tyg_jump(p, out);
+        tyg_block_set(p, out);
+        V ok;
+        ok.t = M.ast.booltype;
+        ok.v = tyg_convert(p, TYG_TRUNC, TYG_I8, ld(okl));
+        return { r, ok };
+    }
     vector<V> GenCallAll(Node *n, size_t count) {
         auto c = Is<Call>(n);
+        if (c && c->builtin == B_FROM_BYTES && count == 2) return GenFromBytes(c);
         if (!DestSpec(c)) No(n->line, "multiple results of this kind");
         GenCall(c);
         if (lastrets.size() != count) No(n->line, "result count");
