@@ -451,7 +451,7 @@ struct TgModule {
                 if (IsRb(t)) return RbOk(t, depth) ? "" : "resizable struct";
                 if (IsRs(t)) {
                     if (RsOk(t, depth)) return "";
-                    auto last = LastRealField(cg.SI(t)->st->fields);
+                    auto last = StFields(t).last;
                     auto b = StFields(t).First([&](size_t i, TypeExpr *ft) {
                         if (!cg.IsResz(ft) || (int)i != last) return why(ft, "resizable struct with ", true);
                         return !(IsGrow(ft) && RzOk(ft)) && !FoOk(ft) ? cat("resizable struct with tail ", Name(ft))
@@ -547,7 +547,7 @@ struct TgModule {
         if (IsScalar(t)) return ScalSize(Scal(t));
         if (t->kind == TY_VARIANT && !cg.FixedSize(t)) return 1;   // A payload-less variant: the gs_empty byte.
         if (ZeroArr(t)) return cg.FixedSize(t) + cg.FixedSize(t->arr->sub);
-        if (FoOk(t)) return FoSize(t);
+        if (cg.IsFrameObj(t)) return FoSize(t);
         return cg.FixedSize(t);
     }
 
@@ -586,7 +586,7 @@ struct TgModule {
         }
         vector<tyg_field> fs;
         for (auto &f : Fields(t)) fs.push_back({ AT(f.t), f.off });
-        return atypes[key] = tyg_type_record(m, CSize(t), 1, fs.data(), (int)fs.size());
+        return atypes[key] = tyg_type_record(m, Size(t), 1, fs.data(), (int)fs.size());
     }
     // A resizable value: a T[>..]'s header, or a frame object, with a stack.
     bool Resz(TypeExpr *t) {
@@ -676,15 +676,14 @@ struct TgModule {
             case TY_SLICE: return DHdr(name, "data", t->sub);   // tinygen has no array whose count is a member
             case TY_STRUCT: {
                 if (IsRb(t)) return DHdr(name, "base", nullptr);
-                if (IsVs(t)) return VsDT(t, name);
+                if (IsVs(t)) return ImgDT(t, name);
                 if (IsRs(t)) return DHdr(name, "base", nullptr, cg.SI(t)->st->line);
-                auto rec = DRec(name, cg.SI(t)->st->line);   // A field may refer back to it through a reference.
-                for (auto &f : Fields(t)) DMem(rec, f.name, DT(f.t), f.off);
-                return DEnd(rec, CSize(t));
+                return FieldsDT(t, name);
             }
             case TY_ENUM: case TY_VARIANT:
                 if (IsRb(t)) return DHdr(name, "base", nullptr);
-                return IsVv(t) ? VvDT(t, name) : AdtDT(t, name);
+                if (IsVv(t)) return ImgDT(t, name);
+                return t->kind == TY_VARIANT ? FieldsDT(t, name) : AdtDT(t, name);
             default: return dtypes[name] = tyg_dt_void(m);
         }
     }
@@ -769,8 +768,6 @@ struct TgModule {
         return IsGrow(tail) ? 16 : Size(tail);
     }
     int64_t FoSize(TypeExpr *t) { return StFields(t).coff[(size_t)StFields(t).var] + FoTailSize(t); }
-    // The bytes of a struct or variant's C struct (a frame object's: its fields, its tail header).
-    int64_t CSize(TypeExpr *t) { return cg.IsFrameObj(t) ? FoSize(t) : cg.FixedSize(t); }
     // Where the innermost tail's header lies in the struct.
     int64_t FoHdrOff(TypeExpr *t) {
         auto &fs = StFields(t);
@@ -792,18 +789,16 @@ struct TgModule {
     bool RsOk(TypeExpr *t, int depth = 0) {
         if (!IsRs(t) || depth > 32) return false;
         return Within(t, true, [&] {
-            auto si = cg.SI(t);
-            auto last = LastRealField(si->st->fields);
-            if (last < 0) return false;
-            auto tail = si->ftypes[(size_t)last];
+            auto &fs = StFields(t);
+            if (fs.last < 0) return false;
+            auto tail = fs.t[(size_t)fs.last];
             return ((IsGrow(tail) && RzOk(tail, depth + 1)) || FoOk(tail, depth + 1)) &&
-                   FieldsOk(StFields(t), depth + 1, (size_t)last);
+                   FieldsOk(fs, depth + 1, (size_t)fs.last);
         });
     }
     // The tail's elements' type: a resizable's, or a frame object's innermost.
     TypeExpr *RsElem(TypeExpr *t) {
-        auto si = cg.SI(t);
-        auto tail = si->ftypes[(size_t)LastRealField(si->st->fields)];
+        auto tail = StFields(t).t[(size_t)StFields(t).last];
         return IsGrow(tail) ? tail->arr->sub : cg.FoTailArr(tail)->arr->sub;
     }
     // An image: a T[] or such a struct. (A resizable ADT is a header and a stack, IsRb, not an image.)
@@ -823,21 +818,17 @@ struct TgModule {
         if (IsVarArr(t)) return PrefixBytes(t);
         if (IsRc(t)) return 8;   // cap and len.
         if (IsVm(t)) return TagSize(t);
-        auto &fs = StFields(t);
+        auto &fs = RunOfType(t);
         return fs.pre + VsMinSize(fs.t[(size_t)fs.var]);
     }
-    // Declares an image's fields at their offsets up to and including the first variable-size one (a T[]'s
-    // `len` and `data`), where later offsets stop being constants; returns the offset reached, and that
-    // field's type in *var. A variable of it is a pointer to the record, as for a T[].
-    int64_t ImageMembers(tyg_dtype *rec, const FieldSet &fs, TypeExpr **var = nullptr) {
+    // An image's record: its fields at their offsets up to and including the first variable-size one (a T[]'s
+    // `len` and `data`), where later offsets stop being constants. A variable of it is a pointer to the
+    // record, as for a T[].
+    const tyg_dtype *ImgDT(TypeExpr *t, const string &name) {
+        auto &fs = RunOfType(t);
+        auto rec = t->kind == TY_STRUCT ? DRec(name, cg.SI(t)->st->line) : DRec(name);
         for (size_t i = 0; i < fs.off.size(); i++)
             if (!fs.f[i].ispad) DMem(rec, fs.f[i].name, DT(fs.t[i]), fs.off[i]);
-        if (var && fs.var >= 0) *var = fs.t[(size_t)fs.var];
-        return fs.pre;
-    }
-    const tyg_dtype *VsDT(TypeExpr *t, const string &name) {
-        auto rec = DRec(name, cg.SI(t)->st->line);
-        ImageMembers(rec, StFields(t));
         return DEnd(rec, VsMinSize(t));
     }
 
@@ -897,14 +888,16 @@ struct TgModule {
     }
     // The C's debugger view under Goose names: `Shape` a struct of `tag`, an enum of the variants' names,
     // and `u`, a union of the payloads by variant name; `Shape.Circle` a struct of its fields.
+    // A fixed struct or variant's record (a variant without fields: C's gs_empty byte). A field may refer
+    // back to it through a reference.
+    const tyg_dtype *FieldsDT(TypeExpr *t, const string &name) {
+        auto fs = Fields(t);
+        auto rec = t->kind == TY_STRUCT ? DRec(name, cg.SI(t)->st->line) : DRec(name);
+        if (fs.empty() && t->kind == TY_VARIANT) DMem(rec, "gs_empty", DT(ast.inttypes[IS_U8]), 0);
+        for (auto &f : fs) DMem(rec, f.name, DT(f.t), f.off);
+        return DEnd(rec, Size(t));
+    }
     const tyg_dtype *AdtDT(TypeExpr *t, const string &name) {
-        if (t->kind == TY_VARIANT) {
-            auto fs = Fields(t);
-            auto rec = DRec(name);
-            if (fs.empty()) DMem(rec, "gs_empty", DT(ast.inttypes[IS_U8]), 0);
-            for (auto &f : fs) DMem(rec, f.name, DT(f.t), f.off);
-            return DEnd(rec, Size(t));
-        }
         auto ei = cg.EIOf(t);
         auto en = ei->en;
         auto rec = DRec(name, en->line);
@@ -982,12 +975,6 @@ struct TgModule {
         if (!IsVv(t) || depth > 32) return false;
         return Within(t, true, [&] { return FieldsOk(VarFields(cg.EIVar(t), VariantIdx(t)), depth + 1); });
     }
-    const tyg_dtype *VvDT(TypeExpr *t, const string &name) {
-        auto rec = DRec(name);
-        TypeExpr *var = nullptr;
-        auto off = ImageMembers(rec, VarFields(cg.EIVar(t), VariantIdx(t)), &var);
-        return DEnd(rec, off + (IsVarArr(var) ? PrefixBytes(var) : 0));
-    }
     // The largest value: the tag and the largest payload.
     int64_t VmMaxSize(TypeExpr *t) {
         auto ei = cg.EIOf(t);
@@ -1010,9 +997,8 @@ struct TgModule {
         if (t->kind == TY_ENUM) return t->enu->varmode && cg.IsResz(t);
         if (t->kind == TY_STRUCT) {   // Resizable, no frame object: a fixed prefix, and such a value as the tail.
             if (!cg.IsResz(t) || cg.IsFrameObj(t) || !cg.SI(t)) return false;
-            auto si = cg.SI(t);
-            auto last = LastRealField(si->st->fields);
-            return last >= 0 && si->ftypes[(size_t)last]->kind != TY_ARRAY && IsRb(si->ftypes[(size_t)last]);
+            auto &fs = StFields(t);
+            return fs.last >= 0 && fs.t[(size_t)fs.last]->kind != TY_ARRAY && IsRb(fs.t[(size_t)fs.last]);
         }
         return t->kind == TY_VARIANT && cg.IsResz(t);
     }
@@ -6644,9 +6630,9 @@ struct TgFn {
     }
     // The image at src copied to the top of stk, header at hdr, bytes as they lie.
     void RsCopy(tyg_val stk, tyg_addr hdr, const P &src, Line l) {
-        auto si = cg.SI(src.t);
-        auto last = LastRealField(si->st->fields);
-        auto tail = si->ftypes[(size_t)last];
+        auto &fs = M.StFields(src.t);
+        auto last = fs.last;
+        auto tail = fs.t[(size_t)last];
         auto from = Ld(src.a);
         auto n = Ld(AddrPlus(src.a, 8));
         // To where the elements start: past a frame object tail's fields.
