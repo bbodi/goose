@@ -7504,35 +7504,49 @@ struct TgFn {
         return InPlaceValue(n, et, n->line, x);
     }
 
-    V GenIf(IfExpr *i, bool discard) {
+    // What every valued control construct shares: its result temporary (or the pool-reference slot a
+    // caller handed down).
+    struct Ctl {
         tyg_local res = 0;
-        auto pr = TakePref(res);
-        auto et = Carry(i->exprtype);
-        auto valued = !discard && et && et->kind != TY_VOID;
-        // A varint-width relative reference is carried through a temporary
-        // as any value of one is: encoded in it, decoded out.
-        if (valued && i->elseb && !M.TypeOk(et) && !M.VrOk(et)) {
-            V x;
-            if (InPlaceValue(i, et, i->line, x)) return x;
+        bool pr = false, valued = false;
+        TypeExpr *et = nullptr;
+    };
+    // Starts construct n. True when n was built in place (value in w); otherwise k is set up. `gate`
+    // false: n gives no value (an if without else, a loop without a break value).
+    bool CtlBegin(Ctl &k, Node *n, bool discard, const InPlace *ip, bool gate, V &w) {
+        k.pr = TakePref(k.res);
+        if (gate && !ip && !k.pr && WantInPlace(n, discard, w)) return true;
+        k.valued = gate && !ip && Valued(n, discard);
+        k.et = Carry(n->exprtype);
+        if (k.valued && !k.pr) k.res = Temp(k.et);
+        return false;
+    }
+    // One arm's value into k's result, or built in place.
+    void CtlArm(const Ctl &k, const InPlace *ip, Node *body, Line l) {
+        if (ip) BuildArm(body, l, [&](Node *v) { BuildTo(v, *ip, l); });
+        else ArmVal(body, k.valued, k.pr, k.et, k.res);
+    }
+    V CtlValue(const Ctl &k, Line l) { return k.valued ? Load(P { AtL(k.res), k.et }, l) : V {}; }
+    // The break/continue target of a loop or block delivering k.
+    LoopTargets CtlTarget(const Ctl &k, tyg_block brk, tyg_block cnt, bool block, const InPlace *ip) {
+        LoopTargets lt { brk, cnt, sscopes.size(), k.res, k.valued ? k.et : nullptr, block };
+        lt.pref = k.valued && k.pr;
+        if (ip) {
+            lt.inplace = ip->mode, lt.dstk = ip->stk, lt.dt = ip->t, lt.hdr = ip->hdr;
+            lt.top0 = Local(Top(ip->stk));
         }
-        if (valued && !M.TypeOk(et) && !M.VrOk(et)) No(i->line, "if value type");
-        if (valued && !pr) res = Temp(et);
+        return lt;
+    }
+
+    V GenIf(IfExpr *i, bool discard) {
+        Ctl k;
+        V w;
+        if (CtlBegin(k, i, discard, nullptr, i->elseb != nullptr, w)) return w;
+        auto arm = [&](Node *n) { CtlArm(k, nullptr, n, i->line); };
         auto c = Truth(i->cond);
-        auto tb = NewBlock(), eb = NewBlock(), done = NewBlock();
-        Branch(c, tb, i->elseb ? eb : done);
-        SetBlock(tb);
-        auto arm = [&](Node *n) {
-            ArmVal(n, valued, pr, et, res);
-            Jump(done);
-        };
-        arm(i->thenb);
-        if (i->elseb) {
-            SetBlock(eb);
-            arm(i->elseb);
-        }
-        SetBlock(done);
-        if (!valued) return V {};
-        return Load(P { AtL(res), et }, i->line);
+        if (i->elseb) IfElse(c, [&] { arm(i->thenb); }, [&] { arm(i->elseb); });
+        else If(c, [&] { arm(i->thenb); });
+        return CtlValue(k, i->line);
     }
 
     // A value a loop, block or match delivers, if wanted: of a type held.
@@ -7545,107 +7559,53 @@ struct TgFn {
 
     // `block { ... }` (EarlyBlock::CgAny): its tail's value, or a break's.
     V GenEarly(EarlyBlock *e, bool discard, const InPlace *ip = nullptr) {
-        tyg_local res = 0;
-        auto pr = TakePref(res);
+        Ctl k;
         V w;
-        if (!ip && !pr && WantInPlace(e, discard, w)) return w;
-        auto valued = !ip && Valued(e, discard);
-        auto et = Carry(e->exprtype);
-        if (valued && !pr) res = Temp(et);
+        if (CtlBegin(k, e, discard, ip, true, w)) return w;
         auto done = NewBlock();
-        LoopTargets lt { done, done, sscopes.size(), res, valued ? et : nullptr, true };
-        lt.pref = valued && pr;
-        if (ip) {
-            lt.inplace = ip->mode, lt.dstk = ip->stk, lt.dt = ip->t, lt.hdr = ip->hdr;
-            lt.top0 = tyg_local_new(p, 8, 8);
-            StL(lt.top0, Top(ip->stk));
-        }
-        loops.push_back(lt);
-        if (ip) {
-            BuildArm(e->body, e->line, [&](Node *v) { BuildTo(v, *ip, e->line); });
-            loops.pop_back();
-            Jump(done);
-            SetBlock(done);
-            return V {};
-        }
-        armwant = valued && et->kind == TY_SLICE ? et : nullptr;
-        V x;
-        if (valued && pr) BuildArm(e->body, e->line, [&](Node *v) { PrefInto(AtL(res), v); });
-        else x = GenBlock(e->body, !valued);
+        loops.push_back(CtlTarget(k, done, done, true, ip));
+        CtlArm(k, ip, e->body, e->line);
         loops.pop_back();
-        if (valued && !pr && !Ended() && x.t) Store(P { AtL(res), et }, Fit(x, et, e->line));
         Jump(done);
         SetBlock(done);
-        if (!valued) return V {};
-        return Load(P { AtL(res), et }, e->line);
+        return CtlValue(k, e->line);
     }
 
     // `loop { ... }`, its value a break's.
     V GenLoopX(LoopExpr *lp, bool discard, const InPlace *ip = nullptr) {
-        tyg_local res = 0;
-        auto pr = TakePref(res);
+        Ctl k;
         V w;
-        if (!ip && !pr && std::any_of(lp->breaks.begin(), lp->breaks.end(), [](Break *b) { return b->val; }) &&
-            WantInPlace(lp, discard, w))
-            return w;
-        auto valued = !ip && std::any_of(lp->breaks.begin(), lp->breaks.end(), [](Break *b) { return b->val; }) &&
-                      Valued(lp, discard);
-        auto et = Carry(lp->exprtype);
-        if (valued && !pr) res = Temp(et);
+        auto brkval = std::any_of(lp->breaks.begin(), lp->breaks.end(), [](Break *b) { return b->val; });
+        if (CtlBegin(k, lp, discard, ip, brkval, w)) return w;
         auto body = NewBlock(), done = NewBlock();
         tyg_jump(p, body);
         SetBlock(body);
-        LoopTargets lt { done, body, sscopes.size(), res, valued ? et : nullptr };
-        lt.pref = valued && pr;
-        if (ip) {
-            lt.inplace = ip->mode, lt.dstk = ip->stk, lt.dt = ip->t, lt.hdr = ip->hdr;
-            lt.top0 = tyg_local_new(p, 8, 8);
-            StL(lt.top0, Top(ip->stk));
-        }
-        loops.push_back(lt);
+        loops.push_back(CtlTarget(k, done, body, false, ip));
         GenBlock(lp->body, true);
         loops.pop_back();
         Jump(body);
         SetBlock(done);
-        if (!valued) return V {};
-        return Load(P { AtL(res), et }, lp->line);
+        return CtlValue(k, lp->line);
     }
 
-    // An integer match (MatchExpr::CgAny): the scrutinee evaluated once,
-    // then the arms tested in order, each listed value or range at the
-    // scrutinee's type, unsigned for an unsigned one. ADTs are not held.
+    // An integer match (MatchExpr::CgAny): the scrutinee evaluated once, then the arms tested in
+    // order, each value or range at the scrutinee's type (unsigned for an unsigned one).
     V GenMatch(MatchExpr *me, bool discard, const InPlace *ip = nullptr) {
-        tyg_local res = 0;
-        auto pr = TakePref(res);
+        Ctl k;
         V w;
-        if (!ip && !pr && WantInPlace(me, discard, w)) return w;
-        if (auto adt = AdtOf(me->scrutinee->exprtype)) {
-            if (pr) {
-                prefctl = true;
-                prefloc = res;
-            }
-            return GenAdtMatch(me, adt, discard, ip);
-        }
+        if (CtlBegin(k, me, discard, ip, true, w)) return w;
+        if (auto adt = AdtOf(me->scrutinee->exprtype)) return GenAdtMatch(me, adt, k, ip);
         auto ot = cg.OperandT(me->scrutinee->exprtype);
         if (!ot || ot->kind != TY_INT || ot->intstorage == IS_VARINT)
             No(me->line, cat("match over type ", ot ? M.NameWhy(ot) : string("?")));
-        auto valued = !ip && Valued(me, discard);
-        auto et = Carry(me->exprtype);
-        if (valued && !pr) res = Temp(et);
         auto uns = IsUnsigned(ot->intstorage);
         auto x0 = Conv(GenAs(me->scrutinee, ot).v, ot, M.ast.inttypes[IS_I64], me->line);
-        if (Ended()) return valued ? Dummy(et) : V {};
+        if (Ended()) return k.valued ? Dummy(k.et) : V {};
         auto xl = Local(x0);
         auto x = [&] { return LdL(xl); };
-        auto k = [&](int64_t v) { return I64(v); };
         auto done = NewBlock();
         auto arm = [&](Node *body) {
-            if (ip) {
-                BuildArm(body, me->line, [&](Node *v) { BuildTo(v, *ip, me->line); });
-                Jump(done);
-                return;
-            }
-            ArmVal(body, valued, pr, et, res);
+            CtlArm(k, ip, body, me->line);
             Jump(done);
         };
         auto wild = false;
@@ -7661,12 +7621,12 @@ struct TgFn {
                 auto &r = a.ranges[i];
                 auto miss = i + 1 < a.ranges.size() ? NewBlock() : next;
                 if (r.lo == r.hi) {
-                    Branch(Cmp(TYG_EQ, x(), k(r.lo)), hit, miss);
+                    Branch(Cmp(TYG_EQ, x(), I64(r.lo)), hit, miss);
                 } else {
                     auto upper = NewBlock();
-                    Branch(Cmp(uns ? TYG_UGE : TYG_SGE, x(), k(r.lo)), upper, miss);
+                    Branch(Cmp(uns ? TYG_UGE : TYG_SGE, x(), I64(r.lo)), upper, miss);
                     SetBlock(upper);
-                    Branch(Cmp(uns ? TYG_ULE : TYG_SLE, x(), k(r.hi)), hit, miss);
+                    Branch(Cmp(uns ? TYG_ULE : TYG_SLE, x(), I64(r.hi)), hit, miss);
                 }
                 if (miss != next) SetBlock(miss);
             }
@@ -7677,8 +7637,7 @@ struct TgFn {
         }
         if (!wild) Jump(done);
         SetBlock(done);
-        if (!valued) return V {};
-        return Load(P { AtL(res), et }, me->line);
+        return CtlValue(k, me->line);
     }
 
     // ---- ADTs ------------------------------------------------------------------
@@ -7835,12 +7794,7 @@ struct TgFn {
         tyg_copy(p, to, from, sz);
     }
 
-    V GenAdtMatch(MatchExpr *me, TypeExpr *adt, bool discard, const InPlace *ip = nullptr) {
-        tyg_local res = 0;
-        auto pr = TakePref(res);
-        auto valued = !ip && Valued(me, discard);
-        auto et = Carry(me->exprtype);
-        if (valued && !pr) res = Temp(et);
+    V GenAdtMatch(MatchExpr *me, TypeExpr *adt, const Ctl &k, const InPlace *ip) {
         auto s = AdtScrutinee(me->scrutinee, adt);
         auto done = NewBlock();
         auto wild = false;
@@ -7856,39 +7810,11 @@ struct TgFn {
             if (!wild) tyg_jump(p, next);
             SetBlock(hit);
             tyg_scope_begin(p);
-            // The arm's own stack scope: a binder's stack is taken and given
-            // back on this arm's path only.
+            // The arm's own stack scope: a binder's stack is taken and given back on this path only.
             OpenScope(false);
-            if (a.binder) {
-                auto vi = adt->enu->en->VariantIndex(a.variants[0]);
-                auto vt = cg.VariantType(adt, vi);
-                auto pay = s.v.a;
-                pay.offset += M.TagSize(adt);
-                // The C binds no resizable payload, and by value only a
-                // resizable ADT's others (§8.1).
-                if (M.IsRb(adt) && (a.pat.byref || cg.IsResz(vt))) No(me->line, "match arm binding of a resizable ADT");
-                if (a.pat.byref) {
-                    // Variable-mode payloads only (§8.1): its address.
-                    if (!M.IsVm(adt)) No(me->line, "match arm binding by reference");
-                    auto slot = Local(tyg_addr_of(p, pay));
-                    locals[a.binder] = slot;
-                    if (!IsAddrRef(a.binder->type)) indirect.insert(a.binder);
-                } else if (!cg.IsFix(vt)) {
-                    // A variable payload, copied onto the binder's own stack.
-                    Declare(a.binder, me->line);
-                    auto stk = LdL(rzstk[a.binder]);
-                    StL(locals[a.binder], ImgCopy(stk, tyg_addr_of(p, pay), vt));
-                } else {
-                    Declare(a.binder, me->line);
-                    CopyPayload(s, vi, AtL(locals[a.binder]));
-                }
-            }
+            if (a.binder) BindAdtArm(me, adt, s, a);
             Loc(a.body->line);   // A breakpoint on the arm's line stops here, bound.
-            if (ip) {
-                BuildArm(a.body, me->line, [&](Node *v) { BuildTo(v, *ip, me->line); });
-            } else {
-                ArmVal(a.body, valued, pr, et, res);
-            }
+            CtlArm(k, ip, a.body, me->line);
             CloseScope();
             tyg_scope_end(p);
             Jump(done);
@@ -7898,8 +7824,27 @@ struct TgFn {
         if (!wild) BadTag(me->line);
         else tyg_unreachable(p);
         SetBlock(done);
-        if (!valued) return V {};
-        return Load(P { AtL(res), et }, me->line);
+        return CtlValue(k, me->line);
+    }
+    // An arm's binder: a payload by reference (variable mode only) or by value (§8.1).
+    template <class A> void BindAdtArm(MatchExpr *me, TypeExpr *adt, const Scrut &s, const A &a) {
+        auto vi = adt->enu->en->VariantIndex(a.variants[0]);
+        auto vt = cg.VariantType(adt, vi);
+        auto pay = s.v.a;
+        pay.offset += M.TagSize(adt);
+        // The C binds no resizable payload, and by value only a resizable ADT's others.
+        if (M.IsRb(adt) && (a.pat.byref || cg.IsResz(vt))) No(me->line, "match arm binding of a resizable ADT");
+        if (a.pat.byref) {
+            if (!M.IsVm(adt)) No(me->line, "match arm binding by reference");
+            locals[a.binder] = Local(tyg_addr_of(p, pay));
+            if (!IsAddrRef(a.binder->type)) indirect.insert(a.binder);
+        } else if (!cg.IsFix(vt)) {
+            Declare(a.binder, me->line);   // A variable payload, copied onto the binder's own stack.
+            StL(locals[a.binder], ImgCopy(LdL(rzstk[a.binder]), tyg_addr_of(p, pay), vt));
+        } else {
+            Declare(a.binder, me->line);
+            CopyPayload(s, vi, AtL(locals[a.binder]));
+        }
     }
 
     // A case-function call dispatched on its ADT argument's tag (§8.2):
