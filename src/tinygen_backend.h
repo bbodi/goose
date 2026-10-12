@@ -4425,12 +4425,6 @@ struct TgFn {
         return MemV(t, AtL(tmp));
     }
 
-    // k copies of the element in `one` from dst on.
-    void FillCopies(tyg_addr dst, tyg_local one, int64_t k, int64_t esz) {
-        Loop(I64(0), I64(k), [&](tyg_val i) {
-            tyg_copy(p, AtV(Add(tyg_addr_of(p, dst), Mul(i, I64(esz)))), AtL(one), esz);
-        });
-    }
     // The literal's elements in consecutive slots from dst, up to cap of them (a [v; k] exactly
     // cap when `exact`): v built once and copied. Their count.
     int64_t LitElemsAt(ArrayLit *al, tyg_addr dst, TypeExpr *et, int64_t cap, bool exact) {
@@ -4440,7 +4434,10 @@ struct TgFn {
             if (!il || il->val < 0 || il->val > cap || (exact && il->val != cap)) No(al->line, "fill count");
             auto one = Temp(et);
             Into(P { AtL(one), et }, al->fillval);
-            if (!Ended()) FillCopies(dst, one, il->val, esz);
+            if (!Ended())
+                Loop(I64(0), I64(il->val), [&](tyg_val i) {
+                    tyg_copy(p, AtV(Add(tyg_addr_of(p, dst), Mul(i, I64(esz)))), AtL(one), esz);
+                });
             return il->val;
         }
         auto count = (int64_t)al->elems.size();
@@ -4492,9 +4489,7 @@ struct TgFn {
     V GenSlice(SliceExpr *se) {
         auto v = ViewOf(Place(se->obj), se->line);
         auto bound = [&](Node *b, bool fromend, tyg_val dflt) {
-            if (!b) return dflt;
-            auto x = Index64(b);
-            return fromend ? Sub(v.len, x) : x;
+            return !b ? dflt : fromend ? Sub(v.len, Index64(b)) : Index64(b);
         };
         auto lo = bound(se->lo, se->lo_from_end, I64(0));
         auto hi = bound(se->hi, se->hi_from_end, v.len);
@@ -4502,8 +4497,7 @@ struct TgFn {
             auto bad = tyg_bin(p, TYG_OR, Cmp(TYG_SLT, lo, I64(0)), Cmp(TYG_SLT, hi, lo));
             If(tyg_bin(p, TYG_OR, bad, Cmp(TYG_SGT, hi, v.len)), [&] {
                 M.NeedShim("gs_tg_slicefail");
-                CallC("gs_tg_slicefail", { tyg_type_ptr(m), IT(TYG_I32) },
-                      { FileArg(se->line), LineArg(se->line) }, nullptr);
+                CallC("gs_tg_slicefail", { tyg_type_ptr(m), IT(TYG_I32) }, { FileArg(se->line), LineArg(se->line) }, nullptr);
                 tyg_unreachable(p);
             });
         }
@@ -4606,28 +4600,31 @@ struct TgFn {
         return TgModule::IsLim(want) && M.TypeOk(want) && x.mem && x.t &&
                (x.t->kind == TY_ARRAY || x.t->kind == TY_SLICE) && !cg.TEq(x.t, want);
     }
-    // x's elements copied into a new `want` (CopyIntoLimited): the count, then the check against
-    // the capacity, then the elements (read before anything is written, moved as memmove moves
-    // them) and the length.
+    // v's elements appended to pl (CopyIntoLimited, EmitAppend): the count, then the check
+    // against the capacity, then the elements (read before anything is written, moved as memmove
+    // moves them) and the length.
+    void LimAppendView(const P &pl, const View &v, Line l) {
+        auto et = pl.t->arr->sub;
+        if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
+        auto nl = Local(v.len), ol = Local(LimLen(pl));
+        auto total = [&] { return Add(LdL(ol), LdL(nl)); };
+        AbortUnless(Cmp(TYG_SLE, total(), LimCapOf(pl)), "CAPACITY", l);
+        tyg_move_dyn(p, LimElemAddr(pl, LdL(ol)), v.elems, Mul(LdL(nl), I64(cg.FixedSize(et))));
+        LimSetLen(pl, total());
+    }
+    // x's elements in a new `want`.
     V LimFrom(const V &x, TypeExpr *want, Line l) {
         auto v = ViewOf(P { x.a, x.t, x.stk }, l);
         auto dst = LimTemp(want);
-        auto et = dst.t->arr->sub;
-        if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
-        auto nl = Local(v.len);
-        AbortUnless(Cmp(TYG_SLE, LdL(nl), LimCapOf(dst)), "CAPACITY", l);
-        tyg_move_dyn(p, LimView(dst).elems, v.elems, Mul(LdL(nl), I64(cg.FixedSize(et))));
-        LimSetLen(dst, LdL(nl));
+        LimAppendView(dst, v, l);
         return MemV(dst.t, dst.a);
     }
     // A string literal typed as a u8[..k].
     V LimStr(StrLit *s) {
         auto t = s->exprtype;
-        auto n = (int64_t)s->val.size();
-        if (!M.TypeOk(t) || !IsU8(t->arr->sub) || n > LimCap(t)) No(s->line, "string of this type");
+        if (!M.TypeOk(t) || !IsU8(t->arr->sub) || (int64_t)s->val.size() > LimCap(t)) No(s->line, "string of this type");
         auto dst = LimTemp(t);
-        if (n) tyg_copy(p, AtV(LimView(dst).elems), tyg_at_sym(M.Bytes(s->val), 0), n);
-        LimSetLen(dst, I64(n));
+        LimAppendView(dst, { tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)), I64((int64_t)s->val.size()), t->arr->sub, -1 }, s->line);
         return MemV(t, dst.a);
     }
     // [a, b], [v; n] and [..c] typed as a T[..k]: the elements in order into the first slots,
@@ -4636,14 +4633,10 @@ struct TgFn {
         auto t = al->exprtype;
         if (!M.TypeOk(t)) No(al->line, cat("array literal of type ", M.NameWhy(t)));
         auto dst = LimTemp(t);
-        int64_t count = 0;
-        if (al->capexpr) {
-            if (al->fillval || !al->elems.empty()) No(al->line, "array literal of this kind");
-        } else {
-            auto first = dst.a;
-            first.offset += M.LimWidth(t);
-            count = LitElemsAt(al, first, t->arr->sub, LimCap(t), false);
-        }
+        auto first = dst.a;
+        first.offset += M.LimWidth(t);
+        if (al->capexpr && (al->fillval || !al->elems.empty())) No(al->line, "array literal of this kind");
+        auto count = al->capexpr ? 0 : LitElemsAt(al, first, t->arr->sub, LimCap(t), false);
         if (!Ended()) LimSetLen(dst, I64(count));
         return MemV(t, dst.a);
     }
@@ -4778,8 +4771,7 @@ struct TgFn {
                 if (c->poolcheck && esz) {
                     auto k = tyg_bin(p, TYG_UDIV, off, I64(esz));
                     auto bad = tyg_bin(p, TYG_OR, Cmp(TYG_NE, tyg_bin(p, TYG_UREM, off, I64(esz)), I64(0)),
-                                       Cmp(TYG_UGE, k, Ld(len)));
-                    bad = tyg_bin(p, TYG_OR, bad, Cmp(TYG_UGT, n, Sub(Ld(len), k)));
+                                       tyg_bin(p, TYG_OR, Cmp(TYG_UGE, k, Ld(len)), Cmp(TYG_UGT, n, Sub(Ld(len), k))));
                     AbortUnless(Cmp(TYG_EQ, bad, tyg_iconst(p, TYG_I8, 0)), "POOLSLICE", c->line);
                 }
                 StL(il, tyg_bin(p, TYG_SDIV, off, I64(std::max<int64_t>(esz, 1))));
@@ -4788,9 +4780,9 @@ struct TgFn {
         };
         auto slicelen = [&](Node *n) {
             auto nl = Local(Index64(n));
-            AbortUnless(esz ? Cmp(TYG_ULE, LdL(nl), I64((int64_t)((2048ull << 20) / (uint64_t)esz)))
-                            : Cmp(TYG_SGE, LdL(nl), I64(0)),
-                        "SLICELEN", c->line);
+            auto max = esz ? Cmp(TYG_ULE, LdL(nl), I64((int64_t)((2048ull << 20) / (uint64_t)esz)))
+                           : Cmp(TYG_SGE, LdL(nl), I64(0));
+            AbortUnless(max, "SLICELEN", c->line);
             return nl;
         };
         // A slice argument's data and count, each in a local.
@@ -4956,13 +4948,7 @@ struct TgFn {
             if (Ended()) return V {};
             v = ViewOf(from, c->line);
         }
-        if (cg.Mangle(v.elem) != cg.Mangle(et)) No(c->line, "append of another element type");
-        auto nl = Local(v.len);
-        auto ol = Local(LimLen(pl));
-        auto total = [&] { return Add(LdL(ol), LdL(nl)); };
-        AbortUnless(Cmp(TYG_SLE, total(), LimCapOf(pl)), "CAPACITY", c->line);
-        tyg_move_dyn(p, LimElemAddr(pl, LdL(ol)), v.elems, Mul(LdL(nl), I64(cg.FixedSize(et))));
-        LimSetLen(pl, total());
+        LimAppendView(pl, v, c->line);
         return V {};
     }
     // pop, pop_n, resize and clear (codegen_builtins.h): the receiver, the arguments, the checks;
@@ -4986,9 +4972,7 @@ struct TgFn {
                 LimSetLen(pl, Sub(ol, nn));
                 return V {};
             }
-            case B_CLEAR:
-                LimSetLen(pl, I64(0));
-                return V {};
+            case B_CLEAR: LimSetLen(pl, I64(0)); return V {};
             default: break;
         }
         // resize(n) / resize(n, fill): the count, the fill, then the length.
