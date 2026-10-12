@@ -4173,15 +4173,12 @@ struct TgFn {
         auto res = tyg_local_new(p, 1, 1);
         auto same = Cmp(TYG_EQ, l.len, r.len);
         tyg_store(p, TYG_I8, AtL(res), same, 0);
-        auto cmp = NewBlock(), done = NewBlock();
-        Branch(same, cmp, done);
-        SetBlock(cmp);
-        auto bytes = Mul(l.len, I64(cg.FixedSize(et)));
-        auto d = CallC("memcmp", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64, false) },
-                       { l.elems, r.elems, bytes }, IT(TYG_I32));
-        tyg_store(p, TYG_I8, AtL(res), Cmp(TYG_EQ, d, tyg_iconst(p, TYG_I32, 0)), 0);
-        tyg_jump(p, done);
-        SetBlock(done);
+        If(same, [&] {
+            auto bytes = Mul(l.len, I64(cg.FixedSize(et)));
+            auto d = CallC("memcmp", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64, false) },
+                           { l.elems, r.elems, bytes }, IT(TYG_I32));
+            tyg_store(p, TYG_I8, AtL(res), Cmp(TYG_EQ, d, tyg_iconst(p, TYG_I32, 0)), 0);
+        });
         V x = ValV(M.ast.booltype, tyg_load(p, TYG_I8, AtL(res), 0));
         if (b->op == T_NEQ) x.v = Cmp(TYG_EQ, x.v, tyg_iconst(p, TYG_I8, 0));
         return x;
@@ -6676,25 +6673,19 @@ struct TgFn {
                 bm = Top(bstk);
                 auto bn = tyg_local_new(p, 8, 8);
                 StL(bn, tyg_bin(p, TYG_SDIV, Add(LdL(pn), I64(7)), I64(8)));
-                auto big = NewBlock(), fits = NewBlock();
-                Branch(Cmp(TYG_SGT, LdL(bn), I64(2048ll << 20)), big, fits);
-                SetBlock(big);
-                StL(bn, I64(0));
-                StL(okl, I64(0));
-                tyg_jump(p, fits);
-                SetBlock(fits);
+                If(Cmp(TYG_SGT, LdL(bn), I64(2048ll << 20)), [&] {
+                    StL(bn, I64(0));
+                    StL(okl, I64(0));
+                });
                 tyg_set_dyn(p, bm, I64(0), LdL(bn));
                 SetTop(bstk, Add(bm, LdL(bn)));
             }
-            auto run = NewBlock(), ran = NewBlock();
-            Branch(Cmp(TYG_NE, LdL(okl), I64(0)), run, ran);
-            SetBlock(run);
-            auto i64t = IT(TYG_I64);
-            auto n = CallC(M.VerifyFn(et), { i64t, i64t, i64t }, { LdL(pay), LdL(pn), bm }, i64t);
-            StL(cnt, n);
-            StL(okl, tyg_convert(p, TYG_ZEXT, TYG_I64, Cmp(TYG_SGE, n, I64(0))));
-            tyg_jump(p, ran);
-            SetBlock(ran);
+            If(Cmp(TYG_NE, LdL(okl), I64(0)), [&] {
+                auto i64t = IT(TYG_I64);
+                auto n = CallC(M.VerifyFn(et), { i64t, i64t, i64t }, { LdL(pay), LdL(pn), bm }, i64t);
+                StL(cnt, n);
+                StL(okl, tyg_convert(p, TYG_ZEXT, TYG_I64, Cmp(TYG_SGE, n, I64(0))));
+            });
         }
         if (isimg) {
             // The prefix reserved, the payload behind it, the count patched
@@ -6724,15 +6715,12 @@ struct TgFn {
         }
         St(r.a, Top(r.stk));
         St(rlen, I64(0));
-        auto copy = NewBlock(), out = NewBlock();
-        Branch(Cmp(TYG_NE, LdL(okl), I64(0)), copy, out);
-        SetBlock(copy);
-        auto top = Top(r.stk);
-        tyg_move_dyn(p, top, LdL(pay), LdL(pn));
-        SetTop(r.stk, Add(top, LdL(pn)));
-        St(rlen, LdL(cnt));
-        tyg_jump(p, out);
-        SetBlock(out);
+        If(Cmp(TYG_NE, LdL(okl), I64(0)), [&] {
+            auto top = Top(r.stk);
+            tyg_move_dyn(p, top, LdL(pay), LdL(pn));
+            SetTop(r.stk, Add(top, LdL(pn)));
+            St(rlen, LdL(cnt));
+        });
         V ok = ValV(M.ast.booltype, tyg_convert(p, TYG_TRUNC, TYG_I8, LdL(okl)));
         return { r, ok };
     }
@@ -8155,15 +8143,12 @@ struct TgFn {
                         if (!Ended()) {
                             auto start = LdL(st);
                             auto top0 = LdL(t.top0);
-                            auto mv = NewBlock(), skip = NewBlock();
-                            Branch(Cmp(TYG_NE, start, top0), mv, skip);
-                            SetBlock(mv);
-                            auto n = Sub(Top(t.dstk), start);
-                            tyg_move_dyn(p, top0, start, n);
-                            SetTop(t.dstk, Add(top0, n));
-                            if (t.inplace == 2) St(t.hdr, top0);
-                            tyg_jump(p, skip);
-                            SetBlock(skip);
+                            If(Cmp(TYG_NE, start, top0), [&] {
+                                auto n = Sub(Top(t.dstk), start);
+                                tyg_move_dyn(p, top0, start, n);
+                                SetTop(t.dstk, Add(top0, n));
+                                if (t.inplace == 2) St(t.hdr, top0);
+                            });
                         }
                     } else if (t.rt) {
                         auto x = GenAs(b->val, t.rt);
