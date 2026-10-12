@@ -2682,6 +2682,10 @@ struct TgFn {
             if (lim && !Ended()) LimSetLen(pl, I64(cnt));
             return;
         }
+        if (IsElemwise(n) && cg.TEq(n->exprtype, pl.t) && !pl.enc) {
+            ElemwiseInto(pl, static_cast<Binary *>(n));
+            return;
+        }
         auto x = GenAs(n, pl.t);
         if (M.IsScalar(pl.t) || x.mem) Store(pl, x);
         else if (!Ended()) No(n->line, "aggregate value");
@@ -2817,7 +2821,7 @@ struct TgFn {
         auto ot = cg.OperandT(u->child->exprtype);
         if (u->op == T_MINUS && (ot->kind == TY_STRUCT || ot->kind == TY_ARRAY)) {
             // Elementwise (CodeGen::GenElemwiseNegInto).
-            auto o = ElemOperand(u->child, ot);
+            auto o = ElemOperand(u->child, ot, nullptr);
             if (Ended()) return Dummy(ot);
             auto r = MemTemp(ot, false);
             ElemLeaves(ot, 0, u->line, [&](TypeExpr *tt, int64_t off, const ElemDyn &dy) {
@@ -3183,16 +3187,35 @@ struct TgFn {
         if (!IsUnsigned(t->intstorage) && M.checks) return CheckedShim("neg", t, { v }, l);
         return tyg_un(p, TYG_NEG, v);
     }
-    // An operand: a scalar's value, or a copy of the struct or array.
+    // An operand: a scalar's value, or the struct or array in memory. A place is read where it lies
+    // unless `later` (an operand built after it) runs statements that could change it, as
+    // CodeGen::ElemwiseOperands; any other value is in memory of its own already.
     struct ElemOp {
         bool scalar;
         TypeExpr *t;
         tyg_val v;
-        tyg_local mem;
+        tyg_addr a;
     };
-    ElemOp ElemOperand(Node *n, TypeExpr *et) {
+    ElemOp ElemOperand(Node *n, TypeExpr *et, Node *later) {
         auto t = cg.OperandT(n->exprtype);
-        ElemOp o { t->kind != et->kind, t, 0, 0 };
+        ElemOp o { t->kind != et->kind, t, 0, {} };
+        if (!o.scalar && ElemPlaceOk(n)) {
+            auto pl = Deref(Place(n));
+            if (Ended()) return o;
+            if (cg.TEq(pl.t, t) && !pl.enc && M.TypeOk(t)) {
+                o.a = pl.a;
+                if (cg.HasStmts(later)) {
+                    auto tmp = Temp(t);
+                    tyg_copy(p, AtL(tmp), pl.a, M.Size(t));
+                    o.a = AtL(tmp);
+                }
+                return o;
+            }
+            auto x = Load(pl, n->line);
+            if (!x.mem) No(n->line, cat("elementwise operand ", M.NameWhy(t)));
+            o.a = x.a;
+            return o;
+        }
         auto x = GenAs(n, t);
         if (Ended()) return o;
         if (o.scalar) {
@@ -3201,26 +3224,44 @@ struct TgFn {
             return o;
         }
         if (!x.mem || !M.TypeOk(t)) No(n->line, cat("elementwise operand ", M.NameWhy(t)));
-        o.mem = Temp(t);
-        tyg_copy(p, AtL(o.mem), x.a, M.Size(t));
+        o.a = x.a;
         return o;
     }
+    // A variable, field or element: Gen1 reads these with Load(Place(n)).
+    static bool ElemPlaceOk(Node *n) {
+        if (auto id = Is<Ident>(n)) return id->vdef != nullptr;
+        if (auto d = Is<Dot>(n))
+            return d->IsField() && d->member != B_LEN && d->member != B_CAP && !d->variantconst;
+        return Is<Index>(n) != nullptr;
+    }
     tyg_val ElemLeaf(const ElemOp &o, TypeExpr *tt, int64_t off, const ElemDyn &dy, Line l) {
-        if (!o.scalar) return tyg_load(p, M.Scal(tt), ElemAt(AtL(o.mem), off, dy), 0);
+        if (!o.scalar) return tyg_load(p, M.Scal(tt), ElemAt(o.a, off, dy), 0);
         return cg.TEq(o.t, tt) ? o.v : Conv(o.v, o.t, tt, l);
     }
-    V GenElemwise(Binary *b) {
+    // Leaf i of the result reads only leaf i of each operand, so the leaves go straight into dst even
+    // when it is an operand (p.vel = p.vel + g; CodeGen::GenElemwiseInto). Values of the same type are
+    // the same memory or apart, never partly overlapping.
+    void ElemwiseInto(const P &dst, Binary *b) {
         auto et = b->exprtype;
         if (!M.TypeOk(et)) No(b->line, cat("elementwise ", M.NameWhy(et)));
-        auto lo = ElemOperand(b->left, et);
-        auto ro = ElemOperand(b->right, et);
-        if (Ended()) return Dummy(et);
-        auto r = MemTemp(et, false);
+        auto lo = ElemOperand(b->left, et, b->right);
+        auto ro = ElemOperand(b->right, et, nullptr);
+        if (Ended()) return;
         ElemLeaves(et, 0, b->line, [&](TypeExpr *tt, int64_t off, const ElemDyn &dy) {
             auto lv = ElemLeaf(lo, tt, off, dy, b->line), rv = ElemLeaf(ro, tt, off, dy, b->line);
-            tyg_store(p, M.Scal(tt), ElemAt(r.a, off, dy), ScalarArith(b->op, tt, lv, rv, b->line), 0);
+            tyg_store(p, M.Scal(tt), ElemAt(dst.a, off, dy), ScalarArith(b->op, tt, lv, rv, b->line), 0);
         });
-        return r;
+    }
+    static bool IsElemwise(Node *n) {
+        auto b = Is<Binary>(n);
+        auto arith = b && (b->op == T_PLUS || b->op == T_MINUS || b->op == T_MUL || b->op == T_DIV ||
+                           b->op == T_MOD);
+        return arith && b->exprtype && (b->exprtype->kind == TY_STRUCT || b->exprtype->kind == TY_ARRAY);
+    }
+    V GenElemwise(Binary *b) {
+        auto r = MemTemp(b->exprtype, false);
+        ElemwiseInto(P { r.a, b->exprtype }, b);
+        return Ended() ? Dummy(b->exprtype) : r;
     }
 
     // a == b of arrays or slices (GenRangeEq, §4.5): the lengths, then the elements' bytes where that
@@ -3347,8 +3388,10 @@ struct TgFn {
 
     // ---- Arrays and slices ----------------------------------------------------------------------
 
-    // The elements of an array or slice at pl (references read through) and their count.
-    View ViewOf(P pl, Line l) {
+    // The elements of an array or slice at pl (references read through) and their count. Without
+    // `needlen` a slice's count is left unread (0): an index whose check BCE elided needs only the
+    // elements.
+    View ViewOf(P pl, Line l, bool needlen = true) {
         pl = Deref(pl);
         if (pl.t->kind == TY_ARRAY && pl.t->arr->akind == A_FIXED && M.TypeOk(pl.t)) {
             auto k = cg.ArrSize(pl.t->arr);
@@ -3359,11 +3402,12 @@ struct TgFn {
         if ((pl.t->kind == TY_SLICE && M.TypeOk(pl.t)) || (IsGrow(pl.t) && M.RzOk(pl.t))) {
             // { data, len }, and gs_rhdr { base, len } alike.
             auto elem = pl.t->kind == TY_SLICE ? pl.t->sub : pl.t->arr->sub;
-            return { BaseOf(pl), Ld(a8), elem, -1 };
+            return { BaseOf(pl), needlen ? Ld(a8) : 0, elem, -1 };
         }
         if (TgModule::IsLim(pl.t) && M.LimHeld(pl.t)) return LimView(pl);
         // Elements of variable size: walked from the first (StepElem).
-        if (IsGrow(pl.t) && M.VeOk(pl.t)) return { BaseOf(pl), Ld(a8), pl.t->arr->sub, -1 };
+        if (IsGrow(pl.t) && M.VeOk(pl.t))
+            return { BaseOf(pl), needlen ? Ld(a8) : 0, pl.t->arr->sub, -1 };
         if (IsArrayKind(pl.t, A_VAR) && (M.RzOk(pl.t) || M.VarImgOk(pl.t))) return VarArrView(pl);
         No(l, "array of this kind");
     }
@@ -3423,7 +3467,7 @@ struct TgFn {
         auto base = Deref(Place(ix->obj));
         auto il = Is<IntLit>(ix->idx);
         auto i = Index64(ix->idx);
-        auto v = ViewOf(base, ix->line);
+        auto v = ViewOf(base, ix->line, !ix->nobc);
         auto known = il && v.k >= 0 && il->val >= 0 && il->val < v.k;
         if (!ix->nobc && !known) BoundsCheck(i, v.len, ix->line);
         return P { AtV(ElemAddr(v, i)), v.elem };
@@ -6565,13 +6609,18 @@ struct TgFn {
         if ((t->kind == TY_STRUCT || t->kind == TY_ARRAY) && M.TypeOk(t) &&
             (a->op == T_PLUSEQ || a->op == T_MINUSEQ || a->op == T_MULEQ || a->op == T_DIVEQ ||
              a->op == T_MODEQ)) {
-            // Elementwise, each leaf from its old value, read before the operand runs.
-            auto old = Temp(t);
-            tyg_copy(p, AtL(old), pl.a, M.Size(t));
-            auto ro = ElemOperand(a->rhs, t);
+            // Elementwise, each leaf from its old value, read before the operand runs: in place
+            // unless the operand runs statements.
+            auto old = pl.a;
+            if (cg.HasStmts(a->rhs)) {
+                auto tmp = Temp(t);
+                tyg_copy(p, AtL(tmp), pl.a, M.Size(t));
+                old = AtL(tmp);
+            }
+            auto ro = ElemOperand(a->rhs, t, nullptr);
             if (Ended()) return;
             ElemLeaves(t, 0, a->line, [&](TypeExpr *tt, int64_t off, const ElemDyn &dy) {
-                auto was = tyg_load(p, M.Scal(tt), ElemAt(AtL(old), off, dy), 0);
+                auto was = tyg_load(p, M.Scal(tt), ElemAt(old, off, dy), 0);
                 tyg_store(p, M.Scal(tt), ElemAt(pl.a, off, dy),
                           ScalarArith(a->op, tt, was, ElemLeaf(ro, tt, off, dy, a->line), a->line), 0);
             });
