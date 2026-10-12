@@ -9850,10 +9850,9 @@ struct TgFn {
 
     // ---- The verifier of an image's elements ---------------------------------
     //
-    // gs_tg_verify_<T>(p, n, bm) (CodeGen::VerifyFn): the element count of the
-    // image at p, or -1 if its n bytes are not one. The walk of each type
-    // mirrors CodeGen::EmitVerifyWalk step for step, over a cursor `vq`;
-    // any failure jumps to `vfail`, which returns -1.
+    // gs_tg_verify_<T>(p, n, bm) (CodeGen::VerifyFn): the element count of the image at p, or -1 if its n
+    // bytes are not one. Each type's walk mirrors CodeGen::EmitVerifyWalk over a cursor `vq`; any failure
+    // jumps to `vfail`, which returns -1.
     tyg_val vP = 0, vN = 0, vBM = 0, vE = 0;
     tyg_local vq = 0;
     tyg_block vfail = 0;
@@ -9863,6 +9862,8 @@ struct TgFn {
     void VSetQ(tyg_val x) { StL(vq, x); }
     void VAddQ(tyg_val x) { VSetQ(Add(VQ(), x)); }
     tyg_local VNew() { return tyg_local_new(p, 8, 8); }
+    tyg_val VBin(tyg_binop op, tyg_val a, tyg_val b) { return tyg_bin(p, op, a, b); }
+    tyg_val VAt() { return Add(vP, VQ()); }
     // The integer of `size` bytes at address `at`, widened to 64 bits.
     tyg_val VLoad(tyg_val at, int64_t size, bool sgn) {
         auto s = size == 1 ? TYG_I8 : size == 2 ? TYG_I16 : size == 4 ? TYG_I32 : TYG_I64;
@@ -9875,63 +9876,79 @@ struct TgFn {
         Branch(bad, vfail, ok);
         SetBlock(ok);
     }
-    // n - q < bytes: fewer bytes left than a value needs.
-    void VNeed(tyg_val bytes) {
-        VFailIf(Cmp(TYG_SLT, Sub(vN, VQ()), bytes));
+    // Fail where fewer than `bytes` bytes are left.
+    void VNeed(tyg_val bytes) { VFailIf(Cmp(TYG_SLT, Sub(vN, VQ()), bytes)); }
+    // The ULEB128 at q (gs_uleb_check), failing where it is none.
+    Uleb VUleb() {
+        auto uc = UlebCheck(VAt(), vE);
+        VFailIf(Cmp(TYG_EQ, LdL(uc.k), I64(0)));
+        return uc;
+    }
+    // body() while q < n.
+    template <class F> void VWhileQ(F body) {
+        auto head = NewBlock(), b = NewBlock(), done = NewBlock();
+        tyg_jump(p, head);
+        SetBlock(head);
+        Branch(Cmp(TYG_SLT, VQ(), vN), b, done);
+        SetBlock(b);
+        body();
+        tyg_jump(p, head);
+        SetBlock(done);
+    }
+    // The procedure's entry and body blocks; Finish fills in the entry.
+    void NewProcBody() {
+        gblk = NewBlock();
+        gstart = NewBlock();
+        tyg_jump(p, gblk);
+        SetBlock(gstart);
+    }
+    void NewProcBegin(tyg_sym sym, tyg_sig *sig, Line line) {
+        p = tyg_proc_begin(m, sym, sig);
+        if (!p) No(line, cat("tyg_proc_begin: ", tyg_error(m) ? tyg_error(m) : "?"));
     }
 
-    // One self-relative reference at field offset q holding `off`
-    // (CodeGen::EmitVerifyLink): the target must be the start of an element,
-    // and where typed at a variant, one carrying that tag.
+    // One self-relative reference at field offset q holding `off` (CodeGen::EmitVerifyLink): the target must
+    // be the start of an element, and where typed at a variant, one carrying that tag.
     void VLink(TypeExpr *rt, tyg_val off) {
         auto offl = Local(off);
         auto pt = rt->ref->sub;
         auto variant = pt->kind == TY_VARIANT && velem->kind == TY_ENUM;
         int64_t skip = 0, vi = 0;
-        IntStorage ts = IS_U8;
         if (variant) {
             auto ei = cg.EIVar(pt);
             vi = ei->en->VariantIndex(pt->var->variant);
-            ts = cg.TagStore(ei->en);
-            skip = CodeGen::IntSize(ts);
+            skip = CodeGen::IntSize(cg.TagStore(ei->en));
         }
-        auto skipb = NewBlock();
-        if (rt->ref->optional) {
-            auto inb = NewBlock();
-            Branch(Cmp(TYG_NE, LdL(offl), I64(0)), inb, skipb);
-            SetBlock(inb);
-        }
-        auto v = Local(Sub(VQ(), I64(skip)));
-        // The untrusted offset is bounded against the image before it is added.
-        VFailIf(Cmp(TYG_SLT, LdL(offl), tyg_un(p, TYG_NEG, LdL(v))));
-        VFailIf(Cmp(TYG_SGE, LdL(offl), Sub(vN, LdL(v))));
-        StL(v, Add(LdL(v), LdL(offl)));
-        if (cg.IsFix(velem)) {
-            VFailIf(Cmp(TYG_NE, tyg_bin(p, TYG_SREM, LdL(v), I64(std::max<int64_t>(cg.FixedSize(velem), 1))), I64(0)));
-        } else {
-            // GS_BM_GET(bm, v)
-            auto byte = VLoad(Add(vBM, tyg_bin(p, TYG_LSHR, LdL(v), I64(3))), 1, false);
-            auto bit = tyg_bin(p, TYG_AND, tyg_bin(p, TYG_LSHR, byte, tyg_bin(p, TYG_AND, LdL(v), I64(7))), I64(1));
-            VFailIf(Cmp(TYG_EQ, bit, I64(0)));
-        }
-        if (variant) {
-            VFailIf(Cmp(TYG_SLT, Sub(vN, LdL(v)), I64(skip)));
-            auto tag = VLoad(Add(vP, LdL(v)), skip, false);
-            VFailIf(Cmp(TYG_NE, tag, I64(vi)));
-        }
-        tyg_jump(p, skipb);
-        SetBlock(skipb);
+        auto check = [&] {
+            auto v = Local(Sub(VQ(), I64(skip)));
+            // The untrusted offset is bounded against the image before it is added.
+            VFailIf(Cmp(TYG_SLT, LdL(offl), tyg_un(p, TYG_NEG, LdL(v))));
+            VFailIf(Cmp(TYG_SGE, LdL(offl), Sub(vN, LdL(v))));
+            StL(v, Add(LdL(v), LdL(offl)));
+            if (cg.IsFix(velem)) {
+                auto sz = I64(std::max<int64_t>(cg.FixedSize(velem), 1));
+                VFailIf(Cmp(TYG_NE, VBin(TYG_SREM, LdL(v), sz), I64(0)));
+            } else {   // GS_BM_GET(bm, v)
+                auto byte = VLoad(Add(vBM, VBin(TYG_LSHR, LdL(v), I64(3))), 1, false);
+                auto bit = VBin(TYG_AND, VBin(TYG_LSHR, byte, VBin(TYG_AND, LdL(v), I64(7))), I64(1));
+                VFailIf(Cmp(TYG_EQ, bit, I64(0)));
+            }
+            if (variant) {
+                VFailIf(Cmp(TYG_SLT, Sub(vN, LdL(v)), I64(skip)));
+                VFailIf(Cmp(TYG_NE, VLoad(Add(vP, LdL(v)), skip, false), I64(vi)));
+            }
+        };
+        if (rt->ref->optional) If(Cmp(TYG_NE, LdL(offl), I64(0)), check);
+        else check();
     }
 
-    // A run of fields (CodeGen::EmitVerifyFields). `lo` is the packed layout of
-    // a fixed struct or variant, whose offsets may include alignment padding a
-    // sequential walk would miss; bytes layouts have none and pass null.
-    void VFields(const vector<Field> &fields, const vector<TypeExpr *> &ftypes, const CodeGen::Layout *lo, int64_t total,
-                 bool links) {
+    // A run of fields (CodeGen::EmitVerifyFields). `lo` is the packed layout of a fixed struct or variant,
+    // whose offsets may include alignment padding a sequential walk would miss; bytes layouts pass null.
+    void VFields(const vector<Field> &fields, const vector<TypeExpr *> &ftypes, const CodeGen::Layout *lo,
+                 int64_t total, bool links) {
         tyg_local start = 0;
         if (lo) {
-            start = VNew();
-            StL(start, VQ());
+            start = Local(VQ());
             VNeed(I64(total));
         }
         for (size_t i = 0; i < fields.size(); i++) {
@@ -9947,8 +9964,7 @@ struct TgFn {
         if (lo) VSetQ(Add(LdL(start), I64(total)));
     }
 
-    // The checks and cursor advance for one value of type t at q
-    // (CodeGen::EmitVerifyWalk).
+    // The checks and cursor advance for one value of type t at q (CodeGen::EmitVerifyWalk).
     void VWalk(TypeExpr *t, bool links) {
         if (!cg.NeedsVerifyWalk(t)) {
             auto sz = cg.FixedSize(t);
@@ -9958,35 +9974,31 @@ struct TgFn {
             }
             return;
         }
+        auto walk = [this, links](TypeExpr *e) { return [this, e, links](tyg_val) { VWalk(e, links); }; };
         switch (t->kind) {
-            case TY_BOOL: {
+            case TY_BOOL:
                 VNeed(I64(1));
-                VFailIf(Cmp(TYG_UGT, VLoad(Add(vP, VQ()), 1, false), I64(1)));
+                VFailIf(Cmp(TYG_UGT, VLoad(VAt(), 1, false), I64(1)));
                 VAddQ(I64(1));
                 return;
-            }
-            case TY_INT: {   // a varint field: only its length matters to the walk
-                auto uc = UlebCheck(Add(vP, VQ()), vE);
-                VFailIf(Cmp(TYG_EQ, LdL(uc.k), I64(0)));
-                VAddQ(LdL(uc.k));
+            case TY_INT:   // a varint field: only its length matters to the walk
+                VAddQ(LdL(VUleb().k));
                 return;
-            }
             case TY_REF: {
                 auto w = (IntStorage)t->ref->lenstorage;
                 auto off = VNew(), k = VNew();
                 if (w == IS_VARINT) {
-                    auto uc = UlebCheck(Add(vP, VQ()), vE);
-                    VFailIf(Cmp(TYG_EQ, LdL(uc.k), I64(0)));
+                    auto uc = VUleb();
                     StL(k, LdL(uc.k));
                     if (links) {   // gs_zig_check
                         auto u = LdL(uc.v);
-                        StL(off, tyg_bin(p, TYG_XOR, tyg_bin(p, TYG_LSHR, u, I64(1)),
-                                        tyg_un(p, TYG_NEG, tyg_bin(p, TYG_AND, u, I64(1)))));
+                        auto sign = tyg_un(p, TYG_NEG, VBin(TYG_AND, u, I64(1)));
+                        StL(off, VBin(TYG_XOR, VBin(TYG_LSHR, u, I64(1)), sign));
                     }
                 } else {
                     VNeed(I64(CodeGen::IntSize(w)));
                     StL(k, I64(CodeGen::IntSize(w)));
-                    if (links) StL(off, VLoad(Add(vP, VQ()), CodeGen::IntSize(w), !t->ref->pool));
+                    if (links) StL(off, VLoad(VAt(), CodeGen::IntSize(w), !t->ref->pool));
                 }
                 if (links) VLink(t, LdL(off));
                 VAddQ(LdL(k));
@@ -9995,57 +10007,51 @@ struct TgFn {
             case TY_ARRAY: {
                 auto &a = *t->arr;
                 switch (a.akind) {
-                    case A_FIXED:
-                        Loop(I64(0), I64(cg.ArrSize(t->arr)), [&](tyg_val) { VWalk(a.sub, links); });
-                        return;
+                    case A_FIXED: Loop(I64(0), I64(cg.ArrSize(t->arr)), walk(a.sub)); return;
                     case A_VAR: {
                         auto ls = cg.LenStore(t->arr);
                         auto nl = VNew();
                         if (ls == IS_VARINT) {
-                            auto uc = UlebCheck(Add(vP, VQ()), vE);
-                            VFailIf(Cmp(TYG_EQ, LdL(uc.k), I64(0)));
+                            auto uc = VUleb();
                             VFailIf(Cmp(TYG_SLT, LdL(uc.v), I64(0)));   // above INT64_MAX
                             StL(nl, LdL(uc.v));
                             VAddQ(LdL(uc.k));
                         } else {
                             VNeed(I64(CodeGen::IntSize(ls)));
-                            StL(nl, VLoad(Add(vP, VQ()), CodeGen::IntSize(ls), false));
+                            StL(nl, VLoad(VAt(), CodeGen::IntSize(ls), false));
                             VAddQ(I64(CodeGen::IntSize(ls)));
                         }
                         VFailIf(Cmp(TYG_SLT, LdL(nl), I64(0)));
-                        VFailIf(Cmp(TYG_SGT, LdL(nl), tyg_bin(p, TYG_SDIV, Sub(vN, VQ()),
-                                                I64(std::max<int64_t>(cg.MinBytes(a.sub), 1)))));
+                        auto per = I64(std::max<int64_t>(cg.MinBytes(a.sub), 1));
+                        VFailIf(Cmp(TYG_SGT, LdL(nl), VBin(TYG_SDIV, Sub(vN, VQ()), per)));
                         if (!cg.NeedsVerifyWalk(a.sub)) VAddQ(Mul(LdL(nl), I64(cg.FixedSize(a.sub))));
-                        else Loop(I64(0), LdL(nl), [&](tyg_val) { VWalk(a.sub, links); });
+                        else Loop(I64(0), LdL(nl), walk(a.sub));
                         return;
                     }
                     case A_LIMITED: {
-                        // Slots past the length were never written, so only the
-                        // live ones are walked; the cursor skips the capacity.
-                        auto s = VNew(), nl = VNew(), cap = VNew();
-                        auto esz = std::max<int64_t>(cg.FixedSize(a.sub), 1);
+                        // Slots past the length were never written, so only the live ones are walked;
+                        // the cursor skips the capacity.
+                        auto s = Local(VQ()), nl = VNew(), cap = VNew();
                         auto stat = cg.IsFix(t);
-                        StL(s, VQ());
                         if (stat) {
-                            auto ls = cg.LenStore(t->arr);
+                            auto ls = CodeGen::IntSize(cg.LenStore(t->arr));
                             VNeed(I64(cg.FixedSize(t)));
-                            StL(nl, VLoad(Add(vP, VQ()), CodeGen::IntSize(ls), false));
+                            StL(nl, VLoad(VAt(), ls, false));
                             VFailIf(Cmp(TYG_SLT, LdL(nl), I64(0)));
                             VFailIf(Cmp(TYG_SGT, LdL(nl), I64(cg.ArrSize(t->arr))));
-                            VAddQ(I64(CodeGen::IntSize(ls)));
+                            VAddQ(I64(ls));
                         } else {
                             VNeed(I64(8));
-                            StL(cap, VLoad(Add(vP, VQ()), 4, false));
-                            StL(nl, VLoad(Add(Add(vP, VQ()), I64(4)), 4, false));
+                            StL(cap, VLoad(VAt(), 4, false));
+                            StL(nl, VLoad(Add(VAt(), I64(4)), 4, false));
                             VFailIf(Cmp(TYG_SGT, LdL(nl), LdL(cap)));
-                            VFailIf(Cmp(TYG_SGT, LdL(cap), tyg_bin(p, TYG_SDIV, Sub(Sub(vN, VQ()), I64(8)),
-                                                    I64(esz))));
+                            auto esz = I64(std::max<int64_t>(cg.FixedSize(a.sub), 1));
+                            VFailIf(Cmp(TYG_SGT, LdL(cap), VBin(TYG_SDIV, Sub(Sub(vN, VQ()), I64(8)), esz)));
                             VAddQ(I64(8));
                         }
-                        if (cg.NeedsVerifyWalk(a.sub)) Loop(I64(0), LdL(nl), [&](tyg_val) { VWalk(a.sub, links); });
-                        if (stat) VSetQ(Add(LdL(s), I64(cg.FixedSize(t))));
-                        else
-                            VSetQ(Add(Add(LdL(s), I64(8)), Mul(LdL(cap), I64(cg.FixedSize(a.sub)))));
+                        if (cg.NeedsVerifyWalk(a.sub)) Loop(I64(0), LdL(nl), walk(a.sub));
+                        auto skip = stat ? I64(cg.FixedSize(t)) : Add(I64(8), Mul(LdL(cap), I64(cg.FixedSize(a.sub))));
+                        VSetQ(Add(LdL(s), skip));
                         return;
                     }
                     default: No(Line {}, "verifier of this array");
@@ -10070,15 +10076,14 @@ struct TgFn {
             case TY_ENUM: {
                 // The tag is range-checked in both modes (a match has no default).
                 auto ei = cg.EIOf(t);
-                auto ts = cg.TagStore(ei->en);
+                auto tsz = CodeGen::IntSize(cg.TagStore(ei->en));
                 auto nv = (int64_t)ei->en->variants.size();
                 auto fix = !t->enu->varmode;
-                auto s = VNew(), tag = VNew();
-                if (fix) StL(s, VQ());
-                VNeed(I64(fix ? cg.FixedSize(t) : CodeGen::IntSize(ts)));
-                StL(tag, VLoad(Add(vP, VQ()), CodeGen::IntSize(ts), false));
+                auto s = Local(VQ()), tag = VNew();
+                VNeed(I64(fix ? cg.FixedSize(t) : tsz));
+                StL(tag, VLoad(VAt(), tsz, false));
                 VFailIf(Cmp(TYG_UGE, LdL(tag), I64(nv)));
-                VAddQ(I64(CodeGen::IntSize(ts)));
+                VAddQ(I64(tsz));
                 auto after = NewBlock();
                 for (int64_t i = 0; i < nv; i++) {
                     auto vt = cg.VariantType(t, (int)i);
@@ -10101,57 +10106,38 @@ struct TgFn {
     void EmitVerify(const string &name, TypeExpr *elem) {
         auto i64t = IT(TYG_I64);
         const tyg_type *pts[3] = { i64t, i64t, i64t };
-        p = tyg_proc_begin(m, M.Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL), tyg_sig_new(m, i64t, pts, 3, 0));
-        if (!p) No(Line {}, cat("tyg_proc_begin: ", tyg_error(m) ? tyg_error(m) : "?"));
-        gblk = NewBlock();
-        gstart = NewBlock();
-        tyg_jump(p, gblk);
-        SetBlock(gstart);
+        NewProcBegin(M.Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL), tyg_sig_new(m, i64t, pts, 3, 0), Line {});
+        NewProcBody();
         velem = elem;
         vP = tyg_param(p, 0);
         vN = tyg_param(p, 1);
         vBM = tyg_param(p, 2);
         vE = Add(vP, vN);
         vfail = NewBlock();
-        // A type whose values can occupy no bytes has no recoverable element
-        // count: only the empty image is one of its arrays.
+        // A type whose values can occupy no bytes has no recoverable element count: only the empty image is
+        // one of its arrays.
         if (cg.MinBytes(elem) <= 0) {
             tyg_ret(p, tyg_select(p, Cmp(TYG_EQ, vN, I64(0)), I64(0), I64(-1)));
         } else {
             auto fixed = cg.IsFix(elem);
             auto rel = cg.HasRelRefAny(elem);
             vq = VNew();
-            auto cnt = VNew();
+            auto cnt = Local(I64(0));
             VSetQ(I64(0));
-            StL(cnt, I64(0));
-            auto head = NewBlock(), body = NewBlock(), done = NewBlock();
-            tyg_jump(p, head);
-            SetBlock(head);
-            Branch(Cmp(TYG_SLT, VQ(), vN), body, done);
-            SetBlock(body);
-            if (!fixed && rel) {   // GS_BM_SET(bm, q)
-                auto at = Add(vBM, tyg_bin(p, TYG_LSHR, VQ(), I64(3)));
-                auto bit = tyg_bin(p, TYG_SHL, I64(1), tyg_bin(p, TYG_AND, VQ(), I64(7)));
-                auto old = VLoad(at, 1, false);
-                tyg_store(p, TYG_I8, AtV(at),
-                          tyg_convert(p, TYG_TRUNC, TYG_I8, tyg_bin(p, TYG_OR, old, bit)), 0);
-            }
-            VWalk(elem, fixed && rel);
-            StL(cnt, Add(LdL(cnt), I64(1)));
-            tyg_jump(p, head);
-            SetBlock(done);
+            VWhileQ([&] {
+                if (!fixed && rel) {   // GS_BM_SET(bm, q)
+                    auto at = Add(vBM, VBin(TYG_LSHR, VQ(), I64(3)));
+                    auto bit = VBin(TYG_SHL, I64(1), VBin(TYG_AND, VQ(), I64(7)));
+                    auto bits = tyg_convert(p, TYG_TRUNC, TYG_I8, VBin(TYG_OR, VLoad(at, 1, false), bit));
+                    tyg_store(p, TYG_I8, AtV(at), bits, 0);
+                }
+                VWalk(elem, fixed && rel);
+                StL(cnt, Add(LdL(cnt), I64(1)));
+            });
             VFailIf(Cmp(TYG_NE, VQ(), vN));
-            if (!fixed && rel) {
-                // The link pass, now that every element start is known.
+            if (!fixed && rel) {   // The link pass, now that every element start is known.
                 VSetQ(I64(0));
-                auto h2 = NewBlock(), b2 = NewBlock(), d2 = NewBlock();
-                tyg_jump(p, h2);
-                SetBlock(h2);
-                Branch(Cmp(TYG_SLT, VQ(), vN), b2, d2);
-                SetBlock(b2);
-                VWalk(elem, true);
-                tyg_jump(p, h2);
-                SetBlock(d2);
+                VWhileQ([&] { VWalk(elem, true); });
             }
             tyg_ret(p, LdL(cnt));
         }
@@ -10160,40 +10146,43 @@ struct TgFn {
         Finish(Line {});
     }
 
-    // The entry's block (gblk): the addresses of the globals the body
-    // names, and the stack block, then on to the body (gstart).
+    // The entry's block (gblk): the addresses of the globals the body names, and the stack block, then on
+    // to the body (gstart).
     void Finish(Line line) {
         SetBlock(gblk);
         Loc(line);
         if (stksl) StL(stksl, CallC("gs_tg_stks", {}, {}, tyg_type_ptr(m)));
-        for (auto &[acc, loc] : gaddrs)
-            StL(loc, CallC(acc, {}, {}, tyg_type_ptr(m)));
+        for (auto &[acc, loc] : gaddrs) StL(loc, CallC(acc, {}, {}, tyg_type_ptr(m)));
         tyg_jump(p, gstart);
-        if (tyg_proc_end(p) != 0) {
-            p = nullptr;
-            No(line, cat("tinygen: ", tyg_error(m) ? tyg_error(m) : "?"));
-        }
+        auto bad = tyg_proc_end(p) != 0;
         p = nullptr;
+        if (bad) No(line, cat("tinygen: ", tyg_error(m) ? tyg_error(m) : "?"));
     }
 
-    // gs_init_globals as a procedure of the object, for a whole program
-    // build (CodeGen::EmitGlobalInit): each initializer in declaration
-    // order with gs_sp fixed at 0, a resizable or T[] global built on its
-    // dedicated stack, reserved first (gs_stack_init). No sp: what refers
-    // to the function's own results (return, return from) is unsupported.
+    // CallC("gs_tg_stack_init") on the stack at `stk`.
+    void StackInitCall(tyg_val stk) {
+        M.NeedShim("gs_tg_stack_init");
+        CallC("gs_tg_stack_init", { tyg_type_ptr(m) }, { stk }, nullptr);
+    }
+    // An empty array header at `at` over the stack `stk`.
+    void EmptyArrayHdr(tyg_val at, tyg_val stk) {
+        St(AtV(at), Top(stk));
+        St(AtV(at, 8), I64(0));
+    }
+
+    // gs_init_globals as a procedure of the object, for a whole program build (CodeGen::EmitGlobalInit):
+    // each initializer in declaration order with gs_sp fixed at 0, a resizable or T[] global built on its
+    // dedicated stack, reserved first (gs_stack_init). No sp: what refers to the function's own results
+    // (return, return from) is unsupported.
     void EmitInit(tyg_sym sym, Line line) {
-        p = tyg_proc_begin(m, sym, tyg_sig_new(m, nullptr, nullptr, 0, 0));
-        if (!p) No(line, cat("tyg_proc_begin: ", tyg_error(m) ? tyg_error(m) : "?"));
-        tyg_debug_proc(p, "gs_init_globals", M.File(line.fileidx), line.line,
-                       tyg_dt_func(m, tyg_dt_void(m), nullptr, 0, 0));
+        NewProcBegin(sym, tyg_sig_new(m, nullptr, nullptr, 0, 0), line);
+        auto fty = tyg_dt_func(m, tyg_dt_void(m), nullptr, 0, 0);
+        tyg_debug_proc(p, "gs_init_globals", M.File(line.fileidx), line.line, fty);
         Loc(line);
         spl = tyg_local_new(p, 8, 8);
         hassp = true;
         StL(spl, I64(0));
-        gblk = NewBlock();
-        gstart = NewBlock();
-        tyg_jump(p, gblk);
-        SetBlock(gstart);
+        NewProcBody();
         OpenScope(false);
         for (auto g : M.ast.globals) {
             if (g->inits.empty()) continue;
@@ -10205,47 +10194,33 @@ struct TgFn {
                 if (cg.gstatic.count(d)) continue;   // Static data.
                 Loc(init->line);
                 if (!M.GlobalOk(d)) No(d->line, "global of this kind");
-                if (M.FoOk(d->type)) {
-                    // A frame object: its tail on the global's own stack.
+                auto fo = M.FoOk(d->type);
+                auto grow = IsGrow(d->type) || M.IsRs(d->type) || M.IsRb(d->type);
+                if (fo || grow || IsImg(d->type)) {
                     auto at = LdL(AccessorLocal(M.Accessor(d)));
                     auto stk = LdL(AccessorLocal(M.StackAccessor(d)));
-                    M.NeedShim("gs_tg_stack_init");
-                    CallC("gs_tg_stack_init", { tyg_type_ptr(m) }, { stk }, nullptr);
-                    GenFo(init, P { AtV(at), d->type, stk }, init->line);
-                    continue;
-                }
-                if (IsGrow(d->type) || M.IsRs(d->type) || M.IsRb(d->type) || IsImg(d->type)) {
-                    auto at = LdL(AccessorLocal(M.Accessor(d)));
-                    auto stk = LdL(AccessorLocal(M.StackAccessor(d)));
-                    M.NeedShim("gs_tg_stack_init");
-                    CallC("gs_tg_stack_init", { tyg_type_ptr(m) }, { stk }, nullptr);
-                    if (IsGrow(d->type) || M.IsRs(d->type) || M.IsRb(d->type)) {
-                        // CodeGen::InitGlobalStack: an empty array, then
-                        // its elements.
-                        St(AtV(at), Top(stk));
-                        St(AtV(at, 8), I64(0));
+                    StackInitCall(stk);
+                    if (fo) {   // A frame object: its tail on the global's own stack.
+                        GenFo(init, P { AtV(at), d->type, stk }, init->line);
+                    } else if (grow) {   // CodeGen::InitGlobalStack: an empty array, then its elements.
+                        EmptyArrayHdr(at, stk);
                         if (M.IsRb(d->type)) GenRb(init, stk, AtV(at), d->type, init->line);
                         else GenRz(init, stk, AtV(at), d->type, init->line);
-                        if (d->reusable && !Ended()) {
-                            // Its freelist, empty, on a stack of its own.
+                        if (d->reusable && !Ended()) {   // Its freelist, empty, on a stack of its own.
                             auto [h, st] = M.PoolAccessors(d);
-                            auto fl = LdL(AccessorLocal(h));
                             auto flstk = LdL(AccessorLocal(st));
-                            CallC("gs_tg_stack_init", { tyg_type_ptr(m) }, { flstk }, nullptr);
-                            St(AtV(fl), Top(flstk));
-                            St(AtV(fl, 8), I64(0));
+                            StackInitCall(flstk);
+                            EmptyArrayHdr(LdL(AccessorLocal(h)), flstk);
                         }
                     } else {
                         auto img = GenImg(init, stk, d->type, init->line);
                         if (!Ended()) St(AtV(at), img);
                     }
-                    continue;
-                }
-                if (cg.PrefVar(d)) {
+                } else if (cg.PrefVar(d)) {
                     PrefInto(GlobalPlace(d, init->line).a, init);
-                    continue;
+                } else {
+                    Into(GlobalPlace(d, init->line), init);
                 }
-                Into(GlobalPlace(d, init->line), init);
             }
             CloseScope();
         }
