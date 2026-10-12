@@ -4376,7 +4376,6 @@ struct TgFn {
         return LdL(cl);
     }
 
-    // An index as the i64 the checks and the address arithmetic take.
     tyg_val Index64(Node *n) {
         auto it = cg.OperandT(n->exprtype);
         if (!it || it->kind != TY_INT || it->intstorage == IS_VARINT) No(n->line, "index type");
@@ -4417,7 +4416,6 @@ struct TgFn {
         return ValV(i64, I64(cg.ArrSize(ot->arr)));
     }
 
-    // A slice { data, len } in a temporary.
     V SliceValue(TypeExpr *t, tyg_val data, tyg_val len) {
         auto tmp = tyg_local_new(p, 16, 8);
         StL(tmp, data);
@@ -4449,7 +4447,7 @@ struct TgFn {
         }
         return count;
     }
-    // A literal's type set to t for a while (put back even when the literal is left to C).
+    // A literal's type set to t until the end of the scope, also when it is left to C.
     struct LitTypeGuard {
         ArrayLit *al;
         TypeExpr *saved;
@@ -4458,8 +4456,7 @@ struct TgFn {
     };
 
     // A value at a slice destination: a whole array there is a view of the array where it lies
-    // (§3.10), or in a temporary of its own if it is a value. The checker may have typed the
-    // node as the slice already.
+    // (§3.10), or of a temporary if it is a value.
     V GenSliceAs(Node *n, TypeExpr *t) {
         if (!M.TypeOk(t)) No(n->line, "slice type");
         if (auto al = Is<ArrayLit>(n); al && !al->capexpr && cg.IsFix(t->sub)) {
@@ -4558,19 +4555,17 @@ struct TgFn {
         a.offset += M.IsRc(pl.t) ? 4 : 0;
         return a;
     }
-    // The length at pl, as an i64.
     tyg_val LimLen(const P &pl) {
         auto s = M.LimLenScal(pl.t);
         auto n = tyg_load(p, s, LimLenAt(pl), 0);
         return s == TYG_I64 ? n : tyg_convert(p, TYG_ZEXT, TYG_I64, n);
     }
-    // Stores n, an i64 within the capacity, as the length at pl.
     void LimSetLen(const P &pl, tyg_val n) {
         auto s = M.LimLenScal(pl.t);
         tyg_store(p, s, LimLenAt(pl), s == TYG_I64 ? n : tyg_convert(p, TYG_TRUNC, s, n), 0);
     }
     int64_t LimCap(TypeExpr *t) { return cg.ArrSize(t->arr); }
-    // The capacity at pl, as an i64: the type's, or a T[..]'s own.
+    // The capacity at pl as an i64: the type's, or a T[..]'s own.
     tyg_val LimCapOf(const P &pl) {
         return M.IsRc(pl.t) ? tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, TYG_I32, pl.a, 0)) : I64(LimCap(pl.t));
     }
@@ -4578,13 +4573,11 @@ struct TgFn {
         return { Add(tyg_addr_of(p, pl.a), I64(M.LimWidth(pl.t))), LimLen(pl), pl.t->arr->sub, -1 };
     }
     tyg_val LimElemAddr(const P &pl, tyg_val i) { return ElemAddr(LimView(pl), i); }
-    // A new value of type t in a temporary: zero bytes, an empty array.
     P LimTemp(TypeExpr *t) {
         P pl { AtL(Temp(t)), t };
         tyg_zero(p, pl.a, M.Size(t));
         return pl;
     }
-    // .cap: the type's.
     V GenCap(Dot *d) {
         auto ot = d->obj->exprtype;
         while (ot && IsPlainRef(ot)) ot = ot->ref->sub;
@@ -4594,15 +4587,13 @@ struct TgFn {
         if (!Is<Ident>(d->obj) && !Is<Dot>(d->obj)) Gen(d->obj);   // What it does, it does.
         return ValV(i64, I64(LimCap(ot)));
     }
-    // Whether x, an array or slice of another representation, is copied into a limited array
-    // where one of type want is wanted.
+    // Whether x, an array or slice, is copied into a limited array where `want` is wanted.
     bool LimAdapts(const V &x, TypeExpr *want) {
         return TgModule::IsLim(want) && M.TypeOk(want) && x.mem && x.t &&
                (x.t->kind == TY_ARRAY || x.t->kind == TY_SLICE) && !cg.TEq(x.t, want);
     }
-    // v's elements appended to pl (CopyIntoLimited, EmitAppend): the count, then the check
-    // against the capacity, then the elements (read before anything is written, moved as memmove
-    // moves them) and the length.
+    // v's elements appended to pl (CopyIntoLimited, EmitAppend): count and capacity check first,
+    // then the elements (moved as memmove moves them) and the length.
     void LimAppendView(const P &pl, const View &v, Line l) {
         auto et = pl.t->arr->sub;
         if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
@@ -4612,14 +4603,12 @@ struct TgFn {
         tyg_move_dyn(p, LimElemAddr(pl, LdL(ol)), v.elems, Mul(LdL(nl), I64(cg.FixedSize(et))));
         LimSetLen(pl, total());
     }
-    // x's elements in a new `want`.
     V LimFrom(const V &x, TypeExpr *want, Line l) {
         auto v = ViewOf(P { x.a, x.t, x.stk }, l);
         auto dst = LimTemp(want);
         LimAppendView(dst, v, l);
         return MemV(dst.t, dst.a);
     }
-    // A string literal typed as a u8[..k].
     V LimStr(StrLit *s) {
         auto t = s->exprtype;
         if (!M.TypeOk(t) || !IsU8(t->arr->sub) || (int64_t)s->val.size() > LimCap(t)) No(s->line, "string of this type");
@@ -4674,8 +4663,8 @@ struct TgFn {
         else Store(P { AtV(at), et }, x);
     }
 
-    // v.push(x) (EmitPush): the receiver, then the element, then the length read and checked; the
-    // slot written, the length raised. Its value is the slot's address.
+    // v.push(x) (EmitPush): the element, then the capacity check, the slot, the length. Its value
+    // is the slot's address.
     V LimPush(Call *c, const P &pl) {
         auto dp = discardpush;
         discardpush = false;
@@ -4691,15 +4680,13 @@ struct TgFn {
         StoreOperand(at, et, atslot, arg, x);
         if (Ended()) return Dummy(c->exprtype);
         LimSetLen(pl, Add(LdL(nl), I64(1)));
-        // The element itself, as a value, where one is wanted.
         pushed = P { AtV(at), et };
         if (c->exprtype && c->exprtype->kind == TY_REF) return ValV(c->exprtype, at);
         if (!dp && c->exprtype && c->exprtype->kind != TY_VOID && M.TypeOk(et)) return Load(*pushed, c->line);
         return V {};
     }
 
-    // A reusable pool's array, its freelist's header and the freelist's stack: a local's, or a
-    // global's through its accessors.
+    // A reusable pool's array, its freelist's header and the freelist's stack.
     void PoolAt(VarDef *vd, Line l, P &pl, tyg_addr &fl, tyg_val &flstk) {
         bool local = vd && prefs.count(vd), pref = !local && vd && cg.PrefVar(vd);
         if (!local && !pref && (!vd || !(poolfl.count(vd) || (vd->isglobal && vd->reusable))))
@@ -4785,7 +4772,6 @@ struct TgFn {
             AbortUnless(max, "SLICELEN", c->line);
             return nl;
         };
-        // A slice argument's data and count, each in a local.
         auto slice = [&](Node *n) {
             auto x = GenAs(n, M.ast.SliceOf(elem, n->line));
             auto a8 = x.a;
@@ -4847,7 +4833,6 @@ struct TgFn {
                    [&] { spans("free", { Add(LdL(il), LdL(nl)), Sub(LdL(ol), LdL(nl)) }, false); },
                    [&] {
                        IfElse(Cmp(TYG_EQ, LdL(ol), I64(0)), [&] { StL(il, LdL(place(LdL(nl)))); }, [&] {
-                           // A run not at the end may move, where the freelist says.
                            If(Cmp(TYG_NE, Add(LdL(il), LdL(ol)), Ld(len)), [&] {
                                auto ni = Local(spans("regrow", { Ld(len), LdL(il), LdL(ol), LdL(nl) }, true));
                                If(Cmp(TYG_NE, LdL(ni), LdL(il)), [&] {
@@ -4864,9 +4849,8 @@ struct TgFn {
         return SliceValue(M.ast.SliceOf(elem, c->line), Add(elems(), Mul(LdL(il), I64(esz))), LdL(nl));
     }
 
-    // pool.alloc_index(x), pool.alloc_ref(x) and pool.free(i) on a reusable pool
-    // (CodeGen::EmitAlloc, B_FREE): a slot from the freelist, or a new one at the top that joins
-    // the array once its element is written.
+    // pool.alloc_index(x), alloc_ref(x) and free(i) (CodeGen::EmitAlloc, B_FREE): a slot from the
+    // freelist, or a new one at the top that joins the array once its element is written.
     V GenPool(Call *c) {
         auto an = c->ArgNodes();
         auto R = PoolOfCall(c);
@@ -4885,8 +4869,7 @@ struct TgFn {
             St(fllen, Add(Ld(fllen), I64(1)));
             return V {};
         }
-        // The value first, then the slot (the checker keeps the array from growing into a fresh
-        // one meanwhile).
+        // The value first, then the slot (the array cannot grow into a fresh one meanwhile).
         bool atslot;
         V x;
         if (!PushOperand(an[1], elem, c->line, atslot, x)) return Dummy(c->exprtype);
@@ -4906,15 +4889,13 @@ struct TgFn {
         if (c->builtin == B_ALLOC_INDEX)
             return ValV(c->exprtype, Conv(LdL(il), M.ast.inttypes[IS_I64], c->exprtype, c->line));
         auto r = slot();
-        // A value the checker decayed the reference to: the element.
         if (c->exprtype && c->exprtype->kind != TY_REF && !M.IsScalar(c->exprtype) && M.TypeOk(elem))
             return Load(P { AtV(r), elem }, c->line);
         return ValV(c->exprtype, r);
     }
 
-    // v.append(x) (EmitAppend): the receiver, then the source's elements (a string literal's
-    // bytes, or an array's, a slice's, a literal's, evaluated whole), then the length read and the
-    // capacity checked, the elements copied after it.
+    // v.append(x) (EmitAppend): the source's elements (a string literal's bytes, or an array's,
+    // a slice's, a literal's, evaluated whole) are copied after the length, capacity checked.
     V LimAppend(Call *c, const P &pl) {
         if (!M.LimHeld(pl.t)) No(c->line, cat("append to ", M.NameWhy(pl.t)));
         auto et = pl.t->arr->sub;
@@ -4925,8 +4906,7 @@ struct TgFn {
         if (auto al = Is<ArrayLit>(src); al && !al->capexpr && cg.HasRelRef(et) && al->exprtype &&
                                          al->exprtype->kind == TY_ARRAY && cg.TEq(al->exprtype->arr->sub, et) &&
                                          (al->fillval ? Is<IntLit>(al->fillcount) != nullptr : true)) {
-            // A literal of elements holding relative references builds its run in the free
-            // slots, once the capacity is checked.
+            // Elements holding relative references are built in the free slots, once checked.
             auto k = LitCount(al);
             auto ol = Local(LimLen(pl));
             AbortUnless(Cmp(TYG_SLE, Add(LdL(ol), I64(k)), LimCapOf(pl)), "CAPACITY", c->line);
@@ -4951,8 +4931,7 @@ struct TgFn {
         LimAppendView(pl, v, c->line);
         return V {};
     }
-    // pop, pop_n, resize and clear (codegen_builtins.h): the receiver, the arguments, the checks;
-    // only the length moves.
+    // pop, pop_n, resize and clear (codegen_builtins.h): only the length moves.
     V LimShrink(Call *c, const P &pl) {
         if (!M.LimHeld(pl.t)) No(c->line, cat(BuiltinByKind(c->builtin).name, " of ", M.NameWhy(pl.t)));
         auto an = c->ArgNodes();
