@@ -1492,22 +1492,18 @@ struct TgFn {
         else if (auto e = Is<EarlyBlock>(n)) GenEarly(e, false, &ip);
         else GenLoopX(static_cast<LoopExpr *>(n), false, &ip);
     }
-    // Each result's channel (CodeGen::SigParams), its parameters kept in
-    // locals: an out-pointer in `a` for a fixed result other than the C
-    // return value; a destination stack in `a` and the count's
-    // out-parameter in `b` for a resizable one.
+    // Each result's channel (CodeGen::SigParams), its parameters kept in locals: an out-pointer in `a` for a
+    // fixed result other than the C return value; for a resizable, its destination stack in `a`, the count's
+    // out-parameter in `b`.
     struct Chan {
         tyg_local a = 0, b = 0;
         tyg_local top0 = 0;   // A destination's top on entry (DstTop0).
     };
     vector<Chan> chans;
-    // Data stacks (§6.2), as the C backend uses them: gs_sp in a local,
-    // the thread's stack block (gs_stks) read once per invocation (gblk);
-    // the body's own stacks are GS(gs_sp + k), k counted up as locals and
-    // temporaries take one (AllocStk) and down as their scopes end, and a
-    // callee is handed gs_sp + the indices in use. Every scope restores
-    // the tops of the stacks it took, on every way out of it, from marks
-    // saved as each was taken (CodeGen::CScope).
+    // Data stacks (§6.2) as the C backend uses them: gs_sp in a local, the thread's stack block (gs_stks) read
+    // once per invocation (gblk). The body's stacks are GS(gs_sp + k), k counted up as locals and temporaries
+    // take one (AllocStk); a callee is handed gs_sp + the indices in use. Every scope restores the tops of the
+    // stacks it took, on every way out, from marks saved as each was taken (CodeGen::CScope).
     tyg_local spl = 0, stksl = 0;
     bool hassp = false;   // spl holds gs_sp (a local's id may be 0).
     int live = 0, maxown = 0;
@@ -1521,16 +1517,13 @@ struct TgFn {
         vector<Mark> marks;
     };
     vector<SScope> sscopes;
-    // The globals of the C half's instance this body names, each with the
-    // local holding its address. The accessors that give them are called
-    // once per invocation, in a block the entry block jumps to (gblk),
-    // filled once the body is done: a body runs on one thread, whose
-    // instance does not change under it.
+    // The globals of the C half's instance this body names, each with the local holding its address. Their
+    // accessors are called once per invocation, in a block the entry block jumps to (gblk), filled once the body
+    // is done: a body runs on one thread, whose instance does not change under it.
     vector<pair<string, tyg_local>> gaddrs;   // By accessor.
     tyg_block gblk = 0, gstart = 0;
-    // By-value T[] parameters, whose locals hold their images' addresses;
-    // and by-value T[>..] ones, whose locals hold their headers, with the
-    // local holding each one's stack.
+    // By-value T[] parameters, whose locals hold their images' addresses; by-value T[>..] ones, whose locals
+    // hold their headers, with the local holding each one's stack.
     set<const VarDef *> indirect;
     map<const VarDef *, tyg_local> rzstk;
     // A reusable pool's freelist (§5.4): its header { base, len } and the
@@ -1553,20 +1546,18 @@ struct TgFn {
     };
     static V MemV(TypeExpr *t, tyg_addr a, tyg_val stk = 0) { return V { 0, a, true, t, stk }; }
     static V ValV(TypeExpr *t, tyg_val v) { return V { v, {}, false, t, 0 }; }
-    // A place: memory holding a value of type t, and for a resizable
-    // array the stack its elements grow on, where known (else 0).
+    // A place: memory holding a value of type t, and for a resizable array the stack its elements grow on
+    // where known (else 0).
     struct P {
         tyg_addr a;
         TypeExpr *t;
         tyg_val stk = 0;
         bool enc = false;   // A varint in a bytes value: zigzag ULEB128 (ZigRead).
-        // The tail of a resizable struct (RsFieldPlace): its elements start
-        // here, not where the header's base says, and the header is the
-        // owner's, whose count it is.
+        // The tail of a resizable struct (RsFieldPlace): its elements start here, not where the header's base
+        // says, and the header is the owner's, whose count it is.
         tyg_val rbase = 0;
-        // A frame object that is the tail of a resizable struct (C.2): bytes
-        // as the other fields are, its fixed fields packed where `a` is, its
-        // elements behind them, the count in the owner's header ohdr.
+        // A frame object that is the tail of a resizable struct (C.2): bytes as the other fields are, its fixed
+        // fields packed where `a` is, its elements behind them, the count in the owner's header ohdr.
         bool bfo = false;
         tyg_addr ohdr {};
         bool tmphdr = false;   // A resizable struct's tail: a header made for it, its stack the struct's.
@@ -1844,10 +1835,9 @@ struct TgFn {
         return LdL(res);
     }
 
-    // Builds n's value, a resizable ADT or variant of type t, at the top of stk, its header at hdr
-    // (CodeGen::GenConstruct, GenStructLit, VariantBehindTag): the tag, the fields in turn, the tail's
-    // elements counted into the header. A literal, a variant constant, a call returning one handed
-    // stk, or a fixed variant of the ADT (payload copied behind the tag); the C copies no other.
+    // Builds n's value, a resizable ADT or variant of type t, at the top of stk, its header at hdr (CodeGen::
+    // GenConstruct, GenStructLit, VariantBehindTag): the tag, the fields in turn, the tail's elements counted
+    // into the header. From a literal, a variant constant, a call handed stk, or a fixed variant of the ADT.
     void GenRb(Node *n, tyg_val stk, tyg_addr hdr, TypeExpr *t, Line l) {
         auto len = CountAt(hdr);
         auto adt = t->kind == TY_ENUM;
@@ -1872,18 +1862,18 @@ struct TgFn {
         auto sl = Is<StructLit>(n);
         auto c = Is<Call>(n);
         if (CallAt(n, InPlace { 2, stk, t, hdr })) return;
+        auto lit = sl && sl->exprtype && cg.TEq(sl->exprtype, t);
         if (isst) {   // Its fixed fields in turn, then its tail, a resizable ADT of its own.
-            if (sl && sl->exprtype && cg.TEq(sl->exprtype, t) && sl->sinst && !sl->variant) {
-                auto si = cg.SI(t);
-                begin(0);
-                fields(sl, si->st->fields, si->ftypes, M.RbStShape(t).tailfi, [&](Node *init, TypeExpr *ft) {
-                    if (!init) No(l, "resizable struct without its tail");
-                    BuildTail(init, stk, ft, len, l);
-                });
-                return;
-            }
-            No(l, "resizable struct built from this value");
-        } else if (sl && sl->exprtype && cg.TEq(sl->exprtype, t) && (adt ? sl->variant != nullptr : true)) {
+            if (!lit || !sl->sinst || sl->variant) No(l, "resizable struct built from this value");
+            auto si = cg.SI(t);
+            begin(0);
+            fields(sl, si->st->fields, si->ftypes, M.RbStShape(t).tailfi, [&](Node *init, TypeExpr *ft) {
+                if (!init) No(l, "resizable struct without its tail");
+                BuildTail(init, stk, ft, len, l);
+            });
+            return;
+        }
+        if (lit && (!adt || sl->variant)) {
             auto vi = adt ? ei->en->VariantIndex(sl->variant) : M.VariantIdx(t);
             auto &fs = ei->en->variants[(size_t)vi].fields;
             auto sh = M.RbShapeOf(ei, vi);
@@ -1902,7 +1892,8 @@ struct TgFn {
         if (auto d = Is<Dot>(n); d && d->variantconst && adt && d->exprtype && cg.TEq(d->exprtype, t))
             return begin(ei->en->VariantIndex(d->variantconst));
         auto rt = DestSpec(c) ? DestSpec(c)->rets[0] : nullptr;
-        if (adt && rt && rt->kind == TY_VARIANT && M.EI(rt) == ei && M.IsRb(rt)) {
+        auto ofadt = adt && rt && rt->kind == TY_VARIANT && M.EI(rt) == ei;   // A call returning one of its variants.
+        if (ofadt && M.IsRb(rt)) {
             // The variant behind the ADT's tag, built where the call puts its result; the header starts at the tag.
             auto start = Local(Top(stk));
             StoreTag(AtV(LdL(start)), t, M.VariantIdx(rt));
@@ -1911,7 +1902,7 @@ struct TgFn {
             if (!Ended()) St(hdr, LdL(start));
             return;
         }
-        if (adt && rt && rt->kind == TY_VARIANT && M.EI(rt) == ei && M.IsVv(rt)) {
+        if (ofadt && M.IsVv(rt)) {
             begin(M.VariantIdx(rt));   // A variable-size variant, built behind the tag by the call.
             CallImg(c, stk);
             return;
@@ -2043,9 +2034,9 @@ struct TgFn {
         }
         tyg_store(p, s, AtV(pre), n, 0);
     }
-    // Builds a T[] image of type t at the top of stk (CodeGen's variable array construction): n's
-    // value -- a call returning one builds at stk, anything else is a resizable's elements (GenRz)
-    // behind a prefix patched once counted -- or the elements of `from`, or none. Its address.
+    // Builds a T[] image of type t at the top of stk (CodeGen's variable array construction): n's value (a
+    // call returning one builds at stk; else its elements as a resizable's, GenRz, behind a prefix patched once
+    // counted), or the elements of `from`, or none. Its address.
     tyg_val GenImg(Node *n, tyg_val stk, TypeExpr *t, Line l, const View *from = nullptr) {
         if (TgModule::IsVarint(t)) {   // A varint field: its value zigzag ULEB128 at the top.
             if (!n || from) No(l, "varint without a value");
@@ -3869,18 +3860,22 @@ struct TgFn {
         return ValV(c->exprtype, r);
     }
 
+    // A literal of relative-reference elements of type et, whose run is built where it lies (§4.3).
+    ArrayLit *RelRunLit(Node *src, TypeExpr *et) {
+        auto al = Is<ArrayLit>(src);
+        if (!al || al->capexpr || !cg.HasRelRef(et) || !al->exprtype || al->exprtype->kind != TY_ARRAY ||
+            !cg.TEq(al->exprtype->arr->sub, et) || (al->fillval && !Is<IntLit>(al->fillcount)))
+            return nullptr;
+        return al;
+    }
     // v.append(x) (EmitAppend): the source's elements (a string literal's bytes, or an array's,
     // a slice's, a literal's, evaluated whole) are copied after the length, capacity checked.
     V LimAppend(Call *c, const P &pl) {
         if (!M.LimHeld(pl.t)) No(c->line, cat("append to ", M.NameWhy(pl.t)));
         auto et = pl.t->arr->sub;
-        auto src = c->ArgNodes()[1];
-        if (auto cc = Is<Call>(src); cc && cc->builtin == B_COPY && cc->ArgNodes().size() == 1)
-            src = cc->ArgNodes()[0];
+        auto src = StripCopy(c->ArgNodes()[1]);
         View v;
-        if (auto al = Is<ArrayLit>(src); al && !al->capexpr && cg.HasRelRef(et) && al->exprtype &&
-                                         al->exprtype->kind == TY_ARRAY && cg.TEq(al->exprtype->arr->sub, et) &&
-                                         (al->fillval ? Is<IntLit>(al->fillcount) != nullptr : true)) {
+        if (auto al = RelRunLit(src, et)) {
             // Elements holding relative references are built in the free slots, once checked.
             auto k = LitCount(al);
             auto ol = Local(LimLen(pl));
@@ -4440,10 +4435,7 @@ struct TgFn {
             return;
         }
         src = StripCopy(src);
-        auto al = Is<ArrayLit>(src);
-        auto same = al && al->exprtype && al->exprtype->kind == TY_ARRAY && cg.TEq(al->exprtype->arr->sub, et);
-        if (same && !al->capexpr && cg.HasRelRef(et) && (!al->fillval || Is<IntLit>(al->fillcount))) {
-            // A literal of relative-reference elements builds its run at the receiver's top (§4.3).
+        if (auto al = RelRunLit(src, et)) {   // Its run is built at the receiver's top.
             auto k = LitCount(al);
             auto base = tyg_local_new(p, 8, 8);
             auto leaves = FillCapture(al);
@@ -6453,13 +6445,10 @@ struct TgFn {
         if (IsImg(t)) {
             auto img = GenImg(init, stk(), t, l);
             if (!Ended()) St(a, img);
-        } else if (IsGrow(t) || M.RsOk(t)) {
-            if (init) GenRz(init, stk(), a, t, l);
-        } else if (M.IsRb(t)) {
-            if (!init) No(l, "resizable ADT without a value");
-            GenRb(init, stk(), a, t, l);
-        } else if (M.FoOk(t)) {
-            if (init) GenFo(init, P { a, t, stk() }, l);
+        } else if (IsGrow(t) || M.RsOk(t) || M.IsRb(t) || M.FoOk(t)) {
+            if (!init && M.IsRb(t)) No(l, "resizable ADT without a value");
+            P pl { a, t, stk() };
+            if (init) BuildInto(init, InPlace { M.FoOk(t) ? 3 : 2, pl.stk, t, a, &pl }, l);
         } else if (cg.PrefVar(d)) {
             if (!init) tyg_zero(p, a, 32);
             else PrefInto(a, init);
@@ -6516,8 +6505,7 @@ struct TgFn {
             // A T[..]: the value as one, its length and elements copied in under the capacity.
             if (!M.RcOk(t)) No(l, "assignment to an array of this kind");
             View v;
-            auto rhs = a->rhs;
-            if (auto c = Is<Call>(rhs); c && c->builtin == B_COPY) rhs = c->ArgNodes()[0];
+            auto rhs = StripCopy(a->rhs);
             if (Is<Ident>(rhs) || Is<Dot>(rhs) || Is<Index>(rhs)) {
                 v = ViewOf(Place(rhs), l);   // A place's elements are read where they lie.
             } else {
