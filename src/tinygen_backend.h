@@ -1965,13 +1965,57 @@ struct TgFn {
         if (l.line > 0) tyg_loc(p, M.File(l.fileidx), l.line, 0);
     }
 
-    // A local for a value of type t, aligned to the largest power of two
-    // up to 8 that its size allows (a packed value needs none).
+    // A local for a value of type t, aligned to the largest power of two up to 8 its size allows.
     tyg_local Temp(TypeExpr *t) {
         auto sz = M.Size(t);
         int64_t align = 1;
         while (align < 8 && align * 2 <= sz) align *= 2;
         return tyg_local_new(p, sz, align);
+    }
+
+    // Shared by the builders below: a resizable's header is (base, count), and a
+    // build dispatches on the node (control flow, call into a destination, copy).
+    static tyg_addr HdrLen(tyg_addr hdr) {
+        hdr.offset += 8;
+        return hdr;
+    }
+    tyg_addr NewHdr() { return AtL(tyg_local_new(p, 16, 8)); }
+    static Node *StripCopy(Node *n) {
+        auto c = Is<Call>(n);
+        return c && c->builtin == B_COPY && c->ArgNodes().size() == 1 ? c->ArgNodes()[0] : n;
+    }
+    // If, block, match, early block, loop or function value n: built with each arm's value
+    // handed to arm, or (match, early block, loop) in place per ip. False for any other n.
+    template <class F> bool BuildCtl(Node *n, const InPlace &ip, Line l, F arm) {
+        if (auto ie = Is<IfExpr>(n); ie && ie->elseb) BuildIf(ie, l, arm);
+        else if (auto b = Is<Block>(n); b && b->tail) BuildArm(b, l, arm);
+        else if (Is<MatchExpr>(n) || Is<EarlyBlock>(n) || Is<LoopExpr>(n)) BuildExpr(n, ip, l);
+        else if (auto c = Is<Call>(n); c && c->fvbody && c->fvbody->tail) BuildFv(c, l, arm);
+        else return false;
+        return true;
+    }
+    // Whether c's first result is of type t, so a call can build it at a destination.
+    bool DestIs(Call *c, TypeExpr *t) { return DestSpec(c) && cg.Mangle(DestSpec(c)->rets[0]) == cg.Mangle(t); }
+    void CallRz(Call *c, tyg_val stk, tyg_addr hdr) {
+        RzDst d { stk, hdr };
+        rzdst = &d;
+        GenCall(c);
+        rzdst = nullptr;
+    }
+    void CallImg(Call *c, tyg_val stk) {
+        imgdst = stk;
+        GenCall(c);
+        imgdst = 0;
+    }
+    // x of type ft built at the top of stk, which moves past it; false if the build ended.
+    bool BuildField(tyg_val stk, TypeExpr *ft, Node *x) {
+        auto v = GenAs(x, ft);
+        if (Ended()) return false;
+        if (!M.IsScalar(ft) && !v.mem) No(x->line, "aggregate value");
+        auto top = Top(stk);
+        Store(P { AtV(top), ft }, v);
+        SetTop(stk, Add(top, I64(cg.FixedSize(ft))));
+        return true;
     }
 
     // ---- Data stacks ---------------------------------------------------------
@@ -1987,16 +2031,14 @@ struct TgFn {
             stksl = tyg_local_new(p, 8, 8);
             M.NeedShim("gs_tg_stks");
         }
-        auto base = LdL(stksl);
-        auto idx = Add(sp0, I64(k));
-        return Add(base, Mul(idx, I64(8)));
+        return Add(LdL(stksl), Mul(Add(sp0, I64(k)), I64(8)));
     }
     tyg_val Top(tyg_val stk) { return Ld(AtV(stk)); }
     void SetTop(tyg_val stk, tyg_val top) { St(AtV(stk), top); }
 
-    // The next free index, for a local (in the innermost scope that is not
-    // a statement's, AllocStk(forlocal) in the C) or a temporary (in the
-    // statement's), its top saved to restore.
+    // The next free index, for a local (in the innermost scope that is not a
+    // statement's) or a temporary (in the statement's), its top saved to
+    // restore (AllocStk(forlocal) in the C).
     int AllocStk(bool forlocal, Line l) {
         auto k = live++;
         maxown = std::max(maxown, live);
@@ -2010,8 +2052,8 @@ struct TgFn {
         for (size_t i = sc.marks.size(); i-- > 0;)
             SetTop(Stk(sc.marks[i].k, Line {}), LdL(sc.marks[i].top));
     }
-    // The restores of every scope from `depth` in, innermost first: a
-    // break's, a continue's, a return's (from 0).
+    // The restores of every scope from `depth` in, innermost first (a break's,
+    // a continue's, a return's from 0).
     void RestoreFrom(size_t depth) {
         for (size_t i = sscopes.size(); i-- > depth;) Restore(sscopes[i]);
     }
@@ -2023,9 +2065,9 @@ struct TgFn {
         live -= (int)sc.marks.size();
     }
 
-    // A call handed gs_sp + the indices in use: none into the recursive
-    // cycle this function is in (§7.8; CodeGen::NoStackAcrossCycleCall),
-    // which the C backend's allocation guarantees and this one's may not.
+    // A call handed gs_sp + the indices in use: none into the recursive cycle
+    // this function is in (§7.8; CodeGen::NoStackAcrossCycleCall), which the C
+    // backend's allocation guarantees and this one's may not.
     tyg_val CalleeSp(FnSpec *callee, Line l) {
         auto cycle = [](FnSpec *s) {
             while (s->cyclelink) s = s->cyclelink;
@@ -2037,8 +2079,7 @@ struct TgFn {
         return Add(SpVal(l), I64(live));
     }
 
-    // Appends x, of the element type et, at the top of stk to the
-    // resizable whose count is at len.
+    // Appends x, of element type et, at the top of stk to the resizable whose count is at len.
     void PushRaw(tyg_val stk, tyg_addr len, TypeExpr *et, const V &x) {
         if (!cg.IsFix(et)) No(Line {}, "an element of variable size");
         auto top = Top(stk);
@@ -2046,73 +2087,53 @@ struct TgFn {
         SetTop(stk, Add(top, I64(cg.FixedSize(et))));
         St(len, Add(Ld(len), I64(1)));
     }
-    // Copies n elements of et from elems to the top of stk, adding them to
-    // the count at len. The source may lie on stk itself, below its top.
-    void CopyRun(tyg_val stk, tyg_addr len, TypeExpr *et, tyg_val elems, tyg_val n) {
-        if (!cg.IsFix(et)) No(Line {}, "a copy of elements of variable size");
+    // Moves `bytes` bytes holding n elements from elems to the top of stk and counts them
+    // at len. The source may lie on stk itself, below its top.
+    void CopyBytes(tyg_val stk, tyg_addr len, tyg_val elems, tyg_val bytes, tyg_val n) {
         auto top = Top(stk);
-        auto bytes = Mul(n, I64(cg.FixedSize(et)));
         tyg_move_dyn(p, top, elems, bytes);
         SetTop(stk, Add(top, bytes));
         St(len, Add(Ld(len), n));
     }
-
-    // CopyRun of a view's elements, which may be images: their bytes as
-    // one run (to RunEnd), their count added to the one at len.
+    void CopyRun(tyg_val stk, tyg_addr len, TypeExpr *et, tyg_val elems, tyg_val n) {
+        if (!cg.IsFix(et)) No(Line {}, "a copy of elements of variable size");
+        CopyBytes(stk, len, elems, Mul(n, I64(cg.FixedSize(et))), n);
+    }
+    // The bytes of a view's elements, which may be images (to RunEnd).
+    tyg_val RunBytes(const View &v) {
+        return cg.IsFix(v.elem) ? Mul(v.len, I64(cg.FixedSize(v.elem))) : Sub(RunEnd(v), v.elems);
+    }
+    // CopyRun of a view's elements, which may be images.
     void CopyView(tyg_val stk, tyg_addr len, TypeExpr *et, const View &v) {
         if (cg.IsFix(et)) return CopyRun(stk, len, et, v.elems, v.len);
-        auto bytes = Sub(RunEnd(v), v.elems);
-        auto top = Top(stk);
-        tyg_move_dyn(p, top, v.elems, bytes);
-        SetTop(stk, Add(top, bytes));
-        St(len, Add(Ld(len), v.len));
+        CopyBytes(stk, len, v.elems, Sub(RunEnd(v), v.elems), v.len);
     }
 
-    // Builds n's value, a resizable array of type t, at the top of stk,
-    // its header at hdr (CodeGen::GenConstruct): a literal's elements one
-    // by one, a call's at the destination it is handed, anything else (an
-    // array, a slice, copy(x)) as a copy of its elements.
+    // Builds n's value, a resizable array of type t, at the top of stk, its header at hdr
+    // (CodeGen::GenConstruct): a literal's elements one by one, a call's at the destination
+    // it is handed, anything else (an array, a slice, copy(x)) as a copy of its elements.
     void GenRz(Node *n, tyg_val stk, tyg_addr hdr, TypeExpr *t, Line l) {
         if (M.IsRs(t)) return GenRs(n, stk, hdr, t, l);
         auto et = t->arr->sub;
-        if (auto c = Is<Call>(n); c && c->builtin == B_COPY && c->ArgNodes().size() == 1)
-            n = c->ArgNodes()[0];
-        auto len = hdr;
-        len.offset += 8;
+        auto fix = cg.IsFix(et);
+        n = StripCopy(n);
+        auto len = HdrLen(hdr);
         auto begin = [&] {
             St(hdr, Top(stk));
             St(len, I64(0));
         };
-        if (auto ie = Is<IfExpr>(n); ie && ie->elseb) {
-            // Each arm builds the array at the same top.
-            BuildIf(ie, l, [&](Node *v) { GenRz(v, stk, hdr, t, l); });
-            return;
-        }
-        if (auto b = Is<Block>(n); b && b->tail) {
-            BuildArm(b, l, [&](Node *v) { GenRz(v, stk, hdr, t, l); });
-            return;
-        }
-        if (Is<MatchExpr>(n) || Is<EarlyBlock>(n) || Is<LoopExpr>(n)) {
-            BuildExpr(n, InPlace { 2, stk, t, hdr }, l);
-            return;
-        }
-        if (auto c = Is<Call>(n); c && c->fvbody && c->fvbody->tail) {
-            BuildFv(c, l, [&](Node *v) { GenRz(v, stk, hdr, t, l); });
-            return;
-        }
-        if (auto al = Is<ArrayLit>(n); al && !cg.IsFix(et) && !al->fillval && !al->capexpr) {
-            // Image elements, each built behind the last.
-            begin();
-            for (auto e : al->elems) {
-                GenImg(e, stk, et, l);
-                if (Ended()) return;
-                St(len, Add(Ld(len), I64(1)));
+        if (BuildCtl(n, InPlace { 2, stk, t, hdr }, l, [&](Node *v) { GenRz(v, stk, hdr, t, l); })) return;
+        if (auto al = Is<ArrayLit>(n)) {
+            if (al->capexpr || (al->fillval && !fix)) No(l, "array literal of this kind");
+            if (!al->fillval) {   // Elements (images each built behind the last) counted one by one.
+                begin();
+                for (auto e : al->elems) {
+                    if (fix ? !BuildField(stk, et, e) : (GenImg(e, stk, et, l), Ended())) return;
+                    St(len, Add(Ld(len), I64(1)));
+                }
+                return;
             }
-            return;
-        }
-        if (auto al = Is<ArrayLit>(n); al && al->fillval && !al->capexpr && cg.IsFix(et)) {
-            // [v; k] (CodeGen::GenArrayLit): v built once, then copied k
-            // times behind the top; k is a constant (§4.2).
+            // [v; k] (CodeGen::GenArrayLit): v built once, then copied k times; k is a constant (§4.2).
             auto fc = Is<IntLit>(al->fillcount);
             if (!fc || fc->val < 0) No(l, "fill count");
             auto esz = cg.FixedSize(et);
@@ -2139,43 +2160,29 @@ struct TgFn {
             St(len, I64(fc->val));
             return;
         }
-        if (auto al = Is<ArrayLit>(n)) {
-            if (al->fillval || al->capexpr) No(l, "array literal of this kind");
-            begin();
-            for (auto e : al->elems) {
-                auto x = GenAs(e, et);
-                if (Ended()) return;
-                if (!M.IsScalar(et) && !x.mem) No(e->line, "aggregate value");
-                PushRaw(stk, len, et, x);
-            }
-            return;
-        }
-        if (auto c = Is<Call>(n); c && c->builtin == B_TO_BYTES && c->ArgNodes().size() == 1) {
+        auto c = Is<Call>(n);
+        if (c && c->builtin == B_TO_BYTES && c->ArgNodes().size() == 1) {
             if (!IsU8(et)) No(l, "to_bytes of this type");
             begin();
             ToBytesInto(stk, len, c->ArgNodes()[0], l);
             return;
         }
-        if (auto c = Is<Call>(n); c && c->builtin == B_STR) {
+        if (c && c->builtin == B_STR) {
             if (!IsU8(et)) No(l, "str of this type");
             begin();
             auto an = c->ArgNodes();
             TextInto(stk, len, c, an, 0);
             return;
         }
-        if (auto c = Is<Call>(n); DestSpec(c) && IsGrow(DestSpec(c)->rets[0])) {
+        if (DestSpec(c) && IsGrow(DestSpec(c)->rets[0])) {
             if (cg.Mangle(DestSpec(c)->rets[0]->arr->sub) != cg.Mangle(et)) No(l, "result of another element type");
-            RzDst d { stk, hdr };
-            rzdst = &d;
-            GenCall(c);
-            rzdst = nullptr;
+            CallRz(c, stk, hdr);
             return;
         }
         if (auto s = Is<StrLit>(n)) {
             if (!IsU8(et)) No(l, "string of this type");
             begin();
-            CopyRun(stk, len, et, tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)),
-                    I64((int64_t)s->val.size()));
+            CopyRun(stk, len, et, tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)), I64((int64_t)s->val.size()));
             return;
         }
         auto pl = ElemsSource(n, l);
@@ -2185,58 +2192,43 @@ struct TgFn {
         begin();
         CopyView(stk, len, et, v);
     }
+
     // ---- Resizable ADTs (TgModule::IsRb) -----------------------------------------
 
-    // The bytes of the value of type t at base, whose tail has cnt elements:
-    // the tag (an ADT's), the variant's fixed fields, the tail's elements.
+    // The bytes of the value of type t at base, whose tail has cnt elements: the
+    // tag (an ADT's), the variant's fixed fields, the tail's elements.
     tyg_val RbBytes(TypeExpr *t, tyg_val base, tyg_val cnt) {
         if (t->kind == TY_STRUCT) {
             auto sh = M.RbStShape(t);
             auto tt = cg.SI(t)->ftypes[(size_t)sh.tailfi];
-            auto at = Add(base, I64(sh.pre));
-            return Add(I64(sh.pre), RbBytes(tt, at, cnt));
+            return Add(I64(sh.pre), RbBytes(tt, Add(base, I64(sh.pre)), cnt));
         }
         auto ei = M.EI(t);
         auto one = [&](int vi, bool tag) {
             auto sh = M.RbShapeOf(ei, vi);
-            if (sh.img) {
-                // A variable-size variant: its image's size, walked.
+            auto ts = tag ? M.TagSize(t) : 0;
+            if (sh.img) {   // A variable-size variant: its image's size, walked.
                 auto vt = t->kind == TY_VARIANT ? t : cg.VariantType(t, vi);
-                auto at = tag ? Add(base, I64(M.TagSize(t))) : base;
-                return Add(I64(tag ? M.TagSize(t) : 0), ImgSize(vt, at));
+                return Add(I64(ts), ImgSize(vt, tag ? Add(base, I64(ts)) : base));
             }
-            auto n = I64((tag ? M.TagSize(t) : 0) + sh.pre);
-            if (sh.elem)
-                n = Add(n, Mul(cnt, I64(cg.FixedSize(sh.elem))));
-            return n;
+            auto n = I64(ts + sh.pre);
+            return sh.elem ? Add(n, Mul(cnt, I64(cg.FixedSize(sh.elem)))) : n;
         };
         if (t->kind == TY_VARIANT) return one(M.VariantIdx(t), false);
-        auto res = tyg_local_new(p, 8, 8);
+        auto res = Local(I64(0));
         auto tag = LoadTag(AtV(base), t);
-        auto done = NewBlock();
-        for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
-            auto hit = NewBlock(), next = NewBlock();
-            Branch(Cmp(TYG_EQ, tag, I64((int64_t)vi)), hit, next);
-            SetBlock(hit);
-            StL(res, one((int)vi, true));
-            tyg_jump(p, done);
-            SetBlock(next);
-        }
-        StL(res, I64(0));
-        tyg_jump(p, done);
-        SetBlock(done);
+        for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
+            If(Cmp(TYG_EQ, tag, I64((int64_t)vi)), [&] { StL(res, one((int)vi, true)); });
         return LdL(res);
     }
 
-    // Builds n's value, a resizable ADT or variant of type t, at the top of
-    // stk, its header at hdr (CodeGen::GenConstruct, GenStructLit,
-    // VariantBehindTag): the tag, the variant's fields in turn, its tail's
-    // elements counted into the header. A literal, a variant constant, a
-    // call returning one handed stk, or a fixed variant of the ADT (its
-    // payload copied behind the tag); the C copies no other.
+    // Builds n's value, a resizable ADT or variant of type t, at the top of stk, its
+    // header at hdr (CodeGen::GenConstruct, GenStructLit, VariantBehindTag): the tag,
+    // the variant's fields in turn, its tail's elements counted into the header. A
+    // literal, a variant constant, a call returning one handed stk, or a fixed variant
+    // of the ADT (its payload copied behind the tag); the C copies no other.
     void GenRb(Node *n, tyg_val stk, tyg_addr hdr, TypeExpr *t, Line l) {
-        auto len = hdr;
-        len.offset += 8;
+        auto len = HdrLen(hdr);
         auto adt = t->kind == TY_ENUM;
         auto isst = t->kind == TY_STRUCT;
         auto ei = isst ? nullptr : M.EI(t);
@@ -2257,242 +2249,159 @@ struct TgFn {
             tyg_zero(p, AtV(top), k);
             SetTop(stk, Add(top, I64(k)));
         };
-        auto fields = [&](StructLit *sl, int vi) {
-            auto &fs = ei->en->variants[(size_t)vi].fields;
-            auto sh = M.RbShapeOf(ei, vi);
-            if (sh.img) {
-                RunLit(sl, stk, fs, ei->vftypes[(size_t)vi]);   // Its fields in turn, as a variable-size variant's.
-                return;
-            }
+        // A tail built behind a header of its own, its count the one at len.
+        auto tailhdr = [&](bool rb, Node *init, TypeExpr *ft) {
+            auto th = NewHdr();
+            if (rb) GenRb(init, stk, th, ft, l);
+            else GenRz(init, stk, th, ft, l);
+            if (!Ended()) St(len, Ld(HdrLen(th)));
+        };
+        // A literal's fields in turn: pads and absent fields zeroed, the tail built by `tail`.
+        auto fields = [&](StructLit *sl, auto &fs, auto &fts, int tailfi, auto tail) {
             for (size_t i = 0; i < fs.size() && !Ended(); i++) {
                 if (fs[i].ispad) {
                     zero(fs[i].padsize);
                     continue;
                 }
-                auto ft = ei->vftypes[(size_t)vi][i];
                 auto init = sl->InitFor((int)i);
-                if ((int)i == sh.tailfi && sh.fo) {
-                    if (!init || Is<SelfRef>(init)) No(l, "resizable ADT without its frame object");
-                    GenFoBytes(init, stk, ft, len, l);
-                    if (Ended()) return;
-                    continue;
-                }
-                if ((int)i == sh.tailfi) {
-                    if (!init) continue;
-                    if (Is<SelfRef>(init)) No(l, "self reference in a resizable ADT");
-                    auto th = AtL(tyg_local_new(p, 16, 8));
-                    GenRz(init, stk, th, ft, l);
-                    if (Ended()) return;
-                    auto tl = th;
-                    tl.offset += 8;
-                    St(len, Ld(tl));
-                    continue;
-                }
-                if (!init) {
-                    zero(cg.FixedSize(ft));
-                    continue;
-                }
-                if (Is<SelfRef>(init)) No(l, "self reference in a resizable ADT");
-                auto x = GenAs(init, ft);
-                if (Ended()) return;
-                if (!M.IsScalar(ft) && !x.mem) No(init->line, "aggregate value");
-                auto top = Top(stk);
-                Store(P { AtV(top), ft }, x);
-                SetTop(stk, Add(top, I64(cg.FixedSize(ft))));
+                if (init && Is<SelfRef>(init)) No(l, "self reference in a resizable ADT");
+                if ((int)i == tailfi) tail(init, fts[i]);
+                else if (!init) zero(cg.FixedSize(fts[i]));
+                else if (!BuildField(stk, fts[i], init)) return;
             }
         };
-        if (auto c = Is<Call>(n); c && c->builtin == B_COPY && c->ArgNodes().size() == 1) No(l, "copy of a resizable ADT");
-        if (auto ie = Is<IfExpr>(n); ie && ie->elseb) {
-            BuildIf(ie, l, [&](Node *v) { GenRb(v, stk, hdr, t, l); });
-            return;
-        }
-        if (auto b = Is<Block>(n); b && b->tail) {
-            BuildArm(b, l, [&](Node *v) { GenRb(v, stk, hdr, t, l); });
-            return;
-        }
-        if (Is<MatchExpr>(n) || Is<EarlyBlock>(n) || Is<LoopExpr>(n)) {
-            BuildExpr(n, InPlace { 2, stk, t, hdr }, l);
-            return;
-        }
-        if (auto c = Is<Call>(n); c && c->fvbody && c->fvbody->tail) {
-            BuildFv(c, l, [&](Node *v) { GenRb(v, stk, hdr, t, l); });
-            return;
-        }
-        if (isst) {
-            if (auto sl = Is<StructLit>(n); sl && sl->exprtype && cg.TEq(sl->exprtype, t) && sl->sinst && !sl->variant) {
-                // Its fixed fields in turn, then its tail, a resizable ADT of its own.
+        if (StripCopy(n) != n) No(l, "copy of a resizable ADT");
+        if (BuildCtl(n, InPlace { 2, stk, t, hdr }, l, [&](Node *v) { GenRb(v, stk, hdr, t, l); })) return;
+        auto sl = Is<StructLit>(n);
+        auto c = Is<Call>(n);
+        if (isst) {   // Its fixed fields in turn, then its tail, a resizable ADT of its own.
+            if (sl && sl->exprtype && cg.TEq(sl->exprtype, t) && sl->sinst && !sl->variant) {
                 auto si = cg.SI(t);
-                auto sh = M.RbStShape(t);
-                St(hdr, Top(stk));
-                St(len, I64(0));
-                for (size_t i = 0; i < si->st->fields.size() && !Ended(); i++) {
-                    auto &f = si->st->fields[i];
-                    if (f.ispad) {
-                        zero(f.padsize);
-                        continue;
-                    }
-                    auto ft = si->ftypes[i];
-                    auto init = sl->InitFor((int)i);
-                    if ((int)i == sh.tailfi) {
-                        if (!init || Is<SelfRef>(init)) No(l, "resizable struct without its tail");
-                        auto th = AtL(tyg_local_new(p, 16, 8));
-                        GenRb(init, stk, th, ft, l);
-                        if (Ended()) return;
-                        auto tl = th;
-                        tl.offset += 8;
-                        St(len, Ld(tl));
-                        continue;
-                    }
-                    if (!init) {
-                        zero(cg.FixedSize(ft));
-                        continue;
-                    }
-                    if (Is<SelfRef>(init)) No(l, "self reference in a resizable struct");
-                    auto x = GenAs(init, ft);
-                    if (Ended()) return;
-                    if (!M.IsScalar(ft) && !x.mem) No(init->line, "aggregate value");
-                    auto top = Top(stk);
-                    Store(P { AtV(top), ft }, x);
-                    SetTop(stk, Add(top, I64(cg.FixedSize(ft))));
-                }
+                begin(0);
+                fields(sl, si->st->fields, si->ftypes, M.RbStShape(t).tailfi, [&](Node *init, TypeExpr *ft) {
+                    if (!init) No(l, "resizable struct without its tail");
+                    tailhdr(true, init, ft);
+                });
                 return;
             }
-            if (auto c = Is<Call>(n); DestSpec(c) && cg.Mangle(DestSpec(c)->rets[0]) == cg.Mangle(t)) {
-                RzDst d { stk, hdr };
-                rzdst = &d;
-                GenCall(c);
-                rzdst = nullptr;
-                return;
-            }
-            No(l, cat("resizable struct built from this value"));
-        }
-        if (auto sl = Is<StructLit>(n); sl && sl->exprtype && cg.TEq(sl->exprtype, t) && (adt ? sl->variant != nullptr : true)) {
+            if (!DestIs(c, t)) No(l, "resizable struct built from this value");
+        } else if (sl && sl->exprtype && cg.TEq(sl->exprtype, t) && (adt ? sl->variant != nullptr : true)) {
             auto vi = adt ? ei->en->VariantIndex(sl->variant) : M.VariantIdx(t);
+            auto &fs = ei->en->variants[(size_t)vi].fields;
+            auto sh = M.RbShapeOf(ei, vi);
             begin(vi);
-            fields(sl, vi);
+            if (sh.img) {   // Its fields in turn, as a variable-size variant's.
+                RunLit(sl, stk, fs, ei->vftypes[(size_t)vi]);
+                return;
+            }
+            fields(sl, fs, ei->vftypes[(size_t)vi], sh.tailfi, [&](Node *init, TypeExpr *ft) {
+                if (sh.fo) {
+                    if (!init) No(l, "resizable ADT without its frame object");
+                    GenFoBytes(init, stk, ft, len, l);
+                } else if (init) {
+                    tailhdr(false, init, ft);
+                }
+            });
             return;
         }
         if (auto d = Is<Dot>(n); d && d->variantconst && adt && d->exprtype && cg.TEq(d->exprtype, t)) {
             begin(ei->en->VariantIndex(d->variantconst));
             return;
         }
-        if (auto c = Is<Call>(n); DestSpec(c)) {
+        if (DestSpec(c)) {
             auto rt = DestSpec(c)->rets[0];
             if (cg.Mangle(rt) == cg.Mangle(t)) {
-                RzDst d { stk, hdr };
-                rzdst = &d;
-                GenCall(c);
-                rzdst = nullptr;
+                CallRz(c, stk, hdr);
                 return;
             }
-            if (adt && rt->kind == TY_VARIANT && M.IsRb(rt) && M.EI(rt) == ei) {
-                // The variant behind the ADT's tag, built where the call
-                // puts its result; the header then starts at the tag.
-                auto start = tyg_local_new(p, 8, 8);
+            if (adt && rt->kind == TY_VARIANT && M.EI(rt) == ei && M.IsRb(rt)) {
+                // The variant behind the ADT's tag, built where the call puts its result;
+                // the header then starts at the tag.
                 auto top = Top(stk);
-                StL(start, top);
+                auto start = Local(top);
                 StoreTag(AtV(top), t, M.VariantIdx(rt));
                 SetTop(stk, Add(top, I64(ts)));
-                RzDst d { stk, hdr };
-                rzdst = &d;
-                GenCall(c);
-                rzdst = nullptr;
+                CallRz(c, stk, hdr);
                 if (!Ended()) St(hdr, LdL(start));
                 return;
             }
-            if (adt && rt->kind == TY_VARIANT && !M.IsRb(rt) && M.IsVv(rt) && M.EI(rt) == ei) {
-                // A variable-size variant, built behind the tag by the call.
-                begin(M.VariantIdx(rt));
-                imgdst = stk;
-                GenCall(c);
-                imgdst = 0;
+            if (adt && rt->kind == TY_VARIANT && M.EI(rt) == ei && !M.IsRb(rt) && M.IsVv(rt)) {
+                begin(M.VariantIdx(rt));   // A variable-size variant, built behind the tag by the call.
+                CallImg(c, stk);
                 return;
             }
         }
-        // A value the ADT's variant is: its type is the variant's, not the
-        // ADT's the checker gave the node.
+        // A value the ADT's variant is: its type is the variant's, not the ADT's the checker gave the node.
         auto x = Gen1(n);
         if (Ended()) return;
         while (x.t && IsAddrRef(x.t)) x = Load(RefTarget(x), l);
         if (!x.mem || !x.t) No(l, cat("value of type ", M.NameWhy(t)));
-        if (adt && x.t->kind == TY_VARIANT && M.EI(x.t) == ei && cg.IsFix(x.t)) {
-            begin(M.VariantIdx(x.t));
-            auto sz = cg.FixedSize(x.t);
-            if (sz) {
-                auto top = Top(stk);
-                tyg_copy(p, AtV(top), x.a, sz);
-                SetTop(stk, Add(top, I64(sz)));
+        if (adt && x.t->kind == TY_VARIANT && M.EI(x.t) == ei) {
+            if (cg.IsFix(x.t)) {
+                begin(M.VariantIdx(x.t));
+                if (auto sz = cg.FixedSize(x.t)) {
+                    auto top = Top(stk);
+                    tyg_copy(p, AtV(top), x.a, sz);
+                    SetTop(stk, Add(top, I64(sz)));
+                }
+                return;
             }
-            return;
-        }
-        if (adt && x.t->kind == TY_VARIANT && M.EI(x.t) == ei && !M.IsRb(x.t) && M.IsVv(x.t)) {
-            begin(M.VariantIdx(x.t));
-            ImgCopy(stk, tyg_addr_of(p, x.a), x.t);
-            return;
+            if (!M.IsRb(x.t) && M.IsVv(x.t)) {
+                begin(M.VariantIdx(x.t));
+                ImgCopy(stk, tyg_addr_of(p, x.a), x.t);
+                return;
+            }
         }
         No(l, cat("resizable ADT built from ", M.NameWhy(x.t)));
     }
-    // A value x of type xt, a result held elsewhere (a forwarded call's),
-    // as the ADT or variant t at the top of stk, its header at hdr: its
-    // bytes copied, an ADT's tag put in front of a variant's payload.
+    // A value x of type xt, a result held elsewhere (a forwarded call's), as the ADT or
+    // variant t at the top of stk, its header at hdr: its bytes copied, an ADT's tag put
+    // in front of a variant's payload.
     void RbFrom(tyg_val stk, tyg_addr hdr, const V &x, TypeExpr *t, Line l) {
-        auto len = hdr;
-        len.offset += 8;
+        auto len = HdrLen(hdr);
         if (!x.mem || !x.t) No(l, cat("value of type ", M.NameWhy(t)));
         auto adt = t->kind == TY_ENUM;
         auto ts = adt ? M.TagSize(t) : 0;
         auto top = Top(stk);
         St(hdr, top);
-        if (cg.Mangle(x.t) == cg.Mangle(t) && M.IsRb(x.t)) {
-            auto xl = x.a;
-            xl.offset += 8;
-            auto xb = Ld(x.a);
-            auto cnt = Ld(xl);
-            auto n = RbBytes(t, xb, cnt);
-            tyg_move_dyn(p, top, xb, n);
-            SetTop(stk, Add(top, n));
-            St(len, cnt);
-            return;
+        auto same = cg.Mangle(x.t) == cg.Mangle(t) && M.IsRb(x.t);
+        if (!same) {
+            if (!adt || x.t->kind != TY_VARIANT || M.EI(x.t) != M.EI(t))
+                No(l, cat("value of type ", M.NameWhy(x.t), " as ", M.Name(t)));
+            StoreTag(AtV(top), t, M.VariantIdx(x.t));
         }
-        if (!adt || x.t->kind != TY_VARIANT || M.EI(x.t) != M.EI(t)) No(l, cat("value of type ", M.NameWhy(x.t), " as ", M.Name(t)));
-        StoreTag(AtV(top), t, M.VariantIdx(x.t));
+        auto at = same ? top : Add(top, I64(ts));   // An ADT's bytes hold their tag; a variant's lie behind it.
         if (M.IsRb(x.t)) {
-            auto xl = x.a;
-            xl.offset += 8;
             auto xb = Ld(x.a);
-            auto cnt = Ld(xl);
-            auto n = RbBytes(x.t, xb, cnt);
-            tyg_move_dyn(p, Add(top, I64(ts)), xb, n);
-            SetTop(stk, Add(Add(top, I64(ts)), n));
+            auto cnt = Ld(HdrLen(x.a));
+            auto n = RbBytes(same ? t : x.t, xb, cnt);
+            tyg_move_dyn(p, at, xb, n);
+            SetTop(stk, Add(at, n));
             St(len, cnt);
             return;
         }
-        if (!cg.IsFix(x.t)) {
-            // A variable-size variant's image, behind the tag.
-            SetTop(stk, Add(top, I64(ts)));
+        St(len, I64(0));
+        if (!cg.IsFix(x.t)) {   // A variable-size variant's image, behind the tag.
+            SetTop(stk, at);
             ImgCopy(stk, tyg_addr_of(p, x.a), x.t);
-            St(len, I64(0));
             return;
         }
         auto sz = cg.FixedSize(x.t);
-        if (sz) tyg_copy(p, AtV(Add(top, I64(ts))), x.a, sz);
-        SetTop(stk, Add(top, I64(ts + sz)));
-        St(len, I64(0));
+        if (sz) tyg_copy(p, AtV(at), x.a, sz);
+        SetTop(stk, Add(at, I64(sz)));
     }
-    // A field of a resizable struct: a fixed one where it lies; the tail, a
-    // resizable ADT, through a header made for it (its base and the
-    // struct's count), which reads see as the struct's own (tmphdr).
+    // A field of a resizable struct: a fixed one where it lies; the tail, a resizable
+    // ADT, through a header made for it (its base and the struct's count), which reads
+    // see as the struct's own (tmphdr).
     P RbStFieldPlace(const P &base, int fi) {
         auto si = cg.SI(base.t);
         auto sh = M.RbStShape(base.t);
         auto at = Add(Ld(base.a), I64(sh.offs[(size_t)fi]));
         auto ft = si->ftypes[(size_t)fi];
         if (fi != sh.tailfi) return P { AtV(at), ft };
-        auto hl = base.a;
-        hl.offset += 8;
         auto th = tyg_local_new(p, 16, 8);
         StL(th, at);
-        StL(th, Ld(hl), 8);
+        StL(th, Ld(HdrLen(base.a)), 8);
         P r { AtL(th), ft, base.stk };
         r.tmphdr = true;
         r.ohdr = base.tmphdr ? base.ohdr : base.a;   // The struct's own header, whose count it is.
@@ -2507,27 +2416,20 @@ struct TgFn {
         return P { AtV(Ld(base.a), sh.offs[(size_t)fi]), ei->vftypes[(size_t)vi][(size_t)fi] };
     }
 
-    // Where the elements an array is built from lie: the place of n.
-    // The checker types a popped or default fixed array as the T[] it is
-    // adapted to, but a fixed array is what lies there: its elements are
-    // copied from it (CodeGen::EmitPop, B_DEFAULT).
+    // The place whose elements an array is built from. The checker types a popped or
+    // default fixed array, to_bytes and from_bytes as the T[] they are adapted to, but
+    // what lies there is their own array (CodeGen::EmitPop, B_DEFAULT, EmitToBytes).
     static bool IsStrCall(Node *n) {
         auto c = Is<Call>(n);
         return c && c->builtin == B_STR;
     }
-    static bool FixedTyped(Node *n) {
-        auto pc = Is<Call>(n);
-        return pc && (pc->builtin == B_POP || pc->builtin == B_DEFAULT);
-    }
-    static bool BytesBuiltin(Node *n) {
+    static bool OwnTypedCall(Node *n) {
         auto c = Is<Call>(n);
-        return c && ((c->builtin == B_TO_BYTES && c->ArgNodes().size() == 1) || c->builtin == B_FROM_BYTES);
+        return c && (c->builtin == B_POP || c->builtin == B_DEFAULT || c->builtin == B_FROM_BYTES ||
+                     (c->builtin == B_TO_BYTES && c->ArgNodes().size() == 1));
     }
     P ElemsSource(Node *n, Line l) {
-        // to_bytes and from_bytes are typed as the array they are adapted
-        // to, but what they build is their own array (CodeGen::EmitToBytes,
-        // EmitFromBytes).
-        if (FixedTyped(n) || BytesBuiltin(n)) {
+        if (OwnTypedCall(n)) {
             auto x = Gen1(n);
             if (Ended()) return P {};
             if (!x.mem) No(l, "popped value in no memory");
@@ -2535,79 +2437,66 @@ struct TgFn {
         }
         return LimCallResult(n) ? LimCallPlace(n) : Place(n);
     }
-    // The function a call to it builds its first result at a destination
-    // for (CodeGen's in-place construction): its own, or a dispatch's
-    // first case, whose results all the cases share.
+    // The function a call to it builds its first result at a destination for (CodeGen's
+    // in-place construction): its own, or a dispatch's first case, whose results all the
+    // cases share.
     FnSpec *DestSpec(Call *c) {
         if (!c || c->builtin >= 0) return nullptr;
         auto sp = c->spec ? c->spec : !c->dispatch.empty() ? c->dispatch[0] : nullptr;
         if (!sp || sp->sf->isextern || sp->rets.empty()) return nullptr;
         return sp;
     }
-    // Where GenCall builds a call's first result, a resizable, instead of
-    // a temporary of its own: a local's stack, a return destination.
+    // Where GenCall builds a call's first result, a resizable, instead of a temporary
+    // of its own: a local's stack, a return destination.
     struct RzDst {
         tyg_val stk;
         tyg_addr hdr;
     };
     const RzDst *rzdst = nullptr;
-    // Where GenCall builds a call's first result, a T[] image: a local's
-    // stack, a return destination.
+    // The same for a T[] image.
     tyg_val imgdst = 0;
     static bool IsVarArr(TypeExpr *t) { return TgModule::IsVarArr(t); }
     bool IsImg(TypeExpr *t) { return M.IsImg(t); }
 
-    // A T[] length prefix (EmitPrefixPatch): n, checked against the
-    // prefix's range as the C checks it, stored at pre.
+    // A T[] length prefix (EmitPrefixPatch): n, checked against the prefix's range as
+    // the C checks it, stored at pre.
     void PatchPrefix(tyg_val pre, TypeExpr *t, tyg_val n, tyg_val stk) {
         auto w = TgModule::LenWidth(t);
-        if (w == 0) {
-            // A varint: one byte reserved, the elements moved up behind a
-            // count that needs more.
+        if (w == 0) {   // A varint: one byte reserved, the elements moved up behind a count that needs more.
             auto nl = Local(n);
             auto cnt = [&] { return LdL(nl); };
-            auto small = NewBlock(), big = NewBlock(), done = NewBlock();
-            Branch(Cmp(TYG_ULT, cnt(), I64(128)), small, big);
-            SetBlock(small);
-            tyg_store(p, TYG_I8, AtV(pre), tyg_convert(p, TYG_TRUNC, TYG_I8, cnt()), 0);
-            tyg_jump(p, done);
-            SetBlock(big);
-            auto tmp = tyg_local_new(p, 16, 8);
-            auto ms = UlebWrite(tyg_addr_of(p, AtL(tmp)), cnt());
-            auto msl = Local(ms);
-            auto msv = [&] { return LdL(msl); };
-            auto elems = Add(pre, I64(1));
-            auto top = Top(stk);
-            tyg_move_dyn(p, Add(elems, Sub(msv(), I64(1))), elems, Sub(top, elems));
-            tyg_copy_dyn(p, pre, tyg_addr_of(p, AtL(tmp)), msv());
-            SetTop(stk, Add(top, Sub(msv(), I64(1))));
-            tyg_jump(p, done);
-            SetBlock(done);
+            IfElse(Cmp(TYG_ULT, cnt(), I64(128)),
+                   [&] { tyg_store(p, TYG_I8, AtV(pre), tyg_convert(p, TYG_TRUNC, TYG_I8, cnt()), 0); },
+                   [&] {
+                       auto tmp = tyg_local_new(p, 16, 8);
+                       auto msl = Local(UlebWrite(tyg_addr_of(p, AtL(tmp)), cnt()));
+                       auto msv = [&] { return LdL(msl); };
+                       auto elems = Add(pre, I64(1));
+                       auto top = Top(stk);
+                       tyg_move_dyn(p, Add(elems, Sub(msv(), I64(1))), elems, Sub(top, elems));
+                       tyg_copy_dyn(p, pre, tyg_addr_of(p, AtL(tmp)), msv());
+                       SetTop(stk, Add(top, Sub(msv(), I64(1))));
+                   });
             return;
         }
         auto s = w == 1 ? TYG_I8 : w == 2 ? TYG_I16 : w == 4 ? TYG_I32 : TYG_I64;
         if (w < 8) {
-            auto ok = NewBlock(), bad = NewBlock();
-            auto max = (int64_t)((1ull << (8 * w)) - 1);
-            Branch(Cmp(TYG_ULE, n, I64(max)), ok, bad);
-            SetBlock(bad);
-            string msg = "array length exceeds storage range";
-            msg.push_back('\0');
-            CallC("gs_panic", { tyg_type_ptr(m) }, { tyg_addr_of(p, tyg_at_sym(M.Bytes(msg), 0)) }, nullptr);
-            tyg_unreachable(p);
-            SetBlock(ok);
+            If(Cmp(TYG_UGT, n, I64((int64_t)((1ull << (8 * w)) - 1))), [&] {
+                string msg = "array length exceeds storage range";
+                msg.push_back('\0');
+                CallC("gs_panic", { tyg_type_ptr(m) }, { tyg_addr_of(p, tyg_at_sym(M.Bytes(msg), 0)) }, nullptr);
+                tyg_unreachable(p);
+            });
             n = tyg_convert(p, TYG_TRUNC, s, n);
         }
         tyg_store(p, s, AtV(pre), n, 0);
     }
-    // Builds a T[] image of type t at the top of stk (CodeGen's variable
-    // array construction): n's value -- a call returning one is handed
-    // stk as its destination, anything else is built as a resizable's
-    // elements (GenRz) behind a prefix patched once they are counted --
-    // or the elements of `from`, or none. Its address.
+    // Builds a T[] image of type t at the top of stk (CodeGen's variable array
+    // construction): n's value -- a call returning one is handed stk as its destination,
+    // anything else is built as a resizable's elements (GenRz) behind a prefix patched
+    // once they are counted -- or the elements of `from`, or none. Its address.
     tyg_val GenImg(Node *n, tyg_val stk, TypeExpr *t, Line l, const View *from = nullptr) {
-        if (TgModule::IsVarint(t)) {
-            // A varint field: its value zigzag ULEB128 at the top.
+        if (TgModule::IsVarint(t)) {   // A varint field: its value zigzag ULEB128 at the top.
             if (!n || from) No(l, "varint without a value");
             auto top = Top(stk);
             auto x = GenAs(n, M.ast.inttypes[IS_I64]);
@@ -2615,31 +2504,14 @@ struct TgFn {
             SetTop(stk, Add(top, ZigWrite(top, x.v)));
             return top;
         }
-        if (auto ie = n && !from ? Is<IfExpr>(n) : nullptr; ie && ie->elseb) {
-            // Each arm builds its value at the same top (CodeGen's
-            // GenConstruct of an if): the image starts where the top was.
-            auto start = Local(Top(stk));
-            BuildIf(ie, l, [&](Node *v) { GenImg(v, stk, t, l); });
-            return LdL(start);
-        }
-        if (auto b = n && !from ? Is<Block>(n) : nullptr; b && b->tail) {
-            auto start = Local(Top(stk));
-            BuildArm(b, l, [&](Node *v) { GenImg(v, stk, t, l); });
-            return LdL(start);
-        }
-        if (n && !from && (Is<MatchExpr>(n) || Is<EarlyBlock>(n) || Is<LoopExpr>(n))) {
-            auto start = Local(Top(stk));
-            BuildExpr(n, InPlace { 1, stk, t, {} }, l);
-            return LdL(start);
-        }
-        if (auto c = n && !from ? Is<Call>(n) : nullptr; c && c->fvbody && c->fvbody->tail) {
-            auto start = Local(Top(stk));
-            BuildFv(c, l, [&](Node *v) { GenImg(v, stk, t, l); });
-            return LdL(start);
-        }
+        auto start = Local(Top(stk));
+        auto at = [&] { return LdL(start); };
+        // Control flow: each arm builds its value at the same top, the image starting where it was.
+        if (n && !from && BuildCtl(n, InPlace { 1, stk, t, {} }, l, [&](Node *v) { GenImg(v, stk, t, l); }))
+            return at();
         if (TgModule::IsVr(t)) {
-            // A varint-width relative reference: the offset of the plain
-            // reference n is, whatever relative width it came from.
+            // A varint-width relative reference: the offset of the plain reference n is,
+            // whatever relative width it came from.
             if (from) No(l, "relative reference without a value");
             if (!n) {   // Declared without one: null, the zero byte.
                 auto top = Top(stk);
@@ -2651,24 +2523,12 @@ struct TgFn {
             if (Ended()) return Top(stk);
             return GenVr(x, stk, t, l);
         }
-        if (M.IsVm(t)) {
+        if (M.IsVm(t) || M.IsVv(t) || M.IsVs(t)) {
             if (!n || from) No(l, cat("value of type ", M.NameWhy(t)));
-            return GenVm(n, stk, t, l);
+            return M.IsVm(t) ? GenVm(n, stk, t, l) : M.IsVv(t) ? GenVv(n, stk, t, l) : GenVs(n, stk, t, l);
         }
-        if (M.IsVv(t)) {
-            if (!n || from) No(l, cat("value of type ", M.NameWhy(t)));
-            return GenVv(n, stk, t, l);
-        }
-        if (M.IsVs(t)) {
-            if (!n || from) No(l, cat("value of type ", M.NameWhy(t)));
-            return GenVs(n, stk, t, l);
-        }
-        auto start = Local(Top(stk));
-        auto at = [&] { return LdL(start); };
-        if (auto c = Is<Call>(n); DestSpec(c) && cg.Mangle(DestSpec(c)->rets[0]) == cg.Mangle(t)) {
-            imgdst = stk;
-            GenCall(c);
-            imgdst = 0;
+        if (auto c = Is<Call>(n); DestIs(c, t)) {
+            CallImg(c, stk);
             return at();
         }
         if (M.VarImgOk(t)) return GenImgOfImgs(n, stk, t, l, from, start);
@@ -2677,9 +2537,8 @@ struct TgFn {
             return at();
         }
         SetTop(stk, Add(at(), I64(TgModule::PrefixBytes(t))));
-        auto hdr = AtL(tyg_local_new(p, 16, 8));
-        auto len = hdr;
-        len.offset += 8;
+        auto hdr = NewHdr();
+        auto len = HdrLen(hdr);
         if (n) {
             GenRz(n, stk, hdr, t, l);
         } else {
@@ -2695,77 +2554,70 @@ struct TgFn {
         return at();
     }
 
-    // A T[..] built at the top of stk, at `at` (CodeGen::GenArrayLit):
-    // [..cap] its capacity and no elements, the slots left as they are;
-    // another T[..] copied whole, capacity and all; any other array or
-    // literal its elements, the capacity their count.
+    // A T[..] built at the top of stk, at `at` (CodeGen::GenArrayLit): [..cap] its capacity
+    // and no elements, the slots left as they are; another T[..] copied whole, capacity and
+    // all; any other array or literal its elements, the capacity their count.
     void GenRc(Node *n, tyg_val stk, TypeExpr *t, Line l, const View *from, tyg_val at) {
         auto et = t->arr->sub;
-        auto esz = cg.FixedSize(et);
         P pl { AtV(at), t };
         auto al = n && !from ? Is<ArrayLit>(n) : nullptr;
+        auto setcap = [&](tyg_val cap, tyg_val cnt) {
+            AbortUnless(Cmp(TYG_ULE, cap, I64(0xffffffffll)), "CAPRANGE", l);
+            tyg_store(p, TYG_I32, pl.a, tyg_convert(p, TYG_TRUNC, TYG_I32, cap), 0);
+            LimSetLen(pl, cnt);
+        };
         if (al && al->capexpr) {
             auto cap = Index64(al->capexpr);
             if (Ended()) return;
-            AbortUnless(Cmp(TYG_ULE, cap, I64(0xffffffffll)), "CAPRANGE", l);
-            tyg_store(p, TYG_I32, pl.a, tyg_convert(p, TYG_TRUNC, TYG_I32, cap), 0);
-            LimSetLen(pl, I64(0));
-            SetTop(stk, Add(at, Add(I64(8), Mul(cap, I64(esz)))));
+            setcap(cap, I64(0));
+            SetTop(stk, Add(at, Add(I64(8), Mul(cap, I64(cg.FixedSize(et))))));
             return;
         }
-        if (n && !from && !al && !Is<StrLit>(n) && !LimCallResult(n) && !FixedTyped(n) && !BytesBuiltin(n) && !IsStrCall(n) &&
-            n->exprtype &&
-            cg.TEq(n->exprtype, t)) {
+        if (n && !from && !al && !Is<StrLit>(n) && !LimCallResult(n) && !OwnTypedCall(n) && !IsStrCall(n) &&
+            n->exprtype && cg.TEq(n->exprtype, t)) {
             auto src = Deref(Place(n));
             if (Ended()) return;
             ImgCopy(stk, tyg_addr_of(p, src.a), t);
             return;
         }
-        // The elements behind an 8-byte header, built as a resizable's
-        // are; then the header, capacity and length both their count.
+        // The elements behind an 8-byte header, built as a resizable's are; then the
+        // header, capacity and length both their count.
         SetTop(stk, Add(at, I64(8)));
-        auto hdr = AtL(tyg_local_new(p, 16, 8));
-        auto len = hdr;
-        len.offset += 8;
+        auto hdr = NewHdr();
+        auto len = HdrLen(hdr);
         St(hdr, Top(stk));
         St(len, I64(0));
+        auto fromview = [&](const View &v) {
+            if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
+            CopyView(stk, len, et, v);
+        };
         if (from) {
-            if (cg.Mangle(from->elem) != cg.Mangle(et)) No(l, "array of another element type");
-            CopyView(stk, len, et, *from);
+            fromview(*from);
         } else if (al || Is<StrLit>(n) || IsStrCall(n)) {
             GenRz(n, stk, hdr, t, l);
         } else if (n) {
-            if (auto c = Is<Call>(n); c && c->builtin == B_COPY) n = c->ArgNodes()[0];
-            auto pl = ElemsSource(n, l);
+            auto src = ElemsSource(StripCopy(n), l);
             if (Ended()) return;
-            auto v = ViewOf(pl, l);
-            if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
-            CopyView(stk, len, et, v);
+            fromview(ViewOf(src, l));
         }
         if (Ended()) return;
         auto cnt = Ld(len);
-        AbortUnless(Cmp(TYG_ULE, cnt, I64(0xffffffffll)), "CAPRANGE", l);
-        tyg_store(p, TYG_I32, pl.a, tyg_convert(p, TYG_TRUNC, TYG_I32, cnt), 0);
-        LimSetLen(pl, cnt);
+        setcap(cnt, cnt);
     }
 
-    // A T[] of images built at the top of stk (its start in `start`): the
-    // length prefix, then a literal's elements each built in place behind
-    // the last, or another such array's elements copied as one run of
-    // bytes, then the prefix patched with the count.
+    // A T[] of images built at the top of stk (its start in `start`): the length prefix,
+    // then a literal's elements each built in place behind the last, or another such
+    // array's elements copied as one run of bytes, then the prefix patched with the count.
     tyg_val GenImgOfImgs(Node *n, tyg_val stk, TypeExpr *t, Line l, const View *from, tyg_local start) {
         auto at = [&] { return LdL(start); };
         auto et = t->arr->sub;
         SetTop(stk, Add(at(), I64(TgModule::PrefixBytes(t))));
         auto cnt = Local(I64(0));
-        View v {};
         auto al = n ? Is<ArrayLit>(n) : nullptr;
         if (al && al->fillval && !al->capexpr) {
-            // [v; k]: v built once, then copied behind itself.
+            // [v; k]: v built once even for none (CodeGen::FreezeFill), then copied behind itself.
             auto fc = Is<IntLit>(al->fillcount);
             if (!fc || fc->val < 0) No(l, "fill count");
-            // The value is built once even for none (CodeGen::FreezeFill),
-            // then copied behind itself in a loop.
             auto saved = Top(stk);
             auto first = GenImg(al->fillval, stk, et, l);
             if (Ended()) return at();
@@ -2783,15 +2635,15 @@ struct TgFn {
                 StL(cnt, Add(LdL(cnt), I64(1)));
             }
         } else {
-            if (auto c = n ? Is<Call>(n) : nullptr; c && c->builtin == B_COPY && c->ArgNodes().size() == 1)
-                n = c->ArgNodes()[0];
+            n = StripCopy(n);
+            View v {};
             if (from) v = *from;
             else if (n) v = ViewOf(LimCallResult(n) ? LimCallPlace(n) : Place(n), l);
             else No(l, "array of images without a value");
             if (Ended()) return at();
             if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
-            auto bytes = Sub(RunEnd(v), v.elems);
             auto top = Top(stk);
+            auto bytes = Sub(RunEnd(v), v.elems);
             tyg_move_dyn(p, top, v.elems, bytes);
             SetTop(stk, Add(top, bytes));
             StL(cnt, v.len);
@@ -2800,37 +2652,36 @@ struct TgFn {
         return at();
     }
 
-    // to_bytes (CodeGen::EmitToBytes): the payload's byte count ULEB128,
-    // then its bytes, appended at the top of stk to the u8 count at len.
-    void ToBytesInto(tyg_val stk, tyg_addr len, Node *a, Line l) {
+    // The view of a's place as a local (source, byte count), for to_bytes.
+    tyg_local SpanOf(Node *a, Line l) {
         auto v = ViewOf(Place(a), l);
-        if (Ended()) return;
         auto sl = tyg_local_new(p, 16, 8);
+        if (Ended()) return sl;
         StL(sl, v.elems);
-        StL(sl, cg.IsFix(v.elem) ? Mul(v.len, I64(cg.FixedSize(v.elem))) : Sub(RunEnd(v), v.elems), 8);
-        auto src = [&] { return LdL(sl); };
+        StL(sl, RunBytes(v), 8);
+        return sl;
+    }
+    // to_bytes (CodeGen::EmitToBytes): the payload's byte count ULEB128, then its bytes,
+    // appended at the top of stk to the u8 count at len.
+    void ToBytesInto(tyg_val stk, tyg_addr len, Node *a, Line l) {
+        auto sl = SpanOf(a, l);
+        if (Ended()) return;
         auto sz = [&] { return LdL(sl, 8); };
         auto top = Top(stk);
         auto pn = UlebWrite(top, sz());
-        auto at = Add(top, pn);
-        tyg_move_dyn(p, at, src(), sz());
+        tyg_move_dyn(p, Add(top, pn), LdL(sl), sz());
         auto tot = Add(pn, sz());
         SetTop(stk, Add(top, tot));
         St(len, Add(Ld(len), tot));
     }
 
-    // to_bytes appended to a limited u8 array: the count's ULEB128 and then
-    // the payload, each copied under the capacity check (CodeGen::AppendBytes).
+    // to_bytes appended to a limited u8 array: the count's ULEB128 and then the payload,
+    // each copied under the capacity check (CodeGen::AppendBytes).
     void ToBytesIntoLim(const P &out, Node *a, Line l) {
-        auto v = ViewOf(Place(a), l);
+        auto sl = SpanOf(a, l);
         if (Ended()) return;
-        auto sl = tyg_local_new(p, 16, 8);
-        StL(sl, v.elems);
-        StL(sl, cg.IsFix(v.elem) ? Mul(v.len, I64(cg.FixedSize(v.elem))) : Sub(RunEnd(v), v.elems), 8);
-        auto src = [&] { return LdL(sl); };
-        auto sz = [&] { return LdL(sl, 8); };
         auto pfx = tyg_local_new(p, 16, 8);
-        auto pn = Local(UlebWrite(tyg_addr_of(p, AtL(pfx)), sz()));
+        auto pn = Local(UlebWrite(tyg_addr_of(p, AtL(pfx)), LdL(sl, 8)));
         auto append = [&](tyg_val from, tyg_val n) {
             auto ol = Local(LimLen(out));
             auto o = [&] { return LdL(ol); };
@@ -2839,13 +2690,11 @@ struct TgFn {
             LimSetLen(out, Add(o(), n));
         };
         append(tyg_addr_of(p, AtL(pfx)), LdL(pn));
-        append(src(), sz());
+        append(LdL(sl), LdL(sl, 8));
     }
 
     // A resizable temporary: a stack of the statement's, its header.
-    V RzTemp(TypeExpr *t, Line l) {
-        return MemV(t, AtL(tyg_local_new(p, 16, 8)), Stk(AllocStk(false, l), l));
-    }
+    V RzTemp(TypeExpr *t, Line l) { return MemV(t, NewHdr(), Stk(AllocStk(false, l), l)); }
 
     // ---- Conversions -------------------------------------------------------
 
