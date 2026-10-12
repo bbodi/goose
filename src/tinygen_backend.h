@@ -2849,27 +2849,62 @@ struct TgFn {
 
     // ---- Conversions -------------------------------------------------------
 
+    static tyg_addr AddrOff(tyg_addr a, int64_t off) {
+        a.offset += off;
+        return a;
+    }
+    tyg_val I8(int v) { return tyg_iconst(p, TYG_I8, v); }
+    static string TyStr(TypeExpr *t) {
+        string s;
+        t->Dump(s);
+        return s;
+    }
+    // A two-word header (a, then b) on a temporary.
+    V PairV(TypeExpr *t, tyg_val a, tyg_val b) {
+        auto tmp = tyg_local_new(p, 16, 8);
+        StL(tmp, a);
+        StL(tmp, b, 8);
+        return MemV(t, AtL(tmp));
+    }
+    // On a difference jump to fail, else go on in a new block.
+    void EqNext(tyg_val same, tyg_block fail) {
+        auto ok = NewBlock();
+        Branch(same, ok, fail);
+        SetBlock(ok);
+    }
+    tyg_val BytesEq(tyg_val a, tyg_val b, tyg_val n) {
+        auto d = CallC("memcmp", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64, false) }, { a, b, n }, IT(TYG_I32));
+        return Cmp(TYG_EQ, d, tyg_iconst(p, TYG_I32, 0));
+    }
+    // arm(vi), in a block entered when the tag in `tag` is variant vi, for each of n variants.
+    template <class F> void TagSwitch(tyg_local tag, size_t n, F arm) {
+        auto done = NewBlock();
+        for (size_t vi = 0; vi < n; vi++) {
+            auto hit = NewBlock(), miss = NewBlock();
+            Branch(Cmp(TYG_EQ, LdL(tag), I64((int64_t)vi)), hit, miss);
+            SetBlock(hit);
+            arm(vi);
+            tyg_jump(p, done);
+            SetBlock(miss);
+        }
+        tyg_jump(p, done);
+        SetBlock(done);
+    }
+
     // C's conversion of a scalar between the scalar types: what an
     // assignment of one to the other does.
     tyg_val Conv(tyg_val v, TypeExpr *from, TypeExpr *to, Line l) {
         auto fs = M.Scal(from), ts = M.Scal(to);
         auto fflt = from->kind == TY_FLT, tflt = to->kind == TY_FLT;
-        if (fflt && tflt) {
-            if (fs == ts) return v;
-            return tyg_convert(p, fs == TYG_F32 ? TYG_FEXT : TYG_FTRUNC, ts, v);
-        }
+        if (fflt && tflt) return fs == ts ? v : tyg_convert(p, fs == TYG_F32 ? TYG_FEXT : TYG_FTRUNC, ts, v);
         if (!fflt && tflt) {
             auto uns = from->kind == TY_BOOL || (from->kind == TY_INT && IsUnsigned(from->intstorage));
-            if (fs != TYG_I64 && fs != TYG_I32) {
-                v = tyg_convert(p, uns ? TYG_ZEXT : TYG_SEXT, TYG_I32, v);
-                fs = TYG_I32;
-            }
+            if (fs != TYG_I64 && fs != TYG_I32) v = tyg_convert(p, uns ? TYG_ZEXT : TYG_SEXT, TYG_I32, v);
             return tyg_convert(p, uns ? TYG_UITOF : TYG_SITOF, ts, v);
         }
         if (fflt) No(l, "implicit float to integer conversion");
         if (fs == ts) return v;
-        auto fz = TgModule::ScalSize(fs), tz = TgModule::ScalSize(ts);
-        if (tz < fz) return tyg_convert(p, TYG_TRUNC, ts, v);
+        if (TgModule::ScalSize(ts) < TgModule::ScalSize(fs)) return tyg_convert(p, TYG_TRUNC, ts, v);
         return tyg_convert(p, TgModule::IsSigned(from) ? TYG_SEXT : TYG_ZEXT, ts, v);
     }
 
@@ -2881,17 +2916,9 @@ struct TgFn {
         while ((IsAddrRef(x.t) || (TgModule::IsRel(x.t) && M.RelOk(x.t, 1) && !x.mem)) && want->kind != TY_REF)
             x = Load(RefTarget(x), l);
         if (M.IsScalar(x.t) && M.IsScalar(want)) {
-            if (x.t->kind == TY_REF || want->kind == TY_REF) {
-                if (x.t->kind != want->kind) {
-                    string a, b;
-                    x.t->Dump(a);
-                    want->Dump(b);
-                    No(l, cat("reference conversion from ", a, " to ", b));
-                }
-                x.t = want;
-                return x;
-            }
-            x.v = Conv(x.v, x.t, want, l);
+            if ((x.t->kind == TY_REF || want->kind == TY_REF) && x.t->kind != want->kind)
+                No(l, cat("reference conversion from ", TyStr(x.t), " to ", TyStr(want)));
+            if (x.t->kind != TY_REF) x.v = Conv(x.v, x.t, want, l);
             x.t = want;
             return x;
         }
@@ -2912,22 +2939,10 @@ struct TgFn {
             auto ei = cg.EIOf(want);
             auto tag = Local(LoadTag(x.a, x.t));
             tyg_store(p, M.TagScal(want), r.a, tyg_convert(p, TYG_TRUNC, M.TagScal(want), LdL(tag)), 0);
-            auto done = NewBlock();
-            for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
+            TagSwitch(tag, ei->en->variants.size(), [&](size_t vi) {
                 auto psz = cg.VariantLayout(ei, (int)vi).size;
-                if (!psz) continue;
-                auto hit = NewBlock(), next = NewBlock();
-                Branch(Cmp(TYG_EQ, LdL(tag), I64((int64_t)vi)), hit, next);
-                SetBlock(hit);
-                auto to = r.a, from = x.a;
-                to.offset += M.TagSize(want);
-                from.offset += M.TagSize(x.t);
-                tyg_copy(p, to, from, psz);
-                tyg_jump(p, done);
-                SetBlock(next);
-            }
-            tyg_jump(p, done);
-            SetBlock(done);
+                if (psz) tyg_copy(p, AddrOff(r.a, M.TagSize(want)), AddrOff(x.a, M.TagSize(x.t)), psz);
+            });
             return r;
         }
         if (want->kind == TY_SLICE && x.t->kind == TY_ARRAY && x.t->arr->akind == A_FIXED && x.mem &&
@@ -2939,91 +2954,59 @@ struct TgFn {
         if (OptFit(x, want)) return x;
         if (x.mem && x.t->kind == TY_ARRAY && want->kind == TY_SLICE && M.TypeOk(want) &&
             (IsGrow(x.t) || IsVarArr(x.t)) && cg.Mangle(x.t->arr->sub) == cg.Mangle(want->sub)) {
-            // An array temporary (a call's result) where a slice is wanted:
-            // a view of it (§6.4).
+            // An array temporary (a call's result) where a slice is wanted: a view of it (§6.4).
             auto v = ViewOf(P { x.a, x.t, x.stk }, l);
             return SliceValue(want, v.elems, v.len);
         }
-        if (M.IsScalar(x.t) != M.IsScalar(want) || !cg.TEq(x.t, want)) {
-            string a, b;
-            x.t->Dump(a);
-            want->Dump(b);
-            No(l, cat("value conversion from ", a, " to ", b));
-        }
+        if (M.IsScalar(x.t) != M.IsScalar(want) || !cg.TEq(x.t, want))
+            No(l, cat("value conversion from ", TyStr(x.t), " to ", TyStr(want)));
         return x;
     }
 
     V Load(const P &pl, Line l) {
         V x;
         x.t = pl.t;
-        if (pl.enc) {
-            x.v = ZigRead(tyg_addr_of(p, pl.a));
-            return x;
-        }
-        if (TgModule::IsRel(pl.t)) {
-            x.v = RelLoad(pl, l);
-            return x;
-        }
-        if (M.IsScalar(pl.t)) {
-            x.v = tyg_load(p, M.Scal(pl.t), pl.a, 0);
-            return x;
-        }
-        if (!M.TypeOk(pl.t) && (M.ImgOk(pl.t) || M.RsOk(pl.t) || M.FoOk(pl.t))) {
+        if (pl.enc) x.v = ZigRead(tyg_addr_of(p, pl.a));
+        else if (TgModule::IsRel(pl.t)) x.v = RelLoad(pl, l);
+        else if (M.IsScalar(pl.t)) x.v = tyg_load(p, M.Scal(pl.t), pl.a, 0);
+        else if (!M.TypeOk(pl.t) && (M.ImgOk(pl.t) || M.RsOk(pl.t) || M.FoOk(pl.t))) {
             // A T[] or a resizable is read where it lies (its uses copy it).
             x.mem = true;
             x.a = pl.a;
             x.stk = pl.stk;
-            return x;
+        } else {
+            if (!M.TypeOk(pl.t)) No(l, "type");
+            // An aggregate read is a copy: what is read must not change under a later operand.
+            auto t = Temp(pl.t);
+            tyg_copy(p, AtL(t), pl.a, M.Size(pl.t));
+            x.mem = true;
+            x.a = AtL(t);
         }
-        if (!M.TypeOk(pl.t)) No(l, "type");
-        // An aggregate read is a copy: what is read must not change under
-        // a later argument or operand.
-        auto t = Temp(pl.t);
-        tyg_copy(p, AtL(t), pl.a, M.Size(pl.t));
-        x.mem = true;
-        x.a = AtL(t);
         return x;
     }
 
     void Store(const P &pl, const V &x) {
         if (Ended()) return;
         if (pl.enc) No(Line {}, "a store into a varint in a bytes value");
-        if (TgModule::IsVr(pl.t)) {
-            // Only into a temporary carrying a value across blocks (Size):
-            // the language never assigns one.
-            RelOffsetInto(pl, x.v, Line {});
-            return;
-        }
-        if (TgModule::IsRel(pl.t)) {
-            RelStore(pl, x.v, Line {});
-            return;
-        }
-        // A scalar without a value comes from code after a return or break,
-        // which tinygen keeps in a block that is never placed.
-        if (M.IsScalar(pl.t) && !x.v) return;
-        if (M.FoOk(pl.t) && x.mem && pl.stk && x.stk) {
-            FoCopy(pl, P { x.a, x.t, x.stk }, Line {});
-            return;
-        }
-        if (!M.IsScalar(pl.t) && !M.TypeOk(pl.t)) No(Line {}, cat("store of a ", M.Name(pl.t)));
-        if (M.IsScalar(pl.t)) tyg_store(p, M.Scal(pl.t), pl.a, x.v, 0);
+        // A Vr only into a temporary carrying a value across blocks (Size): the language never assigns one.
+        if (TgModule::IsVr(pl.t)) RelOffsetInto(pl, x.v, Line {});
+        else if (TgModule::IsRel(pl.t)) RelStore(pl, x.v, Line {});
+        // A scalar without a value comes from code after a return or break (a block never placed).
+        else if (M.IsScalar(pl.t) && !x.v) return;
+        else if (M.FoOk(pl.t) && x.mem && pl.stk && x.stk) FoCopy(pl, P { x.a, x.t, x.stk }, Line {});
+        else if (M.IsScalar(pl.t)) tyg_store(p, M.Scal(pl.t), pl.a, x.v, 0);
+        else if (!M.TypeOk(pl.t)) No(Line {}, cat("store of a ", M.Name(pl.t)));
         else tyg_move(p, pl.a, x.a, M.Size(pl.t));
     }
 
     // ---- Places --------------------------------------------------------------
 
-    // What the reference at pl refers to: a fat reference's header, with
-    // its stack.
+    // What the reference at pl refers to: a fat reference's header, with its stack.
     P Step(const P &pl) {
         if (TgModule::IsRel(pl.t)) return P { AtV(RelLoad(pl, Line {})), pl.t->ref->sub };
-        auto ptr = Ld(pl.a);
-        P r { AtV(ptr), pl.t->ref->sub };
+        P r { AtV(Ld(pl.a)), pl.t->ref->sub };
         r.enc = TgModule::IsVarint(r.t);   // A varint in a bytes value, read-only.
-        if (cg.IsFatRef(pl.t)) {
-            auto a8 = pl.a;
-            a8.offset += 8;
-            r.stk = Ld(a8);
-        }
+        if (cg.IsFatRef(pl.t)) r.stk = Ld(AddrOff(pl.a, 8));
         return r;
     }
     // Through references to what they refer to: an optional one is
@@ -3041,9 +3024,7 @@ struct TgFn {
     tyg_val RelOrigin(const P &pl, Line l) {
         auto pool = pl.t->ref->pool;
         if (!pool) return tyg_addr_of(p, pl.a);
-        auto pp = VarPlace(const_cast<VarDef *>(pool), l);
-        auto base = Ld(pp.a);
-        return Sub(base, I64(1));
+        return Sub(Ld(VarPlace(const_cast<VarDef *>(pool), l).a), I64(1));
     }
     // The address the slot at pl decodes to, null for a 0 offset.
     tyg_val RelLoad(const P &pl, Line l) {
@@ -3064,13 +3045,12 @@ struct TgFn {
     // The offset the slot at pl holds for the address v: its distance
     // from the origin, zero for a null (CodeGen::RelOffset).
     tyg_val RelOffset(const P &pl, tyg_val v, Line l) {
-        auto pool = pl.t->ref->pool;
         auto off = Sub(v, RelOrigin(pl, l));
         if (pl.t->ref->optional) {
             auto isnull = Cmp(TYG_EQ, v, I64(0));
             off = tyg_select(p, isnull, I64(0), off);
             // A link to its own slot would read back as null (RelOffset).
-            if (!pool)
+            if (!pl.t->ref->pool)
                 AbortUnless(tyg_bin(p, TYG_OR, isnull, Cmp(TYG_NE, off, I64(0))), "RELNULL", l);
         }
         return off;
@@ -3085,22 +3065,19 @@ struct TgFn {
     }
     tyg_val GenVr(const V &x, tyg_val stk, TypeExpr *t, Line l) {
         auto top = Top(stk);
-        auto n = RelOffsetInto(P { AtV(top), t }, x.v, l);
-        SetTop(stk, Add(top, n));
+        SetTop(stk, Add(top, RelOffsetInto(P { AtV(top), t }, x.v, l)));
         return top;
     }
     // The address v as the slot's offset, range-checked (EmitRelStoreAt).
     void RelStore(const P &pl, tyg_val v, Line l) {
         auto s = M.RelScal(pl.t);
-        auto pool = pl.t->ref->pool;
         auto off = RelOffset(pl, v, l);
         auto bits = TgModule::ScalSize(s) * 8;
-        if (bits < 64 && pool)
+        if (bits < 64 && pl.t->ref->pool) {
             AbortUnless(Cmp(TYG_ULE, off, I64((int64_t)((1ull << bits) - 1))), "RELOFF", l);
-        if (bits < 64 && !pool) {
+        } else if (bits < 64) {
             auto lo = Cmp(TYG_SGE, off, I64(-(int64_t)(1ull << (bits - 1))));
-            auto hi = Cmp(TYG_SLT, off, I64((int64_t)(1ull << (bits - 1))));
-            AbortUnless(tyg_bin(p, TYG_AND, lo, hi), "RELOFF", l);
+            AbortUnless(tyg_bin(p, TYG_AND, lo, Cmp(TYG_SLT, off, I64((int64_t)(1ull << (bits - 1))))), "RELOFF", l);
         }
         tyg_store(p, s, pl.a, s == TYG_I64 ? off : tyg_convert(p, TYG_TRUNC, s, off), 0);
     }
@@ -3117,7 +3094,6 @@ struct TgFn {
             if (!id->vdef) No(n->line, "function as a value");
             return VarPlace(id->vdef, n->line);
         }
-
         if (auto d = Is<Dot>(n); d && d->IsField()) {
             auto base = Deref(Place(d->obj));
             if (M.VsOk(base.t)) return VsFieldPlace(base, d->fieldidx);
@@ -3127,8 +3103,7 @@ struct TgFn {
             if (M.IsRb(base.t) && base.t->kind == TY_STRUCT && M.RbOk(base.t)) return RbStFieldPlace(base, d->fieldidx);
             if (M.VvOk(base.t)) {
                 auto ei = cg.EIVar(base.t);
-                auto vi = (size_t)ei->en->VariantIndex(base.t->var->variant);
-                auto ft = ei->vftypes[vi][(size_t)d->fieldidx];
+                auto ft = ei->vftypes[(size_t)ei->en->VariantIndex(base.t->var->variant)][(size_t)d->fieldidx];
                 P r { AtV(VvField(base.t, tyg_addr_of(p, base.a), d->fieldidx)), ft };
                 r.enc = TgModule::IsVarint(ft);
                 return r;
@@ -3136,10 +3111,7 @@ struct TgFn {
             if (base.t->kind == TY_VARIANT && M.TypeOk(base.t)) return VariantField(base, d->fieldidx);
             if (base.t->kind != TY_STRUCT || !M.TypeOk(base.t)) No(n->line, "field of this type");
             auto si = cg.SI(base.t);
-            auto &lay = cg.StructLayout(si);
-            auto a = base.a;
-            a.offset += lay.offs[d->fieldidx];
-            return P { a, si->ftypes[d->fieldidx] };
+            return P { AddrOff(base.a, cg.StructLayout(si).offs[d->fieldidx]), si->ftypes[d->fieldidx] };
         }
         if (auto ix = Is<Index>(n)) return IndexPlace(ix);
         if (auto se = Is<SliceExpr>(n)) {
@@ -3151,8 +3123,7 @@ struct TgFn {
         auto x = Gen(n);
         if (x.mem) return P { x.a, x.t, x.stk };
         if (!x.t || x.t->kind == TY_VOID) No(n->line, "place of no value");
-        auto t = Temp(x.t);
-        P pl { AtL(t), x.t };
+        P pl { AtL(Temp(x.t)), x.t };
         Store(pl, x);
         return pl;
     }
@@ -3163,16 +3134,10 @@ struct TgFn {
         auto it = locals.find(vd);
         if (it == locals.end() && vd->isglobal) return GlobalPlace(vd, l);
         if (it == locals.end()) No(l, "variable from outside");
-        if (indirect.count(vd)) {
-            P pl { AtV(LdL(it->second)), vd->type };
-            // A captured resizable: its header's address, its stack.
-            if (auto s = rzstk.find(vd); s != rzstk.end() && M.Resz(vd->type))
-                pl.stk = LdL(s->second);
-            return pl;
-        }
-        P pl { AtL(it->second), vd->type };
-        if (auto s = rzstk.find(vd); s != rzstk.end())
-            pl.stk = LdL(s->second);
+        auto ind = indirect.count(vd) != 0;
+        P pl { ind ? AtV(LdL(it->second)) : AtL(it->second), vd->type };
+        // A captured resizable: its header's address, its stack.
+        if (auto s = rzstk.find(vd); s != rzstk.end() && (!ind || M.Resz(vd->type))) pl.stk = LdL(s->second);
         return pl;
     }
 
@@ -3182,10 +3147,8 @@ struct TgFn {
         if (s != TYG_NO_SYM) return P { tyg_at_sym(s, 0), d->type };
         // The shims now, so that an abandoned body takes them back.
         auto at = LdL(AccessorLocal(M.Accessor(d)));
-        if (IsImg(d->type)) {
-            // A T[], any image: the instance holds its address.
-            return P { AtV(Ld(AtV(at))), d->type };
-        }
+        // A T[], any image: the instance holds its address.
+        if (IsImg(d->type)) return P { AtV(Ld(AtV(at))), d->type };
         P pl { AtV(at), d->type };
         if (IsGrow(d->type) || M.FoOk(d->type) || M.RsOk(d->type) || M.IsRb(d->type))
             pl.stk = LdL(AccessorLocal(M.StackAccessor(d)));
@@ -3200,7 +3163,6 @@ struct TgFn {
         return loc;
     }
 
-    // Builds n's value at the place.
     // A literal of a fixed struct or array with a non-null self-relative
     // link stored in it at any depth: the C builds it where it lies
     // (CodeGen::FixedLitAtLv), whose slots the offsets measure from.
@@ -3225,7 +3187,6 @@ struct TgFn {
             if (stores(et, e)) return true;
         return false;
     }
-    // A struct or array literal SelfRelInto can build.
     // The fields of a struct, variant or fixed-mode ADT literal, their
     // types and offsets from the value's start (a tag first, for the ADT).
     struct LitSh {
@@ -3246,13 +3207,13 @@ struct TgFn {
             for (auto &o : offs) o += M.TagSize(t);
         return { &ei->en->variants[(size_t)vi].fields, &ei->vftypes[(size_t)vi], offs };
     }
+    // A struct or array literal SelfRelInto can build.
     bool SelfRelLitOk(Node *n) {
         if (auto sl = Is<StructLit>(n)) {
             auto t = sl->exprtype;
             if (!t || !M.TypeOk(t)) return false;
             if (t->kind == TY_STRUCT) return sl->sinst && !sl->variant;
-            if (t->kind == TY_VARIANT) return true;
-            return t->kind == TY_ENUM && !t->enu->varmode && sl->variant;
+            return t->kind == TY_VARIANT || (t->kind == TY_ENUM && !t->enu->varmode && sl->variant);
         }
         auto al = Is<ArrayLit>(n);
         return al && !al->capexpr && al->exprtype && al->exprtype->kind == TY_ARRAY &&
@@ -3270,15 +3231,10 @@ struct TgFn {
             auto esz = cg.FixedSize(et);
             if (al->fillval) {
                 auto leaves = FillCapture(al);
-                if (Ended()) return;
-                FillStore(leaves, tyg_addr_of(p, pl.a), cg.ArrSize(t->arr), al);
+                if (!Ended()) FillStore(leaves, tyg_addr_of(p, pl.a), cg.ArrSize(t->arr), al);
                 return;
             }
-            for (size_t i = 0; i < al->elems.size() && !Ended(); i++) {
-                auto a = pl.a;
-                a.offset += (int64_t)i * esz;
-                Into(P { a, et }, al->elems[i]);
-            }
+            for (size_t i = 0; i < al->elems.size() && !Ended(); i++) Into(P { AddrOff(pl.a, (int64_t)i * esz), et }, al->elems[i]);
             return;
         }
         auto sl = Is<StructLit>(lit);
@@ -3291,12 +3247,8 @@ struct TgFn {
         auto sh = LitShape(sl);
         if (t->kind == TY_ENUM) StoreTag(pl.a, t, M.EI(t)->en->VariantIndex(sl->variant));
         for (size_t i = 0; i < sh.fields->size() && !Ended(); i++) {
-            if ((*sh.fields)[i].ispad) continue;
-            auto init = sl->InitFor((int)i);
-            if (!init) continue;
-            auto a = pl.a;
-            a.offset += sh.offs[i];
-            Into(P { a, (*sh.ftypes)[i] }, init);
+            auto init = (*sh.fields)[i].ispad ? nullptr : sl->InitFor((int)i);
+            if (init) Into(P { AddrOff(pl.a, sh.offs[i]), (*sh.ftypes)[i] }, init);
         }
     }
     // A fill [v; k] of a value linking to itself (CodeGen::FreezeFill): the
@@ -3313,14 +3265,12 @@ struct TgFn {
     vector<FillLeaf> FillCapture(ArrayLit *al) {
         vector<FillLeaf> leaves;
         if (!al->fillval) return leaves;
-        auto et = al->exprtype->arr->sub;
         auto capture = [&](Node *init, TypeExpr *ft, int64_t off) {
             if (Is<SelfRef>(init)) {
                 leaves.push_back({ ft, off, true, 0 });
                 return;
             }
-            if (auto il = Is<ArrayLit>(init); il && il->fillval && SelfRelLit(init) && SelfRelLitOk(init) &&
-                                               Is<IntLit>(il->fillcount)) {
+            if (auto il = Is<ArrayLit>(init); il && il->fillval && SelfRelLit(init) && Is<IntLit>(il->fillcount)) {
                 FillLeaf lf { ft, off, false, 0 };
                 lf.sub = make_shared<vector<FillLeaf>>(FillCapture(il));
                 lf.inner = il;
@@ -3342,11 +3292,11 @@ struct TgFn {
         if (auto sl = Is<StructLit>(al->fillval); sl && SelfRelLitOk(sl) && sl->exprtype->kind == TY_STRUCT) {
             auto sh = LitShape(sl);
             for (size_t i = 0; i < sh.fields->size() && !Ended(); i++) {
-                if ((*sh.fields)[i].ispad) continue;
-                if (auto init = sl->InitFor((int)i)) capture(init, (*sh.ftypes)[i], sh.offs[i]);
+                if (auto init = (*sh.fields)[i].ispad ? nullptr : sl->InitFor((int)i))
+                    capture(init, (*sh.ftypes)[i], sh.offs[i]);
             }
         } else {
-            capture(al->fillval, et, 0);
+            capture(al->fillval, al->exprtype->arr->sub, 0);
         }
         return leaves;
     }
@@ -3359,11 +3309,9 @@ struct TgFn {
         auto esz = cg.FixedSize(et);
         auto at = [&](int64_t off) { return AtV(LdL(base), off); };
         tyg_zero(p, at(0), std::max<int64_t>(k * esz, 1));
-        if (al->fillval) {
-            FillStore(leaves, LdL(base), k, al);
-            return;
-        }
-        for (int64_t i = 0; i < k && !Ended(); i++) Into(P { at(i * esz), et }, al->elems[(size_t)i]);
+        if (al->fillval) FillStore(leaves, LdL(base), k, al);
+        else
+            for (int64_t i = 0; i < k && !Ended(); i++) Into(P { at(i * esz), et }, al->elems[(size_t)i]);
     }
     // k slots at base (zeroed), each built from the captured leaves.
     void FillStore(const vector<FillLeaf> &leaves, tyg_val base, int64_t k, ArrayLit *al) {
@@ -3371,26 +3319,19 @@ struct TgFn {
         Loop(I64(0), I64(k), [&](tyg_val i) {
             auto slot = Add(base, Mul(i, I64(esz)));
             for (auto &lf : leaves) {
-                auto a = AtV(slot, lf.off);
                 if (lf.inner) {
-                    FillStore(*lf.sub, Add(slot, I64(lf.off)),
-                              cg.ArrSize(lf.inner->exprtype->arr), lf.inner);
+                    FillStore(*lf.sub, Add(slot, I64(lf.off)), cg.ArrSize(lf.inner->exprtype->arr), lf.inner);
                     continue;
                 }
-                V y;
-                y.t = lf.ft;
-                if (lf.self) {
-                    y.v = slot;
-                } else if (M.IsScalar(lf.ft) || TgModule::IsRel(lf.ft)) {
-                    y.v = tyg_load(p, TgModule::IsRel(lf.ft) ? TYG_I64 : M.Scal(lf.ft), AtL(lf.tmp), 0);
-                } else {
-                    y.mem = true;
-                    y.a = AtL(lf.tmp);
-                }
-                Store(P { a, lf.ft }, y);
+                auto ld = [&] { return tyg_load(p, TgModule::IsRel(lf.ft) ? TYG_I64 : M.Scal(lf.ft), AtL(lf.tmp), 0); };
+                Store(P { AtV(slot, lf.off), lf.ft },
+                      lf.self ? ValV(lf.ft, slot)
+                      : M.IsScalar(lf.ft) || TgModule::IsRel(lf.ft) ? ValV(lf.ft, ld())
+                                                                      : MemV(lf.ft, AtL(lf.tmp)));
             }
         });
     }
+    // Builds n's value at the place.
     void Into(const P &pl, Node *n) {
         if (SelfRelLit(n) && cg.TEq(n->exprtype, pl.t)) {
             SelfRelInto(pl, n);
@@ -3408,11 +3349,8 @@ struct TgFn {
             auto cnt = (int64_t)al->elems.size();
             if (cnt > cg.ArrSize(pl.t->arr)) No(n->line, "array literal length");
             tyg_zero(p, pl.a, M.Size(pl.t));
-            for (int64_t i = 0; i < cnt && !Ended(); i++) {
-                auto a = pl.a;
-                a.offset += (lim ? M.LimWidth(pl.t) : 0) + i * esz;
-                Into(P { a, et }, al->elems[(size_t)i]);
-            }
+            for (int64_t i = 0; i < cnt && !Ended(); i++)
+                Into(P { AddrOff(pl.a, (lim ? M.LimWidth(pl.t) : 0) + i * esz), et }, al->elems[(size_t)i]);
             if (lim && !Ended()) LimSetLen(pl, I64(cnt));
             return;
         }
@@ -3441,10 +3379,7 @@ struct TgFn {
             auto pl = Deref(Place(n));
             if (Ended()) return Dummy(t);
             if (!pl.stk || pl.tmphdr) No(n->line, "reference to an array of this kind");
-            auto tmp = tyg_local_new(p, 16, 8);
-            StL(tmp, tyg_addr_of(p, pl.a));
-            StL(tmp, pl.stk, 8);
-            return MemV(t, AtL(tmp));
+            return PairV(t, tyg_addr_of(p, pl.a), pl.stk);
         }
         if (t && IsAddrRef(t) && n->exprtype && IsImg(n->exprtype) && M.ImgOk(t->ref->sub)) {
             // A T[] (or a variable-size struct) where a reference to one is
@@ -3454,16 +3389,12 @@ struct TgFn {
         }
         return Fit(Gen(n), t, n->line);
     }
-    tyg_val Truth(Node *n) {
-        if (OptCond(n)) return OptTest(n);
-        auto x = GenAs(n, M.ast.booltype);
-        return x.v;
-    }
+    tyg_val Truth(Node *n) { return OptCond(n) ? OptTest(n) : GenAs(n, M.ast.booltype).v; }
     V Dummy(TypeExpr *t) {
         V x;
         x.t = t;
-        if (t && M.IsScalar(t)) x.v = M.Scal(t) >= TYG_F32 ? tyg_fconst(p, M.Scal(t), 0)
-                                                           : tyg_iconst(p, M.Scal(t), 0);
+        if (t && M.IsScalar(t))
+            x.v = M.Scal(t) >= TYG_F32 ? tyg_fconst(p, M.Scal(t), 0) : tyg_iconst(p, M.Scal(t), 0);
         return x;
     }
 
@@ -3472,38 +3403,20 @@ struct TgFn {
             case NK_IntLit: {
                 auto il = static_cast<IntLit *>(n);
                 auto t = n->exprtype;
-                V x;
-                x.t = t;
-                if (t->kind == TY_FLT) {
-                    x.v = tyg_fconst(p, M.Scal(t), il->uns ? (double)(uint64_t)il->val
-                                                           : (double)il->val);
-                } else if (t->kind == TY_INT) {
-                    x.v = tyg_iconst(p, M.Scal(t), il->val);
-                } else {
-                    No(n->line, "integer literal of this type");
-                }
-                return x;
+                if (t->kind == TY_FLT)
+                    return ValV(t, tyg_fconst(p, M.Scal(t), il->uns ? (double)(uint64_t)il->val : (double)il->val));
+                if (t->kind != TY_INT) No(n->line, "integer literal of this type");
+                return ValV(t, tyg_iconst(p, M.Scal(t), il->val));
             }
-            case NK_FltLit: {
-                V x;
-                x.t = n->exprtype;
-                if (x.t->kind != TY_FLT) No(n->line, "float literal of this type");
-                x.v = tyg_fconst(p, M.Scal(x.t), static_cast<FltLit *>(n)->val);
-                return x;
-            }
+            case NK_FltLit:
+                if (n->exprtype->kind != TY_FLT) No(n->line, "float literal of this type");
+                return ValV(n->exprtype, tyg_fconst(p, M.Scal(n->exprtype), static_cast<FltLit *>(n)->val));
             case NK_NullLit: return Null(n->exprtype, n->line);
-            case NK_SelfRef: {
-                // `self` in a literal built where it lies: its start.
+            case NK_SelfRef:   // `self` in a literal built where it lies: its start.
                 if (!selfbase) No(n->line, "self outside a literal built in place");
                 return ValV(n->exprtype, selfbase);
-            }
-            case NK_BoolLit: {
-                return ValV(M.ast.booltype, tyg_iconst(p, TYG_I8, static_cast<BoolLit *>(n)->val ? 1 : 0));
-            }
-            case NK_Ident: {
-                auto pl = Place(n);
-                return Load(pl, n->line);
-            }
+            case NK_BoolLit: return ValV(M.ast.booltype, I8(static_cast<BoolLit *>(n)->val ? 1 : 0));
+            case NK_Ident: case NK_Index: return Load(Place(n), n->line);
             case NK_Dot: {
                 auto d = static_cast<Dot *>(n);
                 if (d->member == B_LEN) return GenLen(d->obj, n);
@@ -3512,7 +3425,6 @@ struct TgFn {
                 if (!d->IsField()) No(n->line, "property or variant constant");
                 return Load(Place(n), n->line);
             }
-            case NK_Index: return Load(Place(n), n->line);
             case NK_ArrayLit: return GenArrayLit(static_cast<ArrayLit *>(n));
             case NK_SliceExpr: return GenSlice(static_cast<SliceExpr *>(n));
             case NK_StrLit: {
@@ -3520,16 +3432,12 @@ struct TgFn {
                 auto t = n->exprtype;
                 if (TgModule::IsLim(t)) return LimStr(static_cast<StrLit *>(n));
                 auto &val = static_cast<StrLit *>(n)->val;
-                if (t && t->kind == TY_ARRAY && t->arr->akind == A_FIXED && IsU8(t->arr->sub) &&
-                    M.TypeOk(t) && (int64_t)val.size() == cg.FixedSize(t)) {
-                    // A u8[k] of exactly its bytes (§4.2): they, where they lie.
+                // A u8[k] of exactly its bytes (§4.2): they, where they lie.
+                if (t && t->kind == TY_ARRAY && t->arr->akind == A_FIXED && IsU8(t->arr->sub) && M.TypeOk(t) &&
+                    (int64_t)val.size() == cg.FixedSize(t))
                     return MemV(t, tyg_at_sym(M.Bytes(val), 0));
-                }
                 if (!t || t->kind != TY_SLICE || !IsU8(t->sub)) No(n->line, "string of this type");
-                auto tmp = tyg_local_new(p, 16, 8);
-                StL(tmp, tyg_addr_of(p, tyg_at_sym(M.Bytes(val), 0)));
-                StL(tmp, I64((int64_t)val.size()), 8);
-                return MemV(t, AtL(tmp));
+                return PairV(t, tyg_addr_of(p, tyg_at_sym(M.Bytes(val), 0)), I64((int64_t)val.size()));
             }
             case NK_Unary: return GenUnary(static_cast<Unary *>(n));
             case NK_Binary: return GenBinary(static_cast<Binary *>(n));
@@ -3551,10 +3459,7 @@ struct TgFn {
             case NK_IncDec: case NK_While: case NK_ForLoop:
                 Stmt(n);
                 return Dummy(n->exprtype && n->exprtype->kind != TY_VOID ? n->exprtype : nullptr);
-            default:
-                No(n->line, n->nkind == NK_MatchExpr ? string("match expression")
-                            : n->nkind == NK_EarlyBlock ? string("block expression")
-                            : cat("expression kind ", (int)n->nkind));
+            default: No(n->line, cat("expression kind ", (int)n->nkind));
         }
     }
 
@@ -3564,24 +3469,19 @@ struct TgFn {
             if (et && et->kind == TY_REF && cg.IsFatRef(et)) {
                 // gs_rref: the header's address and its stack.
                 auto pl = Deref(Place(u->child));
-                if ((!IsGrow(pl.t) && !M.FoOk(pl.t) && !M.RsOk(pl.t) && !M.IsRb(pl.t)) || !pl.stk || pl.rbase || pl.tmphdr)
+                if ((!IsGrow(pl.t) && !M.FoOk(pl.t) && !M.RsOk(pl.t) && !M.IsRb(pl.t)) || !pl.stk || pl.rbase ||
+                    pl.tmphdr)
                     No(u->line, "reference to an array of this kind");
-                auto tmp = tyg_local_new(p, 16, 8);
-                StL(tmp, tyg_addr_of(p, pl.a));
-                StL(tmp, pl.stk, 8);
-                return MemV(et, AtL(tmp));
+                return PairV(et, tyg_addr_of(p, pl.a), pl.stk);
             }
             if (et && et->kind == TY_REF) {
                 if (!IsPlainRef(et) && !M.OptRef(et) && !(TgModule::IsRel(et) && M.RelOk(et, 1)))
                     No(u->line, "reference kind");
-                auto pl = Deref(Place(u->child));
-                return ValV(et, tyg_addr_of(p, pl.a));
+                return ValV(et, tyg_addr_of(p, Deref(Place(u->child)).a));
             }
             return Load(Deref(Place(u->child)), u->line);
         }
-        if (u->op == T_NOT && OptCond(u->child)) {
-            return ValV(M.ast.booltype, Cmp(TYG_EQ, OptTest(u->child), tyg_iconst(p, TYG_I8, 0)));
-        }
+        if (u->op == T_NOT && OptCond(u->child)) return ValV(M.ast.booltype, Cmp(TYG_EQ, OptTest(u->child), I8(0)));
         auto ot = cg.OperandT(u->child->exprtype);
         if (u->op == T_MINUS && (ot->kind == TY_STRUCT || ot->kind == TY_ARRAY)) {
             // Elementwise (CodeGen::GenElemwiseNegInto).
@@ -3601,11 +3501,8 @@ struct TgFn {
         auto x = GenAs(u->child, ot);
         switch (u->op) {
             case T_MINUS:
-                if (ot->kind == TY_FLT) x.v = tyg_un(p, TYG_FNEG, x.v);
-                else if (ot->kind == TY_INT && !IsUnsigned(ot->intstorage) && M.checks)
-                    x.v = CheckedShim("neg", ot, { x.v }, u->line);
-                else if (ot->kind == TY_INT) x.v = tyg_un(p, TYG_NEG, x.v);
-                else No(u->line, "negation type");
+                if (ot->kind != TY_FLT && ot->kind != TY_INT) No(u->line, "negation type");
+                x.v = ScalarNeg(ot, x.v, u->line);
                 return x;
             case T_NOT:
                 x.v = Cmp(TYG_EQ, x.v, tyg_iconst(p, M.Scal(ot), 0));
@@ -3658,24 +3555,15 @@ struct TgFn {
         V x;
         if (op == T_ANDAND || op == T_OROR) {
             auto t = tyg_local_new(p, 1, 1);
-            auto l = Truth(b->left);
-            auto lb = Cmp(TYG_NE, l, tyg_iconst(p, TYG_I8, 0));
+            auto lb = Cmp(TYG_NE, Truth(b->left), I8(0));
             tyg_store(p, TYG_I8, AtL(t), lb, 0);
-            auto rhs = NewBlock(), done = NewBlock();
-            if (op == T_ANDAND) Branch(lb, rhs, done);
-            else Branch(lb, done, rhs);
-            SetBlock(rhs);
-            OpenScope(true);   // Its temporaries exist only when it runs.
-            auto r = Truth(b->right);
-            CloseScope();
-            if (!Ended()) {
-                tyg_store(p, TYG_I8, AtL(t), Cmp(TYG_NE, r, tyg_iconst(p, TYG_I8, 0)), 0);
-                tyg_jump(p, done);
-            }
-            SetBlock(done);
-            x.t = M.ast.booltype;
-            x.v = tyg_load(p, TYG_I8, AtL(t), 0);
-            return x;
+            If(op == T_ANDAND ? lb : Cmp(TYG_EQ, lb, I8(0)), [&] {
+                OpenScope(true);   // Its temporaries exist only when it runs.
+                auto r = Truth(b->right);
+                CloseScope();
+                if (!Ended()) tyg_store(p, TYG_I8, AtL(t), Cmp(TYG_NE, r, I8(0)), 0);
+            });
+            return ValV(M.ast.booltype, tyg_load(p, TYG_I8, AtL(t), 0));
         }
         if (op == T_DOTEQ || op == T_DOTNEQ) return GenRefEq(b);
         if (Is<NullLit>(b->left) || Is<NullLit>(b->right)) {
@@ -3689,8 +3577,8 @@ struct TgFn {
             };
             if (arr(b->left->exprtype) && arr(b->right->exprtype)) return GenArrayEq(b);
         }
-        if ((op == T_PLUS || op == T_MINUS || op == T_MUL || op == T_DIV || op == T_MOD) && b->exprtype &&
-            (b->exprtype->kind == TY_STRUCT || b->exprtype->kind == TY_ARRAY))
+        auto arith = op == T_PLUS || op == T_MINUS || op == T_MUL || op == T_DIV || op == T_MOD;
+        if (arith && b->exprtype && (b->exprtype->kind == TY_STRUCT || b->exprtype->kind == TY_ARRAY))
             return GenElemwise(b);
         auto lt = cg.OperandT(b->left->exprtype);
         if ((op == T_EQ || op == T_NEQ) && !M.IsScalar(lt)) return GenValEq(b, lt);
@@ -3702,13 +3590,10 @@ struct TgFn {
             auto l = GenAs(b->left, lt);
             auto r = GenAs(b->right, M.ast.inttypes[IS_I64]);
             auto s = M.Scal(lt);
-            auto bits = IntBits(lt->intstorage);
-            auto n = tyg_bin(p, TYG_AND, r.v, I64(bits - 1));
+            auto n = tyg_bin(p, TYG_AND, r.v, I64(IntBits(lt->intstorage) - 1));
             auto w = s == TYG_I64 ? l.v : tyg_convert(p, sgn ? TYG_SEXT : TYG_ZEXT, TYG_I64, l.v);
             auto res = tyg_bin(p, op == T_SHL ? TYG_SHL : sgn ? TYG_ASHR : TYG_LSHR, w, n);
-            x.t = lt;
-            x.v = s == TYG_I64 ? res : tyg_convert(p, TYG_TRUNC, s, res);
-            return x;
+            return ValV(lt, s == TYG_I64 ? res : tyg_convert(p, TYG_TRUNC, s, res));
         }
         auto l = GenAs(b->left, lt);
         auto r = GenAs(b->right, lt);
@@ -3729,38 +3614,32 @@ struct TgFn {
             default: break;
         }
         if (isflt) {
-            switch (op) {
-                case T_PLUS: x.v = tyg_bin(p, TYG_FADD, l.v, r.v); return x;
-                case T_MINUS: x.v = tyg_bin(p, TYG_FSUB, l.v, r.v); return x;
-                case T_MUL: x.v = tyg_bin(p, TYG_FMUL, l.v, r.v); return x;
-                case T_DIV: x.v = tyg_bin(p, TYG_FDIV, l.v, r.v); return x;
-                case T_MOD: {
-                    auto f32 = M.Scal(lt) == TYG_F32;
-                    auto ft = tyg_type_scalar(m, M.Scal(lt));
-                    vector<const tyg_type *> pts { ft, ft };
-                    auto sig = tyg_sig_new(m, ft, pts.data(), 2, 0);
-                    tyg_arg as[2] {};
-                    as[0].val = l.v;
-                    as[1].val = r.v;
-                    x.v = tyg_call(p, sig, tyg_direct(M.Sym(f32 ? "fmodf" : "fmod",
-                                                            TYG_SYM_FUNC | TYG_SYM_GLOBAL |
-                                                            TYG_SYM_FOREIGN)),
-                                   as, 2, nullptr, nullptr);
-                    return x;
-                }
-                default: No(b->line, "float operator");
-            }
-        }
-        if (lt->kind != TY_INT) {
-            if (lt->kind == TY_BOOL && (op == T_BITAND || op == T_BITOR || op == T_XOR)) {
-                x.v = tyg_bin(p, op == T_BITAND ? TYG_AND : op == T_BITOR ? TYG_OR : TYG_XOR, l.v, r.v);
-                return x;
-            }
+            if (!arith) No(b->line, "float operator");
+            x.v = ScalarArith(op, lt, l.v, r.v, b->line);
+        } else if (lt->kind == TY_INT) {
+            x.v = IntOp(op, lt, l.v, r.v, b->line);
+        } else if (lt->kind == TY_BOOL && (op == T_BITAND || op == T_BITOR || op == T_XOR)) {
+            x.v = tyg_bin(p, op == T_BITAND ? TYG_AND : op == T_BITOR ? TYG_OR : TYG_XOR, l.v, r.v);
+        } else {
             No(b->line, "operator on this type");
         }
-        x.v = IntOp(op, lt, l.v, r.v, b->line);
         return x;
     }
+
+    // A bool from a body that jumps to `fail` on the first difference; != negates it.
+    template <class F> V EqViaFail(Binary *b, F body) {
+        auto res = tyg_local_new(p, 1, 1);
+        auto fail = NewBlock(), done = NewBlock();
+        body(fail);
+        tyg_store(p, TYG_I8, AtL(res), I8(1), 0);
+        tyg_jump(p, done);
+        SetBlock(fail);
+        tyg_store(p, TYG_I8, AtL(res), I8(0), 0);
+        tyg_jump(p, done);
+        SetBlock(done);
+        return EqResult(b, tyg_load(p, TYG_I8, AtL(res), 0));
+    }
+    V EqResult(Binary *b, tyg_val v) { return ValV(M.ast.booltype, b->op == T_NEQ ? Cmp(TYG_EQ, v, I8(0)) : v); }
 
     // Structural equality (§4.5; CodeGen::EqX): on the first difference
     // a jump to fail, else on past. Fixed values field by field, element
@@ -3768,82 +3647,43 @@ struct TgFn {
     // floats; a bytes value of exact encodings by its bytes.
     void EqJump(const P &a, const P &b, tyg_block fail, Line l) {
         auto t = a.t;
-        auto next = [&](tyg_val same) {
-            auto ok = NewBlock();
-            Branch(same, ok, fail);
-            SetBlock(ok);
+        auto cmpw = [&](int64_t off, tyg_scalar s, tyg_cond c) {
+            EqNext(Cmp(c, tyg_load(p, s, AddrOff(a.a, off), 0), tyg_load(p, s, AddrOff(b.a, off), 0)), fail);
         };
         if (!cg.IsFix(t)) {
             if (!EqBitwise(t)) {
                 // Floats or pads among its bytes: walked field by field,
                 // over a cursor in each (CodeGen::EmitEqWalk).
-                auto ca = tyg_local_new(p, 8, 8), cb = tyg_local_new(p, 8, 8);
-                StL(ca, tyg_addr_of(p, a.a));
-                StL(cb, tyg_addr_of(p, b.a));
+                auto ca = Local(tyg_addr_of(p, a.a)), cb = Local(tyg_addr_of(p, b.a));
                 EqWalk(t, ca, cb, fail, l);
                 return;
             }
             auto pa = tyg_addr_of(p, a.a), pb = tyg_addr_of(p, b.a);
-            auto na = ImgSize(t, pa);
-            next(Cmp(TYG_EQ, na, ImgSize(t, pb)));
-            auto d = CallC("memcmp", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64, false) },
-                           { tyg_addr_of(p, a.a), tyg_addr_of(p, b.a), ImgSize(t, tyg_addr_of(p, a.a)) },
-                           IT(TYG_I32));
-            next(Cmp(TYG_EQ, d, tyg_iconst(p, TYG_I32, 0)));
+            EqNext(Cmp(TYG_EQ, ImgSize(t, pa), ImgSize(t, pb)), fail);
+            EqNext(BytesEq(pa, pb, ImgSize(t, pa)), fail);
             return;
         }
-        if (TgModule::IsRel(t)) {
-            auto s2 = M.RelScal(t);
-            next(Cmp(TYG_EQ, tyg_load(p, s2, a.a, 0), tyg_load(p, s2, b.a, 0)));
-            return;
-        }
-        if (t->kind == TY_REF && cg.IsFatRef(t)) {
-            next(Cmp(TYG_EQ, Ld(a.a), Ld(b.a)));
-            return;
-        }
-        if (M.IsScalar(t)) {
-            auto s2 = M.Scal(t);
-            next(Cmp(t->kind == TY_FLT ? TYG_FEQ : TYG_EQ, tyg_load(p, s2, a.a, 0), tyg_load(p, s2, b.a, 0)));
-            return;
-        }
+        if (TgModule::IsRel(t)) return cmpw(0, M.RelScal(t), TYG_EQ);
+        if (t->kind == TY_REF && cg.IsFatRef(t)) return cmpw(0, TYG_I64, TYG_EQ);
+        if (M.IsScalar(t)) return cmpw(0, M.Scal(t), t->kind == TY_FLT ? TYG_FEQ : TYG_EQ);
         if (t->kind == TY_SLICE) {
-            auto a8 = a.a, b8 = b.a;
-            a8.offset += 8;
-            b8.offset += 8;
-            next(Cmp(TYG_EQ, Ld(a.a), Ld(b.a)));
-            next(Cmp(TYG_EQ, Ld(a8), Ld(b8)));
+            cmpw(0, TYG_I64, TYG_EQ);
+            cmpw(8, TYG_I64, TYG_EQ);
             return;
         }
         if (!M.TypeOk(t)) No(l, cat("comparison of type ", M.NameWhy(t)));
         if (t->kind == TY_STRUCT || t->kind == TY_VARIANT) {
-            for (auto &f : M.Fields(t)) {
-                auto fa = a.a, fb = b.a;
-                fa.offset += f.off;
-                fb.offset += f.off;
-                EqJump(P { fa, f.t }, P { fb, f.t }, fail, l);
-            }
+            for (auto &f : M.Fields(t)) EqJump(P { AddrOff(a.a, f.off), f.t }, P { AddrOff(b.a, f.off), f.t }, fail, l);
             return;
         }
         if (t->kind == TY_ENUM) {
-            auto ta = LoadTag(a.a, t);
-            next(Cmp(TYG_EQ, ta, LoadTag(b.a, t)));
-            auto ei = cg.EIOf(t);
-            auto done = NewBlock();
-            for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
+            EqNext(Cmp(TYG_EQ, LoadTag(a.a, t), LoadTag(b.a, t)), fail);
+            auto tag = Local(LoadTag(a.a, t));
+            TagSwitch(tag, cg.EIOf(t)->en->variants.size(), [&](size_t vi) {
                 auto vt = cg.VariantType(t, (int)vi);
-                if (!cg.FixedSize(vt)) continue;
-                auto hit = NewBlock(), miss = NewBlock();
-                Branch(Cmp(TYG_EQ, LoadTag(a.a, t), I64((int64_t)vi)), hit, miss);
-                SetBlock(hit);
-                auto pa = a.a, pb = b.a;
-                pa.offset += M.TagSize(t);
-                pb.offset += M.TagSize(t);
-                EqJump(P { pa, vt }, P { pb, vt }, fail, l);
-                tyg_jump(p, done);
-                SetBlock(miss);
-            }
-            tyg_jump(p, done);
-            SetBlock(done);
+                if (!cg.FixedSize(vt)) return;
+                EqJump(P { AddrOff(a.a, M.TagSize(t)), vt }, P { AddrOff(b.a, M.TagSize(t)), vt }, fail, l);
+            });
             return;
         }
         if (t->kind == TY_ARRAY) {
@@ -3851,7 +3691,7 @@ struct TgFn {
             if (TgModule::IsLim(t)) {
                 va = LimView(a);
                 vb = LimView(b);
-                next(Cmp(TYG_EQ, va.len, vb.len));
+                EqNext(Cmp(TYG_EQ, va.len, vb.len), fail);
             } else {
                 va = ViewOf(a, l);
                 vb = ViewOf(b, l);
@@ -3873,26 +3713,20 @@ struct TgFn {
             StL(ca, Add(A(), n));
             StL(cb, Add(B(), n));
         };
-        auto next = [&](tyg_val same) {
-            auto ok = NewBlock();
-            Branch(same, ok, fail);
-            SetBlock(ok);
-        };
+        auto bad = [&] { No(l, cat("comparison of type ", M.NameWhy(t))); };
         if (cg.IsFix(t)) {
-            if (!M.TypeOk(t)) No(l, cat("comparison of type ", M.NameWhy(t)));
+            if (!M.TypeOk(t)) bad();
             EqJump(P { AtV(A()), t }, P { AtV(B()), t }, fail, l);
             adv(I64(cg.FixedSize(t)));
             return;
         }
         switch (t->kind) {
             case TY_INT: case TY_REF: {
-                if (!TgModule::IsVarint(t) && !TgModule::IsVr(t)) No(l, cat("comparison of type ", M.NameWhy(t)));
+                if (!TgModule::IsVarint(t) && !TgModule::IsVr(t)) bad();
                 auto na = Local(UlebSize(A()));
-                auto n = [&] { return LdL(na); };
-                next(Cmp(TYG_EQ, UlebSize(B()), n()));
-                auto d = CallC("memcmp", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64, false) }, { A(), B(), n() }, IT(TYG_I32));
-                next(Cmp(TYG_EQ, d, tyg_iconst(p, TYG_I32, 0)));
-                adv(n());
+                EqNext(Cmp(TYG_EQ, UlebSize(B()), LdL(na)), fail);
+                EqNext(BytesEq(A(), B(), LdL(na)), fail);
+                adv(LdL(na));
                 return;
             }
             case TY_ARRAY: {
@@ -3903,51 +3737,37 @@ struct TgFn {
                 // The length (and a limited array's capacity) at a cursor, which moves past them.
                 auto head = [&](tyg_local c, tyg_local len, tyg_local cap) {
                     auto at = [&] { return LdL(c); };
-                    auto put = [&](tyg_local l2, tyg_val v) { StL(l2, v); };
+                    auto u32 = [&](int64_t off) {
+                        return tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, TYG_I32, AtV(at(), off), 0));
+                    };
                     if (t->arr->akind == A_VAR) {
                         auto w = TgModule::LenWidth(t);
                         if (w == 0) {
-                            put(len, UlebRead(at()));
+                            StL(len, UlebRead(at()));
                             StL(c, Add(at(), UlebSize(at())));
                         } else {
                             auto sc = w == 1 ? TYG_I8 : w == 2 ? TYG_I16 : w == 4 ? TYG_I32 : TYG_I64;
                             auto n = tyg_load(p, sc, AtV(at()), 0);
-                            if (sc != TYG_I64) n = tyg_convert(p, TgModule::SignedLen(t) ? TYG_SEXT : TYG_ZEXT, TYG_I64, n);
-                            put(len, n);
+                            StL(len, sc == TYG_I64 ? n : tyg_convert(p, TgModule::SignedLen(t) ? TYG_SEXT : TYG_ZEXT, TYG_I64, n));
                             StL(c, Add(at(), I64(w)));
                         }
                     } else if (rc) {
-                        put(cap, tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, TYG_I32, AtV(at()), 0)));
-                        put(len, tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, TYG_I32, AtV(at(), 4), 0)));
+                        StL(cap, u32(0));
+                        StL(len, u32(4));
                         StL(c, Add(at(), I64(8)));
                     } else {
-                        No(l, cat("comparison of type ", M.NameWhy(t)));
+                        bad();
                     }
                 };
                 head(ca, lena, capa);
                 head(cb, lenb, capb);
-                auto la = [&] { return LdL(lena); };
-                auto lb = [&] { return LdL(lenb); };
-                next(Cmp(TYG_EQ, la(), lb()));
-                auto il = Local(I64(0));
-                auto hd = NewBlock(), body = NewBlock(), done = NewBlock();
-                tyg_jump(p, hd);
-                SetBlock(hd);
-                Branch(Cmp(TYG_SLT, LdL(il), la()), body, done);
-                SetBlock(body);
-                EqWalk(sub, ca, cb, fail, l);
-                StL(il, Add(LdL(il), I64(1)));
-                tyg_jump(p, hd);
-                SetBlock(done);
+                EqNext(Cmp(TYG_EQ, LdL(lena), LdL(lenb)), fail);
+                Loop(I64(0), LdL(lena), [&](tyg_val) { EqWalk(sub, ca, cb, fail, l); });
                 if (rc) {
                     // Each side's unused slots.
                     auto esz = cg.FixedSize(sub);
-                    auto ld = [&](tyg_local c, tyg_local cap, tyg_local len) {
-                        auto gap = Mul(Sub(LdL(cap), LdL(len)), I64(esz));
-                        StL(c, Add(LdL(c), gap));
-                    };
-                    ld(ca, capa, lena);
-                    ld(cb, capb, lenb);
+                    for (auto [c, cap, len] : { std::tuple { ca, capa, lena }, std::tuple { cb, capb, lenb } })
+                        StL(c, Add(LdL(c), Mul(Sub(LdL(cap), LdL(len)), I64(esz))));
                 }
                 return;
             }
@@ -3955,26 +3775,14 @@ struct TgFn {
                 cg.EachField(t, [&](TypeExpr *ft) { EqWalk(ft, ca, cb, fail, l); });
                 return;
             case TY_ENUM: {
-                auto ei = cg.EIOf(t);
-                auto ts = M.TagSize(t);
-                auto ta = LoadTag(AtV(A()), t);
-                next(Cmp(TYG_EQ, ta, LoadTag(AtV(B()), t)));
+                EqNext(Cmp(TYG_EQ, LoadTag(AtV(A()), t), LoadTag(AtV(B()), t)), fail);
                 auto tag = Local(LoadTag(AtV(A()), t));
-                adv(I64(ts));
-                auto done = NewBlock();
-                for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
-                    auto hit = NewBlock(), miss = NewBlock();
-                    Branch(Cmp(TYG_EQ, LdL(tag), I64((int64_t)vi)), hit, miss);
-                    SetBlock(hit);
-                    EqWalk(cg.VariantType(t, (int)vi), ca, cb, fail, l);
-                    tyg_jump(p, done);
-                    SetBlock(miss);
-                }
-                tyg_jump(p, done);
-                SetBlock(done);
+                adv(I64(M.TagSize(t)));
+                TagSwitch(tag, cg.EIOf(t)->en->variants.size(),
+                          [&](size_t vi) { EqWalk(cg.VariantType(t, (int)vi), ca, cb, fail, l); });
                 return;
             }
-            default: No(l, cat("comparison of type ", M.NameWhy(t)));
+            default: bad();
         }
     }
     // The first n elements of two views, n their (equal) count.
@@ -4007,18 +3815,7 @@ struct TgFn {
         auto pa = Deref(Place(b->left));
         auto pb = Deref(Place(b->right));
         if (Ended()) return Dummy(M.ast.booltype);
-        auto res = tyg_local_new(p, 1, 1);
-        auto fail = NewBlock(), done = NewBlock();
-        EqJump(pa, P { pb.a, pa.t, pb.stk }, fail, b->line);
-        tyg_store(p, TYG_I8, AtL(res), tyg_iconst(p, TYG_I8, 1), 0);
-        tyg_jump(p, done);
-        SetBlock(fail);
-        tyg_store(p, TYG_I8, AtL(res), tyg_iconst(p, TYG_I8, 0), 0);
-        tyg_jump(p, done);
-        SetBlock(done);
-        V x = ValV(M.ast.booltype, tyg_load(p, TYG_I8, AtL(res), 0));
-        if (b->op == T_NEQ) x.v = Cmp(TYG_EQ, x.v, tyg_iconst(p, TYG_I8, 0));
-        return x;
+        return EqViaFail(b, [&](tyg_block fail) { EqJump(pa, P { pb.a, pa.t, pb.stk }, fail, b->line); });
     }
 
     // Elementwise arithmetic on structs and fixed arrays (§6.1;
@@ -4032,11 +3829,7 @@ struct TgFn {
         tyg_local loc;
     };
     tyg_addr ElemAt(tyg_addr a, int64_t off, const ElemDyn &dy) {
-        if (!dy.on) {
-            a.offset += off;
-            return a;
-        }
-        return AtV(Add(tyg_addr_of(p, a), LdL(dy.loc)), off);
+        return dy.on ? AtV(Add(tyg_addr_of(p, a), LdL(dy.loc)), off) : AddrOff(a, off);
     }
     // F(leaf type, offset, ElemDyn) for each scalar leaf, in order: the
     // elements of an array of up to 256 unrolled, those of a bigger one
@@ -4071,35 +3864,23 @@ struct TgFn {
         }
     }
     tyg_val ScalarArith(TType op, TypeExpr *t, tyg_val a, tyg_val b, Line l) {
-        switch (op) {
-            case T_PLUSEQ: op = T_PLUS; break;
-            case T_MINUSEQ: op = T_MINUS; break;
-            case T_MULEQ: op = T_MUL; break;
-            case T_DIVEQ: op = T_DIV; break;
-            case T_MODEQ: op = T_MOD; break;
-            default: break;
+        static const pair<TType, TType> compound[] = { { T_PLUSEQ, T_PLUS }, { T_MINUSEQ, T_MINUS },
+                                                       { T_MULEQ, T_MUL }, { T_DIVEQ, T_DIV }, { T_MODEQ, T_MOD } };
+        for (auto &[eq, plain] : compound)
+            if (op == eq) op = plain;
+        if (t->kind != TY_FLT) return IntOp(op, t, a, b, l);
+        if (op != T_PLUS && op != T_MINUS && op != T_MUL && op != T_DIV) {
+            auto f32 = M.Scal(t) == TYG_F32;
+            auto ft = tyg_type_scalar(m, M.Scal(t));
+            vector<const tyg_type *> pts { ft, ft };
+            auto sig = tyg_sig_new(m, ft, pts.data(), 2, 0);
+            tyg_arg as[2] {};
+            as[0].val = a;
+            as[1].val = b;
+            return tyg_call(p, sig, tyg_direct(M.Sym(f32 ? "fmodf" : "fmod", TYG_SYM_FUNC | TYG_SYM_GLOBAL | TYG_SYM_FOREIGN)),
+                            as, 2, nullptr, nullptr);
         }
-        if (t->kind == TY_FLT) {
-            switch (op) {
-                case T_PLUS: return tyg_bin(p, TYG_FADD, a, b);
-                case T_MINUS: return tyg_bin(p, TYG_FSUB, a, b);
-                case T_MUL: return tyg_bin(p, TYG_FMUL, a, b);
-                case T_DIV: return tyg_bin(p, TYG_FDIV, a, b);
-                default: {
-                    auto f32 = M.Scal(t) == TYG_F32;
-                    auto ft = tyg_type_scalar(m, M.Scal(t));
-                    vector<const tyg_type *> pts { ft, ft };
-                    auto sig = tyg_sig_new(m, ft, pts.data(), 2, 0);
-                    tyg_arg as[2] {};
-                    as[0].val = a;
-                    as[1].val = b;
-                    return tyg_call(p, sig, tyg_direct(M.Sym(f32 ? "fmodf" : "fmod",
-                                                             TYG_SYM_FUNC | TYG_SYM_GLOBAL | TYG_SYM_FOREIGN)),
-                                    as, 2, nullptr, nullptr);
-                }
-            }
-        }
-        return IntOp(op, t, a, b, l);
+        return tyg_bin(p, op == T_PLUS ? TYG_FADD : op == T_MINUS ? TYG_FSUB : op == T_MUL ? TYG_FMUL : TYG_FDIV, a, b);
     }
     tyg_val ScalarNeg(TypeExpr *t, tyg_val v, Line l) {
         if (t->kind == TY_FLT) return tyg_un(p, TYG_FNEG, v);
@@ -4140,8 +3921,8 @@ struct TgFn {
         if (Ended()) return Dummy(et);
         auto r = MemTemp(et, false);
         ElemLeaves(et, 0, b->line, [&](TypeExpr *tt, int64_t off, const ElemDyn &dy) {
-            tyg_store(p, M.Scal(tt), ElemAt(r.a, off, dy),
-                      ScalarArith(b->op, tt, ElemLeaf(lo, tt, off, dy, b->line), ElemLeaf(ro, tt, off, dy, b->line), b->line), 0);
+            auto lv = ElemLeaf(lo, tt, off, dy, b->line), rv = ElemLeaf(ro, tt, off, dy, b->line);
+            tyg_store(p, M.Scal(tt), ElemAt(r.a, off, dy), ScalarArith(b->op, tt, lv, rv, b->line), 0);
         });
         return r;
     }
@@ -4153,49 +3934,29 @@ struct TgFn {
         auto r = ViewOf(Place(b->right), b->line);
         auto et = l.elem;
         if (cg.Mangle(et) != cg.Mangle(r.elem)) No(b->line, "array comparison of another element type");
-        if (!(et->kind == TY_INT || et->kind == TY_BOOL) || et->intstorage == IS_VARINT) {
-            // Element by element.
-            auto res = tyg_local_new(p, 1, 1);
-            auto fail = NewBlock(), done = NewBlock(), ok = NewBlock();
-            Branch(Cmp(TYG_EQ, l.len, r.len), ok, fail);
-            SetBlock(ok);
-            EqElems(l, r, fail, b->line);
-            tyg_store(p, TYG_I8, AtL(res), tyg_iconst(p, TYG_I8, 1), 0);
-            tyg_jump(p, done);
-            SetBlock(fail);
-            tyg_store(p, TYG_I8, AtL(res), tyg_iconst(p, TYG_I8, 0), 0);
-            tyg_jump(p, done);
-            SetBlock(done);
-            V x = ValV(M.ast.booltype, tyg_load(p, TYG_I8, AtL(res), 0));
-            if (b->op == T_NEQ) x.v = Cmp(TYG_EQ, x.v, tyg_iconst(p, TYG_I8, 0));
-            return x;
-        }
+        if (!(et->kind == TY_INT || et->kind == TY_BOOL) || et->intstorage == IS_VARINT)
+            return EqViaFail(b, [&](tyg_block fail) {
+                EqNext(Cmp(TYG_EQ, l.len, r.len), fail);
+                EqElems(l, r, fail, b->line);
+            });
         auto res = tyg_local_new(p, 1, 1);
         auto same = Cmp(TYG_EQ, l.len, r.len);
         tyg_store(p, TYG_I8, AtL(res), same, 0);
         If(same, [&] {
-            auto bytes = Mul(l.len, I64(cg.FixedSize(et)));
-            auto d = CallC("memcmp", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64, false) },
-                           { l.elems, r.elems, bytes }, IT(TYG_I32));
-            tyg_store(p, TYG_I8, AtL(res), Cmp(TYG_EQ, d, tyg_iconst(p, TYG_I32, 0)), 0);
+            tyg_store(p, TYG_I8, AtL(res), BytesEq(l.elems, r.elems, Mul(l.len, I64(cg.FixedSize(et)))), 0);
         });
-        V x = ValV(M.ast.booltype, tyg_load(p, TYG_I8, AtL(res), 0));
-        if (b->op == T_NEQ) x.v = Cmp(TYG_EQ, x.v, tyg_iconst(p, TYG_I8, 0));
-        return x;
+        return EqResult(b, tyg_load(p, TYG_I8, AtL(res), 0));
     }
 
     // An integer operation at t's width: unsigned and release-build signed
     // arithmetic wraps, a debug build's signed arithmetic checks (runtime.h),
     // and division and modulo check in every build (§6.2).
     tyg_val IntOp(TType op, TypeExpr *t, tyg_val l, tyg_val r, Line ln) {
-        auto sgn = TgModule::IsSigned(t);
         switch (op) {
-            case T_PLUS: case T_MINUS: case T_MUL: {
-                if (sgn && M.checks)
-                    return CheckedShim(op == T_PLUS ? "add" : op == T_MINUS ? "sub" : "mul", t, { l, r },
-                                       ln);
+            case T_PLUS: case T_MINUS: case T_MUL:
+                if (TgModule::IsSigned(t) && M.checks)
+                    return CheckedShim(op == T_PLUS ? "add" : op == T_MINUS ? "sub" : "mul", t, { l, r }, ln);
                 return tyg_bin(p, op == T_PLUS ? TYG_ADD : op == T_MINUS ? TYG_SUB : TYG_MUL, l, r);
-            }
             case T_DIV: return CheckedShim("div", t, { l, r }, ln);
             case T_MOD: return CheckedShim("mod", t, { l, r }, ln);
             case T_BITAND: return tyg_bin(p, TYG_AND, l, r);
@@ -4210,8 +3971,7 @@ struct TgFn {
         auto tt = c->totype;
         auto x = GenAs(c->child, cg.OperandT(st));
         st = x.t;
-        if (!M.IsScalar(st) || !M.IsScalar(tt) || st->kind == TY_REF || tt->kind == TY_REF)
-            No(c->line, "cast types");
+        if (!M.IsScalar(st) || !M.IsScalar(tt) || st->kind == TY_REF || tt->kind == TY_REF) No(c->line, "cast types");
         V y;
         y.t = tt;
         if (tt->kind == TY_FLT) {
@@ -4221,66 +3981,57 @@ struct TgFn {
         }
         if (tt->kind != TY_INT || tt->intstorage == IS_VARINT) No(c->line, "cast target");
         auto is = tt->intstorage;
+        auto i64t = M.ast.inttypes[IS_I64];
+        auto rng = IntRange(is);
+        auto lo = rng.first, hi = rng.second;
+        auto ptr = tyg_type_ptr(m), i32 = IT(TYG_I32);
+        // The abort message's file and line follow the arguments.
+        auto args = [&](vector<tyg_val> v) {
+            v.push_back(FileArg(c->line));
+            v.push_back(LineArg(c->line));
+            return v;
+        };
         if (st->kind == TY_FLT) {
             auto d = M.Scal(st) == TYG_F32 ? tyg_convert(p, TYG_FEXT, TYG_F64, x.v) : x.v;
             auto f64 = tyg_type_scalar(m, TYG_F64);
+            auto isf32 = tyg_iconst(p, TYG_I32, M.Scal(st) == TYG_F32);
             tyg_val r;
             if (c->unchecked) {
                 M.NeedShim("gs_tg_f2iwrap");
                 r = CallC("gs_tg_f2iwrap", { f64 }, { d }, IT(TYG_I64));
             } else if (is == IS_U64) {
                 M.NeedShim("gs_tg_f2u");
-                r = CallC("gs_tg_f2u", { f64, IT(TYG_I32), tyg_type_ptr(m), IT(TYG_I32) },
-                          { d, tyg_iconst(p, TYG_I32, M.Scal(st) == TYG_F32), FileArg(c->line),
-                            LineArg(c->line) },
-                          IT(TYG_I64, false));
+                r = CallC("gs_tg_f2u", { f64, i32, ptr, i32 }, args({ d, isf32 }), IT(TYG_I64, false));
             } else {
                 M.NeedShim("gs_tg_f2i");
-                auto [lo, hi] = IntRange(is);
-                r = CallC("gs_tg_f2i",
-                          { f64, IT(TYG_I32), IT(TYG_I64), IT(TYG_I64), tyg_type_ptr(m), tyg_type_ptr(m),
-                            IT(TYG_I32) },
-                          { d, tyg_iconst(p, TYG_I32, M.Scal(st) == TYG_F32), I64(lo),
-                            I64(hi), TypeNameArg(is), FileArg(c->line),
-                            LineArg(c->line) },
-                          IT(TYG_I64));
+                r = CallC("gs_tg_f2i", { f64, i32, IT(TYG_I64), IT(TYG_I64), ptr, ptr, i32 },
+                          args({ d, isf32, I64(lo), I64(hi), TypeNameArg(is) }), IT(TYG_I64));
             }
-            y.v = Conv(r, M.ast.inttypes[IS_I64], tt, c->line);
+            y.v = Conv(r, i64t, tt, c->line);
             return y;
         }
         if (st->kind == TY_BOOL) No(c->line, "bool cast");
         auto fits = [&] {
-            auto [slo, shi] = IntRange(st->intstorage);
-            auto [lo, hi] = IntRange(is);
-            return st->intstorage != IS_U64 && slo >= lo && shi <= hi;
+            auto sr = IntRange(st->intstorage);
+            return st->intstorage != IS_U64 && sr.first >= lo && sr.second <= hi;
         };
         if (c->unchecked || cg.TEq(st, tt) || fits() || (st->intstorage == IS_U64 && is == IS_U64)) {
             y.v = Conv(x.v, st, tt, c->line);
             return y;
         }
-        // The checked narrowings of GS_RANGE and GS_RANGE_U: identities in a
-        // release build.
+        // The checked narrowings of GS_RANGE and GS_RANGE_U: identities in a release build.
         tyg_val r;
         if (st->intstorage == IS_U64) {
             M.NeedShim("gs_tg_range_u");
-            r = CallC("gs_tg_range_u",
-                      { IT(TYG_I64, false), IT(TYG_I64, false), tyg_type_ptr(m), tyg_type_ptr(m),
-                        IT(TYG_I32) },
-                      { x.v, I64(IntRange(is).second), TypeNameArg(is),
-                        FileArg(c->line), LineArg(c->line) },
-                      IT(TYG_I64, false));
+            r = CallC("gs_tg_range_u", { IT(TYG_I64, false), IT(TYG_I64, false), ptr, ptr, i32 },
+                      args({ x.v, I64(hi), TypeNameArg(is) }), IT(TYG_I64, false));
             y.v = Conv(r, M.ast.inttypes[IS_U64], tt, c->line);
             return y;
         }
         M.NeedShim("gs_tg_range");
-        auto [lo, hi] = IntRange(is);
-        auto w = Conv(x.v, st, M.ast.inttypes[IS_I64], c->line);
-        r = CallC("gs_tg_range",
-                  { IT(TYG_I64), IT(TYG_I64), IT(TYG_I64), tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I32) },
-                  { w, I64(lo), I64(hi), TypeNameArg(is),
-                    FileArg(c->line), LineArg(c->line) },
-                  IT(TYG_I64));
-        y.v = Conv(r, M.ast.inttypes[IS_I64], tt, c->line);
+        r = CallC("gs_tg_range", { IT(TYG_I64), IT(TYG_I64), IT(TYG_I64), ptr, ptr, i32 },
+                  args({ Conv(x.v, st, i64t, c->line), I64(lo), I64(hi), TypeNameArg(is) }), IT(TYG_I64));
+        y.v = Conv(r, i64t, tt, c->line);
         return y;
     }
     tyg_val TypeNameArg(IntStorage is) {
@@ -4301,15 +4052,13 @@ struct TgFn {
             return MemV(t, AtV(GenImg(sl, stk, t, sl->line)));
         }
         if (t->kind == TY_VARIANT || t->kind == TY_ENUM) return GenVariantLit(sl);
-        if (!sl->sinst || sl->variant || t->kind != TY_STRUCT || !M.TypeOk(t))
-            No(sl->line, "literal of this type");
+        if (!sl->sinst || sl->variant || t->kind != TY_STRUCT || !M.TypeOk(t)) No(sl->line, "literal of this type");
         auto tmp = Temp(t);
         tyg_zero(p, AtL(tmp), M.Size(t));
         auto si = cg.SI(t);
         auto &lay = cg.StructLayout(si);
         for (size_t i = 0; i < si->st->fields.size(); i++) {
-            if (si->st->fields[i].ispad) continue;
-            auto init = sl->InitFor((int)i);
+            auto init = si->st->fields[i].ispad ? nullptr : sl->InitFor((int)i);
             if (!init) continue;
             // A self-relative link measures from the slot it lies in, which a
             // literal built here and copied out of is not.
