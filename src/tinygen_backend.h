@@ -3341,16 +3341,27 @@ struct TgFn {
         };
         if (c->unchecked || cg.TEq(st, tt) || fits() || (st->intstorage == IS_U64 && is == IS_U64))
             return ValV(tt, Conv(x.v, st, tt, c->line));
-        // The checked narrowings of GS_RANGE and GS_RANGE_U: identities in a release build.
+        // The checked narrowings of GS_RANGE and GS_RANGE_U: identities in a release build. With
+        // GS_DEBUG the bounds test is inline, and only a value out of range calls the shim, which
+        // aborts with the runtime's message.
+        if (!M.checks) return ValV(tt, Conv(x.v, st, tt, c->line));
         if (st->intstorage == IS_U64) {
             auto u64 = IT(TYG_I64, false);
-            r = shim("gs_tg_range_u", { u64, u64, ptr }, { x.v, I64(hi), TypeNameArg(is) }, false);
-            return ValV(tt, Conv(r, M.ast.inttypes[IS_U64], tt, c->line));
+            If(Cmp(TYG_UGT, x.v, I64(hi)), [&] {
+                shim("gs_tg_range_u", { u64, u64, ptr }, { x.v, I64(hi), TypeNameArg(is) }, false);
+                tyg_unreachable(p);
+            });
+            return ValV(tt, Conv(x.v, M.ast.inttypes[IS_U64], tt, c->line));
         }
         auto i64 = IT(TYG_I64);
-        r = shim("gs_tg_range", { i64, i64, i64, ptr },
-                 { Conv(x.v, st, i64t, c->line), I64(lo), I64(hi), TypeNameArg(is) }, true);
-        return ValV(tt, Conv(r, i64t, tt, c->line));
+        auto v = Conv(x.v, st, i64t, c->line);
+        // lo <= v <= hi, as one unsigned compare of v - lo
+        If(Cmp(TYG_UGT, Sub(v, I64(lo)), I64((int64_t)((uint64_t)hi - (uint64_t)lo))), [&] {
+            shim("gs_tg_range", { i64, i64, i64, ptr }, { v, I64(lo), I64(hi), TypeNameArg(is) },
+                 true);
+            tyg_unreachable(p);
+        });
+        return ValV(tt, Conv(v, i64t, tt, c->line));
     }
     tyg_val TypeNameArg(IntStorage is) {
         return BytesAddr(cat(IntStorageName(is), string(1, '\0')));
