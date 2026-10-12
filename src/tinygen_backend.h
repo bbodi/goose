@@ -413,7 +413,13 @@ struct TgModule {
             case TY_STRUCT:
                 if (!cg.IsFix(t) || !cg.SI(t)) return false;
                 return Within(t, true, [&] { return StFields(t).All([&](TypeExpr *ft) { return TypeOk(ft, d); }); });
-            case TY_ENUM: case TY_VARIANT: return AdtOk(t, depth);
+            case TY_ENUM: case TY_VARIANT:   // Fixed-mode, its payload fields held.
+                if ((t->kind == TY_ENUM && t->enu->varmode) || !cg.IsFix(t)) return false;
+                return Within(t, true, [&] {
+                    return AllVariants(t, [&](int, const FieldSet &fs) {
+                        return fs.All([&](TypeExpr *ft) { return TypeOk(ft, d); });
+                    });
+                });
             default: return false;
         }
     }
@@ -577,7 +583,14 @@ struct TgModule {
         auto key = cg.Mangle(t);
         if (auto it = atypes.find(key); it != atypes.end()) return it->second;
         if (IsLim(t)) return LimAT(t);
-        if (t->kind == TY_ENUM) return atypes[key] = AdtAT(t);
+        if (t->kind == TY_ENUM) {   // The tag, the payload records behind it.
+            auto ei = cg.EIOf(t);
+            vector<tyg_field> fs { { tyg_type_int(m, TagScal(t), 0), 0 } };
+            for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
+                if (cg.VariantLayout(ei, (int)vi).size)
+                    fs.push_back({ AT(cg.VariantType(t, (int)vi)), TagSize(t) });
+            return atypes[key] = tyg_type_record(m, cg.FixedSize(t), 1, fs.data(), (int)fs.size());
+        }
         if (t->kind == TY_VARIANT && !cg.FixedSize(t)) {   // struct { uint8_t gs_empty; }
             tyg_field f { tyg_type_int(m, TYG_I8, 0), 0 };
             return atypes[key] = tyg_type_record(m, 1, 1, &f, 1);
@@ -853,15 +866,6 @@ struct TgModule {
             if (!ok(vi, VarFields(EI(t), vi))) return false;
         return true;
     }
-    // A fixed-mode ADT or a fixed variant whose payload fields it holds.
-    bool AdtOk(TypeExpr *t, int depth) {
-        if ((t->kind == TY_ENUM && t->enu->varmode) || !cg.IsFix(t)) return false;
-        return Within(t, true, [&] {
-            return AllVariants(t, [&](int, const FieldSet &fs) {
-                return fs.All([&](TypeExpr *ft) { return TypeOk(ft, depth + 1); });
-            });
-        });
-    }
     string AdtBlocker(TypeExpr *t, int depth) {
         if (IsRb(t)) return RbOk(t, depth) ? "" : "resizable ADT";
         if (t->kind == TY_ENUM && t->enu->varmode) return VmOk(t, depth) ? "" : "variable-mode ADT";
@@ -875,14 +879,6 @@ struct TgModule {
             }
             return string();
         });
-    }
-    // The tag, and each non-empty variant's payload record behind it, overlapping as the union's members do.
-    const tyg_type *AdtAT(TypeExpr *t) {
-        auto ei = cg.EIOf(t);
-        vector<tyg_field> fs { { tyg_type_int(m, TagScal(t), 0), 0 } };
-        for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
-            if (cg.VariantLayout(ei, (int)vi).size) fs.push_back({ AT(cg.VariantType(t, (int)vi)), TagSize(t) });
-        return tyg_type_record(m, cg.FixedSize(t), 1, fs.data(), (int)fs.size());
     }
     // A fixed struct or variant's record (a variant without fields: C's gs_empty byte). A field may refer
     // back to it through a reference.
