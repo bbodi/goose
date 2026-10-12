@@ -1486,12 +1486,6 @@ struct TgFn {
         }
         return 0;
     }
-    // A match, block or loop expression built in place.
-    void BuildExpr(Node *n, const InPlace &ip, Line l) {
-        if (auto me = Is<MatchExpr>(n)) GenMatch(me, false, &ip);
-        else if (auto e = Is<EarlyBlock>(n)) GenEarly(e, false, &ip);
-        else GenLoopX(static_cast<LoopExpr *>(n), false, &ip);
-    }
     // Each result's channel (CodeGen::SigParams), its parameters kept in locals: an out-pointer in `a` for a
     // fixed result other than the C return value; for a resizable, its destination stack in `a`, the count's
     // out-parameter in `b`.
@@ -1600,8 +1594,10 @@ struct TgFn {
         if (auto ie = Is<IfExpr>(n); ie && ie->elseb) BuildIf(ie, l, arm);
         else if (auto b = Is<Block>(n); b && b->tail) BuildArm(b, l, arm);
         else if (auto c = Is<Call>(n); c && c->fvbody && c->fvbody->tail) BuildFv(c, l, arm);
-        else if (d.mode <= 2 && !M.IsRs(d.t) && (Is<MatchExpr>(n) || Is<EarlyBlock>(n) || Is<LoopExpr>(n)))
-            BuildExpr(n, d, l);
+        else if (d.mode > 2 || M.IsRs(d.t)) return false;
+        else if (auto me = Is<MatchExpr>(n)) GenMatch(me, false, &d);
+        else if (auto e = Is<EarlyBlock>(n)) GenEarly(e, false, &d);
+        else if (auto lp = Is<LoopExpr>(n)) GenLoopX(lp, false, &d);
         else return false;
         return true;
     }
@@ -1703,12 +1699,6 @@ struct TgFn {
         return Add(SpVal(l), I64(live));
     }
 
-    // Appends x, of element type et, at the top of stk to the resizable whose count is at len.
-    void PushRaw(tyg_val stk, tyg_addr len, TypeExpr *et, const V &x) {
-        if (!cg.IsFix(et)) No(Line {}, "an element of variable size");
-        PushVal(stk, et, x);
-        St(len, Add(Ld(len), I64(1)));
-    }
     // Moves `bytes` bytes of n elements from elems (maybe on stk itself) to its top, counting them at len.
     void CopyBytes(tyg_val stk, tyg_addr len, tyg_val elems, tyg_val bytes, tyg_val n) {
         auto top = Top(stk);
@@ -2059,8 +2049,9 @@ struct TgFn {
                 return top;
             }
             auto x = GenAs(n, t);
-            if (Ended()) return Top(stk);
-            return GenVr(x, stk, t, l);
+            auto top = Top(stk);
+            if (!Ended()) SetTop(stk, Add(top, RelOffsetInto(P { AtV(top), t }, x.v, l)));
+            return top;
         }
         if (M.IsVm(t) || M.IsVv(t) || M.IsVs(t)) {
             if (!n || from) No(l, cat("value of type ", M.NameWhy(t)));
@@ -2353,11 +2344,6 @@ struct TgFn {
         auto off = RelOffset(pl, v, l);
         auto at = tyg_addr_of(p, pl.a);
         return pl.t->ref->pool ? UlebWrite(at, off) : ZigWrite(at, off);
-    }
-    tyg_val GenVr(const V &x, tyg_val stk, TypeExpr *t, Line l) {
-        auto top = Top(stk);
-        SetTop(stk, Add(top, RelOffsetInto(P { AtV(top), t }, x.v, l)));
-        return top;
     }
     // The address v as the slot's offset, range-checked (EmitRelStoreAt).
     void RelStore(const P &pl, tyg_val v, Line l) {
@@ -4259,12 +4245,6 @@ struct TgFn {
     // arm into one temporary (prefctl and prefloc hand it to the construct).
     bool prefctl = false;
     tyg_local prefloc = 0;
-    bool TakePref(tyg_local &res) {
-        auto was = prefctl;
-        prefctl = false;
-        res = prefloc;
-        return was;
-    }
     tyg_addr GenPref(Node *n) {
         if (cg.IsCtl(n)) {
             auto res = tyg_local_new(p, 32, 8);
@@ -4298,15 +4278,6 @@ struct TgFn {
     void PrefInto(tyg_addr dst, Node *n) {
         auto src = GenPref(n);
         if (!Ended()) tyg_copy(p, dst, src, 32);
-    }
-    // An arm of a control construct, its value stored in the construct's temporary.
-    void ArmVal(Node *n, bool valued, bool pr, TypeExpr *et, tyg_local res) {
-        if (valued && pr) {
-            BuildArm(n, n->line, [&](Node *v) { PrefInto(AtL(res), v); });
-            return;
-        }
-        auto x = GenArm(n, !valued, valued ? et : nullptr);
-        if (valued && !Ended() && x.t) Store(P { AtL(res), et }, Fit(x, et, n->line));
     }
 
     // A by-value frame object, image or resizable argument: a copy of its own on a stack of the
@@ -4407,7 +4378,9 @@ struct TgFn {
         if (Ended()) return Dummy(c->exprtype);
         if (!M.IsScalar(et) && !x.mem) No(c->line, "aggregate value");
         auto top = Top(pl.stk);
-        PushRaw(pl.stk, la, et, x);
+        if (!cg.IsFix(et)) No(Line {}, "an element of variable size");
+        PushVal(pl.stk, et, x);
+        St(la, Add(Ld(la), I64(1)));
         V r;
         r.t = c->exprtype && c->exprtype->kind == TY_REF ? c->exprtype : nullptr;
         if (r.t) r.v = top;
@@ -5659,7 +5632,9 @@ struct TgFn {
     // Starts construct n: true if built in place (value in k.w), else k is set up. `gate` false: n gives
     // no value (an if without else, a loop without a break value).
     bool CtlBegin(Ctl &k, Node *n, bool discard, const InPlace *ip, bool gate) {
-        k.pr = TakePref(k.res);
+        k.pr = prefctl;
+        k.res = prefloc;
+        prefctl = false;
         if (gate && !ip && !k.pr && WantInPlace(n, discard, k.w)) return true;
         k.valued = gate && !ip && Valued(n, discard);
         k.et = Carry(n->exprtype);
@@ -5668,7 +5643,11 @@ struct TgFn {
     }
     void CtlArm(const Ctl &k, const InPlace *ip, Node *body, Line l) {
         if (ip) BuildArm(body, l, [&](Node *v) { BuildInto(v, *ip, l); });
-        else ArmVal(body, k.valued, k.pr, k.et, k.res);
+        else if (k.valued && k.pr) BuildArm(body, body->line, [&](Node *v) { PrefInto(AtL(k.res), v); });
+        else {   // The value stored in the construct's temporary.
+            auto x = GenArm(body, !k.valued, k.valued ? k.et : nullptr);
+            if (k.valued && !Ended() && x.t) Store(P { AtL(k.res), k.et }, Fit(x, k.et, body->line));
+        }
     }
     V CtlValue(const Ctl &k, Line l) { return k.valued ? Load(P { AtL(k.res), k.et }, l) : V {}; }
     // The break/continue target of a loop or block delivering k.
