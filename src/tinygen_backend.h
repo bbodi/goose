@@ -3275,6 +3275,33 @@ struct TgFn {
         return EqResult(b, tyg_load(p, TYG_I8, AtL(res), 0));
     }
 
+    // runtime.h's gs_div_<sfx> or gs_mod_<sfx> (`%` is Euclidean), inline. A divisor of 0, or of -1
+    // for a signed type, goes to the shim, which aborts or gives the exact answer (i64.min / -1, a
+    // narrow type's overflow check). The rest divide here, as int64_t like the runtime's narrow
+    // helpers.
+    tyg_val DivMod(bool mod, TypeExpr *t, tyg_val l, tyg_val r, Line ln) {
+        auto sc = M.Scal(t);
+        bool sgn = TgModule::IsSigned(t);
+        auto wide = [&](tyg_val v) {
+            return sc == TYG_I64 ? v : tyg_convert(p, sgn ? TYG_SEXT : TYG_ZEXT, TYG_I64, v);
+        };
+        auto a = wide(l), b = wide(r);
+        auto res = Slot();
+        auto slow = sgn ? Cmp(TYG_ULE, Add(b, I64(1)), I64(1)) : Cmp(TYG_EQ, b, I64(0));
+        IfElse(slow, [&] { StL(res, wide(CheckedShim(mod ? "mod" : "div", t, { l, r }, ln))); }, [&] {
+            auto q = Bin(mod ? (sgn ? TYG_SREM : TYG_UREM) : (sgn ? TYG_SDIV : TYG_UDIV), a, b);
+            if (mod && sgn) {
+                // a negative remainder plus |b|
+                auto sb = Bin(TYG_ASHR, b, I64(63));
+                auto absb = Sub(Bin(TYG_XOR, b, sb), sb);
+                q = Add(q, Bin(TYG_AND, Bin(TYG_ASHR, q, I64(63)), absb));
+            }
+            StL(res, q);
+        });
+        auto v = LdL(res);
+        return sc == TYG_I64 ? v : tyg_convert(p, TYG_TRUNC, sc, v);
+    }
+
     // An integer operation at t's width: unsigned and release-build signed arithmetic wraps, a debug
     // build's signed arithmetic checks (runtime.h), division and modulo check always (§6.2).
     tyg_val IntOp(TType op, TypeExpr *t, tyg_val l, tyg_val r, Line ln) {
@@ -3284,8 +3311,8 @@ struct TgFn {
                     return CheckedShim(op == T_PLUS ? "add" : op == T_MINUS ? "sub" : "mul", t,
                                        { l, r }, ln);
                 return Bin(op == T_PLUS ? TYG_ADD : op == T_MINUS ? TYG_SUB : TYG_MUL, l, r);
-            case T_DIV: return CheckedShim("div", t, { l, r }, ln);
-            case T_MOD: return CheckedShim("mod", t, { l, r }, ln);
+            case T_DIV: return DivMod(false, t, l, r, ln);
+            case T_MOD: return DivMod(true, t, l, r, ln);
             case T_BITAND: return Bin(TYG_AND, l, r);
             case T_BITOR: return Bin(TYG_OR, l, r);
             case T_XOR: return Bin(TYG_XOR, l, r);
