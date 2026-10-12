@@ -2271,10 +2271,8 @@ struct TgFn {
             if (!id->vdef) No(n->line, "function as a value");
             return VarPlace(id->vdef, n->line);
         }
-        if (auto d = Is<Dot>(n); d && d->IsField()) {
-            auto base = Deref(Place(d->obj));
-            return FieldPlace(base, d->fieldidx, n->line);
-        }
+        if (auto d = Is<Dot>(n); d && d->IsField())
+            return FieldPlace(Deref(Place(d->obj)), d->fieldidx, n->line);
         if (auto ix = Is<Index>(n)) return IndexPlace(ix);
         if (auto se = Is<SliceExpr>(n)) {
             // A view, whatever array the checker typed it as.
@@ -6181,17 +6179,10 @@ struct TgFn {
             rebuild(Ld(AddrPlus(pl.a, M.FoHdrOff(t))), InPlace { 3, pl.stk, t, pl.a, &pl });
             return;
         }
-        if (pl.tmphdr && pl.stk && M.RbOk(t)) {   // The tail of a resizable struct: its count the struct's.
+        if (pl.tmphdr || M.RsOk(t) || M.IsRb(t)) {   // A tmphdr place: a resizable struct's tail.
+            if (!pl.stk || (!M.RsOk(t) && !M.RbOk(t))) No(l, "assignment to a resizable of this kind");
             rebuild(Ld(pl.a), InPlace { 2, pl.stk, t, pl.a });
-            if (!Ended()) St(AddrPlus(pl.ohdr, 8), Ld(AddrPlus(pl.a, 8)));
-            return;
-        }
-        if (pl.tmphdr) No(l, "assignment to the tail of a resizable struct");
-        if (M.RsOk(t) || M.IsRb(t)) {
-            if (M.RsOk(t) ? !pl.stk : !M.RbOk(t) || !pl.stk)
-                No(l, M.RsOk(t) ? "assignment to a resizable struct without its stack"
-                                : "assignment to a resizable ADT of this kind");
-            rebuild(Ld(pl.a), InPlace { 2, pl.stk, t, pl.a });
+            if (pl.tmphdr && !Ended()) St(AddrPlus(pl.ohdr, 8), Ld(AddrPlus(pl.a, 8)));   // Its count.
             return;
         }
         if (IsAddrRef(t)) {
