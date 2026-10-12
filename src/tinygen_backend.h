@@ -6745,8 +6745,7 @@ struct TgFn {
         cg.usesthreads = true;
         return CallC(M.QueueAccessor(t), {}, {}, tyg_type_ptr(m));
     }
-    // Whether a value of type t crosses a queue as this backend holds it (CodeGen's IsBytesT): a fixed
-    // value by its bytes, a resizable or frame object or T[] / T[..] as a flat image.
+    // Whether a value of type t crosses a queue as this backend holds it (CodeGen's IsBytesT).
     bool QueueOk(TypeExpr *t) {
         if (!t || t->kind == TY_REF) return false;
         if (cg.IsFix(t)) return M.TypeOk(t);
@@ -6755,14 +6754,19 @@ struct TgFn {
     }
     // The bytes of one freelist unit of pool d (CodeGen::FlEntrySize, GS_SPAN_NODE of a slice pool).
     static int64_t FlEntry(const VarDef *d) { return d->reusable == RU_SLICES ? 512 : 8; }
-    // Whether a thread program's global is one a spawn image carries: a fixed value, a resizable or
-    // frame object (a pool with its freelist), or a T[] image.
+    // Whether a thread program's global is one a spawn image carries.
     bool ThreadGlobalOk(VarDef *d) {
         if (!M.GlobalOk(d) || cg.PrefVar(d)) return false;
         auto t = d->type;
         if (cg.IsFix(t)) return M.TypeOk(t) && !d->reusable;
         if (M.Resz(t)) return (IsGrow(t) && (M.RzOk(t) || M.VeOk(t)) && (!d->reusable || M.RzOk(t))) || M.FoOk(t);
         return IsImg(t) && !d->reusable;
+    }
+    // Reserves n bytes at the top of stk; their address.
+    tyg_val StackReserve(tyg_val stk, tyg_val n) {
+        auto top = Top(stk);
+        SetTop(stk, Add(top, n));
+        return top;
     }
     // A node's value bytes follow its gs_qnode header (next, size).
     static constexpr int64_t QNODE = 16;
@@ -6780,17 +6784,15 @@ struct TgFn {
     // The flat image of the resizable or frame object at src, at the top of stk: [int64 count][a frame
     // object's fixed fields][tail elements] (CodeGen::EmitRzImage); its address.
     tyg_val RzImage(tyg_val stk, const P &src, TypeExpr *t) {
-        auto start = Top(stk);
+        auto start = StackReserve(stk, I64(8));
         auto cnt = AtV(start);
         St(cnt, I64(0));
-        SetTop(stk, Add(start, I64(8)));
         auto h = src.a;
         TypeExpr *et;
         if (M.FoOk(t)) {
             auto pre = M.FoHdrOff(t);
-            auto top = Top(stk);
+            auto top = StackReserve(stk, I64(pre));
             if (pre) tyg_copy(p, AtV(top), src.a, pre);
-            SetTop(stk, Add(top, I64(pre)));
             h.offset += pre;
             et = cg.FoTailArr(t)->arr->sub;
         } else {
@@ -6809,8 +6811,8 @@ struct TgFn {
         return V {};
     }
 
-    // thread_spawn(worker, args...) (CodeGen::EmitThreadSpawn): the arguments and the globals the worker
-    // names contiguous on a stack of the statement's, handed to the worker's thunk, which unpacks them.
+    // thread_spawn(worker, args...) (CodeGen::EmitThreadSpawn): arguments and the worker's globals packed on
+    // a stack of the statement's, handed to the worker's thunk.
     V GenThreadSpawn(Call *c) {
         auto w = c->spec;
         auto an = c->ArgNodes();
@@ -6832,8 +6834,7 @@ struct TgFn {
         auto i64t = M.ast.inttypes[IS_I64];
         // [int64 size][payload]: the size patched in once `body` has appended the payload.
         auto sized = [&](auto body) {
-            auto szp = Top(stk);
-            SetTop(stk, Add(szp, I64(8)));
+            auto szp = StackReserve(stk, I64(8));
             body();
             if (!Ended()) St(AtV(szp), Sub(Top(stk), Add(szp, I64(8))));
         };
@@ -6843,8 +6844,7 @@ struct TgFn {
             if (M.IsRs(pt)) {
                 // Built straight into the packet, prefix and tail as they lie, the count from its header.
                 sized([&] {
-                    auto cntp = AtV(Top(stk));
-                    SetTop(stk, Add(Top(stk), I64(8)));
+                    auto cntp = AtV(StackReserve(stk, I64(8)));
                     auto hdr = AtL(tyg_local_new(p, 16, 8));
                     GenRs(arg, stk, hdr, pt, c->line);
                     if (!Ended()) St(cntp, Ld(AddrPlus(hdr, 8)));
@@ -6870,8 +6870,8 @@ struct TgFn {
                 auto pl = VarPlace(d, c->line);
                 if (cg.IsFix(d->type)) {
                     auto size = cg.FixedSize(d->type);
-                    if (size) tyg_copy(p, AtV(Top(stk)), pl.a, size);
-                    SetTop(stk, Add(Top(stk), I64(size)));
+                    auto at = StackReserve(stk, I64(size));
+                    if (size) tyg_copy(p, AtV(at), pl.a, size);
                 } else if (!M.Resz(d->type)) {
                     ImgCopy(stk, tyg_addr_of(p, pl.a), d->type);
                 } else {
@@ -6928,9 +6928,8 @@ struct TgFn {
         return V {};
     }
 
-    // qget<T>() and qpoll<T>() (CodeGen's B_QGET): the oldest node's bytes as the value, the node freed;
-    // a missed poll gives the zero value and false. An image is built at idst's top (or a stack of the
-    // statement's), so a poll of one is left to C.
+    // qget<T>() and qpoll<T>() (CodeGen's B_QGET): the oldest node's bytes, the node freed; a missed
+    // poll gives the zero value and false (a poll of an image is left to C).
     V GenQget(Call *c, tyg_val idst) {
         auto t = c->rettypes[0];
         auto poll = c->builtin == B_QPOLL;
@@ -6965,18 +6964,15 @@ struct TgFn {
                 St(AddrPlus(obj, pre + 8), Ld(AtV(node, QNODE)));
                 if (pre) tyg_copy(p, obj, AtV(image), pre);
                 auto n = Sub(Ld(AtV(node, 8)), I64(8 + pre));
-                auto top = Top(stk);
-                tyg_move_dyn(p, top, Add(image, I64(pre)), n);
-                SetTop(stk, Add(top, n));
+                tyg_move_dyn(p, StackReserve(stk, n), Add(image, I64(pre)), n);
             });
             return result(MemV(t, obj, stk));
         }
         if (!cg.IsFix(t)) {
             auto stk = idst ? idst : Stk(AllocStk(false, c->line), c->line);
-            auto top = Top(stk);
             auto size = Ld(AtV(node, 8));
+            auto top = StackReserve(stk, size);
             tyg_move_dyn(p, top, Add(node, I64(QNODE)), size);
-            SetTop(stk, Add(top, size));
             CallC("free", { tyg_type_ptr(m) }, { node }, nullptr);
             return result(MemV(t, AtV(top)));
         }
@@ -6989,8 +6985,7 @@ struct TgFn {
         return result(M.IsScalar(t) ? Load(P { at, t }, c->line) : MemV(t, at));
     }
 
-    // An extern fn, through a trampoline the C half defines: the C function may be a static one of an
-    // --include header or of the runtime's extern support, or a macro.
+    // An extern fn, through a trampoline the C half defines (it may be static, or a macro).
     V GenExternCall(Call *c, FnSpec *callee, vector<Node *> &an) {
         if (callee->rets.size() > 1) No(c->line, "extern results");
         lastrets.clear();
@@ -7029,8 +7024,7 @@ struct TgFn {
         return Result(callee, callee->rets.empty() ? -1 : 0, M.ExternSig(callee), tyg_direct(sym), args);
     }
 
-    // print(...) (§3.7): every argument is evaluated before any text is written, as the C backend renders
-    // the whole line first (B_PRINT).
+    // print(...) (§3.7): every argument is evaluated before any text is written (B_PRINT).
     static TypeExpr *PlainPointee(TypeExpr *t) {
         while (t && IsPlainRef(t)) t = t->ref->sub;
         return t;
@@ -7063,22 +7057,19 @@ struct TgFn {
             CallC("gs_out_nl", {}, {}, nullptr);
             return V {};
         }
-        struct Out {
-            string fn;
-            vector<tyg_val> args;
-            vector<const tyg_type *> types;
+        vector<std::function<void()>> outs;   // The calls, made once every argument is evaluated.
+        auto bytes = [&](tyg_val ptr, tyg_val len) {
+            outs.push_back([=] { CallC("gs_out_bytes", { tyg_type_ptr(m), IT(TYG_I64) }, { ptr, len }, nullptr); });
         };
-        vector<Out> outs;
-        auto bytes = [&](vector<tyg_val> args) {
-            outs.push_back({ "gs_out_bytes", args, { tyg_type_ptr(m), IT(TYG_I64) } });
+        auto scalar = [&](const char *fn, tyg_val v, const tyg_type *ty) {
+            outs.push_back([=] { CallC(fn, { ty }, { v }, nullptr); });
         };
-        auto scalar = [&](const char *fn, tyg_val v, const tyg_type *ty) { outs.push_back({ fn, { v }, { ty } }); };
         for (auto a : an) {
             if (auto s = Is<StrLit>(a)) {
-                bytes({ tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)), I64((int64_t)s->val.size()) });
+                bytes(tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)), I64((int64_t)s->val.size()));
             } else if (PrintsAsBytes(PlainPointee(a->exprtype))) {
                 auto v = ViewOf(Place(a), a->line);
-                bytes({ v.elems, v.len });
+                bytes(v.elems, v.len);
             } else {
                 auto ot = cg.OperandT(a->exprtype);
                 if (ot->kind == TY_INT && ot->intstorage == IS_U64) scalar("gs_out_uint", GenAs(a, ot).v, IT(TYG_I64, false));
@@ -7089,16 +7080,15 @@ struct TgFn {
             }
         }
         if (Ended()) return V {};
-        for (auto &o : outs) CallC(o.fn, o.types, o.args, nullptr);
+        for (auto &o : outs) o();
         CallC("gs_out_nl", {}, {}, nullptr);
         return V {};
     }
 
     // ---- Optionals -----------------------------------------------------------
 
-    // Optionals (§3.8) as the C backend lowers them: a T? is the address a T& would be, 0 for null (a
-    // resizable's fat reference with a null hdr), so a narrowed one is used as that reference, and a
-    // test reads the address alone (Binary::CgX, GenTruth).
+    // Optionals (§3.8) as the C backend lowers them: a T? is the address a T& would be, 0 for null (a fat
+    // reference with a null hdr), so a narrowed one is used as that reference (Binary::CgX, GenTruth).
 
     // A reference that is an address: a plain one, or an optional one the checker has narrowed.
     static bool IsAddrRef(const TypeExpr *t) { return IsPlainRef(t) || TgModule::OptRef(t); }
@@ -7135,8 +7125,7 @@ struct TgFn {
             x = Gen(n);
         return Ended() ? I64(0) : Addr(x, n->line);
     }
-    // Whether a condition is an optional's null test: an optional variable (narrowed or not), or a value
-    // of an optional type.
+    // Whether a condition is an optional's null test: an optional variable or a value of optional type.
     bool OptCond(Node *n) {
         if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->type && IsOptional(id->vdef->type)) return true;
         return n->exprtype && IsOptional(n->exprtype);
@@ -7148,8 +7137,7 @@ struct TgFn {
         auto r = RefAddr(b->right);
         return ValV(M.ast.booltype, Cmp(b->op == T_EQ || b->op == T_DOTEQ ? TYG_EQ : TYG_NE, l, r));
     }
-    // An optional's text (CodeGen::RenderLoc): `null`, or its pointee's (a list's pointee reaches its own
-    // type, so a render procedure does it: RenderInto).
+    // An optional's text (CodeGen::RenderLoc): `null`, or its pointee's.
     void RenderOpt(tyg_val stk, tyg_addr len, const P &pl, bool nested, Line l, int depth) {
         // A relative link's offset decodes to its address, null for 0.
         auto at = TgModule::IsRel(pl.t) ? RelLoad(pl, l) : Ld(pl.a);
@@ -7249,8 +7237,7 @@ struct TgFn {
         return Sub(LdL(q), at);
     }
 
-    // An arm whose value `build` makes in place: its statements, then its tail built there, in a scope
-    // of its own.
+    // An arm whose value `build` makes in place: its statements, then its tail built there.
     template <class F> void BuildArm(Node *n, Line l, F build) {
         if (auto b = Is<Block>(n)) {
             InScope([&] {
@@ -7267,8 +7254,7 @@ struct TgFn {
         build(n);
         CloseScope();
     }
-    // A function value's call whose value is built in place: its parameters bound in a scope of its own,
-    // then its body as an arm.
+    // A function value's call built in place: its parameters bound in a scope, then its body as an arm.
     template <class F> void BuildFv(Call *c, Line l, F build) {
         if (c->fvparams.size() > c->args.size()) No(c->line, "function value parameters");
         InScope([&] {
@@ -7305,14 +7291,13 @@ struct TgFn {
         return x;
     }
 
-    // The type a value is carried in between blocks: a relative reference is an offset from its own
-    // slot, so a temporary holds the plain one.
+    // The type a value is carried in between blocks: a relative reference is an offset from its own slot,
+    // so a temporary holds the plain one.
     TypeExpr *Carry(TypeExpr *t) {
         if (t && TgModule::IsRel(t) && !TgModule::IsVr(t)) return M.ast.RefTo(t->ref->sub, Line {}, t->ref->optional);
         return t;
     }
-    // An image or a resizable value of n built on a temporary's stack, each arm or exit building it
-    // there (GenImg, GenRz); false if et is neither.
+    // An image or resizable value of n built on a temporary's stack (GenImg, GenRz); false if et is neither.
     bool InPlaceValue(Node *n, TypeExpr *et, Line l, V &x) {
         if (IsImg(et) && M.ImgOk(et)) {
             x = MemV(et, AtV(GenImg(n, Stk(AllocStk(false, l), l), et, l)));
@@ -7332,16 +7317,15 @@ struct TgFn {
         return InPlaceValue(n, et, n->line, x);
     }
 
-    // What every valued control construct shares: its result temporary (or the pool-reference slot a
-    // caller handed down).
+    // What every valued control construct shares: its result temporary (or a pool-reference slot).
     struct Ctl {
         tyg_local res = 0;
         bool pr = false, valued = false;
         TypeExpr *et = nullptr;
         V w;   // The value, where n was built in place.
     };
-    // Starts construct n. True when n was built in place (value in k.w); otherwise k is set up. `gate`
-    // false: n gives no value (an if without else, a loop without a break value).
+    // Starts construct n: true if built in place (value in k.w), else k is set up. `gate` false: n gives
+    // no value (an if without else, a loop without a break value).
     bool CtlBegin(Ctl &k, Node *n, bool discard, const InPlace *ip, bool gate) {
         k.pr = TakePref(k.res);
         if (gate && !ip && !k.pr && WantInPlace(n, discard, k.w)) return true;
@@ -7419,8 +7403,7 @@ struct TgFn {
         Branch(c, hit, next);
         SetBlock(next);
     }
-    // An integer match (MatchExpr::CgAny): the scrutinee evaluated once, then the arms tested in
-    // order, each value or range at the scrutinee's type (unsigned for an unsigned one).
+    // An integer match (MatchExpr::CgAny): the scrutinee evaluated once, the arms tested in order.
     V GenMatch(MatchExpr *me, bool discard, const InPlace *ip = nullptr) {
         Ctl k;
         if (CtlBegin(k, me, discard, ip, true)) return k.w;
@@ -7454,12 +7437,9 @@ struct TgFn {
     }
 
     // ---- ADTs ------------------------------------------------------------------
-    //
-    // Fixed-mode ADTs and variants as the C backend builds and reads them (TgModule's ADT section has
-    // the layout): literals and constants, a variant adapted to its ADT (CodeGen::AdaptToFixed), payload
-    // fields, `match` (MatchExpr::CgAny) and case-function dispatch (CodeGen::EmitDispatch), each a chain
-    // of tag compares in variant order (tinygen has no switch), with GS_UNREACHABLE's abort past the last
-    // under --debug.
+    // Fixed-mode ADTs and variants as the C backend builds and reads them (TgModule's ADT section has the
+    // layout): `match` and case-function dispatch (CodeGen::EmitDispatch) are chains of tag compares in
+    // variant order (no switch), with GS_UNREACHABLE's abort past the last under --debug.
 
     // The ADT a scrutinee is, or refers to, if a fixed-mode one.
     static TypeExpr *AdtOf(TypeExpr *t) {
@@ -7508,12 +7488,11 @@ struct TgFn {
     // A payload-less variant constant (Dot::CgX).
     V GenVariantConst(Dot *d) {
         auto t = d->exprtype;
-        if (M.RbOk(t)) {
-            auto x = RzTemp(t, d->line);
-            GenRb(d, x.stk, x.a, t, d->line);
+        if (M.RbOk(t) || M.VmOk(t)) {
+            V x;
+            if (!InPlaceValue(d, t, d->line, x)) No(d->line, "variant constant");
             return x;
         }
-        if (M.VmOk(t)) return MemV(t, AtV(GenImg(d, Stk(AllocStk(false, d->line), d->line), t, d->line)));
         if (!M.TypeOk(t)) No(d->line, cat("variant constant of type ", M.NameWhy(t)));
         auto x = MemTemp(t, true);
         if (t->kind == TY_ENUM) StoreTag(x.a, t, d->einst->en->VariantIndex(d->variantconst));
@@ -7524,14 +7503,12 @@ struct TgFn {
         auto vi = M.VariantIdx(base.t);
         return P { AddrPlus(base.a, cg.VariantLayout(ei, vi).offs[fieldidx]), ei->vftypes[vi][fieldidx] };
     }
-    // Past the last variant: a corrupt tag, which --debug reports (GS_UNREACHABLE) and a release build
-    // assumes away.
+    // Past the last variant: a corrupt tag, reported under --debug (GS_UNREACHABLE), else assumed away.
     void BadTag(Line l) {
         if (M.checks) Abort("TAG", l);
         else tyg_unreachable(p);
     }
-    // The ADT value a match or dispatch reads: in memory (a copy of this frame's, the C's sv), its tag
-    // read once, kept in a local.
+    // The ADT value a match or dispatch reads, in memory, its tag read once into a local.
     struct Scrut {
         V v;
         TypeExpr *adt;
@@ -7543,8 +7520,7 @@ struct TgFn {
         return Scrut { MemV(adt, a), adt, Local(LoadTag(a, adt)) };
     }
     Scrut AdtScrutinee(Node *n, TypeExpr *adt) {
-        // A resizable or variable-mode value is read where it lies (a resizable's header holds where
-        // its bytes start), its tag first.
+        // A resizable or variable-mode value is read where it lies (a resizable's header holds its address).
         if (M.RbOk(adt)) {
             auto pl = Deref(Place(n));
             return ScrutAt(adt, Ended() ? tyg_addr {} : AtV(Ld(pl.a)));
@@ -7654,8 +7630,7 @@ struct TgFn {
         Scrut s {};
         tyg_local copied = 0;
         auto havecopy = false;
-        vector<tyg_local> shared(an.size());
-        vector<vector<tyg_arg>> valargs(an.size());   // By-value arrays', built once.
+        vector<vector<tyg_arg>> shared(an.size());   // The others' arguments, built once.
         auto copyval = [&] {
             // The whole variable-mode value copied before the later arguments run (CodeGen::EmitDispatch).
             if (Ended() || !M.IsVm(adt) ||
@@ -7671,17 +7646,20 @@ struct TgFn {
                 s = pt->kind == TY_REF ? ScrutAt(adt, Deref(Place(an[i])).a) : AdtScrutinee(an[i], adt);
                 copyval();
             } else if (cg.IsPoolParam(sp0, i)) {
-                shared[i] = tyg_local_new(p, 32, 8);   // A pool reference, kept as its 32 bytes (GenPrefVal).
-                PrefInto(AtL(shared[i]), an[i]);
+                auto l = tyg_local_new(p, 32, 8);   // A pool reference, kept as its 32 bytes (GenPrefVal).
+                PrefInto(AtL(l), an[i]);
+                for (int k = 0; k < 4 && !Ended(); k++) shared[i].push_back(ArgByVal(LdL(l, 8 * k)));
             } else if (M.RzParam(pt)) {
-                ValArg(an[i], pt, valargs[i]);
+                ValArg(an[i], pt, shared[i]);
             } else {
                 if (!M.TypeOk(pt)) No(an[i]->line, "argument of this type");
                 auto x = GenAs(an[i], pt);
-                shared[i] = Temp(pt);
+                auto l = Temp(pt);
                 if (Ended()) continue;
-                if (M.IsScalar(pt)) tyg_store(p, M.Scal(pt), AtL(shared[i]), x.v, 0);
-                else tyg_copy(p, AtL(shared[i]), x.a, M.Size(pt));
+                if (M.IsScalar(pt)) tyg_store(p, M.Scal(pt), AtL(l), x.v, 0);
+                else tyg_copy(p, AtL(l), x.a, M.Size(pt));
+                shared[i].push_back(M.IsScalar(pt) ? ArgByVal(tyg_load(p, M.Scal(pt), AtL(l), 0))
+                                    : cg.IsLargeFixed(pt) ? ArgByVal(tyg_addr_of(p, AtL(l))) : ArgInMem(AtL(l)));
             }
         }
         auto cret = cg.sinfo[sp0].cret;
@@ -7720,14 +7698,8 @@ struct TgFn {
                     if (havecopy) cs.v.a = AtV(LdL(copied));
                     CopyPayload(cs, (int)vi, AtL(t));
                     args.push_back(cg.IsLargeFixed(pt) ? ArgByVal(tyg_addr_of(p, AtL(t))) : ArgInMem(AtL(t)));
-                } else if (cg.IsPoolParam(sp, i)) {
-                    for (int k = 0; k < 4; k++) args.push_back(ArgByVal(LdL(shared[i], 8 * k)));
-                } else if (M.RzParam(pt)) {
-                    args.insert(args.end(), valargs[i].begin(), valargs[i].end());
-                } else if (M.IsScalar(pt)) {
-                    args.push_back(ArgByVal(tyg_load(p, M.Scal(pt), AtL(shared[i]), 0)));
                 } else {
-                    args.push_back(cg.IsLargeFixed(pt) ? ArgByVal(tyg_addr_of(p, AtL(shared[i]))) : ArgInMem(AtL(shared[i])));
+                    args.insert(args.end(), shared[i].begin(), shared[i].end());
                 }
             }
             FvArgs(c, ci, args);
@@ -7896,10 +7868,10 @@ struct TgFn {
         if (!Ended()) St(len, Ld(hlen));
     }
 
-    // return, return x, return a, b (each result in turn, the ones the C does not return written through
-    // their channels as they are made, as the C does), or return f() forwarding all of a call's results
-    // (§7.1). A resizable result is built at its destination stack, its count written through its
-    // out-parameter. Then every scope's stacks are restored, and the C return value returned.
+    // return, return x, return a, b (results the C does not return are written through their channels as
+    // they are made), or return f() forwarding all of a call's results (§7.1). A resizable result is built at
+    // its destination stack, its count written through its out-parameter. Then every scope's stacks are
+    // restored, and the C return value returned.
     void DoReturn(const vector<Node *> &vals, Line l) {
         auto &rets = sp->rets;
         auto cret = cg.sinfo[sp].cret;
