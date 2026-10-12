@@ -1921,6 +1921,8 @@ struct TgFn {
         TypeExpr *t = nullptr;
         tyg_val stk = 0;   // A resizable's stack, its header at a.
     };
+    static V MemV(TypeExpr *t, tyg_addr a, tyg_val stk = 0) { return V { 0, a, true, t, stk }; }
+    static V ValV(TypeExpr *t, tyg_val v) { return V { v, {}, false, t, 0 }; }
     // A place: memory holding a value of type t, and for a resizable
     // array the stack its elements grow on, where known (else 0).
     struct P {
@@ -2842,12 +2844,7 @@ struct TgFn {
 
     // A resizable temporary: a stack of the statement's, its header.
     V RzTemp(TypeExpr *t, Line l) {
-        V x;
-        x.t = t;
-        x.mem = true;
-        x.stk = Stk(AllocStk(false, l), l);
-        x.a = AtL(tyg_local_new(p, 16, 8));
-        return x;
+        return MemV(t, AtL(tyg_local_new(p, 16, 8)), Stk(AllocStk(false, l), l));
     }
 
     // ---- Conversions -------------------------------------------------------
@@ -2904,11 +2901,7 @@ struct TgFn {
             // A variant, or a fixed-mode ADT, wanted as a variable-mode one:
             // its image on a temporary's stack.
             auto stk = Stk(AllocStk(false, l), l);
-            V r;
-            r.t = want;
-            r.mem = true;
-            r.a = AtV(VmFrom(stk, x.a, x.t, want, l));
-            return r;
+            return MemV(want, AtV(VmFrom(stk, x.a, x.t, want, l)));
         }
         if (x.t->kind == TY_VARIANT && want->kind == TY_ENUM && x.mem) return AdaptToAdt(x, want, l);
         if (x.t->kind == TY_ENUM && want->kind == TY_ENUM && x.mem && M.IsVm(x.t) && !M.IsVm(want) &&
@@ -3451,20 +3444,13 @@ struct TgFn {
             auto tmp = tyg_local_new(p, 16, 8);
             StL(tmp, tyg_addr_of(p, pl.a));
             StL(tmp, pl.stk, 8);
-            V x;
-            x.t = t;
-            x.mem = true;
-            x.a = AtL(tmp);
-            return x;
+            return MemV(t, AtL(tmp));
         }
         if (t && IsAddrRef(t) && n->exprtype && IsImg(n->exprtype) && M.ImgOk(t->ref->sub)) {
             // A T[] (or a variable-size struct) where a reference to one is
             // wanted, plain or optional: its image's address.
             auto pl = Deref(Place(n));
-            V x;
-            x.t = t;
-            x.v = Ended() ? I64(0) : tyg_addr_of(p, pl.a);
-            return x;
+            return ValV(t, Ended() ? I64(0) : tyg_addr_of(p, pl.a));
         }
         return Fit(Gen(n), t, n->line);
     }
@@ -3509,16 +3495,10 @@ struct TgFn {
             case NK_SelfRef: {
                 // `self` in a literal built where it lies: its start.
                 if (!selfbase) No(n->line, "self outside a literal built in place");
-                V x;
-                x.t = n->exprtype;
-                x.v = selfbase;
-                return x;
+                return ValV(n->exprtype, selfbase);
             }
             case NK_BoolLit: {
-                V x;
-                x.t = M.ast.booltype;
-                x.v = tyg_iconst(p, TYG_I8, static_cast<BoolLit *>(n)->val ? 1 : 0);
-                return x;
+                return ValV(M.ast.booltype, tyg_iconst(p, TYG_I8, static_cast<BoolLit *>(n)->val ? 1 : 0));
             }
             case NK_Ident: {
                 auto pl = Place(n);
@@ -3543,21 +3523,13 @@ struct TgFn {
                 if (t && t->kind == TY_ARRAY && t->arr->akind == A_FIXED && IsU8(t->arr->sub) &&
                     M.TypeOk(t) && (int64_t)val.size() == cg.FixedSize(t)) {
                     // A u8[k] of exactly its bytes (§4.2): they, where they lie.
-                    V x;
-                    x.t = t;
-                    x.mem = true;
-                    x.a = tyg_at_sym(M.Bytes(val), 0);
-                    return x;
+                    return MemV(t, tyg_at_sym(M.Bytes(val), 0));
                 }
                 if (!t || t->kind != TY_SLICE || !IsU8(t->sub)) No(n->line, "string of this type");
                 auto tmp = tyg_local_new(p, 16, 8);
                 StL(tmp, tyg_addr_of(p, tyg_at_sym(M.Bytes(val), 0)));
                 StL(tmp, I64((int64_t)val.size()), 8);
-                V x;
-                x.t = t;
-                x.mem = true;
-                x.a = AtL(tmp);
-                return x;
+                return MemV(t, AtL(tmp));
             }
             case NK_Unary: return GenUnary(static_cast<Unary *>(n));
             case NK_Binary: return GenBinary(static_cast<Binary *>(n));
@@ -3597,28 +3569,18 @@ struct TgFn {
                 auto tmp = tyg_local_new(p, 16, 8);
                 StL(tmp, tyg_addr_of(p, pl.a));
                 StL(tmp, pl.stk, 8);
-                V x;
-                x.t = et;
-                x.mem = true;
-                x.a = AtL(tmp);
-                return x;
+                return MemV(et, AtL(tmp));
             }
             if (et && et->kind == TY_REF) {
                 if (!IsPlainRef(et) && !M.OptRef(et) && !(TgModule::IsRel(et) && M.RelOk(et, 1)))
                     No(u->line, "reference kind");
                 auto pl = Deref(Place(u->child));
-                V x;
-                x.t = et;
-                x.v = tyg_addr_of(p, pl.a);
-                return x;
+                return ValV(et, tyg_addr_of(p, pl.a));
             }
             return Load(Deref(Place(u->child)), u->line);
         }
         if (u->op == T_NOT && OptCond(u->child)) {
-            V x;
-            x.t = M.ast.booltype;
-            x.v = Cmp(TYG_EQ, OptTest(u->child), tyg_iconst(p, TYG_I8, 0));
-            return x;
+            return ValV(M.ast.booltype, Cmp(TYG_EQ, OptTest(u->child), tyg_iconst(p, TYG_I8, 0)));
         }
         auto ot = cg.OperandT(u->child->exprtype);
         if (u->op == T_MINUS && (ot->kind == TY_STRUCT || ot->kind == TY_ARRAY)) {
@@ -4054,9 +4016,7 @@ struct TgFn {
         tyg_store(p, TYG_I8, AtL(res), tyg_iconst(p, TYG_I8, 0), 0);
         tyg_jump(p, done);
         SetBlock(done);
-        V x;
-        x.t = M.ast.booltype;
-        x.v = tyg_load(p, TYG_I8, AtL(res), 0);
+        V x = ValV(M.ast.booltype, tyg_load(p, TYG_I8, AtL(res), 0));
         if (b->op == T_NEQ) x.v = Cmp(TYG_EQ, x.v, tyg_iconst(p, TYG_I8, 0));
         return x;
     }
@@ -4206,9 +4166,7 @@ struct TgFn {
             tyg_store(p, TYG_I8, AtL(res), tyg_iconst(p, TYG_I8, 0), 0);
             tyg_jump(p, done);
             SetBlock(done);
-            V x;
-            x.t = M.ast.booltype;
-            x.v = tyg_load(p, TYG_I8, AtL(res), 0);
+            V x = ValV(M.ast.booltype, tyg_load(p, TYG_I8, AtL(res), 0));
             if (b->op == T_NEQ) x.v = Cmp(TYG_EQ, x.v, tyg_iconst(p, TYG_I8, 0));
             return x;
         }
@@ -4224,9 +4182,7 @@ struct TgFn {
         tyg_store(p, TYG_I8, AtL(res), Cmp(TYG_EQ, d, tyg_iconst(p, TYG_I32, 0)), 0);
         tyg_jump(p, done);
         SetBlock(done);
-        V x;
-        x.t = M.ast.booltype;
-        x.v = tyg_load(p, TYG_I8, AtL(res), 0);
+        V x = ValV(M.ast.booltype, tyg_load(p, TYG_I8, AtL(res), 0));
         if (b->op == T_NEQ) x.v = Cmp(TYG_EQ, x.v, tyg_iconst(p, TYG_I8, 0));
         return x;
     }
@@ -4345,11 +4301,7 @@ struct TgFn {
         if (IsImg(t) && M.ImgOk(t)) {
             // An image: built at the top of a temporary's stack.
             auto stk = Stk(AllocStk(false, sl->line), sl->line);
-            V x;
-            x.t = t;
-            x.mem = true;
-            x.a = AtV(GenImg(sl, stk, t, sl->line));
-            return x;
+            return MemV(t, AtV(GenImg(sl, stk, t, sl->line)));
         }
         if (t->kind == TY_VARIANT || t->kind == TY_ENUM) return GenVariantLit(sl);
         if (!sl->sinst || sl->variant || t->kind != TY_STRUCT || !M.TypeOk(t))
@@ -4369,11 +4321,7 @@ struct TgFn {
                 No(sl->line, "self-relative link in a literal");
             Into(P { AtL(tmp, lay.offs[i]), ft }, init);
         }
-        V x;
-        x.t = t;
-        x.mem = true;
-        x.a = AtL(tmp);
-        return x;
+        return MemV(t, AtL(tmp));
     }
 
     // ---- Arrays and slices -------------------------------------------------
@@ -4492,10 +4440,7 @@ struct TgFn {
         } else {
             len = ViewOf(Place(obj), n->line).len;
         }
-        V x;
-        x.t = M.ast.inttypes[IS_I64];
-        x.v = len;
-        return x;
+        return ValV(M.ast.inttypes[IS_I64], len);
     }
 
     // A slice { data, len } in a temporary.
@@ -4503,11 +4448,7 @@ struct TgFn {
         auto tmp = tyg_local_new(p, 16, 8);
         StL(tmp, data);
         StL(tmp, len, 8);
-        V x;
-        x.t = t;
-        x.mem = true;
-        x.a = AtL(tmp);
-        return x;
+        return MemV(t, AtL(tmp));
     }
 
     // A value at a slice destination: a whole array there is a view of the
@@ -4607,11 +4548,7 @@ struct TgFn {
         if (t && IsImg(t) && M.ImgOk(t)) {
             // An image: built at the top of a temporary's stack.
             auto stk = Stk(AllocStk(false, al->line), al->line);
-            V x;
-            x.t = t;
-            x.mem = true;
-            x.a = AtV(GenImg(al, stk, t, al->line));
-            return x;
+            return MemV(t, AtV(GenImg(al, stk, t, al->line)));
         }
         if (t && IsGrow(t) && (M.RzOk(t) || M.VeOk(t))) {
             auto x = RzTemp(t, al->line);
@@ -4665,11 +4602,7 @@ struct TgFn {
             for (size_t i = 0; i < al->elems.size(); i++)
                 Into(P { AtL(tmp, (int64_t)i * esz), et }, al->elems[i]);
         }
-        V x;
-        x.t = t;
-        x.mem = true;
-        x.a = AtL(tmp);
-        return x;
+        return MemV(t, AtL(tmp));
     }
 
     // ---- Limited arrays T[..k] ---------------------------------------------
@@ -4715,11 +4648,7 @@ struct TgFn {
         return pl;
     }
     V LimValue(const P &pl) {
-        V x;
-        x.t = pl.t;
-        x.mem = true;
-        x.a = pl.a;
-        return x;
+        return MemV(pl.t, pl.a);
     }
     // .cap: the type's.
     V GenCap(Dot *d) {
@@ -5372,10 +5301,7 @@ struct TgFn {
             if (Ended()) return Dummy(c->exprtype);
             auto d = Sub(r.v, v.elems);
             auto ix = tyg_bin(p, TYG_SDIV, d, I64(std::max<int64_t>(cg.FixedSize(v.elem), 1)));
-            V x;
-            x.t = c->exprtype;
-            x.v = Conv(ix, M.ast.inttypes[IS_I64], c->exprtype, c->line);
-            return x;
+            return ValV(c->exprtype, Conv(ix, M.ast.inttypes[IS_I64], c->exprtype, c->line));
         }
         if ((c->builtin == B_ALLOC_INDEX || c->builtin == B_ALLOC_REF || c->builtin == B_FREE) &&
             c->ArgNodes().size() == 2)
@@ -5425,11 +5351,7 @@ struct TgFn {
                 auto v = ViewOf(P { AtL(tmp), rt }, c->line);
                 return SliceValue(c->exprtype, v.elems, v.len);
             }
-            V y;
-            y.t = rt;
-            y.mem = true;
-            y.a = AtL(tmp);
-            return y;
+            return MemV(rt, AtL(tmp));
         }
         if (c->builtin == B_TO_BYTES && c->ArgNodes().size() == 2) {
             // Appended to a u8 resizable.
@@ -5473,10 +5395,7 @@ struct TgFn {
             // Zero bytes (CodeGen::EmitDefaultInto).
             auto t = c->rettypes[0];
             if (M.IsScalar(t)) return Dummy(t);
-            V x;
-            x.t = t;
-            x.mem = true;
-            x.a = AtL(Temp(t));
+            V x = MemV(t, AtL(Temp(t)));
             tyg_zero(p, x.a, M.Size(t));
             return x;
         }
@@ -5498,18 +5417,11 @@ struct TgFn {
             }
             if (Ended()) return Dummy(t);
             if (M.IsScalar(t)) return Load(pl, c->line);
-            V x;
-            x.t = t;
-            x.mem = true;
-            x.a = pl.a;
-            return x;
+            return MemV(t, pl.a);
         }
         if (c->builtin == B_HARDWARE_THREADS) {
             // The runtime's count, capped by the thread limit.
-            V x;
-            x.t = c->exprtype;
-            x.v = CallC("gs_hardware_threads", {}, {}, IT(TYG_I64));
-            return x;
+            return ValV(c->exprtype, CallC("gs_hardware_threads", {}, {}, IT(TYG_I64)));
         }
         if ((c->builtin == B_EMBED_FILE || c->builtin == B_EMBED_SHADER) && c->shaderblob &&
             c->rettypes.size() == 1) {
@@ -5519,11 +5431,7 @@ struct TgFn {
             auto t = Temp(c->rettypes[0]);
             StL(t, tyg_addr_of(p, tyg_at_sym(M.Bytes(blob), 0)));
             StL(t, I64((int64_t)blob.size()), 8);
-            V x;
-            x.t = c->rettypes[0];
-            x.mem = true;
-            x.a = AtL(t);
-            return x;
+            return MemV(c->rettypes[0], AtL(t));
         }
         if (c->builtin == B_THREAD_WAIT) return GenThreadWait(c);
         if (c->builtin == B_THREAD_SPAWN) return GenThreadSpawn(c);
@@ -6589,11 +6497,7 @@ struct TgFn {
             // its elements (GenRc).
             auto stk = Stk(AllocStk(false, c->line), c->line);
             auto at = GenImg(c, stk, t, c->line);
-            V r;
-            r.t = t;
-            r.mem = true;
-            r.a = AtV(at);
-            return r;
+            return MemV(t, AtV(at));
         }
         if (t && TgModule::IsLim(t) && M.TypeOk(t) && IsU8(t->arr->sub)) {
             // Typed as a static-capacity u8[..k]: the text rendered as a
@@ -6815,9 +6719,7 @@ struct TgFn {
             SetBlock(keep);
             PatchPrefix(LdL(start), t, LdL(cnt), r.stk);
             r.a = AtV(LdL(start));
-            V ok;
-            ok.t = M.ast.booltype;
-            ok.v = tyg_convert(p, TYG_TRUNC, TYG_I8, LdL(okl));
+            V ok = ValV(M.ast.booltype, tyg_convert(p, TYG_TRUNC, TYG_I8, LdL(okl)));
             return { r, ok };
         }
         St(r.a, Top(r.stk));
@@ -6831,9 +6733,7 @@ struct TgFn {
         St(rlen, LdL(cnt));
         tyg_jump(p, out);
         SetBlock(out);
-        V ok;
-        ok.t = M.ast.booltype;
-        ok.v = tyg_convert(p, TYG_TRUNC, TYG_I8, LdL(okl));
+        V ok = ValV(M.ast.booltype, tyg_convert(p, TYG_TRUNC, TYG_I8, LdL(okl)));
         return { r, ok };
     }
     vector<V> GenCallAll(Node *n, size_t count) {
@@ -7134,9 +7034,7 @@ struct TgFn {
             lastrets.clear();
             lastrets.push_back(x);
             if (poll) {
-                V got;
-                got.t = M.ast.booltype;
-                got.v = Cmp(TYG_NE, node, I64(0));
+                V got = ValV(M.ast.booltype, Cmp(TYG_NE, node, I64(0)));
                 lastrets.push_back(got);
             }
             return x;
@@ -7375,10 +7273,7 @@ struct TgFn {
     V GenRefEq(Binary *b) {
         auto l = RefAddr(b->left);
         auto r = RefAddr(b->right);
-        V x;
-        x.t = M.ast.booltype;
-        x.v = Cmp(b->op == T_EQ || b->op == T_DOTEQ ? TYG_EQ : TYG_NE, l, r);
-        return x;
+        return ValV(M.ast.booltype, Cmp(b->op == T_EQ || b->op == T_DOTEQ ? TYG_EQ : TYG_NE, l, r));
     }
     // An optional's text (CodeGen::RenderLoc): `null`, or its pointee's.
     // A pointee that reaches its own type (a list) is rendered by a render
@@ -7814,10 +7709,7 @@ struct TgFn {
         return t && t->kind == TY_ENUM ? t : nullptr;
     }
     V MemTemp(TypeExpr *t, bool zero) {
-        V x;
-        x.t = t;
-        x.mem = true;
-        x.a = AtL(Temp(t));
+        V x = MemV(t, AtL(Temp(t)));
         if (zero) tyg_zero(p, x.a, M.Size(t));
         return x;
     }
@@ -7876,11 +7768,7 @@ struct TgFn {
         if (M.VmOk(t)) {
             // A variable-mode value: its image on a temporary's stack.
             auto stk = Stk(AllocStk(false, d->line), d->line);
-            V x;
-            x.t = t;
-            x.mem = true;
-            x.a = AtV(GenImg(d, stk, t, d->line));
-            return x;
+            return MemV(t, AtV(GenImg(d, stk, t, d->line)));
         }
         if (!M.TypeOk(t)) No(d->line, cat("variant constant of type ", M.NameWhy(t)));
         auto x = MemTemp(t, true);
