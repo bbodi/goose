@@ -306,18 +306,20 @@ Run time of `bench/goose` programs at medium size, in milliseconds:
 
 | Program | tinygen | C `--debug` (`cc -O0`) | C default (`cc -O2`) |
 |---|---|---|---|
-| sum | 142 | 630 | 34 |
-| calc | 267 | 694 | 108 |
-| sexp | 731 | 1987 | 335 |
-| lru | 515 | 950 | 138 |
-| scene | 145 | 1158 | 38 |
-| blur | 131 | 2659 | 14 |
-| particles | 363 | (aborts, see below) | 141 |
+| sum | 76 | 626 | 34 |
+| push | 58 | 311 | 36 |
+| calc | 190 | 694 | 108 |
+| sexp | 601 | 2011 | 333 |
+| lru | 356 | 945 | 136 |
+| graph | 422 | 897 | 384 |
+| scene | 122 | 1158 | 38 |
+| blur | 99 | 2678 | 14 |
+| particles | 360 | (aborts, see below) | 141 |
 
-tinygen beats `cc -O0` on every benchmark. It is 2 to 10 times slower than
-`cc -O2`, most of all in tight loops such as blur's. particles' `--debug`
-build aborts on a lossy `as` conversion, which its checks are meant to
-catch.
+tinygen beats `cc -O0` on every benchmark, by 2 to 27 times. It is 1.1 to 7
+times slower than `cc -O2`, most of all in tight loops such as blur's.
+particles' `--debug` build aborts on a lossy `as` conversion, which its
+checks are meant to catch.
 
 ## What tinygen lacks
 
