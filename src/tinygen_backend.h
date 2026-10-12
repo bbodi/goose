@@ -2167,9 +2167,8 @@ struct TgFn {
             return;
         }
         if (DestSpec(c) && IsGrow(DestSpec(c)->rets[0])) {
-            if (cg.Mangle(DestSpec(c)->rets[0]->arr->sub) != cg.Mangle(et)) No(l, "result of another element type");
-            CallRz(c, stk, hdr);
-            return;
+            SameElem(DestSpec(c)->rets[0]->arr->sub, et, l);
+            return CallRz(c, stk, hdr);
         }
         auto pl = ElemsSource(n, l);
         if (Ended()) return;
@@ -2243,10 +2242,7 @@ struct TgFn {
         // A literal's fields in turn: pads and absent fields zeroed, the tail built by `tail`.
         auto fields = [&](StructLit *sl, auto &fs, auto &fts, int tailfi, auto tail) {
             for (size_t i = 0; i < fs.size() && !Ended(); i++) {
-                if (fs[i].ispad) {
-                    zero(fs[i].padsize);
-                    continue;
-                }
+                if (fs[i].ispad) { zero(fs[i].padsize); continue; }
                 auto init = sl->InitFor((int)i);
                 if (init && Is<SelfRef>(init)) No(l, "self reference in a resizable ADT");
                 if ((int)i == tailfi) tail(init, fts[i]);
@@ -2274,10 +2270,7 @@ struct TgFn {
             auto &fs = ei->en->variants[(size_t)vi].fields;
             auto sh = M.RbShapeOf(ei, vi);
             begin(vi);
-            if (sh.img) {   // Its fields in turn, as a variable-size variant's.
-                RunLit(sl, stk, fs, ei->vftypes[(size_t)vi]);
-                return;
-            }
+            if (sh.img) return RunLit(sl, stk, fs, ei->vftypes[(size_t)vi]);   // As a variable-size variant's.
             fields(sl, fs, ei->vftypes[(size_t)vi], sh.tailfi, [&](Node *init, TypeExpr *ft) {
                 if (sh.fo) {
                     if (!init) No(l, "resizable ADT without its frame object");
@@ -2288,19 +2281,13 @@ struct TgFn {
             });
             return;
         }
-        if (auto d = Is<Dot>(n); d && d->variantconst && adt && d->exprtype && cg.TEq(d->exprtype, t)) {
-            begin(ei->en->VariantIndex(d->variantconst));
-            return;
-        }
+        if (auto d = Is<Dot>(n); d && d->variantconst && adt && d->exprtype && cg.TEq(d->exprtype, t))
+            return begin(ei->en->VariantIndex(d->variantconst));
         if (DestSpec(c)) {
             auto rt = DestSpec(c)->rets[0];
-            if (cg.Mangle(rt) == cg.Mangle(t)) {
-                CallRz(c, stk, hdr);
-                return;
-            }
+            if (cg.Mangle(rt) == cg.Mangle(t)) return CallRz(c, stk, hdr);
             if (adt && rt->kind == TY_VARIANT && M.EI(rt) == ei && M.IsRb(rt)) {
-                // The variant behind the ADT's tag, built where the call puts its result;
-                // the header then starts at the tag.
+                // The variant behind the ADT's tag, built where the call puts its result; the header starts at the tag.
                 auto top = Top(stk);
                 auto start = Local(top);
                 StoreTag(AtV(top), t, M.VariantIdx(rt));
@@ -2309,7 +2296,7 @@ struct TgFn {
                 if (!Ended()) St(hdr, LdL(start));
                 return;
             }
-            if (adt && rt->kind == TY_VARIANT && M.EI(rt) == ei && !M.IsRb(rt) && M.IsVv(rt)) {
+            if (adt && rt->kind == TY_VARIANT && M.EI(rt) == ei && M.IsVv(rt)) {
                 begin(M.VariantIdx(rt));   // A variable-size variant, built behind the tag by the call.
                 CallImg(c, stk);
                 return;
@@ -2497,15 +2484,9 @@ struct TgFn {
             if (!n || from) No(l, cat("value of type ", M.NameWhy(t)));
             return M.IsVm(t) ? GenVm(n, stk, t, l) : M.IsVv(t) ? GenVv(n, stk, t, l) : GenVs(n, stk, t, l);
         }
-        if (auto c = Is<Call>(n); DestIs(c, t)) {
-            CallImg(c, stk);
-            return at();
-        }
+        if (auto c = Is<Call>(n); DestIs(c, t)) { CallImg(c, stk); return at(); }
         if (M.VarImgOk(t)) return GenImgOfImgs(n, stk, t, l, from, start);
-        if (M.IsRc(t)) {
-            GenRc(n, stk, t, l, from, at());
-            return at();
-        }
+        if (M.IsRc(t)) { GenRc(n, stk, t, l, from, at()); return at(); }
         SetTop(stk, Add(at(), I64(TgModule::PrefixBytes(t))));
         auto hdr = NewHdr();
         auto len = HdrLen(hdr);
@@ -2545,8 +2526,7 @@ struct TgFn {
         if (n && !from && !al && !Is<StrLit>(n) && !LimCallResult(n) && !OwnTypedCall(n) && !IsStrCall(n) &&
             n->exprtype && cg.TEq(n->exprtype, t)) {
             auto src = Deref(Place(n));
-            if (Ended()) return;
-            ImgCopy(stk, tyg_addr_of(p, src.a), t);
+            if (!Ended()) ImgCopy(stk, tyg_addr_of(p, src.a), t);
             return;
         }
         // The elements behind an 8-byte header, built as a resizable's are; then the
@@ -2620,45 +2600,31 @@ struct TgFn {
         return at();
     }
 
-    // The view of a's place as a local (source, byte count), for to_bytes.
-    tyg_local SpanOf(Node *a, Line l) {
+    // to_bytes (CodeGen::EmitToBytes, AppendBytes): the payload's byte count ULEB128, then its
+    // bytes, each handed to append(src, n).
+    template <class F> void ToBytesVia(Node *a, Line l, F append) {
         auto v = ViewOf(Place(a), l);
+        if (Ended()) return;
         auto sl = tyg_local_new(p, 16, 8);
-        if (Ended()) return sl;
         StL(sl, v.elems);
         StL(sl, RunBytes(v), 8);
-        return sl;
-    }
-    // to_bytes (CodeGen::EmitToBytes): the payload's byte count ULEB128, then its bytes,
-    // appended at the top of stk to the u8 count at len.
-    void ToBytesInto(tyg_val stk, tyg_addr len, Node *a, Line l) {
-        auto sl = SpanOf(a, l);
-        if (Ended()) return;
-        auto sz = [&] { return LdL(sl, 8); };
-        auto top = Top(stk);
-        auto pn = UlebWrite(top, sz());
-        tyg_move_dyn(p, Add(top, pn), LdL(sl), sz());
-        auto tot = Add(pn, sz());
-        SetTop(stk, Add(top, tot));
-        St(len, Add(Ld(len), tot));
-    }
-
-    // to_bytes appended to a limited u8 array: the count's ULEB128 and then the payload,
-    // each copied under the capacity check (CodeGen::AppendBytes).
-    void ToBytesIntoLim(const P &out, Node *a, Line l) {
-        auto sl = SpanOf(a, l);
-        if (Ended()) return;
         auto pfx = tyg_local_new(p, 16, 8);
         auto pn = Local(UlebWrite(tyg_addr_of(p, AtL(pfx)), LdL(sl, 8)));
-        auto append = [&](tyg_val from, tyg_val n) {
-            auto ol = Local(LimLen(out));
-            auto o = [&] { return LdL(ol); };
-            AbortUnless(Cmp(TYG_SLE, Add(o(), n), LimCapOf(out)), "CAPACITY", l);
-            tyg_move_dyn(p, ElemAddr(LimView(out), o()), from, n);
-            LimSetLen(out, Add(o(), n));
-        };
         append(tyg_addr_of(p, AtL(pfx)), LdL(pn));
         append(LdL(sl), LdL(sl, 8));
+    }
+    // Appended at the top of stk to the u8 count at len.
+    void ToBytesInto(tyg_val stk, tyg_addr len, Node *a, Line l) {
+        ToBytesVia(a, l, [&](tyg_val from, tyg_val n) { CopyBytes(stk, len, from, n, n); });
+    }
+    // Appended to a limited u8 array, each part copied under the capacity check.
+    void ToBytesIntoLim(const P &out, Node *a, Line l) {
+        ToBytesVia(a, l, [&](tyg_val from, tyg_val n) {
+            auto ol = Local(LimLen(out));
+            AbortUnless(Cmp(TYG_SLE, Add(LdL(ol), n), LimCapOf(out)), "CAPACITY", l);
+            tyg_move_dyn(p, ElemAddr(LimView(out), LdL(ol)), from, n);
+            LimSetLen(out, Add(LdL(ol), n));
+        });
     }
 
     // A resizable temporary: a stack of the statement's, its header.
