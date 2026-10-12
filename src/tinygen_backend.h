@@ -8011,11 +8011,9 @@ struct TgFn {
     }
 
     // ---- The verifier of an image's elements ---------------------------------
-    //
-    // gs_tg_verify_<T>(p, n, bm) (CodeGen::VerifyFn): the element count of the
-    // image at p, or -1 if its n bytes are not one. The walk of each type
-    // mirrors CodeGen::EmitVerifyWalk step for step, over a cursor `vq`;
-    // any failure jumps to `vfail`, which returns -1.
+    // gs_tg_verify_<T>(p, n, bm) (CodeGen::VerifyFn): the element count of the image at p, or -1 if its
+    // n bytes are not one. The walks mirror CodeGen::EmitVerifyWalk over a cursor `vq`; failure goes to
+    // `vfail`.
     tyg_val vP = 0, vN = 0, vBM = 0, vE = 0;
     tyg_local vq = 0;
     tyg_block vfail = 0;
@@ -8025,77 +8023,95 @@ struct TgFn {
     void VSetQ(tyg_val x) { StL(vq, x); }
     void VAddQ(tyg_val x) { VSetQ(Add(VQ(), x)); }
     tyg_local VNew() { return tyg_local_new(p, 8, 8); }
-    // The integer of `size` bytes at address `at`, widened to 64 bits.
+    tyg_val VBin(tyg_binop op, tyg_val a, tyg_val b) { return tyg_bin(p, op, a, b); }
+    tyg_val VAt() { return Add(vP, VQ()); }
+    // The `size`-byte integer at `at`, widened.
     tyg_val VLoad(tyg_val at, int64_t size, bool sgn) {
         auto s = size == 1 ? TYG_I8 : size == 2 ? TYG_I16 : size == 4 ? TYG_I32 : TYG_I64;
         auto x = tyg_load(p, s, AtV(at), 0);
         return size == 8 ? x : tyg_convert(p, sgn ? TYG_SEXT : TYG_ZEXT, TYG_I64, x);
     }
-    // Fail where `bad`, else go on.
-    void VFailIf(tyg_val bad) {
+    // Fail where `a c b`, else go on.
+    void VFail(tyg_cond c, tyg_val a, tyg_val b) {
         auto ok = NewBlock();
-        Branch(bad, vfail, ok);
+        Branch(Cmp(c, a, b), vfail, ok);
         SetBlock(ok);
     }
-    // n - q < bytes: fewer bytes left than a value needs.
-    void VNeed(tyg_val bytes) {
-        VFailIf(Cmp(TYG_SLT, Sub(vN, VQ()), bytes));
+    void VNeed(int64_t bytes) { VFail(TYG_SLT, Sub(vN, VQ()), I64(bytes)); }   // Fewer bytes left.
+    void VSkip(int64_t bytes) {
+        VNeed(bytes);
+        VAddQ(I64(bytes));
+    }
+    // The ULEB128 at q (gs_uleb_check), which must be one.
+    Uleb VUleb() {
+        auto uc = UlebCheck(VAt(), vE);
+        VFail(TYG_EQ, LdL(uc.k), I64(0));
+        return uc;
+    }
+    // body() while q < n.
+    template <class F> void VWhileQ(F body) {
+        auto head = NewBlock(), b = NewBlock(), done = NewBlock();
+        tyg_jump(p, head);
+        SetBlock(head);
+        Branch(Cmp(TYG_SLT, VQ(), vN), b, done);
+        SetBlock(b);
+        body();
+        tyg_jump(p, head);
+        SetBlock(done);
+    }
+    void NewProcBody() {
+        gblk = NewBlock();
+        gstart = NewBlock();
+        tyg_jump(p, gblk);
+        SetBlock(gstart);
+    }
+    void NewProcBegin(tyg_sym sym, tyg_sig *sig, Line line) {
+        p = tyg_proc_begin(m, sym, sig);
+        if (!p) No(line, cat("tyg_proc_begin: ", tyg_error(m) ? tyg_error(m) : "?"));
     }
 
-    // One self-relative reference at field offset q holding `off`
-    // (CodeGen::EmitVerifyLink): the target must be the start of an element,
-    // and where typed at a variant, one carrying that tag.
+    // A self-relative reference at q holding `off` (CodeGen::EmitVerifyLink): it must reach the start
+    // of an element, carrying the tag where typed at a variant.
     void VLink(TypeExpr *rt, tyg_val off) {
         auto offl = Local(off);
         auto pt = rt->ref->sub;
         auto variant = pt->kind == TY_VARIANT && velem->kind == TY_ENUM;
         int64_t skip = 0, vi = 0;
-        IntStorage ts = IS_U8;
         if (variant) {
             auto ei = cg.EIVar(pt);
             vi = ei->en->VariantIndex(pt->var->variant);
-            ts = cg.TagStore(ei->en);
-            skip = CodeGen::IntSize(ts);
+            skip = CodeGen::IntSize(cg.TagStore(ei->en));
         }
-        auto skipb = NewBlock();
-        if (rt->ref->optional) {
-            auto inb = NewBlock();
-            Branch(Cmp(TYG_NE, LdL(offl), I64(0)), inb, skipb);
-            SetBlock(inb);
-        }
-        auto v = Local(Sub(VQ(), I64(skip)));
-        // The untrusted offset is bounded against the image before it is added.
-        VFailIf(Cmp(TYG_SLT, LdL(offl), tyg_un(p, TYG_NEG, LdL(v))));
-        VFailIf(Cmp(TYG_SGE, LdL(offl), Sub(vN, LdL(v))));
-        StL(v, Add(LdL(v), LdL(offl)));
-        if (cg.IsFix(velem)) {
-            VFailIf(Cmp(TYG_NE, tyg_bin(p, TYG_SREM, LdL(v), I64(std::max<int64_t>(cg.FixedSize(velem), 1))), I64(0)));
-        } else {
-            // GS_BM_GET(bm, v)
-            auto byte = VLoad(Add(vBM, tyg_bin(p, TYG_LSHR, LdL(v), I64(3))), 1, false);
-            auto bit = tyg_bin(p, TYG_AND, tyg_bin(p, TYG_LSHR, byte, tyg_bin(p, TYG_AND, LdL(v), I64(7))), I64(1));
-            VFailIf(Cmp(TYG_EQ, bit, I64(0)));
-        }
-        if (variant) {
-            VFailIf(Cmp(TYG_SLT, Sub(vN, LdL(v)), I64(skip)));
-            auto tag = VLoad(Add(vP, LdL(v)), skip, false);
-            VFailIf(Cmp(TYG_NE, tag, I64(vi)));
-        }
-        tyg_jump(p, skipb);
-        SetBlock(skipb);
+        auto check = [&] {
+            auto v = Local(Sub(VQ(), I64(skip)));
+            // Bound the untrusted offset before adding it.
+            VFail(TYG_SLT, LdL(offl), tyg_un(p, TYG_NEG, LdL(v)));
+            VFail(TYG_SGE, LdL(offl), Sub(vN, LdL(v)));
+            StL(v, Add(LdL(v), LdL(offl)));
+            if (cg.IsFix(velem)) {
+                auto esz = I64(std::max<int64_t>(cg.FixedSize(velem), 1));
+                VFail(TYG_NE, VBin(TYG_SREM, LdL(v), esz), I64(0));
+            } else {   // GS_BM_GET(bm, v)
+                auto byte = VLoad(Add(vBM, VBin(TYG_LSHR, LdL(v), I64(3))), 1, false);
+                auto bit = VBin(TYG_AND, VBin(TYG_LSHR, byte, VBin(TYG_AND, LdL(v), I64(7))), I64(1));
+                VFail(TYG_EQ, bit, I64(0));
+            }
+            if (variant) {
+                VFail(TYG_SLT, Sub(vN, LdL(v)), I64(skip));
+                VFail(TYG_NE, VLoad(Add(vP, LdL(v)), skip, false), I64(vi));
+            }
+        };
+        if (rt->ref->optional) If(Cmp(TYG_NE, LdL(offl), I64(0)), check);
+        else check();
     }
 
-    // A run of fields (CodeGen::EmitVerifyFields). `lo` is the packed layout of
-    // a fixed struct or variant, whose offsets may include alignment padding a
-    // sequential walk would miss; bytes layouts have none and pass null.
-    void VFields(const vector<Field> &fields, const vector<TypeExpr *> &ftypes, const CodeGen::Layout *lo, int64_t total,
-                 bool links) {
-        tyg_local start = 0;
-        if (lo) {
-            start = VNew();
-            StL(start, VQ());
-            VNeed(I64(total));
-        }
+    // A run of fields of t (CodeGen::EmitVerifyFields). `lo`: the layout of a fixed struct or variant,
+    // whose offsets may include padding a sequential walk would miss; null for bytes layouts.
+    void VFields(TypeExpr *t, const vector<Field> &fields, const vector<TypeExpr *> &ftypes,
+                 const CodeGen::Layout *lo, bool links) {
+        auto total = lo ? cg.FixedSize(t) : 0;
+        tyg_local start = lo ? Local(VQ()) : 0;
+        if (lo) VNeed(total);
         for (size_t i = 0; i < fields.size(); i++) {
             auto &f = fields[i];
             if (f.ispad) {
@@ -8109,46 +8125,34 @@ struct TgFn {
         if (lo) VSetQ(Add(LdL(start), I64(total)));
     }
 
-    // The checks and cursor advance for one value of type t at q
-    // (CodeGen::EmitVerifyWalk).
+    // The checks and cursor advance for one value of type t at q (CodeGen::EmitVerifyWalk).
     void VWalk(TypeExpr *t, bool links) {
         if (!cg.NeedsVerifyWalk(t)) {
-            auto sz = cg.FixedSize(t);
-            if (sz > 0) {
-                VNeed(I64(sz));
-                VAddQ(I64(sz));
-            }
+            if (cg.FixedSize(t) > 0) VSkip(cg.FixedSize(t));
             return;
         }
+        auto walk = [this, links](TypeExpr *e) { return [=](tyg_val) { VWalk(e, links); }; };
         switch (t->kind) {
-            case TY_BOOL: {
-                VNeed(I64(1));
-                VFailIf(Cmp(TYG_UGT, VLoad(Add(vP, VQ()), 1, false), I64(1)));
+            case TY_BOOL:
+                VNeed(1);
+                VFail(TYG_UGT, VLoad(VAt(), 1, false), I64(1));
                 VAddQ(I64(1));
                 return;
-            }
-            case TY_INT: {   // a varint field: only its length matters to the walk
-                auto uc = UlebCheck(Add(vP, VQ()), vE);
-                VFailIf(Cmp(TYG_EQ, LdL(uc.k), I64(0)));
-                VAddQ(LdL(uc.k));
-                return;
-            }
+            case TY_INT: VAddQ(LdL(VUleb().k)); return;   // a varint: only its length matters
             case TY_REF: {
                 auto w = (IntStorage)t->ref->lenstorage;
                 auto off = VNew(), k = VNew();
                 if (w == IS_VARINT) {
-                    auto uc = UlebCheck(Add(vP, VQ()), vE);
-                    VFailIf(Cmp(TYG_EQ, LdL(uc.k), I64(0)));
+                    auto uc = VUleb();
                     StL(k, LdL(uc.k));
                     if (links) {   // gs_zig_check
-                        auto u = LdL(uc.v);
-                        StL(off, tyg_bin(p, TYG_XOR, tyg_bin(p, TYG_LSHR, u, I64(1)),
-                                        tyg_un(p, TYG_NEG, tyg_bin(p, TYG_AND, u, I64(1)))));
+                        auto u = LdL(uc.v), neg = tyg_un(p, TYG_NEG, VBin(TYG_AND, u, I64(1)));
+                        StL(off, VBin(TYG_XOR, VBin(TYG_LSHR, u, I64(1)), neg));
                     }
                 } else {
-                    VNeed(I64(CodeGen::IntSize(w)));
+                    VNeed(CodeGen::IntSize(w));
                     StL(k, I64(CodeGen::IntSize(w)));
-                    if (links) StL(off, VLoad(Add(vP, VQ()), CodeGen::IntSize(w), !t->ref->pool));
+                    if (links) StL(off, VLoad(VAt(), CodeGen::IntSize(w), !t->ref->pool));
                 }
                 if (links) VLink(t, LdL(off));
                 VAddQ(LdL(k));
@@ -8156,58 +8160,52 @@ struct TgFn {
             }
             case TY_ARRAY: {
                 auto &a = *t->arr;
+                auto nl = VNew();
                 switch (a.akind) {
-                    case A_FIXED:
-                        Loop(I64(0), I64(cg.ArrSize(t->arr)), [&](tyg_val) { VWalk(a.sub, links); });
-                        return;
+                    case A_FIXED: Loop(I64(0), I64(cg.ArrSize(t->arr)), walk(a.sub)); return;
                     case A_VAR: {
                         auto ls = cg.LenStore(t->arr);
-                        auto nl = VNew();
                         if (ls == IS_VARINT) {
-                            auto uc = UlebCheck(Add(vP, VQ()), vE);
-                            VFailIf(Cmp(TYG_EQ, LdL(uc.k), I64(0)));
-                            VFailIf(Cmp(TYG_SLT, LdL(uc.v), I64(0)));   // above INT64_MAX
+                            auto uc = VUleb();
+                            VFail(TYG_SLT, LdL(uc.v), I64(0));   // above INT64_MAX
                             StL(nl, LdL(uc.v));
                             VAddQ(LdL(uc.k));
                         } else {
-                            VNeed(I64(CodeGen::IntSize(ls)));
-                            StL(nl, VLoad(Add(vP, VQ()), CodeGen::IntSize(ls), false));
+                            VNeed(CodeGen::IntSize(ls));
+                            StL(nl, VLoad(VAt(), CodeGen::IntSize(ls), false));
                             VAddQ(I64(CodeGen::IntSize(ls)));
                         }
-                        VFailIf(Cmp(TYG_SLT, LdL(nl), I64(0)));
-                        VFailIf(Cmp(TYG_SGT, LdL(nl), tyg_bin(p, TYG_SDIV, Sub(vN, VQ()),
-                                                I64(std::max<int64_t>(cg.MinBytes(a.sub), 1)))));
+                        auto per = I64(std::max<int64_t>(cg.MinBytes(a.sub), 1));
+                        VFail(TYG_SLT, LdL(nl), I64(0));
+                        VFail(TYG_SGT, LdL(nl), VBin(TYG_SDIV, Sub(vN, VQ()), per));
                         if (!cg.NeedsVerifyWalk(a.sub)) VAddQ(Mul(LdL(nl), I64(cg.FixedSize(a.sub))));
-                        else Loop(I64(0), LdL(nl), [&](tyg_val) { VWalk(a.sub, links); });
+                        else Loop(I64(0), LdL(nl), walk(a.sub));
                         return;
                     }
                     case A_LIMITED: {
-                        // Slots past the length were never written, so only the
-                        // live ones are walked; the cursor skips the capacity.
-                        auto s = VNew(), nl = VNew(), cap = VNew();
-                        auto esz = std::max<int64_t>(cg.FixedSize(a.sub), 1);
+                        // Only the live slots were written, so only they are walked; q skips the
+                        // capacity.
+                        auto s = Local(VQ()), cap = VNew();
                         auto stat = cg.IsFix(t);
-                        StL(s, VQ());
                         if (stat) {
-                            auto ls = cg.LenStore(t->arr);
-                            VNeed(I64(cg.FixedSize(t)));
-                            StL(nl, VLoad(Add(vP, VQ()), CodeGen::IntSize(ls), false));
-                            VFailIf(Cmp(TYG_SLT, LdL(nl), I64(0)));
-                            VFailIf(Cmp(TYG_SGT, LdL(nl), I64(cg.ArrSize(t->arr))));
-                            VAddQ(I64(CodeGen::IntSize(ls)));
+                            auto ls = CodeGen::IntSize(cg.LenStore(t->arr));
+                            VNeed(cg.FixedSize(t));
+                            StL(nl, VLoad(VAt(), ls, false));
+                            VFail(TYG_SLT, LdL(nl), I64(0));
+                            VFail(TYG_SGT, LdL(nl), I64(cg.ArrSize(t->arr)));
+                            VAddQ(I64(ls));
                         } else {
-                            VNeed(I64(8));
-                            StL(cap, VLoad(Add(vP, VQ()), 4, false));
-                            StL(nl, VLoad(Add(Add(vP, VQ()), I64(4)), 4, false));
-                            VFailIf(Cmp(TYG_SGT, LdL(nl), LdL(cap)));
-                            VFailIf(Cmp(TYG_SGT, LdL(cap), tyg_bin(p, TYG_SDIV, Sub(Sub(vN, VQ()), I64(8)),
-                                                    I64(esz))));
+                            VNeed(8);
+                            StL(cap, VLoad(VAt(), 4, false));
+                            StL(nl, VLoad(Add(VAt(), I64(4)), 4, false));
+                            VFail(TYG_SGT, LdL(nl), LdL(cap));
+                            auto esz = I64(std::max<int64_t>(cg.FixedSize(a.sub), 1));
+                            VFail(TYG_SGT, LdL(cap), VBin(TYG_SDIV, Sub(Sub(vN, VQ()), I64(8)), esz));
                             VAddQ(I64(8));
                         }
-                        if (cg.NeedsVerifyWalk(a.sub)) Loop(I64(0), LdL(nl), [&](tyg_val) { VWalk(a.sub, links); });
-                        if (stat) VSetQ(Add(LdL(s), I64(cg.FixedSize(t))));
-                        else
-                            VSetQ(Add(Add(LdL(s), I64(8)), Mul(LdL(cap), I64(cg.FixedSize(a.sub)))));
+                        if (cg.NeedsVerifyWalk(a.sub)) Loop(I64(0), LdL(nl), walk(a.sub));
+                        auto cb = Mul(LdL(cap), I64(cg.FixedSize(a.sub)));
+                        VSetQ(Add(LdL(s), stat ? I64(cg.FixedSize(t)) : Add(I64(8), cb)));
                         return;
                     }
                     default: No(Line {}, "verifier of this array");
@@ -8216,32 +8214,27 @@ struct TgFn {
             }
             case TY_STRUCT: {
                 auto si = cg.SI(t);
-                auto fix = cg.IsFix(t);
-                VFields(si->st->fields, si->ftypes, fix ? &cg.StructLayout(si) : nullptr, fix ? cg.FixedSize(t) : 0,
-                        links);
+                VFields(t, si->st->fields, si->ftypes, cg.IsFix(t) ? &cg.StructLayout(si) : nullptr, links);
                 return;
             }
             case TY_VARIANT: {
                 auto ei = cg.EIVar(t);
                 auto vi = ei->en->VariantIndex(t->var->variant);
-                auto fix = cg.IsFix(t);
-                VFields(ei->en->variants[vi].fields, ei->vftypes[vi], fix ? &cg.VariantLayout(ei, vi) : nullptr,
-                        fix ? cg.FixedSize(t) : 0, links);
+                auto lo = cg.IsFix(t) ? &cg.VariantLayout(ei, vi) : nullptr;
+                VFields(t, ei->en->variants[vi].fields, ei->vftypes[vi], lo, links);
                 return;
             }
-            case TY_ENUM: {
-                // The tag is range-checked in both modes (a match has no default).
+            case TY_ENUM: {   // The tag is range-checked in both modes (a match has no default).
                 auto ei = cg.EIOf(t);
-                auto ts = cg.TagStore(ei->en);
+                auto tsz = CodeGen::IntSize(cg.TagStore(ei->en));
                 auto nv = (int64_t)ei->en->variants.size();
                 auto fix = !t->enu->varmode;
-                auto s = VNew(), tag = VNew();
-                if (fix) StL(s, VQ());
-                VNeed(I64(fix ? cg.FixedSize(t) : CodeGen::IntSize(ts)));
-                StL(tag, VLoad(Add(vP, VQ()), CodeGen::IntSize(ts), false));
-                VFailIf(Cmp(TYG_UGE, LdL(tag), I64(nv)));
-                VAddQ(I64(CodeGen::IntSize(ts)));
+                auto s = Local(VQ()), tag = VNew();
                 auto after = NewBlock();
+                VNeed(fix ? cg.FixedSize(t) : tsz);
+                StL(tag, VLoad(VAt(), tsz, false));
+                VFail(TYG_UGE, LdL(tag), I64(nv));
+                VAddQ(I64(tsz));
                 for (int64_t i = 0; i < nv; i++) {
                     auto vt = cg.VariantType(t, (int)i);
                     auto arm = NewBlock(), next = NewBlock();
@@ -8263,57 +8256,37 @@ struct TgFn {
     void EmitVerify(const string &name, TypeExpr *elem) {
         auto i64t = IT(TYG_I64);
         const tyg_type *pts[3] = { i64t, i64t, i64t };
-        p = tyg_proc_begin(m, M.Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL), tyg_sig_new(m, i64t, pts, 3, 0));
-        if (!p) No(Line {}, cat("tyg_proc_begin: ", tyg_error(m) ? tyg_error(m) : "?"));
-        gblk = NewBlock();
-        gstart = NewBlock();
-        tyg_jump(p, gblk);
-        SetBlock(gstart);
+        NewProcBegin(M.Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL), tyg_sig_new(m, i64t, pts, 3, 0), {});
+        NewProcBody();
         velem = elem;
         vP = tyg_param(p, 0);
         vN = tyg_param(p, 1);
         vBM = tyg_param(p, 2);
         vE = Add(vP, vN);
         vfail = NewBlock();
-        // A type whose values can occupy no bytes has no recoverable element
-        // count: only the empty image is one of its arrays.
+        // Zero-byte elements have no recoverable count: only the empty image is an array of them.
         if (cg.MinBytes(elem) <= 0) {
             tyg_ret(p, tyg_select(p, Cmp(TYG_EQ, vN, I64(0)), I64(0), I64(-1)));
         } else {
             auto fixed = cg.IsFix(elem);
             auto rel = cg.HasRelRefAny(elem);
             vq = VNew();
-            auto cnt = VNew();
+            auto cnt = Local(I64(0));
             VSetQ(I64(0));
-            StL(cnt, I64(0));
-            auto head = NewBlock(), body = NewBlock(), done = NewBlock();
-            tyg_jump(p, head);
-            SetBlock(head);
-            Branch(Cmp(TYG_SLT, VQ(), vN), body, done);
-            SetBlock(body);
-            if (!fixed && rel) {   // GS_BM_SET(bm, q)
-                auto at = Add(vBM, tyg_bin(p, TYG_LSHR, VQ(), I64(3)));
-                auto bit = tyg_bin(p, TYG_SHL, I64(1), tyg_bin(p, TYG_AND, VQ(), I64(7)));
-                auto old = VLoad(at, 1, false);
-                tyg_store(p, TYG_I8, AtV(at),
-                          tyg_convert(p, TYG_TRUNC, TYG_I8, tyg_bin(p, TYG_OR, old, bit)), 0);
-            }
-            VWalk(elem, fixed && rel);
-            StL(cnt, Add(LdL(cnt), I64(1)));
-            tyg_jump(p, head);
-            SetBlock(done);
-            VFailIf(Cmp(TYG_NE, VQ(), vN));
-            if (!fixed && rel) {
-                // The link pass, now that every element start is known.
+            VWhileQ([&] {
+                if (!fixed && rel) {   // GS_BM_SET(bm, q)
+                    auto at = Add(vBM, VBin(TYG_LSHR, VQ(), I64(3)));
+                    auto bit = VBin(TYG_SHL, I64(1), VBin(TYG_AND, VQ(), I64(7)));
+                    auto old = VLoad(at, 1, false);
+                    tyg_store(p, TYG_I8, AtV(at), tyg_convert(p, TYG_TRUNC, TYG_I8, VBin(TYG_OR, old, bit)), 0);
+                }
+                VWalk(elem, fixed && rel);
+                StL(cnt, Add(LdL(cnt), I64(1)));
+            });
+            VFail(TYG_NE, VQ(), vN);
+            if (!fixed && rel) {   // The link pass, now that every element start is known.
                 VSetQ(I64(0));
-                auto h2 = NewBlock(), b2 = NewBlock(), d2 = NewBlock();
-                tyg_jump(p, h2);
-                SetBlock(h2);
-                Branch(Cmp(TYG_SLT, VQ(), vN), b2, d2);
-                SetBlock(b2);
-                VWalk(elem, true);
-                tyg_jump(p, h2);
-                SetBlock(d2);
+                VWhileQ([&] { VWalk(elem, true); });
             }
             tyg_ret(p, LdL(cnt));
         }
@@ -8322,40 +8295,37 @@ struct TgFn {
         Finish(Line {});
     }
 
-    // The entry's block (gblk): the addresses of the globals the body
-    // names, and the stack block, then on to the body (gstart).
+    // The entry block (gblk): the addresses of the globals and the stack block, then on to the body.
     void Finish(Line line) {
         SetBlock(gblk);
         Loc(line);
         if (stksl) StL(stksl, CallC("gs_tg_stks", {}, {}, tyg_type_ptr(m)));
-        for (auto &[acc, loc] : gaddrs)
-            StL(loc, CallC(acc, {}, {}, tyg_type_ptr(m)));
+        for (auto &[acc, loc] : gaddrs) StL(loc, CallC(acc, {}, {}, tyg_type_ptr(m)));
         tyg_jump(p, gstart);
-        if (tyg_proc_end(p) != 0) {
-            p = nullptr;
-            No(line, cat("tinygen: ", tyg_error(m) ? tyg_error(m) : "?"));
-        }
+        auto bad = tyg_proc_end(p) != 0;
         p = nullptr;
+        if (bad) No(line, cat("tinygen: ", tyg_error(m) ? tyg_error(m) : "?"));
     }
 
-    // gs_init_globals as a procedure of the object, for a whole program
-    // build (CodeGen::EmitGlobalInit): each initializer in declaration
-    // order with gs_sp fixed at 0, a resizable or T[] global built on its
-    // dedicated stack, reserved first (gs_stack_init). No sp: what refers
-    // to the function's own results (return, return from) is unsupported.
+    // gs_init_globals for a whole program build (CodeGen::EmitGlobalInit): the initializers in order
+    // with gs_sp fixed at 0, a resizable or T[] global built on its own stack. No sp: what refers to
+    // the function's own results (return, return from) is unsupported.
     void EmitInit(tyg_sym sym, Line line) {
-        p = tyg_proc_begin(m, sym, tyg_sig_new(m, nullptr, nullptr, 0, 0));
-        if (!p) No(line, cat("tyg_proc_begin: ", tyg_error(m) ? tyg_error(m) : "?"));
+        NewProcBegin(sym, tyg_sig_new(m, nullptr, nullptr, 0, 0), line);
         tyg_debug_proc(p, "gs_init_globals", M.File(line.fileidx), line.line,
                        tyg_dt_func(m, tyg_dt_void(m), nullptr, 0, 0));
         Loc(line);
-        spl = tyg_local_new(p, 8, 8);
+        spl = Local(I64(0));
         hassp = true;
-        StL(spl, I64(0));
-        gblk = NewBlock();
-        gstart = NewBlock();
-        tyg_jump(p, gblk);
-        SetBlock(gstart);
+        NewProcBody();
+        auto stackinit = [&](tyg_val stk) {
+            M.NeedShim("gs_tg_stack_init");
+            CallC("gs_tg_stack_init", { tyg_type_ptr(m) }, { stk }, nullptr);
+        };
+        auto emptyhdr = [&](tyg_val at, tyg_val stk) {
+            St(AtV(at), Top(stk));
+            St(AtV(at, 8), I64(0));
+        };
         OpenScope(false);
         for (auto g : M.ast.globals) {
             if (g->inits.empty()) continue;
@@ -8367,47 +8337,33 @@ struct TgFn {
                 if (cg.gstatic.count(d)) continue;   // Static data.
                 Loc(init->line);
                 if (!M.GlobalOk(d)) No(d->line, "global of this kind");
-                if (M.FoOk(d->type)) {
-                    // A frame object: its tail on the global's own stack.
+                auto fo = M.FoOk(d->type);
+                auto grow = IsGrow(d->type) || M.IsRs(d->type) || M.IsRb(d->type);
+                if (fo || grow || IsImg(d->type)) {
                     auto at = LdL(AccessorLocal(M.Accessor(d)));
                     auto stk = LdL(AccessorLocal(M.StackAccessor(d)));
-                    M.NeedShim("gs_tg_stack_init");
-                    CallC("gs_tg_stack_init", { tyg_type_ptr(m) }, { stk }, nullptr);
-                    GenFo(init, P { AtV(at), d->type, stk }, init->line);
-                    continue;
-                }
-                if (IsGrow(d->type) || M.IsRs(d->type) || M.IsRb(d->type) || IsImg(d->type)) {
-                    auto at = LdL(AccessorLocal(M.Accessor(d)));
-                    auto stk = LdL(AccessorLocal(M.StackAccessor(d)));
-                    M.NeedShim("gs_tg_stack_init");
-                    CallC("gs_tg_stack_init", { tyg_type_ptr(m) }, { stk }, nullptr);
-                    if (IsGrow(d->type) || M.IsRs(d->type) || M.IsRb(d->type)) {
-                        // CodeGen::InitGlobalStack: an empty array, then
-                        // its elements.
-                        St(AtV(at), Top(stk));
-                        St(AtV(at, 8), I64(0));
+                    stackinit(stk);
+                    if (fo) {   // A frame object: its tail on the global's own stack.
+                        GenFo(init, P { AtV(at), d->type, stk }, init->line);
+                    } else if (grow) {   // CodeGen::InitGlobalStack: an empty array, then its elements.
+                        emptyhdr(at, stk);
                         if (M.IsRb(d->type)) GenRb(init, stk, AtV(at), d->type, init->line);
                         else GenRz(init, stk, AtV(at), d->type, init->line);
-                        if (d->reusable && !Ended()) {
-                            // Its freelist, empty, on a stack of its own.
+                        if (d->reusable && !Ended()) {   // Its freelist, empty, on a stack of its own.
                             auto [h, st] = M.PoolAccessors(d);
-                            auto fl = LdL(AccessorLocal(h));
                             auto flstk = LdL(AccessorLocal(st));
-                            CallC("gs_tg_stack_init", { tyg_type_ptr(m) }, { flstk }, nullptr);
-                            St(AtV(fl), Top(flstk));
-                            St(AtV(fl, 8), I64(0));
+                            stackinit(flstk);
+                            emptyhdr(LdL(AccessorLocal(h)), flstk);
                         }
                     } else {
                         auto img = GenImg(init, stk, d->type, init->line);
                         if (!Ended()) St(AtV(at), img);
                     }
-                    continue;
-                }
-                if (cg.PrefVar(d)) {
+                } else if (cg.PrefVar(d)) {
                     PrefInto(GlobalPlace(d, init->line).a, init);
-                    continue;
+                } else {
+                    Into(GlobalPlace(d, init->line), init);
                 }
-                Into(GlobalPlace(d, init->line), init);
             }
             CloseScope();
         }
@@ -8417,8 +8373,8 @@ struct TgFn {
     }
 };
 
-// The backend: chooses the specializations it takes as CodeGen asks, then
-// compiles those into one object.
+// The backend: chooses the specializations it takes as CodeGen asks, then compiles those into one
+// object.
 struct TinyGenBackend : CodeGen::SpecBackend {
     Ast &ast;
     bool checks;
@@ -8428,45 +8384,121 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     unique_ptr<TgModule> mod;
     string_view runtime_ext_text;
     string runtime_decls;   // runtime.h and runtime_ext.h (TgModule::RuntimeApi).
-    // Functions left to C whatever they hold (--tinygen-skip): what tests
-    // calls across the two halves with.
+    // Left to C whatever they hold (--tinygen-skip): what tests calls across the two halves with.
     vector<string> skip;
 
     TinyGenBackend(Ast &_ast, bool _checks, const string &_source, string_view _ext, string _decls)
         : ast(_ast), checks(_checks), source(_source), runtime_ext_text(_ext),
           runtime_decls(std::move(_decls)) {}
 
-    // Builds sp into the module. A construct this backend does not
-    // support anywhere in the body abandons the procedure (tyg_proc_abort),
-    // and what it asked of the module for the C half (shims, trampolines) is
-    // taken back, so that the whole body goes to C. "" when it compiled,
-    // else why not. A body that compiled tells the C half's stack
-    // accounting (codegen_stacks.h) the stacks it owns and what it hands
-    // its callees, as one the C backend emits does.
-    string Build(CodeGen &cg, FnSpec *sp) {
-        string why;
-        // A simd function is its baseline version here, which §7.12 allows.
-        if (!mod->SigOk(sp, true, why)) return cat("interface: ", why);
+    // What a procedure asked of the module for the C half, to take back.
+    static string Why(const TgUnsupported &u) {
+        return u.line.line > 0 ? cat(u.why, " (line ", u.line.line, ")") : u.why;
+    }
+    // Runs emit() building fn's procedure: "" when it compiled, else why not. A construct not supported
+    // anywhere in the body abandons the procedure (tyg_proc_abort) and takes back what it asked of the
+    // module for the C half (shims, trampolines), so the whole body goes to C.
+    template <class F> string Attempt(TgFn &fn, F emit) {
         auto nshims = mod->shims.size(), nexterns = mod->externs.size(), ndirect = mod->direct.size();
-        TgFn fn(*mod, sp);
         try {
-            fn.Emit();
+            emit();
         } catch (TgUnsupported &u) {
             if (fn.p) tyg_proc_abort(fn.p);
             mod->shims.resize(nshims);
             mod->externs.resize(nexterns);
             mod->direct.resize(ndirect);
-            return u.line.line > 0 ? cat(u.why, " (line ", u.line.line, ")") : u.why;
+            return Why(u);
         }
+        return "";
+    }
+
+    tyg_sym FSym(const string &name) { return mod->Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL); }
+    tyg_sig *SigOf(const tyg_type *ret, const vector<const tyg_type *> &ps) {
+        return tyg_sig_new(mod->m, ret, ps.data(), (int)ps.size(), 0);
+    }
+    static tyg_arg ValArg(tyg_val v) {
+        tyg_arg a {};
+        a.val = v;
+        return a;
+    }
+    void EndProc(tyg_proc *p, const string &name) {
+        if (tyg_proc_end(p) == 0) return;
+        throw CompileError { cat("tinygen: ", name, ": ", tyg_error(mod->m) ? tyg_error(mod->m) : "?") };
+    }
+    tyg_val CallSig(tyg_proc *p, tyg_sig *sig, tyg_sym fn, const vector<tyg_val> &vals) {
+        vector<tyg_arg> as;
+        for (auto v : vals) as.push_back(ValArg(v));
+        return tyg_call(p, sig, tyg_direct(fn), as.data(), (int)as.size(), nullptr, nullptr);
+    }
+    // A call of the object's procedure `name`.
+    tyg_val CallProc(tyg_proc *p, const string &name, const tyg_type *ret, const vector<const tyg_type *> &ps,
+                     const vector<tyg_val> &vals) {
+        return CallSig(p, SigOf(ret, ps), FSym(name), vals);
+    }
+    tyg_val Acc(tyg_proc *p, const string &name) { return CallProc(p, name, tyg_type_ptr(mod->m), {}, {}); }
+    // A zero-filled data symbol, thread-local if tls.
+    tyg_sym DataSym(const string &name, int64_t size, int64_t align, bool tls) {
+        auto sym = tyg_symbol(mod->m, name.c_str(), tls ? TYG_SYM_TLS : 0);
+        tyg_data(mod->m, sym, tls ? TYG_SECTION_TBSS : TYG_SECTION_BSS, nullptr, std::max<int64_t>(size, 1), align);
+        return sym;
+    }
+    // An accessor `name`: a procedure returning the address of `target`.
+    void DefAccessor(const string &name, tyg_sym target) {
+        auto p = tyg_proc_begin(mod->m, FSym(name), SigOf(tyg_type_ptr(mod->m), {}));
+        tyg_ret(p, tyg_addr_of(p, tyg_at_sym(target, 0)));
+        EndProc(p, name);
+    }
+    // The body of a wrapper p of sp passing its parameters on to `callee` (gs_sp 0 after them if
+    // zerosp) and returning the result; a slice as the C wrapper gives it: the base, its length stored
+    // through an extra out-pointer parameter.
+    void ForwardCall(tyg_proc *p, FnSpec *sp, tyg_sig *sig, tyg_sym callee, bool zerosp, bool slice) {
+        vector<tyg_arg> args;
+        for (size_t i = 0; i < sp->argtypes.size(); i++) {
+            tyg_arg a {};
+            if (mod->IsScalar(sp->argtypes[i])) a.val = tyg_param(p, (int)i);
+            else a.mem = tyg_at_val(tyg_param(p, (int)i), 0);
+            args.push_back(a);
+        }
+        if (zerosp) args.push_back(ValArg(tyg_iconst(p, TYG_I64, 0)));
+        auto call = [&](tyg_addr *ret) {
+            return tyg_call(p, sig, tyg_direct(callee), args.data(), (int)args.size(), nullptr, ret);
+        };
+        auto rt = sp->rets.empty() ? nullptr : sp->rets[0];
+        if (!rt) {
+            call(nullptr);
+            tyg_ret(p, 0);
+        } else if (mod->IsScalar(rt)) {
+            tyg_ret(p, call(nullptr));
+        } else {
+            auto t = tyg_local_new(p, mod->Size(rt), 8);
+            auto ra = tyg_at_local(t, 0);
+            call(&ra);
+            if (slice) {
+                auto out = tyg_at_val(tyg_param(p, (int)sp->argtypes.size()), 0);
+                tyg_store(p, TYG_I64, out, tyg_load(p, TYG_I64, tyg_at_local(t, 8), 0), 0);
+                tyg_ret(p, tyg_load(p, TYG_I64, tyg_at_local(t, 0), 0));
+            } else {
+                tyg_ret_mem(p, ra);
+            }
+        }
+    }
+
+    // Builds sp into the module: "" when it compiled, else why not. A body that compiled tells the C
+    // half's stack accounting (codegen_stacks.h) the stacks it owns and what it hands its callees.
+    string Build(CodeGen &cg, FnSpec *sp) {
+        string why;
+        // A simd function is its baseline version here (§7.12).
+        if (!mod->SigOk(sp, true, why)) return cat("interface: ", why);
+        TgFn fn(*mod, sp);
+        if (auto w = Attempt(fn, [&] { fn.Emit(); }); !w.empty()) return w;
         cg.stackown[sp] = fn.maxown;
         cg.stackcalls[sp] = fn.stackcalls;
         return "";
     }
 
-    // The specializations this backend takes: every one whose body
-    // compiles. Each is built straight into the module; one that does not
-    // compile is left to C. The two halves call each other with gs_sp as
-    // two C functions do, so what one takes does not depend on the other.
+    // The specializations whose body compiles, built straight into the module; the rest are left to C.
+    // The halves call each other with gs_sp as two C functions do, so what one takes does not depend on
+    // the other.
     set<FnSpec *> Choose(CodeGen &cg, const vector<FnSpec *> &specs) override {
         set<FnSpec *> ours;
         mod = make_unique<TgModule>(ast, cg, checks, source);
@@ -8477,9 +8509,8 @@ struct TinyGenBackend : CodeGen::SpecBackend {
             return {};
         }
         for (auto sp : specs) {
-            string w = std::find(skip.begin(), skip.end(), sp->sf->qname) != skip.end()
-                           ? string("--tinygen-skip")
-                           : Build(cg, sp);
+            bool skipped = std::find(skip.begin(), skip.end(), sp->sf->qname) != skip.end();
+            auto w = skipped ? string("--tinygen-skip") : Build(cg, sp);
             if (w.empty()) {
                 ours.insert(sp);
                 taken.push_back(sp);
@@ -8491,8 +8522,8 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         return ours;
     }
 
-    // The render procedures the functions asked for (TgModule::RenderFn),
-    // each possibly asking for others.
+    // The render procedures the functions asked for (TgModule::RenderFn), each possibly asking for
+    // more.
     void BuildRenders() {
         for (size_t i = 0; mod && i < mod->renderq.size(); i++) {
             auto [name, t] = mod->renderq[i];
@@ -8508,8 +8539,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         if (mod) mod->renderq.clear();
     }
 
-    // After CodeGen has made the C half: the extern fns the object calls
-    // are used, so the C half declares them and their packages link.
+    // After the C half is made: the extern fns the object calls count as used, so it declares them.
     set<FnSpec *> declared;   // Extern fns the C half declares already.
 
     void Compile(CodeGen &cg) {
@@ -8521,8 +8551,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                     cg.usedexterns.push_back(sp);
     }
 
-    // The C the object calls into: the shims, and a trampoline per extern
-    // fn called. Appended to the C half, after everything it names.
+    // The C the object calls into (appended to the C half): the shims, and a trampoline per extern fn.
     string Shims(CodeGen &cg) {
         if (!mod) return "";
         string s = "\n/* ---- for the tinygen object (docs/design/tinygen_backend.md) ---- */\n";
@@ -8543,13 +8572,10 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         return s;
     }
 
-    // Whether the object can be the whole program, with no C half: every
-    // live specialization compiled, nothing asked of the C half that the
-    // support object (TgSupportBody) or the object itself does not hold --
-    // globals it can lay out and initialize (gs_init_globals built here),
-    // `return from` channels of fixed types, extern fns the runtime
-    // exports or the support object has trampolines for -- and a plain
-    // main without threads. Else why not.
+    // Whether the object can be the whole program, with no C half: every live specialization compiled,
+    // nothing asked of the C half that the support object (TgSupportBody) or the object does not hold
+    // (globals, `return from` channels of fixed types, extern trampolines), and a plain main. Else why
+    // not.
     bool WholeProgram(CodeGen &cg, string &why) {
         auto mainsf = ast.MainFunction();
         auto mainsp = mainsf && !mainsf->specs.empty() ? mainsf->specs[0] : nullptr;
@@ -8565,8 +8591,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         for (auto sp : mod->externs)
             if (!ExternHeld(sp)) return why = cat("extern ", sp->sf->cname), false;
         if (!GlobalsOk(cg, why)) return false;
-        // A gs_init_globals built but not used stays in the object,
-        // unreferenced, with what it asked of the C half.
+        // An unused gs_init_globals stays in the object, with what it asked of the C half.
         if (!cg.noglobalinit && !BuildInit(cg, why)) return false;
         BuildRenders();
         for (auto &sh : mod->shims)
@@ -8588,10 +8613,9 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         return true;
     }
 
-    // Whether a whole program can call an extern fn through its trampoline
-    // (gs_tg_x_): the support object holds one (TgSupportExterns), or the
-    // object does (ForwardExterns) for a symbol the linker resolves, a
-    // package's or the C library's, which no header of the runtime defines.
+    // Whether a whole program can call an extern fn through its gs_tg_x_ trampoline: the support object
+    // holds one (TgSupportExterns), or the object does (ForwardExterns) for a symbol no runtime header
+    // defines.
     bool ExternHeld(FnSpec *sp) {
         auto &name = sp->sf->cname;
         for (auto &x : TgSupportExterns())
@@ -8600,400 +8624,241 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                mod->rtdecls.find(cat("*", name, "(")) == string_view::npos;
     }
 
-    // The trampolines the object holds itself: a procedure of the name the
-    // calls use that calls the C symbol with the same C parameters.
+    // The trampolines the object holds itself: gs_tg_x_<name> calls the C symbol with the same
+    // parameters.
     void ForwardExterns() {
-        auto m = mod->m;
         for (auto sp : mod->externs) {
             auto &name = sp->sf->cname;
             auto held = false;
             for (auto &x : TgSupportExterns()) held = held || name == x.name;
             if (held) continue;
             auto sig = mod->ExternSig(sp);
-            auto p = tyg_proc_begin(m, mod->Sym(cat("gs_tg_x_", name), TYG_SYM_FUNC | TYG_SYM_GLOBAL), sig);
-            vector<tyg_arg> args;
-            for (size_t i = 0; i < sp->argtypes.size(); i++) {
-                tyg_arg a {};
-                if (mod->IsScalar(sp->argtypes[i])) a.val = tyg_param(p, (int)i);
-                else a.mem = tyg_at_val(tyg_param(p, (int)i), 0);
-                args.push_back(a);
-            }
-            auto callee = tyg_direct(mod->Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL));
-            auto rt = sp->rets.empty() ? nullptr : sp->rets[0];
-            if (!rt) {
-                tyg_call(p, sig, callee, args.data(), (int)args.size(), nullptr, nullptr);
-                tyg_ret(p, 0);
-            } else if (mod->IsScalar(rt)) {
-                tyg_ret(p, tyg_call(p, sig, callee, args.data(), (int)args.size(), nullptr, nullptr));
-            } else {
-                auto t = tyg_local_new(p, mod->Size(rt), 8);
-                auto ra = tyg_at_local(t, 0);
-                tyg_call(p, sig, callee, args.data(), (int)args.size(), nullptr, &ra);
-                tyg_ret_mem(p, ra);
-            }
-            if (tyg_proc_end(p) != 0)
-                throw CompileError { cat("tinygen: ", name, ": ", tyg_error(m) ? tyg_error(m) : "?") };
+            auto p = tyg_proc_begin(mod->m, FSym(cat("gs_tg_x_", name)), sig);
+            ForwardCall(p, sp, sig, FSym(name), false, false);
+            EndProc(p, name);
         }
     }
 
-    // The queues and the worker thunks, which the C half holds in a mixed
-    // build: a queue is eight bytes of data with an accessor, started by
-    // main (EmitMain); a thunk is a procedure taking the spawn image, which
-    // opens the thread program's block of data stacks, unpacks the
-    // arguments and calls the worker (CodeGen::EmitThreadThunk), with an
-    // accessor returning its address.
+    // The queues (eight bytes of data with an accessor, started by main) and the worker thunks the C
+    // half holds in a mixed build: a thunk takes the spawn image, opens the thread program's data
+    // stacks, unpacks the arguments and calls the worker (CodeGen::EmitThreadThunk).
     void EmitThreads(CodeGen &cg) {
         auto m = mod->m;
         auto ptr = tyg_type_ptr(m);
-        auto accessor = [&](const string &name, tyg_sym target) {
-            auto p = tyg_proc_begin(m, mod->Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL),
-                                    tyg_sig_new(m, ptr, nullptr, 0, 0));
-            tyg_ret(p, tyg_addr_of(p, tyg_at_sym(target, 0)));
-            if (tyg_proc_end(p) != 0)
-                throw CompileError { cat("tinygen: ", name, ": ", tyg_error(m) ? tyg_error(m) : "?") };
-        };
-        for (auto &[acc, q] : mod->queueacc) {
-            auto sym = tyg_symbol(m, cat("gs_", q).c_str(), 0);
-            tyg_data(m, sym, TYG_SECTION_BSS, nullptr, 8, 8);
-            accessor(acc, sym);
-        }
+        for (auto &[acc, q] : mod->queueacc) DefAccessor(acc, DataSym(cat("gs_", q), 8, 8, false));
         for (auto &[acc, sp] : mod->thunkacc) {
             auto &ki = cg.sinfo[sp];
-            auto tsym = mod->Sym(cg.thunks[sp], TYG_SYM_FUNC | TYG_SYM_GLOBAL);
-            const tyg_type *ps[] = { ptr };
-            auto p = tyg_proc_begin(m, tsym, tyg_sig_new(m, nullptr, ps, 1, 0));
-            auto cur = tyg_local_new(p, 8, 8);
-            tyg_store(p, TYG_I64, tyg_at_local(cur, 0), tyg_param(p, 0), 0);
-            auto call = [&](tyg_sig *sig, tyg_sym sym, vector<tyg_arg> args) {
-                tyg_call(p, sig, tyg_direct(sym), args.data(), (int)args.size(), nullptr, nullptr);
-            };
-            tyg_arg n {};
-            n.val = tyg_iconst(p, TYG_I64, cg.ProgramStacks({ sp }));
-            const tyg_type *i64s[] = { tyg_type_int(m, TYG_I64, 1) };
-            call(tyg_sig_new(m, nullptr, i64s, 1, 0), mod->Sym("gs_tg_stack_block", TYG_SYM_FUNC | TYG_SYM_GLOBAL),
-                 { n });
-            vector<tyg_arg> args;
-            TgFn fn(*mod, nullptr);   // For the sizes of image arguments.
+            auto tsym = FSym(cg.thunks[sp]);
+            auto p = tyg_proc_begin(m, tsym, SigOf(nullptr, { ptr }));
+            TgFn fn(*mod, nullptr);   // Its IR shorthands, and the sizes of image arguments.
             fn.p = p;
+            auto cur = fn.Local(tyg_param(p, 0));   // The packet, read past each argument and global.
+            auto ld = [&](tyg_val a, int64_t off = 0) { return fn.Ld(fn.AtV(a, off)); };
+            auto st = [&](tyg_val a, int64_t off, tyg_val v) { fn.St(fn.AtV(a, off), v); };
+            auto add = [&](tyg_val a, int64_t k) { return fn.Add(a, fn.I64(k)); };
+            auto stackinit = [&](tyg_val stk) {
+                mod->NeedShim("gs_tg_stack_init");
+                CallProc(p, "gs_tg_stack_init", nullptr, { ptr }, { stk });
+            };
+            // The array at `at`, [int64 size][count][pre bytes of fields][n bytes of elements], into
+            // the header at dst (+ pre), its elements onto the stack whose top cell is at `stk`.
+            auto unpack = [&](tyg_val at, tyg_addr dst, tyg_val stk, int64_t pre, tyg_val n) {
+                auto top = ld(stk);
+                auto hdr = dst, hlen = dst;
+                hdr.offset += pre;
+                hlen.offset += pre + 8;
+                fn.St(hdr, top);
+                fn.St(hlen, ld(at, 8));
+                if (pre) tyg_copy(p, dst, fn.AtV(at, 16), pre);
+                tyg_move_dyn(p, top, add(at, 16 + pre), n);
+                st(stk, 0, fn.Add(top, n));
+            };
+            CallProc(p, "gs_tg_stack_block", nullptr, { tyg_type_int(m, TYG_I64, 1) },
+                     { fn.I64(cg.ProgramStacks({ sp })) });
+            vector<tyg_arg> args;
             for (auto t : sp->argtypes) {
-                auto at = tyg_load(p, TYG_I64, tyg_at_local(cur, 0), 0);
+                auto at = fn.LdL(cur);
                 tyg_arg a {};
                 tyg_val size;
-                if (mod->Resz(t)) {
-                    // [int64 size][count][fixed fields][elements]: a header
-                    // (or the frame object) and a stack of the thunk's own,
-                    // as CodeGen::EmitThreadThunk makes them.
+                if (mod->Resz(t)) {   // A header (or the frame object) and a stack of the thunk's own.
                     auto fo = mod->FoOk(t);
                     auto pre = fo ? mod->FoHdrOff(t) : 0;
-                    auto obj = tyg_at_local(tyg_local_new(p, fo ? mod->Size(t) : 16, 8), 0);
-                    auto stkl = tyg_local_new(p, 8, 8);
-                    mod->NeedShim("gs_tg_stack_init");
-                    {
-                        tyg_arg sa {};
-                        sa.val = tyg_addr_of(p, tyg_at_local(stkl, 0));
-                        const tyg_type *sps[] = { ptr };
-                        tyg_call(p, tyg_sig_new(m, nullptr, sps, 1, 0),
-                                 tyg_direct(mod->Sym("gs_tg_stack_init", TYG_SYM_FUNC | TYG_SYM_GLOBAL)), &sa, 1,
-                                 nullptr, nullptr);
-                    }
-                    tyg_zero(p, obj, fo ? mod->Size(t) : 16);
-                    auto hdr = obj;
-                    hdr.offset += pre;
-                    auto hlen = hdr;
-                    hlen.offset += 8;
-                    auto sz = tyg_load(p, TYG_I64, tyg_at_val(at, 0), 0);
-                    auto top = tyg_load(p, TYG_I64, tyg_at_local(stkl, 0), 0);
-                    tyg_store(p, TYG_I64, hdr, top, 0);
-                    tyg_store(p, TYG_I64, hlen, tyg_load(p, TYG_I64, tyg_at_val(at, 8), 0), 0);
-                    if (pre) tyg_copy(p, obj, tyg_at_val(at, 16), pre);
-                    auto n = tyg_bin(p, TYG_SUB, sz, tyg_iconst(p, TYG_I64, 8 + pre));
-                    tyg_move_dyn(p, top, tyg_bin(p, TYG_ADD, at, tyg_iconst(p, TYG_I64, 16 + pre)), n);
-                    tyg_store(p, TYG_I64, tyg_at_local(stkl, 0), tyg_bin(p, TYG_ADD, top, n), 0);
+                    auto osz = fo ? mod->Size(t) : 16;
+                    auto obj = fn.AtL(tyg_local_new(p, osz, 8));
+                    auto stk = tyg_addr_of(p, fn.AtL(tyg_local_new(p, 8, 8)));
+                    stackinit(stk);
+                    tyg_zero(p, obj, osz);
+                    auto sz = ld(at);
+                    unpack(at, obj, stk, pre, fn.Sub(sz, fn.I64(8 + pre)));
                     a.mem = obj;
                     args.push_back(a);
-                    tyg_arg k {};
-                    k.val = tyg_addr_of(p, tyg_at_local(stkl, 0));
-                    args.push_back(k);
-                    tyg_store(p, TYG_I64, tyg_at_local(cur, 0), tyg_bin(p, TYG_ADD, at, tyg_bin(p, TYG_ADD, sz, tyg_iconst(p, TYG_I64, 8))), 0);
+                    args.push_back(ValArg(stk));
+                    fn.StL(cur, add(fn.Add(at, sz), 8));
                     continue;
                 }
                 if (mod->RzParam(t)) {
                     a.val = at;   // An image, by its address; the packet is the worker's own copy.
                     size = fn.ImgSize(t, at);
                 } else {
-                    size = tyg_iconst(p, TYG_I64, cg.FixedSize(t));
+                    size = fn.I64(cg.FixedSize(t));
                     if (cg.IsLargeFixed(t)) a.val = at;
-                    else if (mod->IsScalar(t)) a.val = tyg_load(p, mod->Scal(t), tyg_at_val(at, 0), 0);
-                    else a.mem = tyg_at_val(at, 0);
+                    else if (mod->IsScalar(t)) a.val = tyg_load(p, mod->Scal(t), fn.AtV(at), 0);
+                    else a.mem = fn.AtV(at);
                 }
                 args.push_back(a);
-                tyg_store(p, TYG_I64, tyg_at_local(cur, 0), tyg_bin(p, TYG_ADD, at, size), 0);
+                fn.StL(cur, fn.Add(at, size));
             }
-            // The worker's globals, each [int64 size][bytes], into this
-            // thread's own instance of them.
+            // The worker's globals, each [int64 size][bytes], into this thread's instance of them.
             for (auto d : cg.ThreadGlobals(sp)) {
-                auto at = tyg_load(p, TYG_I64, tyg_at_local(cur, 0), 0);
-                if (!cg.IsFix(d->type)) {
-                    // [int64 size][image] onto the global's own stack in this
-                    // thread's instance (CodeGen::EmitThreadThunk).
-                    auto acc = [&](const string &name) {
-                        return tyg_call(p, tyg_sig_new(m, ptr, nullptr, 0, 0),
-                                        tyg_direct(mod->Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL)), nullptr, 0,
-                                        nullptr, nullptr);
-                    };
-                    auto stkinit = [&](tyg_val stk) {
-                        tyg_arg sa {};
-                        sa.val = stk;
-                        const tyg_type *sps[] = { ptr };
-                        tyg_call(p, tyg_sig_new(m, nullptr, sps, 1, 0),
-                                 tyg_direct(mod->Sym("gs_tg_stack_init", TYG_SYM_FUNC | TYG_SYM_GLOBAL)), &sa, 1,
-                                 nullptr, nullptr);
-                    };
-                    mod->NeedShim("gs_tg_stack_init");
-                    auto sz = tyg_load(p, TYG_I64, tyg_at_val(at, 0), 0);
-                    auto img = tyg_bin(p, TYG_ADD, at, tyg_iconst(p, TYG_I64, 8));
-                    auto gaddr = acc(mod->accessors.at(d));
-                    auto stk = acc(mod->stkaccessors.at(d));
-                    stkinit(stk);
-                    auto top = tyg_load(p, TYG_I64, tyg_at_val(stk, 0), 0);
-                    auto adv = [&](tyg_val n) { tyg_store(p, TYG_I64, tyg_at_val(stk, 0), tyg_bin(p, TYG_ADD, top, n), 0); };
-                    if (mod->FoOk(d->type)) {
-                        auto pre = mod->FoHdrOff(d->type);
-                        if (pre) tyg_copy(p, tyg_at_val(gaddr, 0), tyg_at_val(img, 8), pre);
-                        tyg_store(p, TYG_I64, tyg_at_val(gaddr, pre), top, 0);
-                        tyg_store(p, TYG_I64, tyg_at_val(gaddr, pre + 8), tyg_load(p, TYG_I64, tyg_at_val(img, 0), 0), 0);
-                        auto n = tyg_bin(p, TYG_SUB, sz, tyg_iconst(p, TYG_I64, 8 + pre));
-                        tyg_move_dyn(p, top, tyg_bin(p, TYG_ADD, img, tyg_iconst(p, TYG_I64, 8 + pre)), n);
-                        adv(n);
-                    } else if (mod->Resz(d->type) && d->reusable) {
-                        // [count][elements][freelist count][entries].
-                        auto ebytes = tyg_bin(p, TYG_MUL, tyg_load(p, TYG_I64, tyg_at_val(img, 0), 0),
-                                              tyg_iconst(p, TYG_I64, cg.FixedSize(d->type->arr->sub)));
-                        tyg_store(p, TYG_I64, tyg_at_val(gaddr, 0), top, 0);
-                        tyg_store(p, TYG_I64, tyg_at_val(gaddr, 8), tyg_load(p, TYG_I64, tyg_at_val(img, 0), 0), 0);
-                        tyg_move_dyn(p, top, tyg_bin(p, TYG_ADD, img, tyg_iconst(p, TYG_I64, 8)), ebytes);
-                        adv(ebytes);
-                        auto [fh, fs] = mod->PoolAccessors(d);
-                        auto fl = acc(fh);
-                        auto flstk = acc(fs);
-                        stkinit(flstk);
-                        auto ftop = tyg_load(p, TYG_I64, tyg_at_val(flstk, 0), 0);
-                        auto fat = tyg_bin(p, TYG_ADD, img, tyg_bin(p, TYG_ADD, ebytes, tyg_iconst(p, TYG_I64, 8)));
-                        auto fcnt = tyg_load(p, TYG_I64, tyg_at_val(fat, 0), 0);
-                        auto fbytes = tyg_bin(p, TYG_MUL, fcnt, tyg_iconst(p, TYG_I64, TgFn::FlEntry(d)));
-                        tyg_store(p, TYG_I64, tyg_at_val(fl, 0), ftop, 0);
-                        tyg_store(p, TYG_I64, tyg_at_val(fl, 8), fcnt, 0);
-                        tyg_move_dyn(p, ftop, tyg_bin(p, TYG_ADD, fat, tyg_iconst(p, TYG_I64, 8)), fbytes);
-                        tyg_store(p, TYG_I64, tyg_at_val(flstk, 0), tyg_bin(p, TYG_ADD, ftop, fbytes), 0);
-                    } else if (mod->Resz(d->type)) {
-                        auto n = tyg_bin(p, TYG_SUB, sz, tyg_iconst(p, TYG_I64, 8));
-                        tyg_store(p, TYG_I64, tyg_at_val(gaddr, 0), top, 0);
-                        tyg_store(p, TYG_I64, tyg_at_val(gaddr, 8), tyg_load(p, TYG_I64, tyg_at_val(img, 0), 0), 0);
-                        tyg_move_dyn(p, top, tyg_bin(p, TYG_ADD, img, tyg_iconst(p, TYG_I64, 8)), n);
-                        adv(n);
-                    } else {
-                        // A T[]: the instance holds its address.
-                        tyg_store(p, TYG_I64, tyg_at_val(gaddr, 0), top, 0);
-                        tyg_move_dyn(p, top, img, sz);
-                        adv(sz);
-                    }
-                    tyg_store(p, TYG_I64, tyg_at_local(cur, 0), tyg_bin(p, TYG_ADD, img, sz), 0);
+                auto at = fn.LdL(cur);
+                if (cg.IsFix(d->type)) {
+                    auto size = cg.FixedSize(d->type);
+                    if (size) tyg_copy(p, fn.AtV(Acc(p, mod->accessors.at(d))), fn.AtV(add(at, 8)), size);
+                    fn.StL(cur, add(at, 8 + size));
                     continue;
                 }
-                auto size = cg.FixedSize(d->type);
-                if (size) {
-                    auto dst = tyg_call(p, tyg_sig_new(m, ptr, nullptr, 0, 0),
-                                        tyg_direct(mod->Sym(mod->accessors.at(d), TYG_SYM_FUNC | TYG_SYM_GLOBAL)),
-                                        nullptr, 0, nullptr, nullptr);
-                    tyg_copy(p, tyg_at_val(dst, 0),
-                             tyg_at_val(tyg_bin(p, TYG_ADD, at, tyg_iconst(p, TYG_I64, 8)), 0), size);
+                auto sz = ld(at), img = add(at, 8);
+                auto gaddr = Acc(p, mod->accessors.at(d)), stk = Acc(p, mod->stkaccessors.at(d));
+                auto fo = mod->FoOk(d->type);
+                stackinit(stk);
+                if (fo || mod->Resz(d->type)) {
+                    // A pool: [count][elements][freelist count][entries].
+                    auto pre = fo ? mod->FoHdrOff(d->type) : 0;
+                    auto pool = !fo && d->reusable;
+                    auto n = pool ? fn.Mul(ld(img), fn.I64(cg.FixedSize(d->type->arr->sub)))
+                                  : fn.Sub(sz, fn.I64(8 + pre));
+                    unpack(at, fn.AtV(gaddr), stk, pre, n);
+                    if (pool) {
+                        auto [fh, fs] = mod->PoolAccessors(d);
+                        auto fl = Acc(p, fh), flstk = Acc(p, fs);
+                        stackinit(flstk);
+                        auto ftop = ld(flstk), fat = fn.Add(img, add(n, 8)), fcnt = ld(fat);
+                        auto fbytes = fn.Mul(fcnt, fn.I64(TgFn::FlEntry(d)));
+                        st(fl, 0, ftop);
+                        st(fl, 8, fcnt);
+                        tyg_move_dyn(p, ftop, add(fat, 8), fbytes);
+                        st(flstk, 0, fn.Add(ftop, fbytes));
+                    }
+                } else {   // A T[]: the instance holds its address.
+                    auto top = ld(stk);
+                    st(gaddr, 0, top);
+                    tyg_move_dyn(p, top, img, sz);
+                    st(stk, 0, fn.Add(top, sz));
                 }
-                tyg_store(p, TYG_I64, tyg_at_local(cur, 0),
-                          tyg_bin(p, TYG_ADD, at, tyg_iconst(p, TYG_I64, 8 + size)), 0);
+                fn.StL(cur, fn.Add(img, sz));
             }
-            if (ki.needssp) {
-                tyg_arg a {};
-                a.val = tyg_iconst(p, TYG_I64, 0);
-                args.push_back(a);
-            }
-            call(mod->Sig(sp), mod->Sym(ki.cname, TYG_SYM_FUNC | TYG_SYM_GLOBAL), args);
+            if (ki.needssp) args.push_back(ValArg(fn.I64(0)));
+            tyg_call(p, mod->Sig(sp), tyg_direct(FSym(ki.cname)), args.data(), (int)args.size(), nullptr, nullptr);
             tyg_ret(p, 0);
-            if (tyg_proc_end(p) != 0)
-                throw CompileError { cat("tinygen: ", cg.thunks[sp], ": ", tyg_error(m) ? tyg_error(m) : "?") };
-            accessor(acc, tsym);
+            EndProc(p, cg.thunks[sp]);
+            DefAccessor(acc, tsym);
         }
     }
 
-    // Whether an `export fn`'s wrapper is one this object writes: a plain
-    // specialization whose parameters and result cross by value as the C
-    // wrapper's do (CodeGen::EmitExports). Else why not.
+    // Whether the object writes an `export fn`'s wrapper (CodeGen::EmitExports): a plain specialization
+    // whose parameters and result cross by value. Else why not.
     bool ExportOk(CodeGen &cg, SFunction *sf, string &why) {
-        if (sf->specs.size() != 1 || !cg.sinfo.count(sf->specs[0])) return why = "export fns", false;
+        auto fail = [&] { return why = "export fns", false; };
+        if (sf->specs.size() != 1 || !cg.sinfo.count(sf->specs[0])) return fail();
         auto sp = sf->specs[0];
         auto &si = cg.sinfo[sp];
-        if (!si.freevars.empty() || sp->rets.size() > 1 || !mod->SigOk(sp, false, why))
-            return why = "export fns", false;
+        if (!si.freevars.empty() || sp->rets.size() > 1 || !mod->SigOk(sp, false, why)) return fail();
         for (size_t i = 0; i < sp->argtypes.size(); i++) {
             auto t = sp->argtypes[i];
-            if (cg.IsPoolParam(sp, i) || mod->RzParam(t) || cg.IsLargeFixed(t) || !mod->TypeOk(t))
-                return why = "export fns", false;
+            if (cg.IsPoolParam(sp, i) || mod->RzParam(t) || cg.IsLargeFixed(t) || !mod->TypeOk(t)) return fail();
         }
-        if (!sp->rets.empty() && (si.cret != 0 || !mod->TypeOk(sp->rets[0]))) return why = "export fns", false;
+        if (!sp->rets.empty() && (si.cret != 0 || !mod->TypeOk(sp->rets[0]))) return fail();
         return true;
     }
 
-    // The C symbol of each `export fn`: a procedure taking the C
-    // parameters, and for a slice result a length out-pointer after them,
-    // which calls the function, passing gs_sp 0 (CodeGen::EmitExports).
+    // The C symbol of each `export fn` (CodeGen::EmitExports), calling it with gs_sp 0.
     void EmitExports(CodeGen &cg) {
-        auto m = mod->m;
+        auto ptr = tyg_type_ptr(mod->m);
         for (auto sf : ast.functions) {
             if (!sf->isexport) continue;
             auto sp = sf->specs[0];
-            auto &si = cg.sinfo[sp];
             auto rt = sp->rets.empty() ? nullptr : sp->rets[0];
             auto slice = rt && rt->kind == TY_SLICE;
             vector<const tyg_type *> ps;
             for (auto t : sp->argtypes) ps.push_back(mod->AT(t));
-            if (slice) ps.push_back(tyg_type_ptr(m));
-            auto csig = tyg_sig_new(m, !rt ? nullptr : slice ? tyg_type_ptr(m) : mod->AT(rt), ps.data(),
-                                    (int)ps.size(), 0);
-            auto p = tyg_proc_begin(m, mod->Sym(sf->cname, TYG_SYM_FUNC | TYG_SYM_GLOBAL), csig);
-            vector<tyg_arg> args;
-            for (size_t i = 0; i < sp->argtypes.size(); i++) {
-                tyg_arg a {};
-                if (mod->IsScalar(sp->argtypes[i])) a.val = tyg_param(p, (int)i);
-                else a.mem = tyg_at_val(tyg_param(p, (int)i), 0);
-                args.push_back(a);
-            }
-            if (si.needssp) {
-                tyg_arg a {};
-                a.val = tyg_iconst(p, TYG_I64, 0);
-                args.push_back(a);
-            }
-            auto callee = tyg_direct(mod->Sym(si.cname, TYG_SYM_FUNC | TYG_SYM_GLOBAL));
-            if (!rt) {
-                tyg_call(p, mod->Sig(sp), callee, args.data(), (int)args.size(), nullptr, nullptr);
-                tyg_ret(p, 0);
-            } else if (mod->IsScalar(rt)) {
-                tyg_ret(p, tyg_call(p, mod->Sig(sp), callee, args.data(), (int)args.size(), nullptr, nullptr));
-            } else {
-                auto t = tyg_local_new(p, mod->Size(rt), 8);
-                auto ra = tyg_at_local(t, 0);
-                tyg_call(p, mod->Sig(sp), callee, args.data(), (int)args.size(), nullptr, &ra);
-                if (slice) {
-                    tyg_store(p, TYG_I64, tyg_at_val(tyg_param(p, (int)sp->argtypes.size()), 0),
-                              tyg_load(p, TYG_I64, tyg_at_local(t, 8), 0), 0);
-                    tyg_ret(p, tyg_load(p, TYG_I64, tyg_at_local(t, 0), 0));
-                } else {
-                    tyg_ret_mem(p, ra);
-                }
-            }
-            if (tyg_proc_end(p) != 0)
-                throw CompileError { cat("tinygen: ", sf->cname, ": ", tyg_error(m) ? tyg_error(m) : "?") };
+            if (slice) ps.push_back(ptr);
+            auto sig = SigOf(!rt ? nullptr : slice ? ptr : mod->AT(rt), ps);
+            auto p = tyg_proc_begin(mod->m, FSym(sf->cname), sig);
+            ForwardCall(p, sp, mod->Sig(sp), FSym(cg.sinfo[sp].cname), cg.sinfo[sp].needssp, slice);
+            EndProc(p, sf->cname);
         }
     }
 
     // ---- Globals of a whole program ------------------------------------------
-    //
-    // With no C half the object holds the globals: each member of the C's
-    // instance block (gs_globals_t) a zero-filled data symbol of its own,
-    // under its Goose name for the debugger, a resizable's or T[]'s
-    // dedicated stack another beside it; the static data the C makes of a
-    // `let` is the object's already (TgModule::StaticGlobal). A whole
-    // program has no threads, so main's instance is the only one, as
-    // GS_GL is &gs_globals_main in the C. The functions compiled reach a
-    // global through its accessor (gs_tg_g<i>, gs_tg_gs<i>) as in a mixed
-    // build, which the object now defines, and gs_init_globals is a
-    // procedure of the object (TgFn::EmitInit) that main calls.
+    // With no C half the object holds the globals: each member of gs_globals_t a zero-filled data
+    // symbol under its Goose name, a resizable's or T[]'s dedicated stack another beside it; `let` data
+    // is the object's already (TgModule::StaticGlobal). There are no threads, so main's instance is the
+    // only one. Functions reach a global through its accessor as in a mixed build, which the object now
+    // defines.
 
     // Whether every global is one the object can hold: else why not.
     bool GlobalsOk(CodeGen &cg, string &why) {
         for (auto g : ast.globals)
             for (auto d : g->defs) {
-                if (cg.gstatic.count(d)) {
-                    // Static data reached through an accessor: its bytes
-                    // were not laid out (StaticBytes).
-                    if (mod->accessors.count(d)) return why = cat("global ", d->name, " as static data"), false;
-                    continue;
-                }
-                if (!mod->GlobalOk(d))
-                    return why = cat("global ", d->name, " of this kind"), false;
+                bool stat = cg.gstatic.count(d);   // Its bytes are not laid out: no accessor can reach it.
+                if (stat ? mod->accessors.count(d) > 0 : !mod->GlobalOk(d))
+                    return why = cat("global ", d->name, stat ? " as static data" : " of this kind"), false;
             }
         return true;
     }
 
-    // Whether a program-specific shim is one the object defines itself:
-    // a global's accessor, or a `return from` channel's of a fixed type.
+    // Whether the object defines a program-specific shim itself: an accessor or a `return from`
+    // channel.
     bool OwnAccessor(const string &name) {
-        if (auto it = mod->channels.find(name); it != mod->channels.end())
-            return true;
-        if (mod->queueacc.count(name) || mod->thunkacc.count(name)) return true;
-        for (auto &[d, n] : mod->accessors)
-            if (n == name) return true;
-        for (auto &[d, n] : mod->stkaccessors)
-            if (n == name) return true;
+        if (mod->channels.count(name) || mod->queueacc.count(name) || mod->thunkacc.count(name)) return true;
+        auto has = [&](auto &table) {
+            for (auto &[d, n] : table)
+                if (n == name) return true;
+            return false;
+        };
         for (auto &[d, n] : mod->flaccessors)
             if (n.first == name || n.second == name) return true;
-        return false;
+        return has(mod->accessors) || has(mod->stkaccessors);
     }
 
-    // gs_init_globals into the object, if its initializers compile and
-    // need no more data stacks than the C's (stackneed[nullptr], which
-    // gs_rt_init's counts were made with). Else why not.
+    // gs_init_globals into the object, if its initializers compile and need no more data stacks than
+    // the C's (stackneed[nullptr]). Else why not.
     tyg_sym initsym = TYG_NO_SYM;
     int64_t initstacks = 0;   // The data stacks gs_tg_init_globals uses at once.
     bool BuildInit(CodeGen &cg, string &why) {
-        auto nshims = mod->shims.size(), nexterns = mod->externs.size(), ndirect = mod->direct.size();
         auto sym = mod->Sym("gs_tg_init_globals", TYG_SYM_FUNC);
         TgFn fn(*mod, nullptr);
-        auto undo = [&](const string &w) {
-            if (fn.p) tyg_proc_abort(fn.p);
-            mod->shims.resize(nshims);
-            mod->externs.resize(nexterns);
-            mod->direct.resize(ndirect);
-            why = w;
-            return false;
-        };
         Line line;
         for (auto g : ast.globals)
             if (!g->inits.empty()) {
                 line = g->line;
                 break;
             }
-        try {
-            fn.EmitInit(sym, line);
-        } catch (TgUnsupported &u) {
-            return undo(cat("global initializer: ", u.why, u.line.line > 0 ? cat(" (line ", u.line.line, ")") : ""));
-        }
+        if (auto w = Attempt(fn, [&] { fn.EmitInit(sym, line); }); !w.empty())
+            return why = cat("global initializer: ", w), false;
         int64_t need = fn.maxown;
         for (auto &c : fn.stackcalls) need = std::max(need, c.offset + cg.stackneed[c.callee]);
-        // The C's count for it is what its own code needs; this one's
-        // temporaries (a dispatch's result before it is re-prefixed) may
-        // need more, which the program's main asks the runtime for.
+        // This one's temporaries may need more than the C's count; main asks the runtime for them.
         if (need > cg.rtinit[0] && cg.maxstacks > 0 && need > cg.maxstacks)
             return why = "global initializers' data stacks", false;
         initstacks = need;
-        // Extern fns: as for any function of a whole program.
-        for (auto sp : mod->externs)
+        for (auto sp : mod->externs)   // Extern fns: as for any function of a whole program.
             if (!ExternHeld(sp)) return why = cat("extern ", sp->sf->cname), false;
         initsym = sym;
         return true;
     }
 
-    // The globals' storage, their debug entries, and the accessors the
-    // functions call, each returning its global's address.
+    // The globals' storage, their debug entries, and the accessors the functions call.
     void EmitGlobalStorage(CodeGen &cg) {
         auto m = mod->m;
         map<const VarDef *, tyg_sym> gsyms, ssyms;
         map<const VarDef *, pair<tyg_sym, tyg_sym>> flsyms;
-        // Each thread program has an instance of the globals it names
-        // (§11.2): thread-local storage, which a thread's thunk fills.
+        // A thread program's instance of the globals it names is thread-local (§11.2); its thunk fills
+        // it.
         auto tls = false;
         for (auto &[acc, sp] : mod->thunkacc) tls = tls || !cg.ThreadGlobals(sp).empty();
         auto def = [&](const string &name, int64_t size, int64_t align, VarDef *d, const tyg_dtype *dt) {
-            auto sym = tyg_symbol(m, cat("gs_g_", name).c_str(), tls ? TYG_SYM_TLS : 0);
-            tyg_data(m, sym, tls ? TYG_SECTION_TBSS : TYG_SECTION_BSS, nullptr, std::max<int64_t>(size, 1), align);
+            auto sym = DataSym(cat("gs_g_", name), size, align, tls);
             if (dt) tyg_debug_global(m, string(d->name).c_str(), dt, sym, mod->File(d->line.fileidx), d->line.line);
             return sym;
         };
@@ -9012,104 +8877,59 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                     gsyms[d] = def(name, sz, align, d, mod->DT(d->type));
                 }
                 if (cg.gstks.count(d)) ssyms[d] = def(cat("gs_gstk_", name), 8, 8, d, nullptr);
-                if (cg.gpools.count(d)) {
+                if (cg.gpools.count(d))
                     flsyms[d] = { def(cat(name, "_fl"), 16, 8, d, nullptr),
                                   def(cat("gs_gstk_", name, "_fl"), 8, 8, d, nullptr) };
-                }
             }
-        auto accessor = [&](const string &name, tyg_sym target) {
-            auto p = tyg_proc_begin(m, mod->Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL),
-                                    tyg_sig_new(m, tyg_type_ptr(m), nullptr, 0, 0));
-            tyg_ret(p, tyg_addr_of(p, tyg_at_sym(target, 0)));
-            if (tyg_proc_end(p) != 0)
-                throw CompileError { cat("tinygen: ", name, ": ", tyg_error(m) ? tyg_error(m) : "?") };
-        };
-        for (auto &[d, n] : mod->accessors) accessor(n, gsyms.at(d));
-        for (auto &[d, n] : mod->stkaccessors) accessor(n, ssyms.at(d));
+        for (auto &[d, n] : mod->accessors) DefAccessor(n, gsyms.at(d));
+        for (auto &[d, n] : mod->stkaccessors) DefAccessor(n, ssyms.at(d));
         for (auto &[d, n] : mod->flaccessors) {
-            accessor(n.first, flsyms.at(d).first);
-            accessor(n.second, flsyms.at(d).second);
+            DefAccessor(n.first, flsyms.at(d).first);
+            DefAccessor(n.second, flsyms.at(d).second);
         }
-        // The `return from` channels, which the C half keeps thread-local
-        // (gs_rf, the support object's, is one too): thread-local here in a
-        // program with threads, plain data in one with a single thread.
+        // The `return from` channels: thread-local in a program with threads, as in the C half.
         auto threaded = cg.usesthreads || !cg.queues.empty();
         for (auto &sh : mod->shims) {
             auto it = mod->channels.find(sh.first);
             if (it == mod->channels.end()) continue;
-            auto sym = tyg_symbol(m, cat("gs_", sh.first.substr(6)).c_str(), threaded ? TYG_SYM_TLS : 0);   // gs_lret_<tid>_<i>
-            tyg_data(m, sym, threaded ? TYG_SECTION_TBSS : TYG_SECTION_BSS, nullptr,
-                     std::max<int64_t>(it->second, 1), 8);
-            accessor(sh.first, sym);
+            DefAccessor(sh.first, DataSym(cat("gs_", sh.first.substr(6)), it->second, 8, threaded));
         }
     }
 
-    // The C main of a whole program build, which the C half otherwise
-    // writes (CodeGen::EmitProgramInit, EmitMain): the runtime started
-    // with the program's stack counts, the globals initialized, fn main()
-    // run, the stack report.
-    // In the debugger it is `main` at fn main()'s line.
+    // The C main of a whole program (CodeGen::EmitProgramInit, EmitMain): the runtime started with the
+    // program's stack counts, the globals initialized, fn main() run. In the debugger it is at fn
+    // main().
     void EmitMain(CodeGen &cg) {
         auto m = mod->m;
         auto mainsp = ast.MainFunction()->specs[0];
         auto i32 = tyg_type_int(m, TYG_I32, 1), i64 = tyg_type_int(m, TYG_I64, 1);
         auto ptr = tyg_type_ptr(m);
-        const tyg_type *ps[] = { i32, ptr };
-        auto p = tyg_proc_begin(m, mod->Sym("main", TYG_SYM_FUNC | TYG_SYM_GLOBAL),
-                                tyg_sig_new(m, i32, ps, 2, 0));
+        auto p = tyg_proc_begin(m, FSym("main"), SigOf(i32, { i32, ptr }));
         auto line = mainsp->sf->line;
         auto file = mod->File(line.fileidx);
         auto dint = tyg_dt_base(m, "int", 4, TYG_DT_SIGNED);
         const tyg_dtype *pdt[] = { dint, tyg_dt_pointer(m, tyg_dt_void(m)) };
         tyg_debug_proc(p, "main", file, line.line, tyg_dt_func(m, dint, pdt, 2, 0));
         tyg_loc(p, file, line.line, 0);
-        auto call = [&](tyg_sig *sig, const string &name, vector<tyg_val> args) {
-            vector<tyg_arg> as;
-            for (auto a : args) {
-                tyg_arg x {};
-                x.val = a;
-                as.push_back(x);
-            }
-            tyg_call(p, sig, tyg_direct(mod->Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL)), as.data(),
-                     (int)as.size(), nullptr, nullptr);
-        };
-        const tyg_type *sps[] = { i32, ptr, i64, i64, i64 };
-        // The main program's stacks, or what the initializers use if more
-        // (the global regions follow them).
-        auto mainstacks = std::max(cg.rtinit[0], initstacks);
-        call(tyg_sig_new(m, nullptr, sps, 5, 0), "gs_tg_start",
-             { tyg_param(p, 0), tyg_param(p, 1), tyg_iconst(p, TYG_I64, mainstacks),
-               tyg_iconst(p, TYG_I64, cg.rtinit[1] + mainstacks - cg.rtinit[0]),
-               tyg_iconst(p, TYG_I64, cg.rtinit[2]) });
-        // The queues, before anything that could use one runs.
-        for (auto &[acc, q] : mod->queueacc) {
-            auto addr = tyg_call(p, tyg_sig_new(m, ptr, nullptr, 0, 0), tyg_direct(mod->Sym(acc, TYG_SYM_FUNC | TYG_SYM_GLOBAL)),
-                                 nullptr, 0, nullptr, nullptr);
-            tyg_arg a {};
-            a.val = addr;
-            const tyg_type *qps[] = { ptr };
-            tyg_call(p, tyg_sig_new(m, nullptr, qps, 1, 0),
-                     tyg_direct(mod->Sym("gs_qinit", TYG_SYM_FUNC | TYG_SYM_GLOBAL)), &a, 1, nullptr, nullptr);
-        }
-        if (initsym != TYG_NO_SYM) {
-            tyg_call(p, tyg_sig_new(m, nullptr, nullptr, 0, 0), tyg_direct(initsym), nullptr, 0, nullptr,
-                     nullptr);
-        }
-        vector<tyg_val> margs;
-        if (cg.sinfo[mainsp].needssp) margs.push_back(tyg_iconst(p, TYG_I64, 0));
-        call(mod->Sig(mainsp), cg.sinfo[mainsp].cname, margs);
-        call(tyg_sig_new(m, nullptr, nullptr, 0, 0), "gs_tg_end", {});
+        auto I = [&](int64_t v) { return tyg_iconst(p, TYG_I64, v); };
+        // The main program's stacks, or what the initializers use if more.
+        auto stacks = std::max(cg.rtinit[0], initstacks);
+        CallProc(p, "gs_tg_start", nullptr, { i32, ptr, i64, i64, i64 },
+                 { tyg_param(p, 0), tyg_param(p, 1), I(stacks), I(cg.rtinit[1] + stacks - cg.rtinit[0]),
+                   I(cg.rtinit[2]) });
+        for (auto &[acc, q] : mod->queueacc) CallProc(p, "gs_qinit", nullptr, { ptr }, { Acc(p, acc) });
+        if (initsym != TYG_NO_SYM) CallSig(p, SigOf(nullptr, {}), initsym, {});
+        auto &mi = cg.sinfo[mainsp];
+        CallSig(p, mod->Sig(mainsp), FSym(mi.cname), mi.needssp ? vector<tyg_val> { I(0) } : vector<tyg_val> {});
+        CallProc(p, "gs_tg_end", nullptr, {}, {});
         tyg_ret(p, tyg_iconst(p, TYG_I32, 0));
-        if (tyg_proc_end(p) != 0)
-            throw CompileError { cat("tinygen: main: ", tyg_error(m) ? tyg_error(m) : "?") };
+        EndProc(p, "main");
     }
 
     bool Write(const string &path, string &err) {
-        if (tyg_module_write(mod->m, path.c_str()) != 0) {
-            err = tyg_error(mod->m) ? tyg_error(mod->m) : "?";
-            return false;
-        }
-        return true;
+        if (tyg_module_write(mod->m, path.c_str()) == 0) return true;
+        err = tyg_error(mod->m) ? tyg_error(mod->m) : "?";
+        return false;
     }
 };
 
