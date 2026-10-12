@@ -882,8 +882,6 @@ struct TgModule {
             if (cg.VariantLayout(ei, (int)vi).size) fs.push_back({ AT(cg.VariantType(t, (int)vi)), TagSize(t) });
         return tyg_type_record(m, cg.FixedSize(t), 1, fs.data(), (int)fs.size());
     }
-    // The C's debugger view under Goose names: `Shape` a struct of `tag`, an enum of the variants' names,
-    // and `u`, a union of the payloads by variant name; `Shape.Circle` a struct of its fields.
     // A fixed struct or variant's record (a variant without fields: C's gs_empty byte). A field may refer
     // back to it through a reference.
     const tyg_dtype *FieldsDT(TypeExpr *t, const string &name) {
@@ -893,6 +891,8 @@ struct TgModule {
         for (auto &f : fs) DMem(rec, f.name, DT(f.t), f.off);
         return DEnd(rec, Size(t));
     }
+    // The C's debugger view under Goose names: `Shape` a struct of `tag`, an enum of the variants' names,
+    // and `u`, a union of the payloads by variant name; `Shape.Circle` a struct of its fields.
     const tyg_dtype *AdtDT(TypeExpr *t, const string &name) {
         auto ei = cg.EIOf(t);
         auto en = ei->en;
@@ -947,12 +947,14 @@ struct TgModule {
         auto w = t->ref->lenstorage;
         return ScalOfBytes(w == IS_U8 ? 1 : w == IS_U16 ? 2 : w == IS_U32 ? 4 : 8);
     }
-    bool VmOk(TypeExpr *t, int depth = 0) {
-        if (!IsVm(t) || depth > 32) return false;
+    // Whether the payload fields of each variant a value of t may be are ones this backend reads and
+    // builds as bytes.
+    bool PayloadsOk(TypeExpr *t, int depth) {
         return Within(t, true, [&] {
             return AllVariants(t, [&](int, const FieldSet &fs) { return FieldsOk(fs, depth + 1); });
         });
     }
+    bool VmOk(TypeExpr *t, int depth = 0) { return IsVm(t) && depth <= 32 && PayloadsOk(t, depth); }
     // Whether the first n fields (all by default) are ones this backend reads and builds: fixed ones it
     // holds, T[]s and variable-size structs it holds as images.
     bool FieldsOk(const FieldSet &fs, int depth, size_t n = SIZE_MAX) {
@@ -967,10 +969,7 @@ struct TgModule {
     // A variant type whose payload has a variable-size field (`Msg.Text` with a u8[]): an image of its
     // fields, as a variable-size struct is.
     bool IsVv(TypeExpr *t) { return t && t->kind == TY_VARIANT && !cg.IsFix(t); }
-    bool VvOk(TypeExpr *t, int depth = 0) {
-        if (!IsVv(t) || depth > 32) return false;
-        return Within(t, true, [&] { return FieldsOk(VarFields(cg.EIVar(t), VariantIdx(t)), depth + 1); });
-    }
+    bool VvOk(TypeExpr *t, int depth = 0) { return IsVv(t) && depth <= 32 && PayloadsOk(t, depth); }
     // The largest value: the tag and the largest payload.
     int64_t VmMaxSize(TypeExpr *t) {
         auto ei = cg.EIOf(t);
@@ -6692,13 +6691,9 @@ struct TgFn {
             r.rbase = at;
             return r;
         };
-        if (base.tmphdr || (M.IsRb(t) && (t->kind == TY_VARIANT || M.RbOk(t)))) {
+        if (base.tmphdr || M.RsOk(t) || (M.IsRb(t) && (t->kind == TY_VARIANT || M.RbOk(t)))) {
             if (tail && t->kind == TY_VARIANT && !read) No(l, "tail of a resizable variant");
-            auto at = FieldAddr(t, Ld(base.a), fi);
-            return tail ? tailat(at, base.a) : plain(at);
-        }
-        if (M.RsOk(t)) {
-            auto at = FieldAddr(t, Ld(base.a), fi);
+            auto at = FieldAddr(t, Ld(base.a), fi);   // Behind the header's base.
             return tail ? tailat(at, base.a) : plain(at);
         }
         if (M.FoOk(t)) {
@@ -6746,9 +6741,8 @@ struct TgFn {
         }
         auto tag = Local(LoadTag(src, srct));
         tyg_store(p, M.TagScal(t), AtV(base), tyg_convert(p, TYG_TRUNC, M.TagScal(t), LdL(tag)), 0);
-        for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
-            If(Cmp(TYG_EQ, LdL(tag), I64((int64_t)vi)),
-               [&] { copyfix(cg.VariantLayout(ei, (int)vi).size, AddrPlus(src, ts)); });
+        TagSwitch(tag, ei->en->variants.size(),
+                  [&](size_t vi) { copyfix(cg.VariantLayout(ei, (int)vi).size, AddrPlus(src, ts)); });
         return LdL(start);
     }
 
@@ -6774,26 +6768,23 @@ struct TgFn {
             return at();
         }
         auto ei = cg.EIOf(t);
-        auto vi = (size_t)ei->en->VariantIndex(var);
-        auto vt = cg.VariantType(t, (int)vi);
+        auto vi = ei->en->VariantIndex(var);
+        auto vt = cg.VariantType(t, vi);
+        auto fixed = cg.IsFix(vt);
+        if (!fixed && !sl) No(l, cat("variant constant of type ", M.NameWhy(t)));
+        // The tag, then the payload: a fixed one zero bytes, a literal's fields stored in place; a
+        // variable one its fields built in turn.
         auto base = at();
-        auto ts = M.TagSize(t);
-        if (!cg.IsFix(vt)) {   // A variable payload: the tag, then its fields built in turn.
-            if (!sl) No(l, cat("variant constant of type ", M.NameWhy(t)));
-            SetTop(stk, Add(base, I64(ts)));
-            StoreTag(AtV(base), t, (int)vi);
-            SelfScope scope(selfbase, base);
-            RunLit(sl, stk, M.VarFields(ei, (int)vi));
-            return at();
-        }
-        // A fixed payload: the tag, the rest zero bytes, a literal's fields stored in place.
-        auto size = ts + cg.FixedSize(vt);
+        auto size = M.TagSize(t) + (fixed ? cg.FixedSize(vt) : 0);
         SetTop(stk, Add(base, I64(size)));
-        tyg_zero(p, AtV(base), size);
-        StoreTag(AtV(base), t, (int)vi);
+        if (fixed) tyg_zero(p, AtV(base), size);
+        StoreTag(AtV(base), t, vi);
         if (!sl) return at();
         SelfScope scope(selfbase, base);
-        EachLitInit(sl, [&](Node *init, TypeExpr *ft, int64_t off) { Into(P { AtV(at(), off), ft }, init); });
+        if (!fixed) RunLit(sl, stk, M.VarFields(ei, vi));
+        else EachLitInit(sl, [&](Node *x, TypeExpr *ft, int64_t o) {
+            Into(P { AtV(at(), o), ft }, x);
+        });
         return at();
     }
 
