@@ -1598,7 +1598,17 @@ struct TgFn {
         else return false;
         return true;
     }
-    bool DestIs(Call *c, TypeExpr *t) { return DestSpec(c) && cg.Mangle(DestSpec(c)->rets[0]) == cg.Mangle(t); }
+    // A call returning d.t (the same by name, or by TEq if !bymangle) is handed d to build its first
+    // result at; false if n is not one.
+    bool CallAt(Node *n, const InPlace &d, bool bymangle = true) {
+        auto c = Is<Call>(n);
+        if (!DestSpec(c)) return false;
+        auto rt = DestSpec(c)->rets[0];
+        if (bymangle ? cg.Mangle(rt) != cg.Mangle(d.t) : !cg.TEq(rt, d.t)) return false;
+        if (d.mode == 1) CallImg(c, d.stk);
+        else CallRz(c, d.stk, d.hdr);
+        return true;
+    }
     void CallRz(Call *c, tyg_val stk, tyg_addr hdr) { RzDst d { stk, hdr }; rzdst = &d; GenCall(c); rzdst = nullptr; }
     void CallImg(Call *c, tyg_val stk) { imgdst = stk; GenCall(c); imgdst = 0; }
     // The header of a resizable about to be built at the top of stk: its base, no elements.
@@ -1842,6 +1852,7 @@ struct TgFn {
         if (BuildCtl(n, InPlace { 2, stk, t, hdr }, l)) return;
         auto sl = Is<StructLit>(n);
         auto c = Is<Call>(n);
+        if (CallAt(n, InPlace { 2, stk, t, hdr })) return;
         if (isst) {   // Its fixed fields in turn, then its tail, a resizable ADT of its own.
             if (sl && sl->exprtype && cg.TEq(sl->exprtype, t) && sl->sinst && !sl->variant) {
                 auto si = cg.SI(t);
@@ -1852,7 +1863,7 @@ struct TgFn {
                 });
                 return;
             }
-            if (!DestIs(c, t)) No(l, "resizable struct built from this value");
+            No(l, "resizable struct built from this value");
         } else if (sl && sl->exprtype && cg.TEq(sl->exprtype, t) && (adt ? sl->variant != nullptr : true)) {
             auto vi = adt ? ei->en->VariantIndex(sl->variant) : M.VariantIdx(t);
             auto &fs = ei->en->variants[(size_t)vi].fields;
@@ -1873,7 +1884,6 @@ struct TgFn {
             return begin(ei->en->VariantIndex(d->variantconst));
         if (DestSpec(c)) {
             auto rt = DestSpec(c)->rets[0];
-            if (cg.Mangle(rt) == cg.Mangle(t)) return CallRz(c, stk, hdr);
             if (adt && rt->kind == TY_VARIANT && M.EI(rt) == ei && M.IsRb(rt)) {
                 // The variant behind the ADT's tag, built where the call puts its result; the header starts at the tag.
                 auto top = Top(stk);
@@ -2050,9 +2060,9 @@ struct TgFn {
         }
         if (M.IsVm(t) || M.IsVv(t) || M.IsVs(t)) {
             if (!n || from) No(l, cat("value of type ", M.NameWhy(t)));
-            return M.IsVm(t) ? GenVm(n, stk, t, l) : M.IsVv(t) ? GenVv(n, stk, t, l) : GenVs(n, stk, t, l);
+            return M.IsVm(t) ? GenVm(n, stk, t, l) : GenVs(n, stk, t, l);
         }
-        if (auto c = Is<Call>(n); DestIs(c, t)) { CallImg(c, stk); return at(); }
+        if (CallAt(n, InPlace { 1, stk, t })) return at();
         if (M.VarImgOk(t)) return GenImgOfImgs(n, stk, t, l, from, start);
         if (M.IsRc(t)) { GenRc(n, stk, t, l, from, at()); return at(); }
         SetTop(stk, Add(at(), I64(TgModule::PrefixBytes(t))));
@@ -2189,6 +2199,28 @@ struct TgFn {
     }
 
     V RzTemp(TypeExpr *t, Line l) { return MemV(t, NewHdr(), Stk(AllocStk(false, l), l)); }
+    // A frame object's struct in a temporary, its tail on a stack of the statement's.
+    V FoTemp(TypeExpr *t, Line l) { return MemV(t, AtL(tyg_local_new(p, M.Size(t), 8)), Stk(AllocStk(false, l), l)); }
+    // A type BuildTemp builds: an image, a resizable array or a frame object.
+    bool TempOk(TypeExpr *t) {
+        return M.FoOk(t) || (IsImg(t) && M.ImgOk(t)) || (IsGrow(t) && (M.RzOk(t) || M.VeOk(t)));
+    }
+    // n's value of type t built on a temporary stack of the statement's (an image at its top, the
+    // others behind a header beside it); the builder is chosen by t.
+    V BuildTemp(Node *n, TypeExpr *t, Line l) {
+        if (M.FoOk(t)) {
+            auto x = FoTemp(t, l);
+            GenFo(n, P { x.a, t, x.stk }, l);
+            return x;
+        }
+        if (!IsGrow(t) && !M.IsRs(t) && !M.IsRb(t)) {
+            auto stk = Stk(AllocStk(false, l), l);
+            return MemV(t, AtV(GenImg(n, stk, t, l)));
+        }
+        auto x = RzTemp(t, l);
+        GenRz(n, x.stk, x.a, t, l);
+        return x;
+    }
 
     // ---- Conversions -------------------------------------------------------
 
@@ -3319,17 +3351,7 @@ struct TgFn {
 
     V GenStructLit(StructLit *sl) {
         auto t = sl->exprtype;
-        if (M.RbOk(t)) {
-            // A resizable ADT's literal: on a temporary's stack, its header beside it.
-            auto x = RzTemp(t, sl->line);
-            GenRb(sl, x.stk, x.a, t, sl->line);
-            return x;
-        }
-        if (IsImg(t) && M.ImgOk(t)) {
-            // An image: built at the top of a temporary's stack.
-            auto stk = Stk(AllocStk(false, sl->line), sl->line);
-            return MemV(t, AtV(GenImg(sl, stk, t, sl->line)));
-        }
+        if (V x; InPlaceValue(sl, t, sl->line, x)) return x;
         if (t->kind == TY_VARIANT || t->kind == TY_ENUM) return GenVariantLit(sl);
         if (!sl->sinst || sl->variant || t->kind != TY_STRUCT || !M.TypeOk(t)) No(sl->line, "literal of this type");
         auto tmp = Temp(t);
@@ -3539,16 +3561,7 @@ struct TgFn {
     V GenArrayLit(ArrayLit *al) {
         auto t = al->exprtype;
         if (TgModule::IsLim(t)) return LimLit(al);
-        if (t && IsImg(t) && M.ImgOk(t)) {
-            // An image: built at the top of a temporary's stack.
-            auto stk = Stk(AllocStk(false, al->line), al->line);
-            return MemV(t, AtV(GenImg(al, stk, t, al->line)));
-        }
-        if (t && IsGrow(t) && (M.RzOk(t) || M.VeOk(t))) {
-            auto x = RzTemp(t, al->line);
-            GenRz(al, x.stk, x.a, t, al->line);
-            return x;
-        }
+        if (V x; t && InPlaceValue(al, t, al->line, x)) return x;
         if (t && t->kind == TY_SLICE && M.TypeOk(t) && !al->capexpr && cg.IsFix(t->sub)) {
             // A literal in slice position: a temporary fixed array, sliced whole
             // (CodeGen::GenFixedArrayLit).
@@ -4031,16 +4044,6 @@ struct TgFn {
         Branch(c, yes, no);
         SetBlock(yes);
     }
-    // An image of n built at the top of a stack of the statement's.
-    V ImgTemp(Node *n, TypeExpr *t, Line l) {
-        auto stk = Stk(AllocStk(false, l), l);
-        return MemV(t, AtV(GenImg(n, stk, t, l)));
-    }
-    // A frame object's struct in a temporary, its tail on a stack of the statement's.
-    V FoTemp(TypeExpr *t, Line l) {
-        auto loc = tyg_local_new(p, M.Size(t), 8);
-        return MemV(t, AtL(loc), Stk(AllocStk(false, l), l));
-    }
 
     tyg_arg Arg(Node *n, TypeExpr *pt) {
         if (!M.TypeOk(pt)) No(n->line, "argument of this type");
@@ -4150,14 +4153,8 @@ struct TgFn {
                 auto tmp = Temp(rt);
                 tyg_copy(p, AtL(tmp), x.a, M.Size(rt));
                 x = MemV(rt, AtL(tmp));
-            } else if (IsImg(rt) && M.ImgOk(rt)) {
-                x = ImgTemp(an[0], rt, line);
-            } else if (IsGrow(rt) && (M.RzOk(rt) || M.VeOk(rt))) {
-                x = RzTemp(rt, line);
-                GenRz(c, x.stk, x.a, rt, line);
-            } else if (M.FoOk(rt)) {
-                x = FoTemp(rt, line);
-                GenFo(an[0], P { x.a, rt, x.stk }, line);
+            } else if (TempOk(rt)) {
+                x = BuildTemp(an[0], rt, line);
             } else {
                 No(line, cat("copy of type ", M.NameWhy(rt)));
             }
@@ -4184,9 +4181,7 @@ struct TgFn {
             return lastrets[0];
         }
         if (b == B_TO_BYTES && nargs == 1) {
-            auto x = RzTemp(cg.GrowU8(), line);
-            GenRz(c, x.stk, x.a, x.t, line);
-            return x;
+            return BuildTemp(c, cg.GrowU8(), line);
         }
         if (b == B_BYTES_OF && nargs == 1) {
             // The element region of an array or slice as a u8[:] (CodeGen::PayloadOf).
@@ -4386,16 +4381,14 @@ struct TgFn {
     void ValArg(Node *n, TypeExpr *pt, vector<tyg_arg> &args) {
         auto l = n->line;
         if (M.FoOk(pt)) {
-            auto x = FoTemp(pt, l);
-            GenFo(n, P { x.a, pt, x.stk }, l);
+            auto x = BuildTemp(n, pt, l);
             args.push_back(ArgOfMem(x.a));
             args.push_back(ArgOfVal(x.stk));
         } else if (!IsGrow(pt) && !M.IsRs(pt) && !M.IsRb(pt)) {   // A T[]: by the image's address.
             auto stk = Stk(AllocStk(false, l), l);
             args.push_back(ArgOfVal(GenImg(n, stk, pt, l)));
         } else {
-            auto x = RzTemp(pt, l);
-            GenRz(n, x.stk, x.a, pt, l);
+            auto x = BuildTemp(n, pt, l);
             args.push_back(ArgOfMem(x.a));
             args.push_back(ArgOfVal(x.stk));
         }
@@ -5052,18 +5045,16 @@ struct TgFn {
     V GenStr(Call *c) {
         auto t = c->exprtype;
         auto slice = t && t->kind == TY_SLICE && IsU8(t->sub);
-        if (t && M.RcOk(t) && IsU8(t->arr->sub)) return ImgTemp(c, t, c->line);   // u8[..] (GenRc).
+        if (t && M.RcOk(t) && IsU8(t->arr->sub)) return BuildTemp(c, t, c->line);   // u8[..] (GenRc).
         if (t && TgModule::IsLim(t) && M.TypeOk(t) && IsU8(t->arr->sub)) {
             // A static-capacity u8[..k]: rendered as a resizable's, then copied under the check.
-            auto r = RzTemp(cg.GrowU8(), c->line);
-            GenRz(c, r.stk, r.a, r.t, c->line);
+            auto r = BuildTemp(c, cg.GrowU8(), c->line);
             if (Ended()) return Dummy(t);
             return LimFrom(r, t, c->line);
         }
         if (!slice && (!t || !IsGrow(t) || !IsU8(t->arr->sub)))
             No(c->line, cat("str of type ", t ? M.Name(t) : "?"));
-        auto x = RzTemp(slice ? cg.GrowU8() : t, c->line);
-        GenRz(c, x.stk, x.a, x.t, c->line);
+        auto x = BuildTemp(c, slice ? cg.GrowU8() : t, c->line);
         if (!slice || Ended()) return x;
         // Where the checker typed it as the slice it is passed as: a view.
         return SliceValue(t, Ld(x.a), Ld(CountAt(x.a)));
@@ -5266,13 +5257,7 @@ struct TgFn {
     static constexpr int64_t QNODE = 16;
 
     P RzValue(Node *n, TypeExpr *t, Line l) {
-        if (M.FoOk(t)) {
-            P x { AtL(tyg_local_new(p, M.Size(t), 8)), t, Stk(AllocStk(false, l), l) };
-            GenFo(n, x, l);
-            return x;
-        }
-        auto x = RzTemp(t, l);
-        GenRz(n, x.stk, x.a, t, l);
+        auto x = BuildTemp(n, t, l);
         return P { x.a, t, x.stk };
     }
     // The flat image of the resizable or frame object at src, at the top of stk: [int64 count][a frame
@@ -5793,14 +5778,8 @@ struct TgFn {
     }
     // An image or resizable value of n built on a temporary's stack (GenImg, GenRz); false if et is neither.
     bool InPlaceValue(Node *n, TypeExpr *et, Line l, V &x) {
-        if (IsImg(et) && M.ImgOk(et)) {
-            x = MemV(et, AtV(GenImg(n, Stk(AllocStk(false, l), l), et, l)));
-            return true;
-        }
-        auto grow = IsGrow(et) && (M.RzOk(et) || M.VeOk(et));
-        if (!grow && !M.RbOk(et)) return false;
-        x = RzTemp(et, l);
-        GenRz(n, x.stk, x.a, et, l);
+        if (M.FoOk(et) || !(TempOk(et) || M.RbOk(et))) return false;
+        x = BuildTemp(n, et, l);
         return true;
     }
     // A value wanted of a type neither scalar nor held in a register: in place if an image or a resizable.
@@ -7175,13 +7154,7 @@ struct TgFn {
             if (!Ended()) St(hdr, LdL(start));
             return;
         }
-        if (auto c = Is<Call>(n); DestSpec(c) && cg.Mangle(DestSpec(c)->rets[0]) == cg.Mangle(t)) {
-            RzDst d { stk, hdr };
-            rzdst = &d;
-            GenCall(c);
-            rzdst = nullptr;
-            return;
-        }
+        if (CallAt(n, InPlace { 2, stk, t, hdr })) return;
         auto pl = Deref(Place(n));
         if (Ended()) return;
         if (!cg.TEq(pl.t, t)) No(l, cat("value of type ", M.NameWhy(pl.t), " as ", M.Name(t)));
@@ -7328,25 +7301,6 @@ struct TgFn {
         return LdL(start);
     }
 
-    // A call returning t is handed stk as its destination; false if n is not one.
-    bool ImgFromCall(Node *n, tyg_val stk, TypeExpr *t, bool bymangle = false) {
-        auto c = Is<Call>(n);
-        if (!DestSpec(c)) return false;
-        auto rt = DestSpec(c)->rets[0];
-        if (bymangle ? cg.Mangle(rt) != cg.Mangle(t) : !cg.TEq(rt, t)) return false;
-        imgdst = stk;
-        GenCall(c);
-        imgdst = 0;
-        return true;
-    }
-    // The rest of GenVv and GenVs: a call built on stk, anything else copied whole.
-    void ImgFromCallOrPlace(Node *n, tyg_val stk, TypeExpr *t, Line l) {
-        if (ImgFromCall(n, stk, t)) return;
-        auto pl = Deref(Place(n));
-        if (Ended()) return;
-        if (!cg.TEq(pl.t, t)) No(l, cat("value of type ", M.NameWhy(pl.t), " as ", M.Name(t)));
-        ImgCopy(stk, tyg_addr_of(p, pl.a), t);
-    }
     // `self` is a variant's value start while its fields are built (§3.9).
     struct SelfScope {
         tyg_val &slot, was;
@@ -7359,7 +7313,7 @@ struct TgFn {
     tyg_val GenVm(Node *n, tyg_val stk, TypeExpr *t, Line l) {
         auto start = Local(Top(stk));
         auto at = [&] { return LdL(start); };
-        if (ImgFromCall(n, stk, t, true)) return at();
+        if (CallAt(n, InPlace { 1, stk, t })) return at();
         auto sl = Is<StructLit>(n);
         auto d = Is<Dot>(n);
         auto var = sl && sl->variant ? sl->variant : d && d->variantconst ? d->variantconst : nullptr;
@@ -7401,25 +7355,24 @@ struct TgFn {
         return ImgCopy(stk, tyg_addr_of(p, pl.a), t);
     }
 
-    // A variable-size variant's value at the top of stk.
-    tyg_val GenVv(Node *n, tyg_val stk, TypeExpr *t, Line l) {
-        auto start = Local(Top(stk));
-        if (auto sl = Is<StructLit>(n); sl && cg.TEq(sl->exprtype, t)) {
-            auto ei = cg.EIVar(t);
-            auto vi = (size_t)ei->en->VariantIndex(t->var->variant);
-            RunLit(sl, stk, ei->en->variants[vi].fields, ei->vftypes[vi]);
-        } else {
-            ImgFromCallOrPlace(n, stk, t, l);
-        }
-        return LdL(start);
-    }
-
+    // A variable-size struct's or variant's value at the top of stk: a literal's fields in turn, a call
+    // handed stk, else a copy whole.
     tyg_val GenVs(Node *n, tyg_val stk, TypeExpr *t, Line l) {
         auto start = Local(Top(stk));
-        n = StripCopy(n);
-        if (auto sl = Is<StructLit>(n); sl && sl->sinst && !sl->variant && cg.TEq(sl->exprtype, t))
-            RunLit(sl, stk, cg.SI(t)->st->fields, cg.SI(t)->ftypes);
-        else ImgFromCallOrPlace(n, stk, t, l);
+        auto isvv = t->kind == TY_VARIANT;
+        if (!isvv) n = StripCopy(n);
+        auto sl = Is<StructLit>(n);
+        if (sl && cg.TEq(sl->exprtype, t) && (isvv || (sl->sinst && !sl->variant))) {
+            auto ei = isvv ? cg.EIVar(t) : nullptr;
+            auto vi = isvv ? (size_t)ei->en->VariantIndex(t->var->variant) : 0;
+            if (isvv) RunLit(sl, stk, ei->en->variants[vi].fields, ei->vftypes[vi]);
+            else RunLit(sl, stk, cg.SI(t)->st->fields, cg.SI(t)->ftypes);
+        } else if (!CallAt(n, InPlace { 1, stk, t }, false)) {
+            auto pl = Deref(Place(n));
+            if (Ended()) return LdL(start);
+            if (!cg.TEq(pl.t, t)) No(l, cat("value of type ", M.NameWhy(pl.t), " as ", M.Name(t)));
+            ImgCopy(stk, tyg_addr_of(p, pl.a), t);
+        }
         return LdL(start);
     }
     // A literal's fields in layout order (CodeGen::GenFieldInits), each built at the top in turn: a
