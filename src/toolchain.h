@@ -281,6 +281,20 @@ inline string NinjaPath() {
 
 // --- the C toolchain -----------------------------------------------------------
 
+// On macOS, the architecture this compiler was built for, as clang's -arch
+// names it; "" elsewhere. The C a build compiles must target it, since the
+// tinygen object and the runtime cache are this architecture's: an x86-64
+// compiler run under Rosetta may find a cc that runs, and so targets, arm64.
+inline const char *AppleArch() {
+    #if defined(__APPLE__) && defined(__x86_64__)
+        return "x86_64";
+    #elif defined(__APPLE__) && defined(__aarch64__)
+        return "arm64";
+    #else
+        return "";
+    #endif
+}
+
 // Fills in what the driver at `cc` says about itself: its version, the
 // description, the id.
 inline Toolchain DescribeToolchain(const string &name, const string &style, const string &cc,
@@ -299,7 +313,9 @@ inline Toolchain DescribeToolchain(const string &name, const string &style, cons
         t.version = ToolVersion(cc, { "--version" });
         t.desc = cat(name, " ", t.version);
     }
-    t.id = cat(name, "-", t.version, "-", Hex8(cat(cc, "|", style)));
+    auto key = cat(cc, "|", style);
+    if (*AppleArch()) Append(key, "|", AppleArch());
+    t.id = cat(name, "-", t.version, "-", Hex8(key));
     return t;
 }
 

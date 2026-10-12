@@ -272,6 +272,7 @@ inline bool BuildCMakePart(const Ast &ast, int pkg, const Builder &b, bool wantj
                 argv.push_back(cat("-DCMAKE_CXX_COMPILER=", b.tc.cxx.empty() ? b.tc.cc : b.tc.cxx));
             #endif
         }
+        if (*AppleArch()) argv.push_back(cat("-DCMAKE_OSX_ARCHITECTURES=", AppleArch()));
         for (auto &o : p.cmake_options) argv.push_back(cat("-D", o));
         if (!b.Run(argv, cat("configuring the package ", p.name, " with CMake"),
                    cat(out.dir, "/cmake-configure.log")))

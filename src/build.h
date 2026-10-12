@@ -52,8 +52,16 @@ struct Builder {
             else f.push_back("/O2");
             return f;
         }
-        if (opts.debug) return { "-O0", "-g" };
-        return { "-O2" };
+        vector<string> f = TargetFlags();
+        if (opts.debug) f.push_back("-O0"), f.push_back("-g");
+        else f.push_back("-O2");
+        return f;
+    }
+
+    // The cc style's target: this compiler's own architecture on macOS (AppleArch).
+    vector<string> TargetFlags() const {
+        if (tc.style == "msvc" || !*AppleArch()) return {};
+        return { "-arch", AppleArch() };
     }
 
     // The system libraries a program links beyond the C library, in the cc
@@ -130,6 +138,7 @@ struct Builder {
             for (auto &l : libs) argv.push_back(l);
         } else {
             argv.push_back("-shared");
+            for (auto &f : TargetFlags()) argv.push_back(f);
             for (auto &o : objects) argv.push_back(o);
             argv.push_back("-o");
             argv.push_back(out);
