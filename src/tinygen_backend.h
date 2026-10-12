@@ -5229,7 +5229,6 @@ struct TgFn {
 
     // ---- Threads and queues (§11.2) ------------------------------------------
 
-    static tyg_addr AddrPlus(tyg_addr a, int64_t off) { return a.offset += off, a; }
     tyg_val QueueAddr(TypeExpr *t) {
         cg.usesthreads = true;
         return CallC(M.QueueAccessor(t), {}, {}, tyg_type_ptr(m));
