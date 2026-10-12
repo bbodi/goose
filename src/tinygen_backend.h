@@ -2037,8 +2037,7 @@ struct TgFn {
         return k;
     }
     void Restore(const SScope &sc) {
-        for (size_t i = sc.marks.size(); i-- > 0;)
-            SetTop(Stk(sc.marks[i].k, Line {}), LdL(sc.marks[i].top));
+        for (auto mk = sc.marks.rbegin(); mk != sc.marks.rend(); ++mk) SetTop(Stk(mk->k, Line {}), LdL(mk->top));
     }
     // The restores of every scope from `depth` in, innermost first (a break's, continue's, return's).
     void RestoreFrom(size_t depth) {
@@ -2197,10 +2196,9 @@ struct TgFn {
         auto ts = adt ? M.TagSize(t) : 0;
         auto begin = [&](int vi) {
             auto top = StartHdr(stk, hdr);
-            if (adt) {
-                StoreTag(AtV(top), t, vi);
-                SetTop(stk, Add(top, I64(ts)));
-            }
+            if (!adt) return;
+            StoreTag(AtV(top), t, vi);
+            SetTop(stk, Add(top, I64(ts)));
         };
         auto zero = [&](int64_t k) {
             if (!k) return;
@@ -2370,10 +2368,10 @@ struct TgFn {
         auto sp = c->spec ? c->spec : !c->dispatch.empty() ? c->dispatch[0] : nullptr;
         return !sp || sp->sf->isextern || sp->rets.empty() ? nullptr : sp;
     }
-    // Where GenCall builds a call's first resizable result instead of in a temporary: a stack, a header.
+    // Where GenCall builds a call's first result instead of in a temporary: a resizable's stack and
+    // header (rzdst), a T[] image's stack (imgdst).
     struct RzDst { tyg_val stk; tyg_addr hdr; };
     const RzDst *rzdst = nullptr;
-    // The same for a T[] image.
     tyg_val imgdst = 0;
     static bool IsVarArr(TypeExpr *t) { return TgModule::IsVarArr(t); }
     bool IsImg(TypeExpr *t) { return M.IsImg(t); }
@@ -2401,8 +2399,7 @@ struct TgFn {
         auto s = w == 1 ? TYG_I8 : w == 2 ? TYG_I16 : w == 4 ? TYG_I32 : TYG_I64;
         if (w < 8) {
             If(Cmp(TYG_UGT, n, I64((int64_t)((1ull << (8 * w)) - 1))), [&] {
-                string msg = "array length exceeds storage range";
-                msg.push_back('\0');
+                auto msg = string("array length exceeds storage range") + '\0';
                 CallC("gs_panic", { tyg_type_ptr(m) }, { tyg_addr_of(p, tyg_at_sym(M.Bytes(msg), 0)) }, nullptr);
                 tyg_unreachable(p);
             });
@@ -2579,7 +2576,6 @@ struct TgFn {
         });
     }
 
-    // A resizable temporary: a stack of the statement's, its header.
     V RzTemp(TypeExpr *t, Line l) { return MemV(t, NewHdr(), Stk(AllocStk(false, l), l)); }
 
     // ---- Conversions -------------------------------------------------------
