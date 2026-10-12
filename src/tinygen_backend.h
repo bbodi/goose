@@ -1432,22 +1432,6 @@ struct TgFn {
     tyg_module *m;
     tyg_proc *p = nullptr;
     unordered_map<const VarDef *, tyg_local> locals;
-    struct LoopTargets {
-        tyg_block brk, cnt;
-        size_t depth;   // The stack scopes open outside the body (sscopes).
-        tyg_local res = 0;        // Where a break's value goes, if wanted,
-        TypeExpr *rt = nullptr;   // of this type.
-        bool block = false;       // A block, which continue passes by.
-        // A value built in place (an image or a resizable) rather than
-        // stored in res: each break builds it at the same top of dstk.
-        int inplace = 0;          // 1 an image, 2 a resizable.
-        tyg_val dstk = 0;
-        TypeExpr *dt = nullptr;
-        tyg_addr hdr {};
-        tyg_local top0 = 0;       // dstk's top where the value starts.
-        bool pref = false;        // Its value is a pool reference (GenPref).
-    };
-    vector<LoopTargets> loops;
     // Where a value is built, at the top of stk: mode 1 a T[] image (BuildInto returns its address), 2 a
     // resizable of any kind (header at hdr), 3 a frame object (its struct at hdr), 4 a frame object's
     // bytes (the innermost count stored at hdr). A match, block or loop delivers modes 1 and 2 this way.
@@ -1459,6 +1443,19 @@ struct TgFn {
         tyg_addr hdr {};
         const P *fo = nullptr;   // Mode 3: the place, whose flags the struct's fields inherit.
     };
+    struct LoopTargets {
+        tyg_block brk, cnt;
+        size_t depth;   // The stack scopes open outside the body (sscopes).
+        tyg_local res = 0;        // Where a break's value goes, if wanted,
+        TypeExpr *rt = nullptr;   // of this type.
+        bool block = false;       // A block, which continue passes by.
+        // A value built in place (an image or a resizable) rather than stored in res: each break builds it
+        // at the same top of ip.stk, which was top0 where the value starts.
+        InPlace ip;
+        tyg_local top0 = 0;
+        bool pref = false;        // Its value is a pool reference (GenPref).
+    };
+    vector<LoopTargets> loops;
     // The value at src copied to d as d.t is: a frame object, an image (a variant or fixed ADT adapted to a
     // variable-mode one), a resizable ADT, resizable struct or array (its elements).
     void CopyFrom(const P &src, const InPlace &d, Line l) {
@@ -4134,9 +4131,7 @@ struct TgFn {
             lastrets = GenFromBytes(c);
             return lastrets[0];
         }
-        if (b == B_TO_BYTES && nargs == 1) {
-            return BuildTemp(c, cg.GrowU8(), line);
-        }
+        if (b == B_TO_BYTES && nargs == 1) return BuildTemp(c, cg.GrowU8(), line);
         if (b == B_BYTES_OF && nargs == 1) {
             // The element region of an array or slice as a u8[:] (CodeGen::PayloadOf).
             auto rt = an[0]->exprtype;
@@ -5058,10 +5053,7 @@ struct TgFn {
         auto bits = [&](int64_t mask) { return tyg_bin(p, TYG_AND, b, I64(mask)); };
         If(Cmp(TYG_EQ, shv, I64(63)), [&] { ContinueIf(Cmp(TYG_EQ, bits(0x7e), I64(0)), fail); });
         StL(r.v, tyg_bin(p, TYG_OR, LdL(r.v), tyg_bin(p, TYG_SHL, bits(0x7f), shv)));
-        If(Cmp(TYG_NE, bits(0x80), I64(0)), [&] {
-            StL(sh, Add(shv, I64(7)));
-            tyg_jump(p, head);
-        });
+        If(Cmp(TYG_NE, bits(0x80), I64(0)), [&] { StL(sh, Add(shv, I64(7))); tyg_jump(p, head); });
         // A redundant high zero group is no shortest form.
         If(Cmp(TYG_NE, shv, I64(0)), [&] { ContinueIf(Cmp(TYG_NE, b, I64(0)), fail); });
         StL(r.k, Sub(LdL(q), at));
@@ -5162,10 +5154,7 @@ struct TgFn {
             auto rlen = CountAt(r.a);
             St(r.a, Top(r.stk));
             St(rlen, I64(0));
-            If(accepted, [&] {
-                moveIn();
-                St(rlen, LdL(cnt));
-            });
+            If(accepted, [&] { moveIn(); St(rlen, LdL(cnt)); });
         }
         return { r, ValV(M.ast.booltype, tyg_convert(p, TYG_TRUNC, TYG_I8, LdL(okl))) };
     }
@@ -5412,9 +5401,7 @@ struct TgFn {
         auto size = cg.FixedSize(t);
         auto at = AtL(Temp(t));
         if (poll) tyg_zero(p, at, std::max<int64_t>(size, 1));
-        take([&] {
-            if (size) tyg_copy(p, at, AtV(Add(node, I64(QNODE))), size);
-        });
+        take([&] { if (size) tyg_copy(p, at, AtV(Add(node, I64(QNODE))), size); });
         return result(M.IsScalar(t) ? Load(P { at, t }, c->line) : MemV(t, at));
     }
 
@@ -5770,7 +5757,7 @@ struct TgFn {
         LoopTargets lt { brk, cnt, sscopes.size(), k.res, k.valued ? k.et : nullptr, block };
         lt.pref = k.valued && k.pr;
         if (ip) {
-            lt.inplace = ip->mode, lt.dstk = ip->stk, lt.dt = ip->t, lt.hdr = ip->hdr;
+            lt.ip = *ip;
             lt.top0 = Local(Top(ip->stk));
         }
         return lt;
@@ -6160,19 +6147,18 @@ struct TgFn {
     void BreakValue(Break *b, const LoopTargets &t) {
         if (t.pref) {
             PrefInto(AtL(t.res), b->val);
-        } else if (t.inplace) {
+        } else if (t.ip.mode) {
             // Built at the top, which something under construction may have moved up: the value then
             // moves down to where the exit's value starts.
-            InPlace ip { t.inplace, t.dstk, t.dt, t.hdr };
-            auto st = Local(Top(t.dstk));
-            BuildInto(b->val, ip, b->line);
+            auto st = Local(Top(t.ip.stk));
+            BuildInto(b->val, t.ip, b->line);
             if (Ended()) return;
             auto start = LdL(st), top0 = LdL(t.top0);
             If(Cmp(TYG_NE, start, top0), [&] {
-                auto n = Sub(Top(t.dstk), start);
+                auto n = Sub(Top(t.ip.stk), start);
                 tyg_move_dyn(p, top0, start, n);
-                SetTop(t.dstk, Add(top0, n));
-                if (t.inplace == 2) St(t.hdr, top0);
+                SetTop(t.ip.stk, Add(top0, n));
+                if (t.ip.mode == 2) St(t.ip.hdr, top0);
             });
         } else if (t.rt) {
             Into(P { AtL(t.res), t.rt }, b->val);
