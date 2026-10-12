@@ -7003,9 +7003,8 @@ struct TgFn {
         return result(M.IsScalar(t) ? Load(P { at, t }, c->line) : MemV(t, at));
     }
 
-    // An extern fn, through a trampoline the C half defines: the C function
-    // may be a static one of an --include header or of the runtime's extern
-    // support, or a macro.
+    // An extern fn, through a trampoline the C half defines: the C function may be a static one of an
+    // --include header or of the runtime's extern support, or a macro.
     V GenExternCall(Call *c, FnSpec *callee, vector<Node *> &an) {
         if (callee->rets.size() > 1) No(c->line, "extern results");
         lastrets.clear();
@@ -7013,32 +7012,26 @@ struct TgFn {
         vector<tyg_arg> args;
         for (size_t i = 0; i < an.size(); i++) {
             auto pt = callee->argtypes[i];
-            if (pt->kind == TY_SLICE) {
-                auto s = Is<StrLit>(an[i]);
-                if (!s && M.TypeOk(pt)) {
-                    args.push_back(Arg(an[i], pt));
-                    continue;
-                }
-                if (!s || !IsU8(pt->sub)) No(c->line, "slice argument");
-                auto t = tyg_local_new(p, 16, 8);
-                StL(t, tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)));
-                StL(t, I64((int64_t)s->val.size()), 8);
-                tyg_arg a {};
-                a.mem = AtL(t);
-                args.push_back(a);
+            auto isl = pt->kind == TY_SLICE;
+            auto s = isl ? Is<StrLit>(an[i]) : nullptr;
+            if (!s) {
+                if (!M.TypeOk(pt)) No(c->line, isl ? "slice argument" : "extern parameter type");
+                args.push_back(Arg(an[i], pt));
                 continue;
             }
-            if (!M.TypeOk(pt)) No(c->line, "extern parameter type");
-            args.push_back(Arg(an[i], pt));
+            if (!IsU8(pt->sub)) No(c->line, "slice argument");
+            auto t = tyg_local_new(p, 16, 8);
+            StL(t, tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)));
+            StL(t, I64((int64_t)s->val.size()), 8);
+            tyg_arg a {};
+            a.mem = AtL(t);
+            args.push_back(a);
         }
-        // The C names of its types, now, while the C half can still take
-        // their declarations.
+        // The C names of its types, now, while the C half can still take their declarations.
         for (auto t : callee->argtypes) cg.CT(t);
         for (auto t : callee->rets) cg.CT(t);
-        // One trampoline per C name: a call may have a specialization of
-        // its own of the same extern. A function the runtime object
-        // exports needs none.
-        // Nor does an export's own wrapper, which the object defines.
+        // One trampoline per C name (a call may have a specialization of its own of the same extern); a
+        // function the runtime object exports, or an export's own wrapper, needs none.
         auto direct = M.RuntimeApi(callee->sf->cname);
         for (auto sf : M.ast.functions) direct = direct || (sf->isexport && sf->cname == callee->sf->cname);
         auto &list = direct ? M.direct : M.externs;
@@ -7046,34 +7039,36 @@ struct TgFn {
         for (auto e : list) known = known || e->sf->cname == callee->sf->cname;
         if (!known) list.push_back(callee);
         if (Ended()) return Dummy(callee->rets.empty() ? nullptr : callee->rets[0]);
-        auto sym = M.Sym(direct ? callee->sf->cname : cat("gs_tg_x_", callee->sf->cname),
-                         TYG_SYM_FUNC | TYG_SYM_GLOBAL);
+        auto sym = M.Sym(direct ? callee->sf->cname : cat("gs_tg_x_", callee->sf->cname), TYG_SYM_FUNC | TYG_SYM_GLOBAL);
         return Result(callee, callee->rets.empty() ? -1 : 0, M.ExternSig(callee), tyg_direct(sym), args);
     }
 
-    // print(...) (§3.7): every argument is evaluated before any text is
-    // written, as the C backend renders the whole line first.
+    // print(...) (§3.7): every argument is evaluated before any text is written, as the C backend renders
+    // the whole line first (B_PRINT).
+    static TypeExpr *PlainPointee(TypeExpr *t) {
+        while (t && IsPlainRef(t)) t = t->ref->sub;
+        return t;
+    }
+    // A u8 array or slice prints as its bytes (SimpleText).
+    static bool PrintsAsBytes(TypeExpr *bt) {
+        return bt && ((bt->kind == TY_ARRAY && IsU8(bt->arr->sub)) || (bt->kind == TY_SLICE && IsU8(bt->sub)));
+    }
     V GenPrint(Call *c) {
-        // A value rendered structurally: the whole line is rendered into a
-        // builder on a stack of the statement's and written at once, as
-        // the C backend writes every line (B_PRINT).
+        auto an = c->ArgNodes();
+        // A value rendered structurally sends the whole line through a builder on a stack of the statement's.
         auto simple = [&](Node *a) {
             if (Is<StrLit>(a)) return true;
-            auto bt = a->exprtype;
-            while (bt && IsPlainRef(bt)) bt = bt->ref->sub;
+            auto bt = PlainPointee(a->exprtype);
             auto fc = cg.FmtContext(c, a);
             if (bt && cg.FmtSpecFor(fc, bt)) return false;
             if (TgModule::IsVarint(bt) && cg.FmtSpecFor(fc, M.ast.inttypes[IS_I64])) return false;
-            if (bt && ((bt->kind == TY_ARRAY && IsU8(bt->arr->sub)) || (bt->kind == TY_SLICE && IsU8(bt->sub))))
-                return true;
+            if (PrintsAsBytes(bt)) return true;
             auto ot = cg.OperandT(a->exprtype);
             return ot && M.IsScalar(ot) && ot->kind != TY_REF;
         };
-        auto an = c->ArgNodes();
         if (!std::all_of(an.begin(), an.end(), simple)) {
             auto b = RzTemp(cg.GrowU8(), c->line);
-            auto len = b.a;
-            len.offset += 8;
+            auto len = AddrPlus(b.a, 8);
             St(b.a, Top(b.stk));
             St(len, I64(0));
             TextInto(b.stk, len, c, an, 0);
@@ -7088,36 +7083,23 @@ struct TgFn {
             vector<const tyg_type *> types;
         };
         vector<Out> outs;
-        for (auto a : c->ArgNodes()) {
-            auto t = a->exprtype;
+        auto bytes = [&](vector<tyg_val> args) {
+            outs.push_back({ "gs_out_bytes", args, { tyg_type_ptr(m), IT(TYG_I64) } });
+        };
+        auto scalar = [&](const char *fn, tyg_val v, const tyg_type *ty) { outs.push_back({ fn, { v }, { ty } }); };
+        for (auto a : an) {
             if (auto s = Is<StrLit>(a)) {
-                outs.push_back({ "gs_out_bytes",
-                                 { tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)),
-                                   I64((int64_t)s->val.size()) },
-                                 { tyg_type_ptr(m), IT(TYG_I64) } });
-                continue;
-            }
-            auto ot = cg.OperandT(t);
-            auto bt = t;
-            while (bt && IsPlainRef(bt)) bt = bt->ref->sub;
-            if (bt && ((bt->kind == TY_ARRAY && IsU8(bt->arr->sub)) || (bt->kind == TY_SLICE && IsU8(bt->sub)))) {
-                // A u8 array or slice prints as its bytes (SimpleText).
+                bytes({ tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)), I64((int64_t)s->val.size()) });
+            } else if (PrintsAsBytes(PlainPointee(a->exprtype))) {
                 auto v = ViewOf(Place(a), a->line);
-                outs.push_back({ "gs_out_bytes", { v.elems, v.len }, { tyg_type_ptr(m), IT(TYG_I64) } });
-                continue;
-            }
-            if (!ot || !M.IsScalar(ot) || ot->kind == TY_REF) No(a->line, cat("print of type ", M.NameWhy(ot)));
-            if (ot->kind == TY_INT && ot->intstorage == IS_U64) {
-                outs.push_back({ "gs_out_uint", { GenAs(a, ot).v }, { IT(TYG_I64, false) } });
-            } else if (ot->kind == TY_INT) {
-                outs.push_back({ "gs_out_int", { GenAs(a, M.ast.inttypes[IS_I64]).v }, { IT(TYG_I64) } });
-            } else if (ot->kind == TY_FLT && M.Scal(ot) == TYG_F32) {
-                outs.push_back({ "gs_out_f32", { GenAs(a, ot).v }, { tyg_type_scalar(m, TYG_F32) } });
-            } else if (ot->kind == TY_FLT) {
-                outs.push_back({ "gs_out_flt", { GenAs(a, ot).v }, { tyg_type_scalar(m, TYG_F64) } });
+                bytes({ v.elems, v.len });
             } else {
-                auto v = GenAs(a, ot).v;
-                outs.push_back({ "gs_out_bool", { tyg_convert(p, TYG_ZEXT, TYG_I64, v) }, { IT(TYG_I64) } });
+                auto ot = cg.OperandT(a->exprtype);
+                if (ot->kind == TY_INT && ot->intstorage == IS_U64) scalar("gs_out_uint", GenAs(a, ot).v, IT(TYG_I64, false));
+                else if (ot->kind == TY_INT) scalar("gs_out_int", GenAs(a, M.ast.inttypes[IS_I64]).v, IT(TYG_I64));
+                else if (ot->kind == TY_FLT && M.Scal(ot) == TYG_F32) scalar("gs_out_f32", GenAs(a, ot).v, tyg_type_scalar(m, TYG_F32));
+                else if (ot->kind == TY_FLT) scalar("gs_out_flt", GenAs(a, ot).v, tyg_type_scalar(m, TYG_F64));
+                else scalar("gs_out_bool", tyg_convert(p, TYG_ZEXT, TYG_I64, GenAs(a, ot).v), IT(TYG_I64));
             }
         }
         if (Ended()) return V {};
@@ -7128,17 +7110,13 @@ struct TgFn {
 
     // ---- Optionals -----------------------------------------------------------
 
-    // Optionals (§3.8) as the C backend lowers them: a T? is the address a
-    // T& would be, 0 for null (a resizable's fat reference with a null
-    // hdr), so a narrowed one is used as that reference, and a test reads
-    // the address alone (Binary::CgX, GenTruth).
+    // Optionals (§3.8) as the C backend lowers them: a T? is the address a T& would be, 0 for null (a
+    // resizable's fat reference with a null hdr), so a narrowed one is used as that reference, and a
+    // test reads the address alone (Binary::CgX, GenTruth).
 
-    // A reference that is an address: a plain one, or an optional one
-    // used where the checker has narrowed it (a path through it, a value
-    // read through it), which is the same address.
+    // A reference that is an address: a plain one, or an optional one the checker has narrowed.
     static bool IsAddrRef(const TypeExpr *t) { return IsPlainRef(t) || TgModule::OptRef(t); }
-    // A fat reference where one differing only in optionality is wanted
-    // (T& to T?, a narrowed T? to T&): the same two words.
+    // A fat reference where one differing only in optionality is wanted (T& to T?, a narrowed T? to T&).
     bool OptFit(V &x, TypeExpr *want) {
         if (x.t->kind != TY_REF || want->kind != TY_REF || !cg.IsFatRef(x.t) || !cg.IsFatRef(want) ||
             x.t->ref->lenstorage >= 0 || want->ref->lenstorage >= 0 || !cg.TEq(x.t->ref->sub, want->ref->sub))
@@ -7148,72 +7126,56 @@ struct TgFn {
     }
     // The null of an optional (or of the checker's bare null type).
     V Null(TypeExpr *t, Line l) {
-        V x;
-        x.t = t;
         if (t && t->kind == TY_REF && cg.IsFatRef(t)) {
             auto tmp = tyg_local_new(p, 16, 8);
             tyg_zero(p, AtL(tmp), 16);
-            x.mem = true;
-            x.a = AtL(tmp);
-            return x;
+            return MemV(t, AtL(tmp));
         }
         if (!t || t->kind != TY_REF || (t->ref->lenstorage >= 0 && !M.RelOk(t, 1))) No(l, "null of this type");
-        x.v = I64(0);
-        return x;
+        return ValV(t, I64(0));
     }
     // A reference value's address: a fat reference's hdr.
     tyg_val Addr(const V &x, Line l) {
         if (!x.t || x.t->kind != TY_REF || (x.t->ref->lenstorage >= 0 && !M.RelOk(x.t, 1))) No(l, "address of this value");
-        if (x.mem) return Ld(x.a);
-        return x.v;
+        return x.mem ? Ld(x.a) : x.v;
     }
-    // A reference as a test or identity sees it: a variable's own value,
-    // even where it is narrowed; null; anything else's value.
+    // A reference as a test or identity sees it: a variable's own value, even where narrowed; null;
+    // anything else's value.
     tyg_val RefAddr(Node *n) {
         if (Is<NullLit>(n)) return I64(0);
-        if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->type && id->vdef->type->kind == TY_REF) {
-            auto x = Load(VarPlace(id->vdef, n->line), n->line);
-            return Ended() ? I64(0) : Addr(x, n->line);
-        }
-        auto x = Gen(n);
+        V x;
+        if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->type && id->vdef->type->kind == TY_REF)
+            x = Load(VarPlace(id->vdef, n->line), n->line);
+        else
+            x = Gen(n);
         return Ended() ? I64(0) : Addr(x, n->line);
     }
-    // Whether a condition is an optional's null test: an optional
-    // variable (narrowed already or not), or a value of an optional type.
+    // Whether a condition is an optional's null test: an optional variable (narrowed or not), or a value
+    // of an optional type.
     bool OptCond(Node *n) {
         if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->type && IsOptional(id->vdef->type)) return true;
         return n->exprtype && IsOptional(n->exprtype);
     }
     tyg_val OptTest(Node *n) { return Cmp(TYG_NE, RefAddr(n), I64(0)); }
-    // `a == null`, `a != null`, and identity `a .== b`, `a .!= b`: the
-    // addresses, left first.
+    // `a == null`, `a != null`, and identity `a .== b`, `a .!= b`: the addresses, left first.
     V GenRefEq(Binary *b) {
         auto l = RefAddr(b->left);
         auto r = RefAddr(b->right);
         return ValV(M.ast.booltype, Cmp(b->op == T_EQ || b->op == T_DOTEQ ? TYG_EQ : TYG_NE, l, r));
     }
-    // An optional's text (CodeGen::RenderLoc): `null`, or its pointee's.
-    // A pointee that reaches its own type (a list) is rendered by a render
-    // procedure (RenderInto).
+    // An optional's text (CodeGen::RenderLoc): `null`, or its pointee's (a list's pointee reaches its own
+    // type, so a render procedure does it: RenderInto).
     void RenderOpt(tyg_val stk, tyg_addr len, const P &pl, bool nested, Line l, int depth) {
-        auto none = NewBlock(), some = NewBlock(), done = NewBlock();
         // A relative link's offset decodes to its address, null for 0.
         auto at = TgModule::IsRel(pl.t) ? RelLoad(pl, l) : Ld(pl.a);
-        Branch(Cmp(TYG_EQ, at, I64(0)), none, some);
-        SetBlock(none);
-        TextLit(stk, len, "null");
-        tyg_jump(p, done);
-        SetBlock(some);
-        RenderInto(stk, len, Step(pl), nested, l, depth + 1);
-        Jump(done);
-        SetBlock(done);
+        IfElse(Cmp(TYG_EQ, at, I64(0)), [&] { TextLit(stk, len, "null"); },
+               [&] { RenderInto(stk, len, Step(pl), nested, l, depth + 1); });
     }
 
     // ---- Control -----------------------------------------------------------
 
-    // A block's value is its tail's (none in statement position).
-    // A block's value is its tail's (none in statement position); a
-    // function body's tail with a result is returned (tailret).
+    // A block's value is its tail's (none in statement position); a function body's tail with a result
+    // is returned (tailret).
     TypeExpr *armwant = nullptr;   // What GenArm wants of a block arm's tail.
     V GenBlock(Block *b, bool discard, bool tailret = false) {
         auto want = armwant;
@@ -7243,78 +7205,65 @@ struct TgFn {
 
     // ---- Varints in bytes values (§3.6: ULEB128, values zigzag) --------------
 
-    // The ULEB128 at `at`, unsigned.
-    tyg_val UlebRead(tyg_val at) {
-        auto v = tyg_local_new(p, 8, 8), sh = tyg_local_new(p, 8, 8), q = tyg_local_new(p, 8, 8);
-        StL(v, I64(0));
-        StL(sh, I64(0));
-        StL(q, at);
-        auto head = NewBlock(), more = NewBlock(), done = NewBlock();
+    // body() once, then again while it returns true.
+    template <class F> void DoWhile(F body) {
+        auto head = NewBlock(), again = NewBlock(), done = NewBlock();
         tyg_jump(p, head);
         SetBlock(head);
-        auto qa = LdL(q);
-        auto b = tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, TYG_I8, AtV(qa), 0));
-        auto bits = tyg_bin(p, TYG_SHL, tyg_bin(p, TYG_AND, b, I64(0x7f)), LdL(sh));
-        StL(v, tyg_bin(p, TYG_OR, LdL(v), bits));
-        StL(q, Add(qa, I64(1)));
-        Branch(Cmp(TYG_NE, tyg_bin(p, TYG_AND, b, I64(0x80)), I64(0)), more, done);
-        SetBlock(more);
-        StL(sh, Add(LdL(sh), I64(7)));
+        Branch(body(), again, done);
+        SetBlock(again);
         tyg_jump(p, head);
         SetBlock(done);
+    }
+    tyg_val ViLoad8(tyg_val at) { return tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, TYG_I8, AtV(at), 0)); }
+    void ViStore8(tyg_val at, tyg_val v) { tyg_store(p, TYG_I8, AtV(at), tyg_convert(p, TYG_TRUNC, TYG_I8, v), 0); }
+    tyg_val ViAnd(tyg_val v, int64_t k) { return tyg_bin(p, TYG_AND, v, I64(k)); }
+    // The ULEB128 at `at`, unsigned.
+    tyg_val UlebRead(tyg_val at) {
+        auto v = Local(I64(0)), sh = Local(I64(0)), q = Local(at);
+        DoWhile([&] {
+            auto qa = LdL(q);
+            auto b = ViLoad8(qa);
+            StL(v, tyg_bin(p, TYG_OR, LdL(v), tyg_bin(p, TYG_SHL, ViAnd(b, 0x7f), LdL(sh))));
+            StL(q, Add(qa, I64(1)));
+            StL(sh, Add(LdL(sh), I64(7)));
+            return Cmp(TYG_NE, ViAnd(b, 0x80), I64(0));
+        });
         return LdL(v);
     }
     // A varint value: (u >> 1) ^ -(u & 1) (gs_zig_read).
     tyg_val ZigRead(tyg_val at) {
         auto u = UlebRead(at);
-        auto half = tyg_bin(p, TYG_LSHR, u, I64(1));
-        auto sign = tyg_un(p, TYG_NEG, tyg_bin(p, TYG_AND, u, I64(1)));
-        return tyg_bin(p, TYG_XOR, half, sign);
+        return tyg_bin(p, TYG_XOR, tyg_bin(p, TYG_LSHR, u, I64(1)), tyg_un(p, TYG_NEG, ViAnd(u, 1)));
     }
     // The bytes of the ULEB128 at `at` (gs_uleb_size).
     tyg_val UlebSize(tyg_val at) {
         auto q = Local(at);
-        auto head = NewBlock(), more = NewBlock(), done = NewBlock();
-        tyg_jump(p, head);
-        SetBlock(head);
-        auto qa = LdL(q);
-        auto b = tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, TYG_I8, AtV(qa), 0));
-        StL(q, Add(qa, I64(1)));
-        Branch(Cmp(TYG_NE, tyg_bin(p, TYG_AND, b, I64(0x80)), I64(0)), more, done);
-        SetBlock(more);
-        tyg_jump(p, head);
-        SetBlock(done);
+        DoWhile([&] {
+            auto qa = LdL(q);
+            StL(q, Add(qa, I64(1)));
+            return Cmp(TYG_NE, ViAnd(ViLoad8(qa), 0x80), I64(0));
+        });
         return Sub(LdL(q), at);
     }
-    // Writes the varint value v at `at`, zigzag ULEB128 (gs_zig_write); its
-    // byte count.
+    // Writes the varint value v at `at`, zigzag ULEB128 (gs_zig_write); its byte count.
     tyg_val ZigWrite(tyg_val at, tyg_val v) {
-        return UlebWrite(at, tyg_bin(p, TYG_XOR, tyg_bin(p, TYG_SHL, v, I64(1)),
-                                     tyg_bin(p, TYG_ASHR, v, I64(63))));
+        return UlebWrite(at, tyg_bin(p, TYG_XOR, tyg_bin(p, TYG_SHL, v, I64(1)), tyg_bin(p, TYG_ASHR, v, I64(63))));
     }
     // Writes the unsigned uv at `at`, ULEB128 (gs_uleb_write); its byte count.
     tyg_val UlebWrite(tyg_val at, tyg_val uv0) {
-        auto u = tyg_local_new(p, 8, 8), q = tyg_local_new(p, 8, 8);
-        StL(u, uv0);
-        StL(q, at);
-        auto head = NewBlock(), more = NewBlock(), last = NewBlock(), done = NewBlock();
-        tyg_jump(p, head);
-        SetBlock(head);
-        auto uv = LdL(u);
-        auto b = tyg_bin(p, TYG_AND, uv, I64(0x7f));
-        auto rest = tyg_bin(p, TYG_LSHR, uv, I64(7));
-        StL(u, rest);
-        auto qa = LdL(q);
-        StL(q, Add(qa, I64(1)));
-        Branch(Cmp(TYG_NE, rest, I64(0)), more, last);
-        SetBlock(more);
-        tyg_store(p, TYG_I8, AtV(qa),
-                  tyg_convert(p, TYG_TRUNC, TYG_I8, tyg_bin(p, TYG_OR, b, I64(0x80))), 0);
-        tyg_jump(p, head);
-        SetBlock(last);
-        tyg_store(p, TYG_I8, AtV(qa), tyg_convert(p, TYG_TRUNC, TYG_I8, b), 0);
-        tyg_jump(p, done);
-        SetBlock(done);
+        auto u = Local(uv0), q = Local(at);
+        DoWhile([&] {
+            auto uv = LdL(u);
+            auto b = ViAnd(uv, 0x7f);
+            auto rest = tyg_bin(p, TYG_LSHR, uv, I64(7));
+            StL(u, rest);
+            auto qa = LdL(q);
+            StL(q, Add(qa, I64(1)));
+            auto more = Cmp(TYG_NE, rest, I64(0));
+            IfElse(more, [&] { ViStore8(qa, tyg_bin(p, TYG_OR, b, I64(0x80))); }, [&] { ViStore8(qa, b); });
+            return more;
+        });
         return Sub(LdL(q), at);
     }
 
