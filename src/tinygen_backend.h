@@ -1779,6 +1779,42 @@ struct TgFn {
     void Branch(tyg_val c, tyg_block a, tyg_block b) { tyg_branch(p, c, a, b); }
     tyg_block NewBlock() { return tyg_block_new(p); }
     void SetBlock(tyg_block b) { tyg_block_set(p, b); }
+    // body(i) for i from `from` up to n (n read once), each in a block of
+    // its own; on after the last.
+    template <class F> void Loop(tyg_val from, tyg_val n, F body) {
+        auto il = Local(from), nl = Local(n);
+        auto head = NewBlock(), b = NewBlock(), done = NewBlock();
+        tyg_jump(p, head);
+        SetBlock(head);
+        Branch(Cmp(TYG_SLT, LdL(il), LdL(nl)), b, done);
+        SetBlock(b);
+        body(LdL(il));
+        if (!Ended()) {
+            StL(il, Add(LdL(il), I64(1)));
+            tyg_jump(p, head);
+        }
+        SetBlock(done);
+    }
+    // then() where c holds; on after it either way.
+    template <class F> void If(tyg_val c, F then) {
+        auto t = NewBlock(), done = NewBlock();
+        Branch(c, t, done);
+        SetBlock(t);
+        then();
+        if (!Ended()) tyg_jump(p, done);
+        SetBlock(done);
+    }
+    template <class F, class G> void IfElse(tyg_val c, F then, G other) {
+        auto t = NewBlock(), e = NewBlock(), done = NewBlock();
+        Branch(c, t, e);
+        SetBlock(t);
+        then();
+        if (!Ended()) tyg_jump(p, done);
+        SetBlock(e);
+        other();
+        if (!Ended()) tyg_jump(p, done);
+        SetBlock(done);
+    }
     // An i64 local holding v.
     tyg_local Local(tyg_val v) {
         auto l = tyg_local_new(p, 8, 8);
@@ -2095,18 +2131,8 @@ struct TgFn {
             if (Ended()) return;
             begin();
             auto top = Top(stk);
-            auto i = Local(I64(0));
-            auto head = NewBlock(), body = NewBlock(), done = NewBlock();
-            tyg_jump(p, head);
-            SetBlock(head);
-            auto iv = [&] { return LdL(i); };
-            Branch(Cmp(TYG_SLT, iv(), I64(fc->val)), body, done);
-            SetBlock(body);
-            auto at = Add(top, Mul(iv(), I64(esz)));
-            tyg_copy(p, AtV(at), AtL(one), esz);
-            StL(i, Add(iv(), I64(1)));
-            tyg_jump(p, head);
-            SetBlock(done);
+            Loop(I64(0), I64(fc->val),
+                 [&](tyg_val i) { tyg_copy(p, AtV(Add(top, Mul(i, I64(esz)))), AtL(one), esz); });
             SetTop(stk, Add(top, I64(fc->val * esz)));
             St(len, I64(fc->val));
             return;
@@ -2745,17 +2771,7 @@ struct TgFn {
                 SetTop(stk, saved);
             } else if (fc->val > 1) {
                 auto fl = Local(first);
-                auto ctr = Local(I64(1));
-                auto head = NewBlock(), body = NewBlock(), done = NewBlock();
-                tyg_jump(p, head);
-                SetBlock(head);
-                auto c = LdL(ctr);
-                Branch(Cmp(TYG_SLT, c, I64(fc->val)), body, done);
-                SetBlock(body);
-                ImgCopy(stk, LdL(fl), et);
-                StL(ctr, Add(c, I64(1)));
-                tyg_jump(p, head);
-                SetBlock(done);
+                Loop(I64(1), I64(fc->val), [&](tyg_val) { ImgCopy(stk, LdL(fl), et); });
             }
             StL(cnt, I64(fc->val));
         } else if (al && !al->fillval && !al->capexpr) {
@@ -3359,36 +3375,28 @@ struct TgFn {
     // k slots at base (zeroed), each built from the captured leaves.
     void FillStore(const vector<FillLeaf> &leaves, tyg_val base, int64_t k, ArrayLit *al) {
         auto esz = cg.FixedSize(al->exprtype->arr->sub);
-        auto i = Local(I64(0));
-        auto head = NewBlock(), body = NewBlock(), done = NewBlock();
-        tyg_jump(p, head);
-        SetBlock(head);
-        auto iv = [&] { return LdL(i); };
-        Branch(Cmp(TYG_SLT, iv(), I64(k)), body, done);
-        SetBlock(body);
-        auto slot = Add(base, Mul(iv(), I64(esz)));
-        for (auto &lf : leaves) {
-            auto a = AtV(slot, lf.off);
-            if (lf.inner) {
-                FillStore(*lf.sub, Add(slot, I64(lf.off)),
-                          cg.ArrSize(lf.inner->exprtype->arr), lf.inner);
-                continue;
+        Loop(I64(0), I64(k), [&](tyg_val i) {
+            auto slot = Add(base, Mul(i, I64(esz)));
+            for (auto &lf : leaves) {
+                auto a = AtV(slot, lf.off);
+                if (lf.inner) {
+                    FillStore(*lf.sub, Add(slot, I64(lf.off)),
+                              cg.ArrSize(lf.inner->exprtype->arr), lf.inner);
+                    continue;
+                }
+                V y;
+                y.t = lf.ft;
+                if (lf.self) {
+                    y.v = slot;
+                } else if (M.IsScalar(lf.ft) || TgModule::IsRel(lf.ft)) {
+                    y.v = tyg_load(p, TgModule::IsRel(lf.ft) ? TYG_I64 : M.Scal(lf.ft), AtL(lf.tmp), 0);
+                } else {
+                    y.mem = true;
+                    y.a = AtL(lf.tmp);
+                }
+                Store(P { a, lf.ft }, y);
             }
-            V y;
-            y.t = lf.ft;
-            if (lf.self) {
-                y.v = slot;
-            } else if (M.IsScalar(lf.ft) || TgModule::IsRel(lf.ft)) {
-                y.v = tyg_load(p, TgModule::IsRel(lf.ft) ? TYG_I64 : M.Scal(lf.ft), AtL(lf.tmp), 0);
-            } else {
-                y.mem = true;
-                y.a = AtL(lf.tmp);
-            }
-            Store(P { a, lf.ft }, y);
-        }
-        StL(i, Add(iv(), I64(1)));
-        tyg_jump(p, head);
-        SetBlock(done);
+        });
     }
     void Into(const P &pl, Node *n) {
         if (SelfRelLit(n) && cg.TEq(n->exprtype, pl.t)) {
@@ -3908,11 +3916,10 @@ struct TgFn {
             Branch(same, ok, fail);
             SetBlock(ok);
         };
-        auto i64 = [&](int64_t v) { return I64(v); };
         if (cg.IsFix(t)) {
             if (!M.TypeOk(t)) No(l, cat("comparison of type ", M.NameWhy(t)));
             EqJump(P { AtV(A()), t }, P { AtV(B()), t }, fail, l);
-            adv(i64(cg.FixedSize(t)));
+            adv(I64(cg.FixedSize(t)));
             return;
         }
         switch (t->kind) {
@@ -3945,12 +3952,12 @@ struct TgFn {
                             auto n = tyg_load(p, sc, AtV(at()), 0);
                             if (sc != TYG_I64) n = tyg_convert(p, TgModule::SignedLen(t) ? TYG_SEXT : TYG_ZEXT, TYG_I64, n);
                             put(len, n);
-                            StL(c, Add(at(), i64(w)));
+                            StL(c, Add(at(), I64(w)));
                         }
                     } else if (rc) {
                         put(cap, tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, TYG_I32, AtV(at()), 0)));
                         put(len, tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, TYG_I32, AtV(at(), 4), 0)));
-                        StL(c, Add(at(), i64(8)));
+                        StL(c, Add(at(), I64(8)));
                     } else {
                         No(l, cat("comparison of type ", M.NameWhy(t)));
                     }
@@ -3960,21 +3967,21 @@ struct TgFn {
                 auto la = [&] { return LdL(lena); };
                 auto lb = [&] { return LdL(lenb); };
                 next(Cmp(TYG_EQ, la(), lb()));
-                auto il = Local(i64(0));
+                auto il = Local(I64(0));
                 auto hd = NewBlock(), body = NewBlock(), done = NewBlock();
                 tyg_jump(p, hd);
                 SetBlock(hd);
                 Branch(Cmp(TYG_SLT, LdL(il), la()), body, done);
                 SetBlock(body);
                 EqWalk(sub, ca, cb, fail, l);
-                StL(il, Add(LdL(il), i64(1)));
+                StL(il, Add(LdL(il), I64(1)));
                 tyg_jump(p, hd);
                 SetBlock(done);
                 if (rc) {
                     // Each side's unused slots.
                     auto esz = cg.FixedSize(sub);
                     auto ld = [&](tyg_local c, tyg_local cap, tyg_local len) {
-                        auto gap = Mul(Sub(LdL(cap), LdL(len)), i64(esz));
+                        auto gap = Mul(Sub(LdL(cap), LdL(len)), I64(esz));
                         StL(c, Add(LdL(c), gap));
                     };
                     ld(ca, capa, lena);
@@ -3991,11 +3998,11 @@ struct TgFn {
                 auto ta = LoadTag(AtV(A()), t);
                 next(Cmp(TYG_EQ, ta, LoadTag(AtV(B()), t)));
                 auto tag = Local(LoadTag(AtV(A()), t));
-                adv(i64(ts));
+                adv(I64(ts));
                 auto done = NewBlock();
                 for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
                     auto hit = NewBlock(), miss = NewBlock();
-                    Branch(Cmp(TYG_EQ, LdL(tag), i64((int64_t)vi)), hit, miss);
+                    Branch(Cmp(TYG_EQ, LdL(tag), I64((int64_t)vi)), hit, miss);
                     SetBlock(hit);
                     EqWalk(cg.VariantType(t, (int)vi), ca, cb, fail, l);
                     tyg_jump(p, done);
@@ -4011,25 +4018,12 @@ struct TgFn {
     // The first n elements of two views, n their (equal) count.
     void EqElems(const View &va, const View &vb, tyg_block fail, Line l) {
         auto et = va.elem;
-        auto il = Local(I64(0));
-        auto nl = Local(va.len);
-        auto ca = tyg_local_new(p, 8, 8), cb = tyg_local_new(p, 8, 8);
-        StL(ca, va.elems);
-        StL(cb, vb.elems);
-        auto head = NewBlock(), body = NewBlock(), done = NewBlock();
-        tyg_jump(p, head);
-        SetBlock(head);
-        auto i = LdL(il);
-        Branch(Cmp(TYG_SLT, i, LdL(nl)), body, done);
-        SetBlock(body);
-        auto xa = LdL(ca), xb = LdL(cb);
-        EqJump(P { AtV(xa), et }, P { AtV(xb), et }, fail, l);
-        auto xa2 = LdL(ca), xb2 = LdL(cb);
-        StL(ca, StepElem(va, xa2));
-        StL(cb, StepElem(vb, xb2));
-        StL(il, Add(LdL(il), I64(1)));
-        tyg_jump(p, head);
-        SetBlock(done);
+        auto ca = Local(va.elems), cb = Local(vb.elems);
+        Loop(I64(0), va.len, [&](tyg_val) {
+            EqJump(P { AtV(LdL(ca)), et }, P { AtV(LdL(cb)), et }, fail, l);
+            StL(ca, StepElem(va, LdL(ca)));
+            StL(cb, StepElem(vb, LdL(cb)));
+        });
     }
     // Whether a bytes value's bytes are equal exactly when it is: no pad,
     // no float, no fixed-mode ADT (CodeGen::EmitEqBytes's bitwise).
@@ -4107,24 +4101,10 @@ struct TgFn {
                     for (int64_t i = 0; i < n && !Ended(); i++) ElemLeaves(t->arr->sub, off + i * esz, l, leaf, dy);
                     return;
                 }
-                auto il = tyg_local_new(p, 8, 8);
-                auto i = [&] { return LdL(il); };
-                StL(il, I64(0));
-                auto head = NewBlock(), body = NewBlock(), done = NewBlock();
-                tyg_jump(p, head);
-                SetBlock(head);
-                Branch(Cmp(TYG_SLT, i(), I64(n)), body, done);
-                SetBlock(body);
-                auto dl = tyg_local_new(p, 8, 8);
-                auto at = Mul(i(), I64(esz));
-                if (dy.on) at = Add(at, LdL(dy.loc));
-                StL(dl, at);
-                ElemLeaves(t->arr->sub, off, l, leaf, ElemDyn { true, dl });
-                if (!Ended()) {
-                    StL(il, Add(i(), I64(1)));
-                    tyg_jump(p, head);
-                }
-                SetBlock(done);
+                Loop(I64(0), I64(n), [&](tyg_val i) {
+                    auto at = Mul(i, I64(esz));
+                    ElemLeaves(t->arr->sub, off, l, leaf, ElemDyn { true, Local(dy.on ? Add(at, LdL(dy.loc)) : at) });
+                });
                 return;
             }
             default: No(l, cat("elementwise ", M.NameWhy(t)));
@@ -4461,20 +4441,8 @@ struct TgFn {
     tyg_val RunEnd(const View &v) {
         if (cg.IsFix(v.elem))
             return Add(v.elems, Mul(v.len, I64(cg.FixedSize(v.elem))));
-        auto cl = tyg_local_new(p, 8, 8), il = tyg_local_new(p, 8, 8);
-        StL(cl, v.elems);
-        StL(il, I64(0));
-        auto head = NewBlock(), body = NewBlock(), done = NewBlock();
-        tyg_jump(p, head);
-        SetBlock(head);
-        auto i = LdL(il);
-        Branch(Cmp(TYG_SLT, i, v.len), body, done);
-        SetBlock(body);
-        auto c = LdL(cl);
-        StL(cl, Add(c, ImgSize(v.elem, c)));
-        StL(il, Add(i, I64(1)));
-        tyg_jump(p, head);
-        SetBlock(done);
+        auto cl = Local(v.elems);
+        Loop(I64(0), v.len, [&](tyg_val) { StL(cl, Add(LdL(cl), ImgSize(v.elem, LdL(cl)))); });
         return LdL(cl);
     }
 
@@ -4574,18 +4542,9 @@ struct TgFn {
             auto one = Temp(et);
             Into(P { AtL(one), et }, al->fillval);
             if (Ended()) return Dummy(t);
-            auto il = Local(I64(0));
-            auto head = NewBlock(), body = NewBlock(), done = NewBlock();
-            tyg_jump(p, head);
-            SetBlock(head);
-            auto iv = [&] { return LdL(il); };
-            Branch(Cmp(TYG_SLT, iv(), I64(k)), body, done);
-            SetBlock(body);
-            auto at = Add(tyg_addr_of(p, AtL(tmp)), Mul(iv(), I64(esz)));
-            tyg_copy(p, AtV(at), AtL(one), esz);
-            StL(il, Add(iv(), I64(1)));
-            tyg_jump(p, head);
-            SetBlock(done);
+            Loop(I64(0), I64(k), [&](tyg_val i) {
+                tyg_copy(p, AtV(Add(tyg_addr_of(p, AtL(tmp)), Mul(i, I64(esz)))), AtL(one), esz);
+            });
             return SliceValue(t, tyg_addr_of(p, AtL(tmp)), I64(k));
         }
         auto d = Is<Dot>(n);
@@ -4696,18 +4655,10 @@ struct TgFn {
                 for (int64_t i = 0; i < k; i++)
                     tyg_copy(p, AtL(tmp, i * esz), AtL(one), esz);
             } else {
-                auto ctr = Local(I64(0));
-                auto head = NewBlock(), body = NewBlock(), done = NewBlock();
-                tyg_jump(p, head);
-                SetBlock(head);
-                auto c = LdL(ctr);
-                Branch(Cmp(TYG_SLT, c, I64(k)), body, done);
-                SetBlock(body);
-                View v { tyg_addr_of(p, AtL(tmp)), 0, et, k };
-                tyg_copy(p, AtV(ElemAddr(v, c)), AtL(one), esz);
-                StL(ctr, Add(c, I64(1)));
-                tyg_jump(p, head);
-                SetBlock(done);
+                Loop(I64(0), I64(k), [&](tyg_val c) {
+                    View v { tyg_addr_of(p, AtL(tmp)), 0, et, k };
+                    tyg_copy(p, AtV(ElemAddr(v, c)), AtL(one), esz);
+                });
             }
         } else {
             if ((int64_t)al->elems.size() > k) No(al->line, "array literal length");
@@ -4966,9 +4917,6 @@ struct TgFn {
         len.offset += 8;
         auto fllen = fl;
         fllen.offset += 8;
-        auto i64 = [&](int64_t v) { return I64(v); };
-        auto ld = [&](tyg_local x) { return LdL(x); };
-        auto st = [&](tyg_local x, tyg_val v) { StL(x, v); };
         auto pt = tyg_type_ptr(m);
         auto spanargs = [&]() -> vector<tyg_val> {
             return { Ld(fl), tyg_addr_of(p, fllen), flstk };
@@ -4979,61 +4927,61 @@ struct TgFn {
         // elements in and to end inside the length.
         auto indexof = [&](tyg_val data, tyg_val n) {
             auto il = tyg_local_new(p, 8, 8);
-            st(il, i64(0));
+            StL(il, I64(0));
             auto ne = NewBlock(), done = NewBlock();
-            Branch(Cmp(TYG_NE, n, i64(0)), ne, done);
+            Branch(Cmp(TYG_NE, n, I64(0)), ne, done);
             SetBlock(ne);
             auto off = Sub(data, elems());
             if (c->poolcheck && esz) {
-                auto bad = tyg_bin(p, TYG_OR, Cmp(TYG_NE, tyg_bin(p, TYG_UREM, off, i64(esz)), i64(0)),
-                                   Cmp(TYG_UGE, tyg_bin(p, TYG_UDIV, off, i64(esz)), Ld(len)));
-                auto k = tyg_bin(p, TYG_UDIV, off, i64(esz));
+                auto bad = tyg_bin(p, TYG_OR, Cmp(TYG_NE, tyg_bin(p, TYG_UREM, off, I64(esz)), I64(0)),
+                                   Cmp(TYG_UGE, tyg_bin(p, TYG_UDIV, off, I64(esz)), Ld(len)));
+                auto k = tyg_bin(p, TYG_UDIV, off, I64(esz));
                 bad = tyg_bin(p, TYG_OR, bad, Cmp(TYG_UGT, n, Sub(Ld(len), k)));
                 AbortUnless(Cmp(TYG_EQ, bad, tyg_iconst(p, TYG_I8, 0)), "POOLSLICE", c->line);
             }
-            st(il, tyg_bin(p, TYG_SDIV, off, i64(std::max<int64_t>(esz, 1))));
+            StL(il, tyg_bin(p, TYG_SDIV, off, I64(std::max<int64_t>(esz, 1))));
             tyg_jump(p, done);
             SetBlock(done);
             return il;
         };
         auto slicelen = [&](Node *n) {
             auto nl = tyg_local_new(p, 8, 8);
-            st(nl, Index64(n));
-            if (esz) AbortUnless(Cmp(TYG_ULE, ld(nl), i64((int64_t)((2048ull << 20) / (uint64_t)esz))),
+            StL(nl, Index64(n));
+            if (esz) AbortUnless(Cmp(TYG_ULE, LdL(nl), I64((int64_t)((2048ull << 20) / (uint64_t)esz))),
                                  "SLICELEN", c->line);
-            else AbortUnless(Cmp(TYG_SGE, ld(nl), i64(0)), "SLICELEN", c->line);
+            else AbortUnless(Cmp(TYG_SGE, LdL(nl), I64(0)), "SLICELEN", c->line);
             return nl;
         };
         auto slice = [&](Node *n, tyg_local &data, tyg_local &cnt) {
             auto x = GenAs(n, M.ast.SliceOf(elem, n->line));
             data = tyg_local_new(p, 8, 8);
             cnt = tyg_local_new(p, 8, 8);
-            st(data, Ld(x.a));
+            StL(data, Ld(x.a));
             auto a8 = x.a;
             a8.offset += 8;
-            st(cnt, Ld(a8));
+            StL(cnt, Ld(a8));
         };
         if (c->builtin == B_FREE_SLICE) {
             tyg_local d, n;
             slice(an[1], d, n);
             if (Ended()) return V {};
-            auto il = indexof(ld(d), ld(n));
+            auto il = indexof(LdL(d), LdL(n));
             auto as = spanargs();
-            CallC("gs_spans_free", { pt, pt, pt, IT(TYG_I64), IT(TYG_I64) }, { as[0], as[1], as[2], ld(il), ld(n) }, nullptr);
+            CallC("gs_spans_free", { pt, pt, pt, IT(TYG_I64), IT(TYG_I64) }, { as[0], as[1], as[2], LdL(il), LdL(n) }, nullptr);
             return V {};
         }
         // Where a run of n goes: past the end while the freelist is empty.
         auto place = [&](tyg_val n) {
             auto r = tyg_local_new(p, 8, 8);
             auto some = NewBlock(), none = NewBlock(), done = NewBlock();
-            Branch(Cmp(TYG_NE, Ld(fllen), i64(0)), some, none);
+            Branch(Cmp(TYG_NE, Ld(fllen), I64(0)), some, none);
             SetBlock(some);
             auto as = spanargs();
-            st(r, CallC("gs_spans_alloc", { pt, pt, pt, IT(TYG_I64), IT(TYG_I64) },
+            StL(r, CallC("gs_spans_alloc", { pt, pt, pt, IT(TYG_I64), IT(TYG_I64) },
                         { as[0], as[1], as[2], Ld(len), n }, IT(TYG_I64)));
             tyg_jump(p, done);
             SetBlock(none);
-            st(r, Ld(len));
+            StL(r, Ld(len));
             tyg_jump(p, done);
             SetBlock(done);
             return r;
@@ -5042,11 +4990,11 @@ struct TgFn {
             auto ext = Sub(end, Ld(len));
             auto grow = NewBlock(), done = NewBlock();
             auto el = tyg_local_new(p, 8, 8);
-            st(el, ext);
-            Branch(Cmp(TYG_SGT, ext, i64(0)), grow, done);
+            StL(el, ext);
+            Branch(Cmp(TYG_SGT, ext, I64(0)), grow, done);
             SetBlock(grow);
-            St(len, Add(Ld(len), ld(el)));
-            SetTop(pl.stk, Add(Top(pl.stk), Mul(ld(el), i64(esz))));
+            St(len, Add(Ld(len), LdL(el)));
+            SetTop(pl.stk, Add(Top(pl.stk), Mul(LdL(el), I64(esz))));
             tyg_jump(p, done);
             SetBlock(done);
         };
@@ -5054,84 +5002,74 @@ struct TgFn {
         auto defaults = [&](tyg_val first, tyg_val count) {
             if (!esz) return;
             if (!cg.HasFieldDefaults(elem)) {
-                auto at = Add(elems(), Mul(first, i64(esz)));
+                auto at = Add(elems(), Mul(first, I64(esz)));
                 CallC("memset", { pt, IT(TYG_I32), IT(TYG_I64, false) },
-                      { at, tyg_iconst(p, TYG_I32, 0), Mul(count, i64(esz)) }, pt);
+                      { at, tyg_iconst(p, TYG_I32, 0), Mul(count, I64(esz)) }, pt);
                 return;
             }
             if (!c->defaultinit) No(c->line, "slice pool defaults");
-            auto fl0 = tyg_local_new(p, 8, 8), kl = tyg_local_new(p, 8, 8), cl = tyg_local_new(p, 8, 8);
-            st(fl0, first);
-            st(cl, count);
-            st(kl, i64(0));
-            auto head = NewBlock(), body = NewBlock(), done = NewBlock();
-            tyg_jump(p, head);
-            SetBlock(head);
-            Branch(Cmp(TYG_SLT, ld(kl), ld(cl)), body, done);
-            SetBlock(body);
-            auto at = Add(elems(), Mul(Add(ld(fl0), ld(kl)), i64(esz)));
-            OpenScope(true);
-            Into(P { AtV(at), elem }, c->defaultinit);
-            CloseScope();
-            st(kl, Add(ld(kl), i64(1)));
-            tyg_jump(p, head);
-            SetBlock(done);
+            auto fl0 = Local(first);
+            Loop(I64(0), count, [&](tyg_val k) {
+                OpenScope(true);
+                Into(P { AtV(Add(elems(), Mul(Add(LdL(fl0), k), I64(esz)))), elem }, c->defaultinit);
+                CloseScope();
+            });
         };
         tyg_local il, nl;
         if (c->builtin == B_ALLOC_SLICE) {
             nl = slicelen(an[1]);
             if (Ended()) return Dummy(c->exprtype);
-            il = place(ld(nl));
-            extend(Add(ld(il), ld(nl)));
-            defaults(ld(il), ld(nl));
+            il = place(LdL(nl));
+            extend(Add(LdL(il), LdL(nl)));
+            defaults(LdL(il), LdL(nl));
         } else {
             tyg_local d, ol;
             slice(an[1], d, ol);
             nl = slicelen(an[2]);
             if (Ended()) return Dummy(c->exprtype);
-            il = indexof(ld(d), ld(ol));
+            il = indexof(LdL(d), LdL(ol));
             auto shrink = NewBlock(), growb = NewBlock(), done = NewBlock();
-            Branch(Cmp(TYG_SLE, ld(nl), ld(ol)), shrink, growb);
+            Branch(Cmp(TYG_SLE, LdL(nl), LdL(ol)), shrink, growb);
             SetBlock(shrink);
             {
                 auto as = spanargs();
                 CallC("gs_spans_free", { pt, pt, pt, IT(TYG_I64), IT(TYG_I64) },
-                      { as[0], as[1], as[2], Add(ld(il), ld(nl)), Sub(ld(ol), ld(nl)) },
+                      { as[0], as[1], as[2], Add(LdL(il), LdL(nl)), Sub(LdL(ol), LdL(nl)) },
                       nullptr);
             }
             tyg_jump(p, done);
             SetBlock(growb);
             auto empty = NewBlock(), notempty = NewBlock(), moved = NewBlock(), placed = NewBlock();
-            Branch(Cmp(TYG_EQ, ld(ol), i64(0)), empty, notempty);
+            Branch(Cmp(TYG_EQ, LdL(ol), I64(0)), empty, notempty);
             SetBlock(empty);
-            st(il, ld(place(ld(nl))));
+            StL(il, LdL(place(LdL(nl))));
             tyg_jump(p, placed);
             SetBlock(notempty);
-            Branch(Cmp(TYG_NE, Add(ld(il), ld(ol)), Ld(len)), moved, placed);
+            Branch(Cmp(TYG_NE, Add(LdL(il), LdL(ol)), Ld(len)), moved, placed);
             SetBlock(moved);
             {
                 auto as = spanargs();
                 auto ni = tyg_local_new(p, 8, 8);
-                st(ni, CallC("gs_spans_regrow", { pt, pt, pt, IT(TYG_I64), IT(TYG_I64), IT(TYG_I64), IT(TYG_I64) },
-                             { as[0], as[1], as[2], Ld(len), ld(il), ld(ol), ld(nl) }, IT(TYG_I64)));
+                StL(ni, CallC("gs_spans_regrow", { pt, pt, pt, IT(TYG_I64), IT(TYG_I64), IT(TYG_I64), IT(TYG_I64) },
+                             { as[0], as[1], as[2], Ld(len), LdL(il), LdL(ol), LdL(nl) }, IT(TYG_I64)));
                 auto mv = NewBlock(), same = NewBlock();
-                Branch(Cmp(TYG_NE, ld(ni), ld(il)), mv, same);
+                Branch(Cmp(TYG_NE, LdL(ni), LdL(il)), mv, same);
                 SetBlock(mv);
-                tyg_move_dyn(p, Add(elems(), Mul(ld(ni), i64(esz))),
-                             Add(elems(), Mul(ld(il), i64(esz))),
-                             Mul(ld(ol), i64(esz)));
+                tyg_move_dyn(p, Add(elems(), Mul(LdL(ni), I64(esz))),
+                             Add(elems(), Mul(LdL(il), I64(esz))),
+                             Mul(LdL(ol), I64(esz)));
                 tyg_jump(p, same);
                 SetBlock(same);
-                st(il, ld(ni));
+                StL(il, LdL(ni));
             }
             tyg_jump(p, placed);
             SetBlock(placed);
-            extend(Add(ld(il), ld(nl)));
-            defaults(Add(ld(il), ld(ol)), Sub(ld(nl), ld(ol)));
+            extend(Add(LdL(il), LdL(nl)));
+            defaults(Add(LdL(il), LdL(ol)), Sub(LdL(nl), LdL(ol)));
             tyg_jump(p, done);
             SetBlock(done);
         }
-        return SliceValue(M.ast.SliceOf(elem, c->line), Add(elems(), Mul(ld(il), i64(esz))), ld(nl));
+        return SliceValue(M.ast.SliceOf(elem, c->line), Add(elems(), Mul(LdL(il), I64(esz))), LdL(nl));
     }
 
     // pool.alloc_index(x), pool.alloc_ref(x) and pool.free(i) on a reusable
@@ -5268,11 +5206,10 @@ struct TgFn {
         if (!M.LimHeld(pl.t)) No(c->line, cat(BuiltinByKind(c->builtin).name, " of ", M.NameWhy(pl.t)));
         auto an = c->ArgNodes();
         auto et = pl.t->arr->sub;
-        auto i64 = [&](int64_t v) { return I64(v); };
         switch (c->builtin) {
             case B_POP: {
-                auto nl = Sub(LimLen(pl), i64(1));
-                AbortUnless(Cmp(TYG_SGE, nl, i64(0)), "POP", c->line);
+                auto nl = Sub(LimLen(pl), I64(1));
+                AbortUnless(Cmp(TYG_SGE, nl, I64(0)), "POP", c->line);
                 LimSetLen(pl, nl);
                 return Load(P { AtV(ElemAddr(LimView(pl), LimLen(pl))), et }, c->line);
             }
@@ -5285,7 +5222,7 @@ struct TgFn {
                 return V {};
             }
             case B_CLEAR:
-                LimSetLen(pl, i64(0));
+                LimSetLen(pl, I64(0));
                 return V {};
             default: break;
         }
@@ -5301,7 +5238,7 @@ struct TgFn {
         auto n = [&] { return LdL(nl); };
         auto ol = Local(LimLen(pl));
         auto o = [&] { return LdL(ol); };
-        AbortUnless(Cmp(TYG_SGE, n(), i64(0)), "RESIZENEG", c->line);
+        AbortUnless(Cmp(TYG_SGE, n(), I64(0)), "RESIZENEG", c->line);
         auto shrink = NewBlock(), notshrink = NewBlock(), grow = NewBlock(),
              done = NewBlock();
         Branch(Cmp(TYG_SLT, n(), o()), shrink, notshrink);
@@ -5315,17 +5252,7 @@ struct TgFn {
             Abort("RESIZEFILL", c->line);
         } else {
             AbortUnless(Cmp(TYG_SLE, n(), LimCapOf(pl)), "CAPACITY", c->line);
-            auto il = Local(o());
-            auto i = [&] { return LdL(il); };
-            auto head = NewBlock(), body = NewBlock(), out = NewBlock();
-            tyg_jump(p, head);
-            SetBlock(head);
-            Branch(Cmp(TYG_SLT, i(), n()), body, out);
-            SetBlock(body);
-            Store(P { AtV(ElemAddr(LimView(pl), i())), et }, fv);
-            StL(il, Add(i(), i64(1)));
-            tyg_jump(p, head);
-            SetBlock(out);
+            Loop(o(), n(), [&](tyg_val i) { Store(P { AtV(ElemAddr(LimView(pl), i)), et }, fv); });
             LimSetLen(pl, n());
             tyg_jump(p, done);
         }
@@ -5563,21 +5490,9 @@ struct TgFn {
             tyg_zero(p, pl.a, M.Size(t));
             if (c->defaultinit && t->kind == TY_ARRAY && t->arr->akind == A_FIXED) {
                 auto et = t->arr->sub;
-                auto il = Local(I64(0));
-                auto head = NewBlock(), body = NewBlock(), done = NewBlock();
-                tyg_jump(p, head);
-                SetBlock(head);
-                auto i = LdL(il);
-                Branch(Cmp(TYG_SLT, i, I64(cg.ArrSize(t->arr))), body, done);
-                SetBlock(body);
-                auto at = Add(tyg_addr_of(p, pl.a), Mul(i, I64(cg.FixedSize(et))));
-                Into(P { AtV(at), et }, c->defaultinit);
-                if (!Ended()) {
-                    auto i2 = LdL(il);
-                    StL(il, Add(i2, I64(1)));
-                    tyg_jump(p, head);
-                }
-                SetBlock(done);
+                Loop(I64(0), I64(cg.ArrSize(t->arr)), [&](tyg_val i) {
+                    Into(P { AtV(Add(tyg_addr_of(p, pl.a), Mul(i, I64(cg.FixedSize(et))))), et }, c->defaultinit);
+                });
             } else if (c->defaultinit) {
                 Into(pl, c->defaultinit);
             }
@@ -6433,29 +6348,12 @@ struct TgFn {
                     return;
                 }
                 TextLit(stk, len, "[");
-                auto il = tyg_local_new(p, 8, 8);
-                auto i = [&] { return LdL(il); };
-                StL(il, I64(0));
-                // The element's address, walked on from the first.
-                auto cl = tyg_local_new(p, 8, 8);
-                auto cur = [&] { return LdL(cl); };
-                StL(cl, v.elems);
-                auto head = NewBlock(), body = NewBlock(), sep = NewBlock(),
-                     elem = NewBlock(), out = NewBlock();
-                tyg_jump(p, head);
-                SetBlock(head);
-                Branch(Cmp(TYG_SLT, i(), v.len), body, out);
-                SetBlock(body);
-                Branch(Cmp(TYG_NE, i(), I64(0)), sep, elem);
-                SetBlock(sep);
-                TextLit(stk, len, ", ");
-                tyg_jump(p, elem);
-                SetBlock(elem);
-                RenderInto(stk, len, ElemPlace(cur(), v.elem), true, l, depth + 1);
-                StL(cl, StepElem(v, cur()));
-                StL(il, Add(i(), I64(1)));
-                tyg_jump(p, head);
-                SetBlock(out);
+                auto cl = Local(v.elems);   // The element's address, walked on from the first.
+                Loop(I64(0), v.len, [&](tyg_val i) {
+                    If(Cmp(TYG_NE, i, I64(0)), [&] { TextLit(stk, len, ", "); });
+                    RenderInto(stk, len, ElemPlace(LdL(cl), v.elem), true, l, depth + 1);
+                    StL(cl, StepElem(v, LdL(cl)));
+                });
                 TextLit(stk, len, "]");
                 return;
             }
@@ -6612,17 +6510,16 @@ struct TgFn {
         auto esz = cg.FixedSize(et);
         auto len = pl.a;
         len.offset += 8;
-        auto i64 = [&](int64_t v) { return I64(v); };
         auto setlen = [&](tyg_val n) { St(len, n); };
         auto at = [&](tyg_val n) {   // The address of element n.
-            return Add(BaseOf(pl), Mul(n, i64(esz)));
+            return Add(BaseOf(pl), Mul(n, I64(esz)));
         };
         switch (c->builtin) {
             case B_POP: {
-                auto nl = Sub(Ld(len), i64(1));
-                AbortUnless(Cmp(TYG_SGE, nl, i64(0)), "POP", c->line);
+                auto nl = Sub(Ld(len), I64(1));
+                AbortUnless(Cmp(TYG_SGE, nl, I64(0)), "POP", c->line);
                 setlen(nl);
-                auto top = Sub(Top(pl.stk), i64(esz));
+                auto top = Sub(Top(pl.stk), I64(esz));
                 SetTop(pl.stk, top);
                 return Load(P { AtV(top), et }, c->line);
             }
@@ -6632,12 +6529,12 @@ struct TgFn {
                 auto ol = Ld(len);
                 AbortUnless(Cmp(TYG_ULE, nn, ol), "POPN", c->line);
                 setlen(Sub(ol, nn));
-                SetTop(pl.stk, Sub(Top(pl.stk), Mul(nn, i64(esz))));
+                SetTop(pl.stk, Sub(Top(pl.stk), Mul(nn, I64(esz))));
                 return V {};
             }
             case B_CLEAR:
                 SetTop(pl.stk, BaseOf(pl));
-                setlen(i64(0));
+                setlen(I64(0));
                 return V {};
             default: break;
         }
@@ -6654,7 +6551,7 @@ struct TgFn {
         auto n = [&] { return LdL(nl); };
         auto ol = Local(Ld(len));
         auto o = [&] { return LdL(ol); };
-        AbortUnless(Cmp(TYG_SGE, n(), i64(0)), "RESIZENEG", c->line);
+        AbortUnless(Cmp(TYG_SGE, n(), I64(0)), "RESIZENEG", c->line);
         auto shrink = NewBlock(), notshrink = NewBlock(), grow = NewBlock(),
              done = NewBlock();
         Branch(Cmp(TYG_SLT, n(), o()), shrink, notshrink);
@@ -6669,18 +6566,12 @@ struct TgFn {
             Abort("RESIZEFILL", c->line);
         } else {
             // The new slots through a cursor, the top written once after.
-            auto cur = Local(Top(pl.stk));
-            auto head = NewBlock(), body = NewBlock(), out = NewBlock();
-            tyg_jump(p, head);
-            SetBlock(head);
-            auto cv = LdL(cur);
-            Branch(Cmp(TYG_ULT, cv, at(n())), body, out);
-            SetBlock(body);
-            Store(P { AtV(cv), et }, fv);
-            StL(cur, Add(cv, i64(esz)));
-            tyg_jump(p, head);
-            SetBlock(out);
-            SetTop(pl.stk, LdL(cur));
+            auto top = Top(pl.stk);
+            if (esz) {
+                auto cnt = tyg_bin(p, TYG_SDIV, Sub(at(n()), top), I64(esz));
+                Loop(I64(0), cnt, [&](tyg_val k) { Store(P { AtV(Add(top, Mul(k, I64(esz)))), et }, fv); });
+            }
+            SetTop(pl.stk, at(n()));
             setlen(n());
             tyg_jump(p, done);
         }
@@ -6761,44 +6652,41 @@ struct TgFn {
     Uleb UlebCheck(tyg_val at, tyg_val end) {
         Uleb r { tyg_local_new(p, 8, 8), tyg_local_new(p, 8, 8) };
         auto sh = tyg_local_new(p, 8, 8), q = tyg_local_new(p, 8, 8);
-        auto i64 = [&](int64_t x) { return I64(x); };
-        auto ld = [&](tyg_local l) { return LdL(l); };
-        auto st = [&](tyg_local l, tyg_val x) { StL(l, x); };
-        st(r.v, i64(0));
-        st(sh, i64(0));
-        st(q, at);
+        StL(r.v, I64(0));
+        StL(sh, I64(0));
+        StL(q, at);
         auto head = NewBlock(), rd = NewBlock(), top = NewBlock(), chk = NewBlock(),
              body = NewBlock(), more = NewBlock(), last = NewBlock(), chk2 = NewBlock(),
              ok = NewBlock(), fail = NewBlock(), done = NewBlock();
         tyg_jump(p, head);
         SetBlock(head);
-        Branch(Cmp(TYG_ULT, ld(q), end), rd, fail);
+        Branch(Cmp(TYG_ULT, LdL(q), end), rd, fail);
         SetBlock(rd);
-        auto qa = ld(q);
+        auto qa = LdL(q);
         auto b = tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, TYG_I8, AtV(qa), 0));
-        auto shv = ld(sh);
-        st(q, Add(qa, i64(1)));
-        Branch(Cmp(TYG_SGT, shv, i64(63)), fail, top);
+        auto shv = LdL(sh);
+        StL(q, Add(qa, I64(1)));
+        Branch(Cmp(TYG_SGT, shv, I64(63)), fail, top);
         SetBlock(top);
-        Branch(Cmp(TYG_EQ, shv, i64(63)), chk, body);
+        Branch(Cmp(TYG_EQ, shv, I64(63)), chk, body);
         SetBlock(chk);
-        Branch(Cmp(TYG_NE, tyg_bin(p, TYG_AND, b, i64(0x7e)), i64(0)), fail, body);
+        Branch(Cmp(TYG_NE, tyg_bin(p, TYG_AND, b, I64(0x7e)), I64(0)), fail, body);
         SetBlock(body);
-        st(r.v, tyg_bin(p, TYG_OR, ld(r.v), tyg_bin(p, TYG_SHL, tyg_bin(p, TYG_AND, b, i64(0x7f)), shv)));
-        Branch(Cmp(TYG_NE, tyg_bin(p, TYG_AND, b, i64(0x80)), i64(0)), more, last);
+        StL(r.v, tyg_bin(p, TYG_OR, LdL(r.v), tyg_bin(p, TYG_SHL, tyg_bin(p, TYG_AND, b, I64(0x7f)), shv)));
+        Branch(Cmp(TYG_NE, tyg_bin(p, TYG_AND, b, I64(0x80)), I64(0)), more, last);
         SetBlock(more);
-        st(sh, Add(shv, i64(7)));
+        StL(sh, Add(shv, I64(7)));
         tyg_jump(p, head);
         SetBlock(last);
         // A redundant high zero group is no shortest form.
-        Branch(Cmp(TYG_NE, shv, i64(0)), chk2, ok);
+        Branch(Cmp(TYG_NE, shv, I64(0)), chk2, ok);
         SetBlock(chk2);
-        Branch(Cmp(TYG_EQ, b, i64(0)), fail, ok);
+        Branch(Cmp(TYG_EQ, b, I64(0)), fail, ok);
         SetBlock(ok);
-        st(r.k, Sub(ld(q), at));
+        StL(r.k, Sub(LdL(q), at));
         tyg_jump(p, done);
         SetBlock(fail);
-        st(r.k, i64(0));
+        StL(r.k, I64(0));
         tyg_jump(p, done);
         SetBlock(done);
         return r;
@@ -6830,9 +6718,6 @@ struct TgFn {
         if (Ended()) return { Dummy(t), Dummy(M.ast.booltype) };
         auto v = ViewOf(src0, c->line);
         if (!IsU8(v.elem)) No(c->line, "from_bytes of this source");
-        auto i64 = [&](int64_t x) { return I64(x); };
-        auto ld = [&](tyg_local l) { return LdL(l); };
-        auto st = [&](tyg_local l, tyg_val x) { StL(l, x); };
         V r;
         if (isimg) {
             r.t = t;
@@ -6845,32 +6730,32 @@ struct TgFn {
         rlen.offset += 8;
         auto src = tyg_local_new(p, 8, 8), len = tyg_local_new(p, 8, 8), pay = tyg_local_new(p, 8, 8),
              pn = tyg_local_new(p, 8, 8), okl = tyg_local_new(p, 8, 8), cnt = tyg_local_new(p, 8, 8);
-        st(src, v.elems);
-        st(len, v.len);
-        st(pay, ld(src));
-        st(pn, i64(0));
-        st(okl, i64(0));
-        st(cnt, i64(0));
-        auto uc = UlebCheck(ld(src), Add(ld(src), ld(len)));
+        StL(src, v.elems);
+        StL(len, v.len);
+        StL(pay, LdL(src));
+        StL(pn, I64(0));
+        StL(okl, I64(0));
+        StL(cnt, I64(0));
+        auto uc = UlebCheck(LdL(src), Add(LdL(src), LdL(len)));
         auto c1 = NewBlock(), c2 = NewBlock(), good = NewBlock(), whole = NewBlock(),
              framed = NewBlock();
-        Branch(Cmp(TYG_NE, ld(uc.k), i64(0)), c1, framed);
+        Branch(Cmp(TYG_NE, LdL(uc.k), I64(0)), c1, framed);
         SetBlock(c1);
-        Branch(Cmp(TYG_SGE, ld(uc.v), i64(0)), c2, framed);
+        Branch(Cmp(TYG_SGE, LdL(uc.v), I64(0)), c2, framed);
         SetBlock(c2);
-        Branch(Cmp(TYG_EQ, ld(uc.v), Sub(ld(len), ld(uc.k))), good, framed);
+        Branch(Cmp(TYG_EQ, LdL(uc.v), Sub(LdL(len), LdL(uc.k))), good, framed);
         SetBlock(good);
-        st(pay, Add(ld(src), ld(uc.k)));
-        st(pn, ld(uc.v));
+        StL(pay, Add(LdL(src), LdL(uc.k)));
+        StL(pn, LdL(uc.v));
         if (plain) {
             // Whole elements: their count, else not an image.
-            Branch(Cmp(TYG_EQ, tyg_bin(p, TYG_SREM, ld(pn), i64(esz)), i64(0)), whole, framed);
+            Branch(Cmp(TYG_EQ, tyg_bin(p, TYG_SREM, LdL(pn), I64(esz)), I64(0)), whole, framed);
             SetBlock(whole);
-            st(okl, i64(1));
-            st(cnt, tyg_bin(p, TYG_SDIV, ld(pn), i64(esz)));
+            StL(okl, I64(1));
+            StL(cnt, tyg_bin(p, TYG_SDIV, LdL(pn), I64(esz)));
             tyg_jump(p, framed);
         } else {
-            st(okl, i64(1));
+            StL(okl, I64(1));
             tyg_jump(p, whole);
             SetBlock(whole);
             tyg_jump(p, framed);
@@ -6881,29 +6766,29 @@ struct TgFn {
             // elements gets a bitmap of element starts, on a stack of its
             // own; one needing more of that stack than is reserved (GS_BM_MAX)
             // cannot be verified and is rejected.
-            tyg_val bm = i64(0);
+            tyg_val bm = I64(0);
             if (!cg.IsFix(et) && cg.HasRelRefAny(et)) {
                 auto bstk = Stk(AllocStk(false, c->line), c->line);
                 bm = Top(bstk);
                 auto bn = tyg_local_new(p, 8, 8);
-                st(bn, tyg_bin(p, TYG_SDIV, Add(ld(pn), i64(7)), i64(8)));
+                StL(bn, tyg_bin(p, TYG_SDIV, Add(LdL(pn), I64(7)), I64(8)));
                 auto big = NewBlock(), fits = NewBlock();
-                Branch(Cmp(TYG_SGT, ld(bn), i64(2048ll << 20)), big, fits);
+                Branch(Cmp(TYG_SGT, LdL(bn), I64(2048ll << 20)), big, fits);
                 SetBlock(big);
-                st(bn, i64(0));
-                st(okl, i64(0));
+                StL(bn, I64(0));
+                StL(okl, I64(0));
                 tyg_jump(p, fits);
                 SetBlock(fits);
-                tyg_set_dyn(p, bm, i64(0), ld(bn));
-                SetTop(bstk, Add(bm, ld(bn)));
+                tyg_set_dyn(p, bm, I64(0), LdL(bn));
+                SetTop(bstk, Add(bm, LdL(bn)));
             }
             auto run = NewBlock(), ran = NewBlock();
-            Branch(Cmp(TYG_NE, ld(okl), i64(0)), run, ran);
+            Branch(Cmp(TYG_NE, LdL(okl), I64(0)), run, ran);
             SetBlock(run);
             auto i64t = IT(TYG_I64);
-            auto n = CallC(M.VerifyFn(et), { i64t, i64t, i64t }, { ld(pay), ld(pn), bm }, i64t);
-            st(cnt, n);
-            st(okl, tyg_convert(p, TYG_ZEXT, TYG_I64, Cmp(TYG_SGE, n, i64(0))));
+            auto n = CallC(M.VerifyFn(et), { i64t, i64t, i64t }, { LdL(pay), LdL(pn), bm }, i64t);
+            StL(cnt, n);
+            StL(okl, tyg_convert(p, TYG_ZEXT, TYG_I64, Cmp(TYG_SGE, n, I64(0))));
             tyg_jump(p, ran);
             SetBlock(ran);
         }
@@ -6911,44 +6796,44 @@ struct TgFn {
             // The prefix reserved, the payload behind it, the count patched
             // in (CodeGen::OpenRzDest, EmitPrefixPatch).
             auto start = tyg_local_new(p, 8, 8);
-            st(start, Top(r.stk));
-            SetTop(r.stk, Add(ld(start), i64(TgModule::PrefixBytes(t))));
+            StL(start, Top(r.stk));
+            SetTop(r.stk, Add(LdL(start), I64(TgModule::PrefixBytes(t))));
             auto copy = NewBlock(), out = NewBlock();
-            Branch(Cmp(TYG_NE, ld(okl), i64(0)), copy, out);
+            Branch(Cmp(TYG_NE, LdL(okl), I64(0)), copy, out);
             SetBlock(copy);
             auto top = Top(r.stk);
-            tyg_move_dyn(p, top, ld(pay), ld(pn));
-            SetTop(r.stk, Add(top, ld(pn)));
+            tyg_move_dyn(p, top, LdL(pay), LdL(pn));
+            SetTop(r.stk, Add(top, LdL(pn)));
             tyg_jump(p, out);
             SetBlock(out);
             // The count: the verifier's, or none for a rejected image.
             auto zero = NewBlock(), keep = NewBlock();
-            Branch(Cmp(TYG_NE, ld(okl), i64(0)), keep, zero);
+            Branch(Cmp(TYG_NE, LdL(okl), I64(0)), keep, zero);
             SetBlock(zero);
-            st(cnt, i64(0));
+            StL(cnt, I64(0));
             tyg_jump(p, keep);
             SetBlock(keep);
-            PatchPrefix(ld(start), t, ld(cnt), r.stk);
-            r.a = AtV(ld(start));
+            PatchPrefix(LdL(start), t, LdL(cnt), r.stk);
+            r.a = AtV(LdL(start));
             V ok;
             ok.t = M.ast.booltype;
-            ok.v = tyg_convert(p, TYG_TRUNC, TYG_I8, ld(okl));
+            ok.v = tyg_convert(p, TYG_TRUNC, TYG_I8, LdL(okl));
             return { r, ok };
         }
         St(r.a, Top(r.stk));
-        St(rlen, i64(0));
+        St(rlen, I64(0));
         auto copy = NewBlock(), out = NewBlock();
-        Branch(Cmp(TYG_NE, ld(okl), i64(0)), copy, out);
+        Branch(Cmp(TYG_NE, LdL(okl), I64(0)), copy, out);
         SetBlock(copy);
         auto top = Top(r.stk);
-        tyg_move_dyn(p, top, ld(pay), ld(pn));
-        SetTop(r.stk, Add(top, ld(pn)));
-        St(rlen, ld(cnt));
+        tyg_move_dyn(p, top, LdL(pay), LdL(pn));
+        SetTop(r.stk, Add(top, LdL(pn)));
+        St(rlen, LdL(cnt));
         tyg_jump(p, out);
         SetBlock(out);
         V ok;
         ok.t = M.ast.booltype;
-        ok.v = tyg_convert(p, TYG_TRUNC, TYG_I8, ld(okl));
+        ok.v = tyg_convert(p, TYG_TRUNC, TYG_I8, LdL(okl));
         return { r, ok };
     }
     vector<V> GenCallAll(Node *n, size_t count) {
@@ -10101,12 +9986,9 @@ struct TgFn {
     tyg_block vfail = 0;
     TypeExpr *velem = nullptr;
 
-    tyg_val VI(int64_t x) { return I64(x); }
     tyg_val VQ() { return LdL(vq); }
     void VSetQ(tyg_val x) { StL(vq, x); }
     void VAddQ(tyg_val x) { VSetQ(Add(VQ(), x)); }
-    tyg_val VL(tyg_local l) { return LdL(l); }
-    void VS(tyg_local l, tyg_val x) { StL(l, x); }
     tyg_local VNew() { return tyg_local_new(p, 8, 8); }
     // The integer of `size` bytes at address `at`, widened to 64 bits.
     tyg_val VLoad(tyg_val at, int64_t size, bool sgn) {
@@ -10124,28 +10006,12 @@ struct TgFn {
     void VNeed(tyg_val bytes) {
         VFailIf(Cmp(TYG_SLT, Sub(vN, VQ()), bytes));
     }
-    // for (i = 0; i < count; i++) body
-    template<typename F> void VLoop(tyg_val count, F body) {
-        auto cl = VNew(), il = VNew();
-        VS(cl, count);
-        VS(il, VI(0));
-        auto head = NewBlock(), bd = NewBlock(), done = NewBlock();
-        tyg_jump(p, head);
-        SetBlock(head);
-        Branch(Cmp(TYG_SLT, VL(il), VL(cl)), bd, done);
-        SetBlock(bd);
-        body();
-        VS(il, Add(VL(il), VI(1)));
-        tyg_jump(p, head);
-        SetBlock(done);
-    }
 
     // One self-relative reference at field offset q holding `off`
     // (CodeGen::EmitVerifyLink): the target must be the start of an element,
     // and where typed at a variant, one carrying that tag.
     void VLink(TypeExpr *rt, tyg_val off) {
-        auto offl = VNew();
-        VS(offl, off);
+        auto offl = Local(off);
         auto pt = rt->ref->sub;
         auto variant = pt->kind == TY_VARIANT && velem->kind == TY_ENUM;
         int64_t skip = 0, vi = 0;
@@ -10159,27 +10025,26 @@ struct TgFn {
         auto skipb = NewBlock();
         if (rt->ref->optional) {
             auto inb = NewBlock();
-            Branch(Cmp(TYG_NE, VL(offl), VI(0)), inb, skipb);
+            Branch(Cmp(TYG_NE, LdL(offl), I64(0)), inb, skipb);
             SetBlock(inb);
         }
-        auto v = VNew();
-        VS(v, Sub(VQ(), VI(skip)));
+        auto v = Local(Sub(VQ(), I64(skip)));
         // The untrusted offset is bounded against the image before it is added.
-        VFailIf(Cmp(TYG_SLT, VL(offl), tyg_un(p, TYG_NEG, VL(v))));
-        VFailIf(Cmp(TYG_SGE, VL(offl), Sub(vN, VL(v))));
-        VS(v, Add(VL(v), VL(offl)));
+        VFailIf(Cmp(TYG_SLT, LdL(offl), tyg_un(p, TYG_NEG, LdL(v))));
+        VFailIf(Cmp(TYG_SGE, LdL(offl), Sub(vN, LdL(v))));
+        StL(v, Add(LdL(v), LdL(offl)));
         if (cg.IsFix(velem)) {
-            VFailIf(Cmp(TYG_NE, tyg_bin(p, TYG_SREM, VL(v), VI(std::max<int64_t>(cg.FixedSize(velem), 1))), VI(0)));
+            VFailIf(Cmp(TYG_NE, tyg_bin(p, TYG_SREM, LdL(v), I64(std::max<int64_t>(cg.FixedSize(velem), 1))), I64(0)));
         } else {
             // GS_BM_GET(bm, v)
-            auto byte = VLoad(Add(vBM, tyg_bin(p, TYG_LSHR, VL(v), VI(3))), 1, false);
-            auto bit = tyg_bin(p, TYG_AND, tyg_bin(p, TYG_LSHR, byte, tyg_bin(p, TYG_AND, VL(v), VI(7))), VI(1));
-            VFailIf(Cmp(TYG_EQ, bit, VI(0)));
+            auto byte = VLoad(Add(vBM, tyg_bin(p, TYG_LSHR, LdL(v), I64(3))), 1, false);
+            auto bit = tyg_bin(p, TYG_AND, tyg_bin(p, TYG_LSHR, byte, tyg_bin(p, TYG_AND, LdL(v), I64(7))), I64(1));
+            VFailIf(Cmp(TYG_EQ, bit, I64(0)));
         }
         if (variant) {
-            VFailIf(Cmp(TYG_SLT, Sub(vN, VL(v)), VI(skip)));
-            auto tag = VLoad(Add(vP, VL(v)), skip, false);
-            VFailIf(Cmp(TYG_NE, tag, VI(vi)));
+            VFailIf(Cmp(TYG_SLT, Sub(vN, LdL(v)), I64(skip)));
+            auto tag = VLoad(Add(vP, LdL(v)), skip, false);
+            VFailIf(Cmp(TYG_NE, tag, I64(vi)));
         }
         tyg_jump(p, skipb);
         SetBlock(skipb);
@@ -10193,20 +10058,20 @@ struct TgFn {
         tyg_local start = 0;
         if (lo) {
             start = VNew();
-            VS(start, VQ());
-            VNeed(VI(total));
+            StL(start, VQ());
+            VNeed(I64(total));
         }
         for (size_t i = 0; i < fields.size(); i++) {
             auto &f = fields[i];
             if (f.ispad) {
-                if (!lo && f.padsize > 0) VAddQ(VI(f.padsize));
+                if (!lo && f.padsize > 0) VAddQ(I64(f.padsize));
                 continue;
             }
             if (lo && !cg.NeedsVerifyWalk(ftypes[i])) continue;
-            if (lo) VSetQ(Add(VL(start), VI(lo->offs[i])));
+            if (lo) VSetQ(Add(LdL(start), I64(lo->offs[i])));
             VWalk(ftypes[i], links);
         }
-        if (lo) VSetQ(Add(VL(start), VI(total)));
+        if (lo) VSetQ(Add(LdL(start), I64(total)));
     }
 
     // The checks and cursor advance for one value of type t at q
@@ -10215,22 +10080,22 @@ struct TgFn {
         if (!cg.NeedsVerifyWalk(t)) {
             auto sz = cg.FixedSize(t);
             if (sz > 0) {
-                VNeed(VI(sz));
-                VAddQ(VI(sz));
+                VNeed(I64(sz));
+                VAddQ(I64(sz));
             }
             return;
         }
         switch (t->kind) {
             case TY_BOOL: {
-                VNeed(VI(1));
-                VFailIf(Cmp(TYG_UGT, VLoad(Add(vP, VQ()), 1, false), VI(1)));
-                VAddQ(VI(1));
+                VNeed(I64(1));
+                VFailIf(Cmp(TYG_UGT, VLoad(Add(vP, VQ()), 1, false), I64(1)));
+                VAddQ(I64(1));
                 return;
             }
             case TY_INT: {   // a varint field: only its length matters to the walk
                 auto uc = UlebCheck(Add(vP, VQ()), vE);
-                VFailIf(Cmp(TYG_EQ, VL(uc.k), VI(0)));
-                VAddQ(VL(uc.k));
+                VFailIf(Cmp(TYG_EQ, LdL(uc.k), I64(0)));
+                VAddQ(LdL(uc.k));
                 return;
             }
             case TY_REF: {
@@ -10238,47 +10103,47 @@ struct TgFn {
                 auto off = VNew(), k = VNew();
                 if (w == IS_VARINT) {
                     auto uc = UlebCheck(Add(vP, VQ()), vE);
-                    VFailIf(Cmp(TYG_EQ, VL(uc.k), VI(0)));
-                    VS(k, VL(uc.k));
+                    VFailIf(Cmp(TYG_EQ, LdL(uc.k), I64(0)));
+                    StL(k, LdL(uc.k));
                     if (links) {   // gs_zig_check
-                        auto u = VL(uc.v);
-                        VS(off, tyg_bin(p, TYG_XOR, tyg_bin(p, TYG_LSHR, u, VI(1)),
-                                        tyg_un(p, TYG_NEG, tyg_bin(p, TYG_AND, u, VI(1)))));
+                        auto u = LdL(uc.v);
+                        StL(off, tyg_bin(p, TYG_XOR, tyg_bin(p, TYG_LSHR, u, I64(1)),
+                                        tyg_un(p, TYG_NEG, tyg_bin(p, TYG_AND, u, I64(1)))));
                     }
                 } else {
-                    VNeed(VI(CodeGen::IntSize(w)));
-                    VS(k, VI(CodeGen::IntSize(w)));
-                    if (links) VS(off, VLoad(Add(vP, VQ()), CodeGen::IntSize(w), !t->ref->pool));
+                    VNeed(I64(CodeGen::IntSize(w)));
+                    StL(k, I64(CodeGen::IntSize(w)));
+                    if (links) StL(off, VLoad(Add(vP, VQ()), CodeGen::IntSize(w), !t->ref->pool));
                 }
-                if (links) VLink(t, VL(off));
-                VAddQ(VL(k));
+                if (links) VLink(t, LdL(off));
+                VAddQ(LdL(k));
                 return;
             }
             case TY_ARRAY: {
                 auto &a = *t->arr;
                 switch (a.akind) {
                     case A_FIXED:
-                        VLoop(VI(cg.ArrSize(t->arr)), [&] { VWalk(a.sub, links); });
+                        Loop(I64(0), I64(cg.ArrSize(t->arr)), [&](tyg_val) { VWalk(a.sub, links); });
                         return;
                     case A_VAR: {
                         auto ls = cg.LenStore(t->arr);
                         auto nl = VNew();
                         if (ls == IS_VARINT) {
                             auto uc = UlebCheck(Add(vP, VQ()), vE);
-                            VFailIf(Cmp(TYG_EQ, VL(uc.k), VI(0)));
-                            VFailIf(Cmp(TYG_SLT, VL(uc.v), VI(0)));   // above INT64_MAX
-                            VS(nl, VL(uc.v));
-                            VAddQ(VL(uc.k));
+                            VFailIf(Cmp(TYG_EQ, LdL(uc.k), I64(0)));
+                            VFailIf(Cmp(TYG_SLT, LdL(uc.v), I64(0)));   // above INT64_MAX
+                            StL(nl, LdL(uc.v));
+                            VAddQ(LdL(uc.k));
                         } else {
-                            VNeed(VI(CodeGen::IntSize(ls)));
-                            VS(nl, VLoad(Add(vP, VQ()), CodeGen::IntSize(ls), false));
-                            VAddQ(VI(CodeGen::IntSize(ls)));
+                            VNeed(I64(CodeGen::IntSize(ls)));
+                            StL(nl, VLoad(Add(vP, VQ()), CodeGen::IntSize(ls), false));
+                            VAddQ(I64(CodeGen::IntSize(ls)));
                         }
-                        VFailIf(Cmp(TYG_SLT, VL(nl), VI(0)));
-                        VFailIf(Cmp(TYG_SGT, VL(nl), tyg_bin(p, TYG_SDIV, Sub(vN, VQ()),
-                                                VI(std::max<int64_t>(cg.MinBytes(a.sub), 1)))));
-                        if (!cg.NeedsVerifyWalk(a.sub)) VAddQ(Mul(VL(nl), VI(cg.FixedSize(a.sub))));
-                        else VLoop(VL(nl), [&] { VWalk(a.sub, links); });
+                        VFailIf(Cmp(TYG_SLT, LdL(nl), I64(0)));
+                        VFailIf(Cmp(TYG_SGT, LdL(nl), tyg_bin(p, TYG_SDIV, Sub(vN, VQ()),
+                                                I64(std::max<int64_t>(cg.MinBytes(a.sub), 1)))));
+                        if (!cg.NeedsVerifyWalk(a.sub)) VAddQ(Mul(LdL(nl), I64(cg.FixedSize(a.sub))));
+                        else Loop(I64(0), LdL(nl), [&](tyg_val) { VWalk(a.sub, links); });
                         return;
                     }
                     case A_LIMITED: {
@@ -10287,27 +10152,27 @@ struct TgFn {
                         auto s = VNew(), nl = VNew(), cap = VNew();
                         auto esz = std::max<int64_t>(cg.FixedSize(a.sub), 1);
                         auto stat = cg.IsFix(t);
-                        VS(s, VQ());
+                        StL(s, VQ());
                         if (stat) {
                             auto ls = cg.LenStore(t->arr);
-                            VNeed(VI(cg.FixedSize(t)));
-                            VS(nl, VLoad(Add(vP, VQ()), CodeGen::IntSize(ls), false));
-                            VFailIf(Cmp(TYG_SLT, VL(nl), VI(0)));
-                            VFailIf(Cmp(TYG_SGT, VL(nl), VI(cg.ArrSize(t->arr))));
-                            VAddQ(VI(CodeGen::IntSize(ls)));
+                            VNeed(I64(cg.FixedSize(t)));
+                            StL(nl, VLoad(Add(vP, VQ()), CodeGen::IntSize(ls), false));
+                            VFailIf(Cmp(TYG_SLT, LdL(nl), I64(0)));
+                            VFailIf(Cmp(TYG_SGT, LdL(nl), I64(cg.ArrSize(t->arr))));
+                            VAddQ(I64(CodeGen::IntSize(ls)));
                         } else {
-                            VNeed(VI(8));
-                            VS(cap, VLoad(Add(vP, VQ()), 4, false));
-                            VS(nl, VLoad(Add(Add(vP, VQ()), VI(4)), 4, false));
-                            VFailIf(Cmp(TYG_SGT, VL(nl), VL(cap)));
-                            VFailIf(Cmp(TYG_SGT, VL(cap), tyg_bin(p, TYG_SDIV, Sub(Sub(vN, VQ()), VI(8)),
-                                                    VI(esz))));
-                            VAddQ(VI(8));
+                            VNeed(I64(8));
+                            StL(cap, VLoad(Add(vP, VQ()), 4, false));
+                            StL(nl, VLoad(Add(Add(vP, VQ()), I64(4)), 4, false));
+                            VFailIf(Cmp(TYG_SGT, LdL(nl), LdL(cap)));
+                            VFailIf(Cmp(TYG_SGT, LdL(cap), tyg_bin(p, TYG_SDIV, Sub(Sub(vN, VQ()), I64(8)),
+                                                    I64(esz))));
+                            VAddQ(I64(8));
                         }
-                        if (cg.NeedsVerifyWalk(a.sub)) VLoop(VL(nl), [&] { VWalk(a.sub, links); });
-                        if (stat) VSetQ(Add(VL(s), VI(cg.FixedSize(t))));
+                        if (cg.NeedsVerifyWalk(a.sub)) Loop(I64(0), LdL(nl), [&](tyg_val) { VWalk(a.sub, links); });
+                        if (stat) VSetQ(Add(LdL(s), I64(cg.FixedSize(t))));
                         else
-                            VSetQ(Add(Add(VL(s), VI(8)), Mul(VL(cap), VI(cg.FixedSize(a.sub)))));
+                            VSetQ(Add(Add(LdL(s), I64(8)), Mul(LdL(cap), I64(cg.FixedSize(a.sub)))));
                         return;
                     }
                     default: No(Line {}, "verifier of this array");
@@ -10336,16 +10201,16 @@ struct TgFn {
                 auto nv = (int64_t)ei->en->variants.size();
                 auto fix = !t->enu->varmode;
                 auto s = VNew(), tag = VNew();
-                if (fix) VS(s, VQ());
-                VNeed(VI(fix ? cg.FixedSize(t) : CodeGen::IntSize(ts)));
-                VS(tag, VLoad(Add(vP, VQ()), CodeGen::IntSize(ts), false));
-                VFailIf(Cmp(TYG_UGE, VL(tag), VI(nv)));
-                VAddQ(VI(CodeGen::IntSize(ts)));
+                if (fix) StL(s, VQ());
+                VNeed(I64(fix ? cg.FixedSize(t) : CodeGen::IntSize(ts)));
+                StL(tag, VLoad(Add(vP, VQ()), CodeGen::IntSize(ts), false));
+                VFailIf(Cmp(TYG_UGE, LdL(tag), I64(nv)));
+                VAddQ(I64(CodeGen::IntSize(ts)));
                 auto after = NewBlock();
                 for (int64_t i = 0; i < nv; i++) {
                     auto vt = cg.VariantType(t, (int)i);
                     auto arm = NewBlock(), next = NewBlock();
-                    Branch(Cmp(TYG_EQ, VL(tag), VI(i)), arm, next);
+                    Branch(Cmp(TYG_EQ, LdL(tag), I64(i)), arm, next);
                     SetBlock(arm);
                     if (!fix || cg.NeedsVerifyWalk(vt)) VWalk(vt, links);
                     tyg_jump(p, after);
@@ -10353,7 +10218,7 @@ struct TgFn {
                 }
                 tyg_jump(p, vfail);
                 SetBlock(after);
-                if (fix) VSetQ(Add(VL(s), VI(cg.FixedSize(t))));
+                if (fix) VSetQ(Add(LdL(s), I64(cg.FixedSize(t))));
                 return;
             }
             default: No(Line {}, "verifier of this type");
@@ -10378,34 +10243,34 @@ struct TgFn {
         // A type whose values can occupy no bytes has no recoverable element
         // count: only the empty image is one of its arrays.
         if (cg.MinBytes(elem) <= 0) {
-            tyg_ret(p, tyg_select(p, Cmp(TYG_EQ, vN, VI(0)), VI(0), VI(-1)));
+            tyg_ret(p, tyg_select(p, Cmp(TYG_EQ, vN, I64(0)), I64(0), I64(-1)));
         } else {
             auto fixed = cg.IsFix(elem);
             auto rel = cg.HasRelRefAny(elem);
             vq = VNew();
             auto cnt = VNew();
-            VSetQ(VI(0));
-            VS(cnt, VI(0));
+            VSetQ(I64(0));
+            StL(cnt, I64(0));
             auto head = NewBlock(), body = NewBlock(), done = NewBlock();
             tyg_jump(p, head);
             SetBlock(head);
             Branch(Cmp(TYG_SLT, VQ(), vN), body, done);
             SetBlock(body);
             if (!fixed && rel) {   // GS_BM_SET(bm, q)
-                auto at = Add(vBM, tyg_bin(p, TYG_LSHR, VQ(), VI(3)));
-                auto bit = tyg_bin(p, TYG_SHL, VI(1), tyg_bin(p, TYG_AND, VQ(), VI(7)));
+                auto at = Add(vBM, tyg_bin(p, TYG_LSHR, VQ(), I64(3)));
+                auto bit = tyg_bin(p, TYG_SHL, I64(1), tyg_bin(p, TYG_AND, VQ(), I64(7)));
                 auto old = VLoad(at, 1, false);
                 tyg_store(p, TYG_I8, AtV(at),
                           tyg_convert(p, TYG_TRUNC, TYG_I8, tyg_bin(p, TYG_OR, old, bit)), 0);
             }
             VWalk(elem, fixed && rel);
-            VS(cnt, Add(VL(cnt), VI(1)));
+            StL(cnt, Add(LdL(cnt), I64(1)));
             tyg_jump(p, head);
             SetBlock(done);
             VFailIf(Cmp(TYG_NE, VQ(), vN));
             if (!fixed && rel) {
                 // The link pass, now that every element start is known.
-                VSetQ(VI(0));
+                VSetQ(I64(0));
                 auto h2 = NewBlock(), b2 = NewBlock(), d2 = NewBlock();
                 tyg_jump(p, h2);
                 SetBlock(h2);
@@ -10415,10 +10280,10 @@ struct TgFn {
                 tyg_jump(p, h2);
                 SetBlock(d2);
             }
-            tyg_ret(p, VL(cnt));
+            tyg_ret(p, LdL(cnt));
         }
         SetBlock(vfail);
-        tyg_ret(p, VI(-1));
+        tyg_ret(p, I64(-1));
         Finish(Line {});
     }
 
