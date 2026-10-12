@@ -8396,35 +8396,31 @@ struct TgFn {
         if (!cg.sinfo[callee].hasrf || cg.norfcheck || Ended()) return;
         auto rfa = RfAddr();
         auto rf = tyg_load(p, TYG_I32, AtV(rfa), 0);
-        auto on = NewBlock(), cont = NewBlock();
-        Branch(Cmp(TYG_NE, rf, tyg_iconst(p, TYG_I32, 0)), on, cont);
-        SetBlock(on);
-        if (sp && callee->needs.count(sp)) {
-            auto here = NewBlock(), other = NewBlock();
-            Branch(Cmp(TYG_EQ, rf, tyg_iconst(p, TYG_I32, cg.fromids[sp])), here, other);
-            SetBlock(here);
-            tyg_store(p, TYG_I32, AtV(rfa), tyg_iconst(p, TYG_I32, 0), 0);   // Nothing in flight again.
-            auto &rets = sp->rets;
-            auto cret = cg.sinfo[sp].cret;
-            for (size_t i = 0; i < rets.size(); i++) {
-                if ((int)i == cret) continue;
-                if (NonFixedRet(rets[i])) LandChannel(i);
-                else Store(P { AtV(LdL(chans[i].a)), rets[i] }, Load(P { LretAt(sp, i), rets[i] }, Line {}));
+        auto i32 = [&](int v) { return tyg_iconst(p, TYG_I32, v); };
+        If(Cmp(TYG_NE, rf, i32(0)), [&] {
+            if (sp && callee->needs.count(sp))
+                If(Cmp(TYG_EQ, rf, i32(cg.fromids[sp])), [&] {
+                    tyg_store(p, TYG_I32, AtV(rfa), i32(0), 0);   // Nothing in flight again.
+                    auto &rets = sp->rets;
+                    auto cret = cg.sinfo[sp].cret;
+                    for (size_t i = 0; i < rets.size(); i++) {
+                        if ((int)i == cret) continue;
+                        if (NonFixedRet(rets[i])) LandChannel(i);
+                        else Store(P { AtV(LdL(chans[i].a)), rets[i] }, Load(P { LretAt(sp, i), rets[i] }, Line {}));
+                    }
+                    Leave();
+                    if (cret < 0) tyg_ret(p, 0);
+                    else if (M.IsScalar(rets[cret])) tyg_ret(p, Load(P { LretAt(sp, cret), rets[cret] }, Line {}).v);
+                    else tyg_ret_mem(p, LretAt(sp, cret));
+                });
+            if (sp && cg.sinfo[sp].hasrf) {
+                Propagate();
+            } else {
+                M.NeedShim("gs_tg_rfpanic");
+                CallC("gs_tg_rfpanic", {}, {}, nullptr);
+                tyg_unreachable(p);
             }
-            Leave();
-            if (cret < 0) tyg_ret(p, 0);
-            else if (M.IsScalar(rets[cret])) tyg_ret(p, Load(P { LretAt(sp, cret), rets[cret] }, Line {}).v);
-            else tyg_ret_mem(p, LretAt(sp, cret));
-            SetBlock(other);
-        }
-        if (sp && cg.sinfo[sp].hasrf) {
-            Propagate();
-        } else {
-            M.NeedShim("gs_tg_rfpanic");
-            CallC("gs_tg_rfpanic", {}, {}, nullptr);
-            tyg_unreachable(p);
-        }
-        SetBlock(cont);
+        });
     }
 
     void DebugVar(decltype(&tyg_debug_var) fn, VarDef *d, const tyg_dtype *dt, tyg_local loc) {
