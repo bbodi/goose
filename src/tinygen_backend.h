@@ -1448,18 +1448,26 @@ struct TgFn {
         bool pref = false;        // Its value is a pool reference (GenPref).
     };
     vector<LoopTargets> loops;
-    // A value a match, a block or a loop delivers, built in place at the
-    // top of a stack (GenImg for mode 1, GenRz for mode 2).
+    // Where a value is built, at the top of stk: mode 1 a T[] image (BuildInto returns its address), 2 a
+    // resizable of any kind (header at hdr), 3 a frame object (its struct at hdr), 4 a frame object's
+    // bytes (the innermost count stored at hdr). A match, block or loop delivers modes 1 and 2 this way.
+    struct P;
     struct InPlace {
         int mode = 0;
         tyg_val stk = 0;
         TypeExpr *t = nullptr;
         tyg_addr hdr {};
+        const P *fo = nullptr;   // Mode 3: the place, whose flags the struct's fields inherit.
     };
-    void BuildTo(Node *v, const InPlace &ip, Line l) {
-        if (ip.mode == 1) GenImg(v, ip.stk, ip.t, l);
-        else if (M.IsRb(ip.t)) GenRb(v, ip.stk, ip.hdr, ip.t, l);
-        else GenRz(v, ip.stk, ip.hdr, ip.t, l);
+    // The one entry to every builder: n's value built at d.
+    tyg_val BuildInto(Node *n, const InPlace &d, Line l) {
+        switch (d.mode) {
+            case 1: return GenImg(n, d.stk, d.t, l);
+            case 2: GenRz(n, d.stk, d.hdr, d.t, l); break;
+            case 3: GenFo(n, *d.fo, l); break;
+            default: GenFoBytes(n, d.stk, d.t, d.hdr, l);
+        }
+        return 0;
     }
     // A match, block or loop expression built in place.
     void BuildExpr(Node *n, const InPlace &ip, Line l) {
@@ -1578,13 +1586,15 @@ struct TgFn {
         auto c = Is<Call>(n);
         return c && c->builtin == B_COPY && c->ArgNodes().size() == 1 ? c->ArgNodes()[0] : n;
     }
-    // If, block, match, early block, loop or function value n: built with each arm's value
-    // handed to arm, or (match, early block, loop) in place per ip. False for any other n.
-    template <class F> bool BuildCtl(Node *n, const InPlace &ip, Line l, F arm) {
+    // If, block, match, early block, loop or function value n built at d, each arm's value by BuildInto.
+    // A match, early block or loop only for a destination they deliver to. False for any other n.
+    bool BuildCtl(Node *n, const InPlace &d, Line l) {
+        auto arm = [&](Node *v) { BuildInto(v, d, l); };
         if (auto ie = Is<IfExpr>(n); ie && ie->elseb) BuildIf(ie, l, arm);
         else if (auto b = Is<Block>(n); b && b->tail) BuildArm(b, l, arm);
-        else if (Is<MatchExpr>(n) || Is<EarlyBlock>(n) || Is<LoopExpr>(n)) BuildExpr(n, ip, l);
         else if (auto c = Is<Call>(n); c && c->fvbody && c->fvbody->tail) BuildFv(c, l, arm);
+        else if (d.mode <= 2 && !M.IsRs(d.t) && (Is<MatchExpr>(n) || Is<EarlyBlock>(n) || Is<LoopExpr>(n)))
+            BuildExpr(n, d, l);
         else return false;
         return true;
     }
@@ -1698,12 +1708,12 @@ struct TgFn {
     // GenConstruct): a literal's elements one by one, a call's at its destination, else a copy of elements.
     void GenRz(Node *n, tyg_val stk, tyg_addr hdr, TypeExpr *t, Line l) {
         if (M.IsRs(t)) return GenRs(n, stk, hdr, t, l);
+        if (M.IsRb(t)) return GenRb(n, stk, hdr, t, l);
         auto et = t->arr->sub;
         auto fix = cg.IsFix(et);
         n = StripCopy(n);
         auto len = HdrLen(hdr);
-        auto arm = [&](Node *v) { GenRz(v, stk, hdr, t, l); };
-        if (BuildCtl(n, InPlace { 2, stk, t, hdr }, l, arm)) return;
+        if (BuildCtl(n, InPlace { 2, stk, t, hdr }, l)) return;
         if (auto al = Is<ArrayLit>(n)) {
             if (al->capexpr || (al->fillval && !fix)) No(l, "array literal of this kind");
             if (!al->fillval) {   // Elements (images each built behind the last) counted one by one.
@@ -1812,10 +1822,9 @@ struct TgFn {
             SetTop(stk, Add(top, I64(k)));
         };
         // A tail built behind a header of its own, its count the one at len.
-        auto tailhdr = [&](bool rb, Node *init, TypeExpr *ft) {
+        auto tailhdr = [&](Node *init, TypeExpr *ft) {
             auto th = NewHdr();
-            if (rb) GenRb(init, stk, th, ft, l);
-            else GenRz(init, stk, th, ft, l);
+            GenRz(init, stk, th, ft, l);
             if (!Ended()) St(len, Ld(HdrLen(th)));
         };
         // A literal's fields in turn: pads and absent fields zeroed, the tail built by `tail`.
@@ -1830,8 +1839,7 @@ struct TgFn {
             }
         };
         if (StripCopy(n) != n) No(l, "copy of a resizable ADT");
-        auto arm = [&](Node *v) { GenRb(v, stk, hdr, t, l); };
-        if (BuildCtl(n, InPlace { 2, stk, t, hdr }, l, arm)) return;
+        if (BuildCtl(n, InPlace { 2, stk, t, hdr }, l)) return;
         auto sl = Is<StructLit>(n);
         auto c = Is<Call>(n);
         if (isst) {   // Its fixed fields in turn, then its tail, a resizable ADT of its own.
@@ -1840,7 +1848,7 @@ struct TgFn {
                 begin(0);
                 fields(sl, si->st->fields, si->ftypes, M.RbStShape(t).tailfi, [&](Node *init, TypeExpr *ft) {
                     if (!init) No(l, "resizable struct without its tail");
-                    tailhdr(true, init, ft);
+                    tailhdr(init, ft);
                 });
                 return;
             }
@@ -1856,7 +1864,7 @@ struct TgFn {
                     if (!init) No(l, "resizable ADT without its frame object");
                     GenFoBytes(init, stk, ft, len, l);
                 } else if (init) {
-                    tailhdr(false, init, ft);
+                    tailhdr(init, ft);
                 }
             });
             return;
@@ -2026,8 +2034,7 @@ struct TgFn {
         }
         auto start = Local(Top(stk));
         auto at = [&] { return LdL(start); };
-        if (n && !from && BuildCtl(n, InPlace { 1, stk, t, {} }, l, [&](Node *v) { GenImg(v, stk, t, l); }))
-            return at();
+        if (n && !from && BuildCtl(n, InPlace { 1, stk, t, {} }, l)) return at();
         if (TgModule::IsVr(t)) {
             // A varint-width relative reference: the offset of the plain reference n is.
             if (from) No(l, "relative reference without a value");
@@ -4388,8 +4395,7 @@ struct TgFn {
             args.push_back(ArgOfVal(GenImg(n, stk, pt, l)));
         } else {
             auto x = RzTemp(pt, l);
-            if (M.IsRb(pt)) GenRb(n, x.stk, x.a, pt, l);
-            else GenRz(n, x.stk, x.a, pt, l);
+            GenRz(n, x.stk, x.a, pt, l);
             args.push_back(ArgOfMem(x.a));
             args.push_back(ArgOfVal(x.stk));
         }
@@ -5794,8 +5800,7 @@ struct TgFn {
         auto grow = IsGrow(et) && (M.RzOk(et) || M.VeOk(et));
         if (!grow && !M.RbOk(et)) return false;
         x = RzTemp(et, l);
-        if (grow) GenRz(n, x.stk, x.a, et, l);
-        else GenRb(n, x.stk, x.a, et, l);
+        GenRz(n, x.stk, x.a, et, l);
         return true;
     }
     // A value wanted of a type neither scalar nor held in a register: in place if an image or a resizable.
@@ -5823,7 +5828,7 @@ struct TgFn {
         return false;
     }
     void CtlArm(const Ctl &k, const InPlace *ip, Node *body, Line l) {
-        if (ip) BuildArm(body, l, [&](Node *v) { BuildTo(v, *ip, l); });
+        if (ip) BuildArm(body, l, [&](Node *v) { BuildInto(v, *ip, l); });
         else ArmVal(body, k.valued, k.pr, k.et, k.res);
     }
     V CtlValue(const Ctl &k, Line l) { return k.valued ? Load(P { AtL(k.res), k.et }, l) : V {}; }
@@ -6227,7 +6232,7 @@ struct TgFn {
             // moves down to where the exit's value starts.
             InPlace ip { t.inplace, t.dstk, t.dt, t.hdr };
             auto st = Local(Top(t.dstk));
-            BuildTo(b->val, ip, b->line);
+            BuildInto(b->val, ip, b->line);
             if (Ended()) return;
             auto start = LdL(st), top0 = LdL(t.top0);
             If(Cmp(TYG_NE, start, top0), [&] {
@@ -6937,20 +6942,6 @@ struct TgFn {
 
     // ---- Frame objects ---------------------------------------------------------
 
-    // n as an if-else, a block with a tail or a with-body call: build(arm value) for each arm.
-    // False if n is none of those.
-    template <class F> bool BuildArms(Node *n, Line l, F build, bool fvbody = true) {
-        if (auto ie = Is<IfExpr>(n); ie && ie->elseb) {
-            BuildIf(ie, l, build);
-        } else if (auto b = Is<Block>(n); b && b->tail) {
-            BuildArm(b, l, build);
-        } else if (auto c = Is<Call>(n); fvbody && c && c->fvbody && c->fvbody->tail) {
-            BuildFv(c, l, build);
-        } else {
-            return false;
-        }
-        return true;
-    }
     // A tail's header at th: init built on stk, or empty at its top.
     void TailHdr(Node *init, tyg_val stk, tyg_addr th, TypeExpr *ft, Line l) {
         if (init) {
@@ -6975,7 +6966,7 @@ struct TgFn {
     }
     // A frame object built at pl, its tail on pl.stk (CodeGen's GenConstruct).
     void GenFo(Node *n, P pl, Line l) {
-        if (BuildArms(n, l, [&](Node *v) { GenFo(v, pl, l); })) return;
+        if (BuildCtl(n, InPlace { 3, pl.stk, pl.t, pl.a, &pl }, l)) return;
         auto sl = Is<StructLit>(n);
         if (!sl && n->exprtype && cg.TEq(n->exprtype, pl.t)) {
             // Any other one copied: a call's result, a variable.
@@ -7132,7 +7123,7 @@ struct TgFn {
     // one: its fields as bytes, its innermost tail's count into olen (CodeGen::GenFoAsBytes). Anything
     // but a literal is built as a frame object behind room left for the fields, stored there after.
     void GenFoBytes(Node *n, tyg_val stk, TypeExpr *t, tyg_addr olen, Line l) {
-        if (BuildArms(n, l, [&](Node *v) { GenFoBytes(v, stk, t, olen, l); }, false)) return;
+        if (BuildCtl(n, InPlace { 4, stk, t, olen }, l)) return;
         if (auto sl = Is<StructLit>(n); sl && sl->sinst && !sl->variant && cg.TEq(sl->exprtype, t)) {
             LitWithTail(sl, stk, t, M.FoLayout(t).tailfi, olen, l);
             return;
@@ -7175,8 +7166,8 @@ struct TgFn {
     }
     // A resizable struct built at the top of stk, its header at hdr (CodeGen::GenConstruct).
     void GenRs(Node *n, tyg_val stk, tyg_addr hdr, TypeExpr *t, Line l) {
-        if (auto c = Is<Call>(n); c && c->builtin == B_COPY && c->ArgNodes().size() == 1) n = c->ArgNodes()[0];
-        if (BuildArms(n, l, [&](Node *v) { GenRs(v, stk, hdr, t, l); })) return;
+        n = StripCopy(n);
+        if (BuildCtl(n, InPlace { 2, stk, t, hdr }, l)) return;
         auto len = AddrPlus(hdr, 8);
         if (auto sl = Is<StructLit>(n); sl && sl->sinst && !sl->variant && cg.TEq(sl->exprtype, t)) {
             auto start = Local(Top(stk));
@@ -7425,7 +7416,7 @@ struct TgFn {
 
     tyg_val GenVs(Node *n, tyg_val stk, TypeExpr *t, Line l) {
         auto start = Local(Top(stk));
-        if (auto c = Is<Call>(n); c && c->builtin == B_COPY && c->ArgNodes().size() == 1) n = c->ArgNodes()[0];
+        n = StripCopy(n);
         if (auto sl = Is<StructLit>(n); sl && sl->sinst && !sl->variant && cg.TEq(sl->exprtype, t))
             RunLit(sl, stk, cg.SI(t)->st->fields, cg.SI(t)->ftypes);
         else ImgFromCallOrPlace(n, stk, t, l);
@@ -7972,8 +7963,7 @@ struct TgFn {
                         GenFo(init, P { AtV(at), d->type, stk }, init->line);
                     } else if (grow) {   // CodeGen::InitGlobalStack: an empty array, then its elements.
                         emptyhdr(at, stk);
-                        if (M.IsRb(d->type)) GenRb(init, stk, AtV(at), d->type, init->line);
-                        else GenRz(init, stk, AtV(at), d->type, init->line);
+                        GenRz(init, stk, AtV(at), d->type, init->line);
                         if (d->reusable && !Ended()) {   // Its freelist, empty, on a stack of its own.
                             auto [h, st] = M.PoolAccessors(d);
                             auto flstk = LdL(AccessorLocal(st));
