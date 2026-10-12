@@ -2423,9 +2423,7 @@ struct TgFn {
         auto x = Gen(n);
         if (x.mem) return P { x.a, x.t, x.stk };
         if (!x.t || x.t->kind == TY_VOID) No(n->line, "place of no value");
-        P pl { AtL(Temp(x.t)), x.t };
-        Store(pl, x);
-        return pl;
+        return Spill(x);
     }
 
     // A variable: a local or parameter of this frame, one it was handed
@@ -3967,6 +3965,12 @@ struct TgFn {
     }
     // The count of the resizable whose header is at hdr.
     static tyg_addr CountAt(tyg_addr hdr) { return AddrPlus(hdr, 8); }
+    // x stored to a temporary of its own.
+    P Spill(const V &x) {
+        P pl { AtL(Temp(x.t)), x.t };
+        Store(pl, x);
+        return pl;
+    }
     // A 16-byte local holding two words.
     tyg_local PairLocal(tyg_val a, tyg_val b) {
         auto l = tyg_local_new(p, 16, 8);
@@ -4313,19 +4317,10 @@ struct TgFn {
     // A by-value frame object, image or resizable argument: a copy of its own on a stack of the
     // statement's, as the C passes it (SigParams).
     void ValArg(Node *n, TypeExpr *pt, vector<tyg_arg> &args) {
-        auto l = n->line;
-        if (M.FoOk(pt)) {
-            auto x = BuildTemp(n, pt, l);
-            args.push_back(ArgOfMem(x.a));
-            args.push_back(ArgOfVal(x.stk));
-        } else if (!IsGrow(pt) && !M.IsRs(pt) && !M.IsRb(pt)) {   // A T[]: by the image's address.
-            auto stk = Stk(AllocStk(false, l), l);
-            args.push_back(ArgOfVal(GenImg(n, stk, pt, l)));
-        } else {
-            auto x = BuildTemp(n, pt, l);
-            args.push_back(ArgOfMem(x.a));
-            args.push_back(ArgOfVal(x.stk));
-        }
+        auto x = BuildTemp(n, pt, n->line);
+        if (!x.stk) return args.push_back(ArgOfVal(tyg_addr_of(p, x.a)));   // A T[]: by the image's address.
+        args.push_back(ArgOfMem(x.a));
+        args.push_back(ArgOfVal(x.stk));
     }
 
     void FvArgs(Call *c, CodeGen::SpecInfo &ci, vector<tyg_arg> &args) {
@@ -4357,20 +4352,12 @@ struct TgFn {
         }
         if (c->fvparams.size() > c->args.size()) No(c->line, "function value parameters");
         if (Ended()) return Dummy(et);
-        tyg_scope_begin(p);
-        OpenScope(false);
-        for (size_t i = 0; i < c->fvparams.size(); i++) {
-            Declare(c->fvparams[i], c->args[i]->line);
-            Init(c->fvparams[i], c->args[i], c->args[i]->line);
-        }
-        auto x = GenBlock(c->fvbody, !wantsval);
-        if (wantsval && x.mem && !Ended()) {
-            P pl { AtL(Temp(x.t)), x.t };
-            Store(pl, x);
-            x.a = pl.a;
-        }
-        CloseScope();
-        tyg_scope_end(p);
+        V x;
+        InScope([&] {
+            BindFvParams(c);
+            x = GenBlock(c->fvbody, !wantsval);
+            if (wantsval && x.mem && !Ended()) x.a = Spill(x).a;
+        });
         if (!wantsval) return V {};
         return Ended() ? Dummy(et) : x;
     }
@@ -4435,29 +4422,16 @@ struct TgFn {
         return wanted ? Load(*pushed, c->line) : r;
     }
 
-    // v.append(x) (EmitAppend): a call's resizable result built at v's top, its count added;
-    // anything else holding elements (an array, a slice, a string literal, copy(x)) copied there.
+    // v.append(x) (EmitAppend): x's elements built at v's top, their count added.
     V GenAppend(Call *c) {
         auto an = c->ArgNodes();
         auto pl = Deref(Place(an[0]));
         if (TgModule::IsLim(pl.t)) return LimAppend(c, pl);
-        if (IsGrow(pl.t) && M.VeOk(pl.t) && pl.stk) {
-            // Elements of variable size: the source's run of bytes copied whole.
-            auto src = an[1];
-            if (auto cc = Is<Call>(src); cc && cc->builtin == B_COPY && cc->ArgNodes().size() == 1)
-                src = cc->ArgNodes()[0];
-            auto v = ViewOf(LimCallResult(src) ? LimCallPlace(src) : Place(src), c->line);
-            if (Ended()) return V {};
-            if (cg.Mangle(v.elem) != cg.Mangle(pl.t->arr->sub))
-                No(c->line, "append of another element type");
-            CopyView(pl.stk, CountAt(pl.a), pl.t->arr->sub, v);
-            return V {};
-        }
-        if (!IsGrow(pl.t) || !M.RzOk(pl.t) || !pl.stk) No(c->line, "append to an array of this kind");
+        if (!IsGrow(pl.t) || !(M.RzOk(pl.t) || M.VeOk(pl.t)) || !pl.stk) No(c->line, "append to an array of this kind");
         AppendSrc(pl, an[1], c->line);
         return V {};
     }
-    // The elements of src added to the resizable at pl.
+    // The elements of src added to the resizable at pl: built behind a header of their own at its top (GenRz).
     void AppendSrc(const P &pl, Node *src, Line l) {
         auto et = pl.t->arr->sub;
         auto len = CountAt(pl.a);
@@ -4465,24 +4439,7 @@ struct TgFn {
             BuildIf(ie, l, [&](Node *v) { AppendSrc(pl, v, l); });
             return;
         }
-        if (auto cc = Is<Call>(src); cc && cc->builtin == B_COPY && cc->ArgNodes().size() == 1)
-            src = cc->ArgNodes()[0];
-        auto st = src->exprtype;
-        auto call = Is<Call>(src);
-        // A function value's call builds it in place as well (GenRz).
-        auto fvcall = call && call->fvbody && call->fvbody->tail;
-        if (call && call->builtin < 0 && st && IsGrow(st)) {
-            if (!DestSpec(call) && !fvcall) No(l, "append of this call");
-            auto tmp = tyg_local_new(p, 16, 8);
-            GenRz(src, pl.stk, AtL(tmp), st, l);
-            if (!Ended()) St(len, Add(Ld(len), LdL(tmp, 8)));
-            return;
-        }
-        if (auto s = Is<StrLit>(src)) {
-            if (!IsU8(et)) No(l, "string of this type");
-            CopyLit(pl.stk, len, et, s->val);
-            return;
-        }
+        src = StripCopy(src);
         auto al = Is<ArrayLit>(src);
         auto same = al && al->exprtype && al->exprtype->kind == TY_ARRAY && cg.TEq(al->exprtype->arr->sub, et);
         if (same && !al->capexpr && cg.HasRelRef(et) && (!al->fillval || Is<IntLit>(al->fillcount))) {
@@ -4498,12 +4455,9 @@ struct TgFn {
             St(len, Add(Ld(len), I64(k)));
             return;
         }
-        // A literal is a fixed array, all of it evaluated before any of it is copied, as in the C.
-        auto from = Place(src);
-        if (Ended()) return;
-        auto v = ViewOf(from, l);
-        if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "append of another element type");
-        CopyView(pl.stk, len, et, v);
+        auto th = NewHdr();
+        GenRz(src, pl.stk, th, pl.t, l);
+        if (!Ended()) St(len, Add(Ld(len), Ld(CountAt(th))));
     }
     static bool IsGrow(TypeExpr *t) { return TgModule::IsGrow(t); }
 
@@ -4579,9 +4533,7 @@ struct TgFn {
             if (pushed) return *pushed;
             if (x.mem) return P { x.a, x.t, x.stk };
             if (!x.t || x.t->kind == TY_VOID) No(a->line, "place of no value");
-            P pl { AtL(Temp(x.t)), x.t };
-            Store(pl, x);
-            return pl;
+            return Spill(x);
         }
         auto rs = !fc ? nullptr : fc->spec ? fc->spec : !fc->dispatch.empty() ? fc->dispatch[0] : nullptr;
         if (fc && fc->builtin < 0 && rs && !rs->rets.empty() && rs->rets[0]->kind == TY_REF &&
@@ -5646,14 +5598,17 @@ struct TgFn {
         build(n);
         CloseScope();
     }
+    void BindFvParams(Call *c) {
+        for (size_t i = 0; i < c->fvparams.size(); i++) {
+            Declare(c->fvparams[i], c->args[i]->line);
+            Init(c->fvparams[i], c->args[i], c->args[i]->line);
+        }
+    }
     // A function value's call built in place: its parameters bound in a scope, then its body as an arm.
     template <class F> void BuildFv(Call *c, Line l, F build) {
         if (c->fvparams.size() > c->args.size()) No(c->line, "function value parameters");
         InScope([&] {
-            for (size_t i = 0; i < c->fvparams.size(); i++) {
-                Declare(c->fvparams[i], c->args[i]->line);
-                Init(c->fvparams[i], c->args[i], c->args[i]->line);
-            }
+            BindFvParams(c);
             if (!Ended()) BuildArm(c->fvbody, l, build);
         });
     }
