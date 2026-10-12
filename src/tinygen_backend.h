@@ -1867,7 +1867,11 @@ struct TgFn {
             if (!x.mem) No(l, "popped value in no memory");
             return P { x.a, x.t, x.stk };
         }
-        return LimCallResult(n) ? LimCallPlace(n) : Place(n);
+        if (!LimCallResult(n)) return Place(n);
+        auto x = Gen1(n);
+        if (!Ended() && (!x.mem || !x.t || (x.t->kind != TY_ARRAY && x.t->kind != TY_SLICE)))
+            No(n->line, "array result of this kind");
+        return P { x.a, x.t };
     }
     // The function whose first result a call builds at a destination (CodeGen's in-place
     // construction): its own, or a dispatch's first case, whose results all cases share.
@@ -2099,7 +2103,10 @@ struct TgFn {
             x.t = want;
             return x;
         }
-        if (LimAdapts(x, want)) return LimFrom(x, want, l);
+        // An array or slice where a limited array is wanted: copied into one.
+        if (TgModule::IsLim(want) && M.TypeOk(want) && x.mem &&
+            (x.t->kind == TY_ARRAY || x.t->kind == TY_SLICE) && !cg.TEq(x.t, want))
+            return LimFrom(x, want, l);
         if (want->kind == TY_ENUM && M.IsVm(want) && x.mem && M.VmOk(want) && x.t->kind != TY_REF &&
             (x.t->kind == TY_VARIANT || (x.t->kind == TY_ENUM && !M.IsVm(x.t))) && M.EI(x.t) == M.EI(want)) {
             // A variant or fixed-mode ADT as a variable-mode one: its image on a temporary's stack.
@@ -3366,11 +3373,6 @@ struct TgFn {
         if (!Is<Ident>(d->obj) && !Is<Dot>(d->obj)) Gen(d->obj);   // What it does, it does.
         return ValV(i64, I64(LimCap(ot)));
     }
-    // Whether x, an array or slice, is copied into a limited array where `want` is wanted.
-    bool LimAdapts(const V &x, TypeExpr *want) {
-        return TgModule::IsLim(want) && M.TypeOk(want) && x.mem && x.t &&
-               (x.t->kind == TY_ARRAY || x.t->kind == TY_SLICE) && !cg.TEq(x.t, want);
-    }
     // v's elements appended to pl (CopyIntoLimited, EmitAppend): count and capacity check first,
     // then the elements (moved as memmove moves them) and the length.
     void LimAppendView(const P &pl, const View &v, Line l) {
@@ -3419,12 +3421,6 @@ struct TgFn {
         auto arr = rt->kind == TY_ARRAY &&
                    (rt->arr->akind == A_LIMITED || rt->arr->akind == A_FIXED || IsVarArr(rt) || IsGrow(rt));
         return (arr || rt->kind == TY_SLICE) && !cg.TEq(n->exprtype, rt);
-    }
-    P LimCallPlace(Node *n) {
-        auto x = Gen1(n);
-        if (!Ended() && (!x.mem || !x.t || (x.t->kind != TY_ARRAY && x.t->kind != TY_SLICE)))
-            No(n->line, "array result of this kind");
-        return P { x.a, x.t };
     }
 
     // The element a push or alloc stores: evaluated now into x, or, for a literal linking to
