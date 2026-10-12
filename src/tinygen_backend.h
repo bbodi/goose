@@ -1954,16 +1954,10 @@ struct TgFn {
 
     // Code after a jump or return is unreachable, but tinygen wants every
     // instruction in an open block: such code goes into one of its own.
-    void Open() {
-        if (tyg_block_terminated(p)) SetBlock(NewBlock());
-    }
+    void Open() { if (tyg_block_terminated(p)) SetBlock(NewBlock()); }
     bool Ended() { return tyg_block_terminated(p) != 0; }
-    void Jump(tyg_block b) {
-        if (!Ended()) tyg_jump(p, b);
-    }
-    void Loc(Line l) {
-        if (l.line > 0) tyg_loc(p, M.File(l.fileidx), l.line, 0);
-    }
+    void Jump(tyg_block b) { if (!Ended()) tyg_jump(p, b); }
+    void Loc(Line l) { if (l.line > 0) tyg_loc(p, M.File(l.fileidx), l.line, 0); }
 
     // A local for a value of type t, aligned to the largest power of two up to 8 its size allows.
     tyg_local Temp(TypeExpr *t) {
@@ -2002,10 +1996,13 @@ struct TgFn {
         GenCall(c);
         rzdst = nullptr;
     }
-    void CallImg(Call *c, tyg_val stk) {
-        imgdst = stk;
-        GenCall(c);
-        imgdst = 0;
+    void CallImg(Call *c, tyg_val stk) { imgdst = stk; GenCall(c); imgdst = 0; }
+    // The header of a resizable about to be built at the top of stk: its base, no elements.
+    tyg_val StartHdr(tyg_val stk, tyg_addr hdr) {
+        auto top = Top(stk);
+        St(hdr, top);
+        St(HdrLen(hdr), I64(0));
+        return top;
     }
     // x of type ft built at the top of stk, which moves past it; false if the build ended.
     bool BuildField(tyg_val stk, TypeExpr *ft, Node *x) {
@@ -2099,15 +2096,15 @@ struct TgFn {
         if (!cg.IsFix(et)) No(Line {}, "a copy of elements of variable size");
         CopyBytes(stk, len, elems, Mul(n, I64(cg.FixedSize(et))), n);
     }
+    void SameElem(TypeExpr *a, TypeExpr *b, Line l) {
+        if (cg.Mangle(a) != cg.Mangle(b)) No(l, "array of another element type");
+    }
     // The bytes of a view's elements, which may be images (to RunEnd).
     tyg_val RunBytes(const View &v) {
         return cg.IsFix(v.elem) ? Mul(v.len, I64(cg.FixedSize(v.elem))) : Sub(RunEnd(v), v.elems);
     }
     // CopyRun of a view's elements, which may be images.
-    void CopyView(tyg_val stk, tyg_addr len, TypeExpr *et, const View &v) {
-        if (cg.IsFix(et)) return CopyRun(stk, len, et, v.elems, v.len);
-        CopyBytes(stk, len, v.elems, Sub(RunEnd(v), v.elems), v.len);
-    }
+    void CopyView(tyg_val stk, tyg_addr len, TypeExpr *, const View &v) { CopyBytes(stk, len, v.elems, RunBytes(v), v.len); }
 
     // Builds n's value, a resizable array of type t, at the top of stk, its header at hdr
     // (CodeGen::GenConstruct): a literal's elements one by one, a call's at the destination
@@ -2118,10 +2115,7 @@ struct TgFn {
         auto fix = cg.IsFix(et);
         n = StripCopy(n);
         auto len = HdrLen(hdr);
-        auto begin = [&] {
-            St(hdr, Top(stk));
-            St(len, I64(0));
-        };
+        auto begin = [&] { StartHdr(stk, hdr); };
         if (BuildCtl(n, InPlace { 2, stk, t, hdr }, l, [&](Node *v) { GenRz(v, stk, hdr, t, l); })) return;
         if (auto al = Is<ArrayLit>(n)) {
             if (al->capexpr || (al->fillval && !fix)) No(l, "array literal of this kind");
@@ -2161,17 +2155,15 @@ struct TgFn {
             return;
         }
         auto c = Is<Call>(n);
-        if (c && c->builtin == B_TO_BYTES && c->ArgNodes().size() == 1) {
-            if (!IsU8(et)) No(l, "to_bytes of this type");
+        auto s = Is<StrLit>(n);
+        auto tobytes = c && c->builtin == B_TO_BYTES && c->ArgNodes().size() == 1;
+        if (tobytes || IsStrCall(n) || s) {   // Bytes: a payload's, a text's, a string literal's.
+            if (!IsU8(et)) No(l, "bytes of an array of this type");
             begin();
-            ToBytesInto(stk, len, c->ArgNodes()[0], l);
-            return;
-        }
-        if (c && c->builtin == B_STR) {
-            if (!IsU8(et)) No(l, "str of this type");
-            begin();
-            auto an = c->ArgNodes();
-            TextInto(stk, len, c, an, 0);
+            auto an = c ? c->ArgNodes() : vector<Node *> {};
+            if (tobytes) ToBytesInto(stk, len, an[0], l);
+            else if (c) TextInto(stk, len, c, an, 0);
+            else CopyRun(stk, len, et, tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)), I64((int64_t)s->val.size()));
             return;
         }
         if (DestSpec(c) && IsGrow(DestSpec(c)->rets[0])) {
@@ -2179,16 +2171,10 @@ struct TgFn {
             CallRz(c, stk, hdr);
             return;
         }
-        if (auto s = Is<StrLit>(n)) {
-            if (!IsU8(et)) No(l, "string of this type");
-            begin();
-            CopyRun(stk, len, et, tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)), I64((int64_t)s->val.size()));
-            return;
-        }
         auto pl = ElemsSource(n, l);
         if (Ended()) return;
         auto v = ViewOf(pl, l);
-        if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
+        SameElem(v.elem, et, l);
         begin();
         CopyView(stk, len, et, v);
     }
@@ -2235,9 +2221,7 @@ struct TgFn {
         auto ts = adt ? M.TagSize(t) : 0;
         // The header at the top, the ADT's tag behind it.
         auto begin = [&](int vi) {
-            auto top = Top(stk);
-            St(hdr, top);
-            St(len, I64(0));
+            auto top = StartHdr(stk, hdr);
             if (adt) {
                 StoreTag(AtV(top), t, vi);
                 SetTop(stk, Add(top, I64(ts)));
@@ -2336,22 +2320,8 @@ struct TgFn {
         if (Ended()) return;
         while (x.t && IsAddrRef(x.t)) x = Load(RefTarget(x), l);
         if (!x.mem || !x.t) No(l, cat("value of type ", M.NameWhy(t)));
-        if (adt && x.t->kind == TY_VARIANT && M.EI(x.t) == ei) {
-            if (cg.IsFix(x.t)) {
-                begin(M.VariantIdx(x.t));
-                if (auto sz = cg.FixedSize(x.t)) {
-                    auto top = Top(stk);
-                    tyg_copy(p, AtV(top), x.a, sz);
-                    SetTop(stk, Add(top, I64(sz)));
-                }
-                return;
-            }
-            if (!M.IsRb(x.t) && M.IsVv(x.t)) {
-                begin(M.VariantIdx(x.t));
-                ImgCopy(stk, tyg_addr_of(p, x.a), x.t);
-                return;
-            }
-        }
+        if (adt && x.t->kind == TY_VARIANT && M.EI(x.t) == ei && !M.IsRb(x.t) && (cg.IsFix(x.t) || M.IsVv(x.t)))
+            return RbFrom(stk, hdr, x, t, l);
         No(l, cat("resizable ADT built from ", M.NameWhy(x.t)));
     }
     // A value x of type xt, a result held elsewhere (a forwarded call's), as the ADT or
@@ -2542,10 +2512,9 @@ struct TgFn {
         if (n) {
             GenRz(n, stk, hdr, t, l);
         } else {
-            St(hdr, Top(stk));
-            St(len, I64(0));
+            StartHdr(stk, hdr);
             if (from) {
-                if (cg.Mangle(from->elem) != cg.Mangle(t->arr->sub)) No(l, "array of another element type");
+                SameElem(from->elem, t->arr->sub, l);
                 CopyRun(stk, len, t->arr->sub, from->elems, from->len);
             }
         }
@@ -2585,10 +2554,9 @@ struct TgFn {
         SetTop(stk, Add(at, I64(8)));
         auto hdr = NewHdr();
         auto len = HdrLen(hdr);
-        St(hdr, Top(stk));
-        St(len, I64(0));
+        StartHdr(stk, hdr);
         auto fromview = [&](const View &v) {
-            if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
+            SameElem(v.elem, et, l);
             CopyView(stk, len, et, v);
         };
         if (from) {
@@ -2641,9 +2609,9 @@ struct TgFn {
             else if (n) v = ViewOf(LimCallResult(n) ? LimCallPlace(n) : Place(n), l);
             else No(l, "array of images without a value");
             if (Ended()) return at();
-            if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
+            SameElem(v.elem, et, l);
             auto top = Top(stk);
-            auto bytes = Sub(RunEnd(v), v.elems);
+            auto bytes = RunBytes(v);
             tyg_move_dyn(p, top, v.elems, bytes);
             SetTop(stk, Add(top, bytes));
             StL(cnt, v.len);
