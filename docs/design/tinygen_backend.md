@@ -314,12 +314,10 @@ Run time of `bench/goose` programs at medium size, in milliseconds:
 | graph | 422 | 897 | 384 |
 | scene | 122 | 1158 | 38 |
 | blur | 99 | 2678 | 14 |
-| particles | 360 | (aborts, see below) | 141 |
+| particles | 357 | 797 | 141 |
 
 tinygen beats `cc -O0` on every benchmark, by 2 to 27 times. It is 1.1 to 7
 times slower than `cc -O2`, most of all in tight loops such as blur's.
-particles' `--debug` build aborts on a lossy `as` conversion, which its
-checks are meant to catch.
 
 ## What tinygen lacks
 

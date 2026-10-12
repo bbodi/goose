@@ -45,8 +45,8 @@ fn main() {
     }
     var total = 0;
     for &p in ps {
-        total += (p.pos.x * 16.0) as i64 + (p.pos.y * 16.0) as i64
-               + (p.pos.z * 16.0) as i64;
+        total += (p.pos.x * 16.0) as! i64 + (p.pos.y * 16.0) as! i64
+               + (p.pos.z * 16.0) as! i64;
     }
     print(ps.len);
     print(total);
