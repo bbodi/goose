@@ -305,8 +305,7 @@ struct TgModule {
     }
     static bool IsSigned(TypeExpr *t) { return t->kind == TY_INT && !IsUnsigned(t->intstorage); }
 
-    // The fields of a struct or of one ADT variant with their types, which the predicates below walk
-    // alike (pads skipped).
+    // The fields of a struct or of one ADT variant with their types; pads are skipped by the walkers.
     struct FieldSet {
         const vector<Field> &f;
         const vector<TypeExpr *> &t;
@@ -316,12 +315,11 @@ struct TgModule {
                 if (!f[i].ispad && !ok(t[i])) return false;
             return true;
         }
-        // The first non-empty blk(index, type) over the real fields, "" if none.
+        // The first non-empty blk(index, type), "" if none.
         template <class B> string First(B blk) const {
-            for (size_t i = 0; i < f.size(); i++) {
-                if (f[i].ispad) continue;
-                if (auto b = blk(i, t[i]); !b.empty()) return b;
-            }
+            for (size_t i = 0; i < f.size(); i++)
+                if (!f[i].ispad)
+                    if (auto b = blk(i, t[i]); !b.empty()) return b;
             return "";
         }
     };
@@ -334,8 +332,8 @@ struct TgModule {
     }
     static int64_t PadSize(const Field &f) { return f.padsize > 0 ? f.padsize : 0; }
 
-    // The structs the predicates are inside of: one reached again (through an optional link, `struct
-    // Node { next: Node? }`) holds if the rest of it does.
+    // The structs the predicates are inside of: one reached again (through an optional link, `struct Node {
+    // next: Node? }`) holds if the rest of it does.
     vector<TypeExpr *> tyopen;
     bool Reentered(TypeExpr *t) {
         for (auto o : tyopen)
@@ -360,23 +358,19 @@ struct TgModule {
         if (!t || depth > 32) return false;
         auto d = depth + 1;
         switch (t->kind) {
-            // A varint on its own is an i64, as the C holds it; in a bytes value it is zigzag ULEB128 (FieldsOk).
+            // A varint on its own is an i64, as the C holds it; in a bytes value it is zigzag ULEB128.
             case TY_INT: case TY_FLT: case TY_BOOL: return true;
             case TY_REF: {
-                // A relative reference outside a slot (a local, a parameter, a global) holds the offset too: of
-                // the `in pool` form, or a self-relative one only null reaches (§3.9); a varint width is an
-                // image (ImgOk).
+                // A relative reference outside a slot holds the offset (§3.9); a varint one is an image.
                 if (IsRel(t)) return !IsVr(t) && RelOk(t, depth);
-                // The address of a fixed value, or of a variable-size or resizable array it reads in place
-                // (RzOk): a fat reference { hdr, stk } for a resizable one (gs_rref). An optional one is the
-                // same address, null where empty.
+                // The address of a fixed value, or of an array or image read in place (a fat gs_rref for a
+                // resizable one); an optional one is null where empty.
                 if (!IsPlainRef(t) && !OptRef(t)) return false;
                 auto s = t->ref->sub;
-                return (cg.IsFix(s) && TypeOk(s, d)) || IsVarint(s) || ImgOk(s, d) || ZeroOk(s, d) || FoOk(s, d) ||
-                       RsOk(s, d) || (IsPlainRef(t) && VeOk(s, d));
+                return (cg.IsFix(s) && TypeOk(s, d)) || IsVarint(s) || ImgOk(s, d) || ZeroOk(s, d) ||
+                       FoOk(s, d) || RsOk(s, d) || (IsPlainRef(t) && VeOk(s, d));
             }
-            case TY_ARRAY:
-                // T[k]: k elements, packed; a static-capacity T[..k], a length beside them (LimOk).
+            case TY_ARRAY:   // T[k], packed; a static-capacity T[..k] has a length beside the elements.
                 if (ZeroArr(t)) return depth == 0 && ZeroOk(t, depth);
                 if (t->arr->akind == A_LIMITED) return LimOk(t, depth);
                 return t->arr->akind == A_FIXED && cg.IsFix(t) && cg.ArrSize(t->arr) > 0 && TypeOk(t->arr->sub, d);
@@ -389,13 +383,11 @@ struct TgModule {
             default: return false;
         }
     }
-    // Why TypeOk refuses a type, as a class: what -v says beside the type, so the reasons a sweep collects
-    // rank by what blocks them.
+    // Why TypeOk refuses a type, as a class: what -v says beside the type, so a sweep ranks reasons.
     string Blocker(TypeExpr *t, int depth = 0) {
         if (!t || depth > 32) return "unknown type";
         auto d = depth + 1;
-        // The class of field ft's blocker under `pre`, "" if it has none (or only the variable size
-        // a variable-size or resizable struct has by nature, if skipvs).
+        // Field ft's blocker under `pre`; skipvs: bar the variable size such a struct has by nature.
         auto why = [&](TypeExpr *ft, const char *pre, bool skipvs) {
             auto b = Blocker(ft, d);
             return b.empty() || (skipvs && b == "variable-size value") ? string() : cat(pre, b);
@@ -413,7 +405,8 @@ struct TgModule {
             case TY_ARRAY: {
                 if (t->arr->akind == A_LIMITED && cg.ArrSize(t->arr) < 0)
                     return RcOk(t, depth) ? "" : "runtime-capacity limited array";
-                if (!cg.IsFix(t->arr->sub)) return VarImgOk(t, depth) || VeOk(t, depth) ? "" : "variable-size elements";
+                if (!cg.IsFix(t->arr->sub))
+                    return VarImgOk(t, depth) || VeOk(t, depth) ? "" : "variable-size elements";
                 auto b = Blocker(t->arr->sub, d);
                 if (!b.empty()) return b;
                 return t->arr->akind == A_FIXED || t->arr->akind == A_LIMITED ? "" : "variable-size value";
@@ -428,16 +421,16 @@ struct TgModule {
                     if (RsOk(t, depth)) return "";
                     auto last = LastRealField(cg.SI(t)->st->fields);
                     auto b = StFields(t).First([&](size_t i, TypeExpr *ft) {
-                        if (cg.IsResz(ft) && (int)i == last)   // The tail.
-                            return !(IsGrow(ft) && RzOk(ft)) && !FoOk(ft) ? cat("resizable struct with tail ", Name(ft))
-                                                                           : string();
-                        return why(ft, "resizable struct with ", true);
+                        if (!cg.IsResz(ft) || (int)i != last) return why(ft, "resizable struct with ", true);
+                        return !(IsGrow(ft) && RzOk(ft)) && !FoOk(ft) ? cat("resizable struct with tail ", Name(ft))
+                                                                       : string();
                     });
                     return b.empty() ? "resizable struct" : b;
                 }
                 if (!cg.IsFix(t)) {
                     if (VsOk(t, depth)) return "";
-                    auto b = StFields(t).First([&](size_t, TypeExpr *ft) { return why(ft, "variable-size struct with ", true); });
+                    auto b = StFields(t).First(
+                        [&](size_t, TypeExpr *ft) { return why(ft, "variable-size struct with ", true); });
                     return b.empty() ? "variable-size struct" : b;
                 }
                 if (!cg.SI(t)) return "empty struct";
@@ -462,10 +455,8 @@ struct TgModule {
     }
 
     // A variable-size or resizable array of fixed elements, read and grown where it lies but never a slot's
-    // value: T[] / T[uN], a length prefix and then the elements, an image a uint8_t * points at (§6.1); and
-    // T[>..] / T[>..<], a gs_rhdr { base, len } with the elements on a data stack, whose top they end at.
-    // Held behind a reference or as a by-value parameter (the C passes the image's address, or the header
-    // and its stack).
+    // value: T[] / T[uN], a length prefix then the elements (§6.1); T[>..] / T[>..<], a gs_rhdr { base, len }
+    // with the elements on a data stack. Held behind a reference or as a by-value parameter.
     bool RzOk(TypeExpr *t, int depth = 0) {
         if (!t || t->kind != TY_ARRAY || depth > 32) return false;
         return (IsVarArr(t) || IsGrow(t)) && cg.IsFix(t->arr->sub) && TypeOk(t->arr->sub, depth + 1);
@@ -477,47 +468,35 @@ struct TgModule {
     }
     // Elements that are images themselves (strings, variable-size structs), or varints.
     bool ImgElemOk(TypeExpr *e, int depth) { return e && !cg.IsFix(e) && (ImgOk(e, depth + 1) || IsVarint(e)); }
-    // A T[] whose elements are images (u8[][], an array of strings): its length prefix, then the elements
-    // back to back, each walked by its size; never indexed (the checker forbids it).
+    // A T[] of images (u8[][]), and a resizable one: the elements back to back, each walked by its size
+    // (CodeGen::SizeFn) and never indexed.
     bool VarImgOk(TypeExpr *t, int depth = 0) { return IsVarArr(t) && depth <= 32 && ImgElemOk(t->arr->sub, depth); }
-    // A resizable array of such elements: their bytes back to back on its stack, each walked by its size
-    // (CodeGen::SizeFn). Built by push, read by `for`, len and text; never indexed.
     bool VeOk(TypeExpr *t, int depth = 0) { return IsGrow(t) && depth <= 32 && ImgElemOk(t->arr->sub, depth); }
     static bool IsGrow(TypeExpr *t) {
         return t && t->kind == TY_ARRAY && (t->arr->akind == A_GROW || t->arr->akind == A_GROWSHRINK);
     }
-    // A variable-size T[]: an image, its length prefix then its elements.
     static bool IsVarArr(TypeExpr *t) { return t && t->kind == TY_ARRAY && t->arr->akind == A_VAR; }
-    // A T[] length prefix's bytes: u32 by default, else its storage's; 0 for a varint (ULEB128,
-    // CodeGen::EmitLenStore).
+    // A T[] length prefix's bytes: u32 by default, else its storage's; 0 for a varint (CodeGen::EmitLenStore).
     static int LenWidth(TypeExpr *t) {
-        switch (t->arr->lenstorage) {
-            case -1: case IS_U32: case IS_I32: return 4;
-            case IS_U8: case IS_I8: return 1;
-            case IS_U16: case IS_I16: return 2;
-            case IS_U64: case IS_I64: return 8;
-            default: return 0;
-        }
+        auto ls = t->arr->lenstorage;
+        return ls < 0 ? 4 : ls == IS_VARINT ? 0 : IntBits((IntStorage)ls) / 8;
     }
-    // The bytes reserved for it while the elements are built: a varint's one, moved up behind a longer
-    // count (CodeGen::PrefixBytes).
+    // The bytes reserved while the elements are built: a varint's one, moved up behind a longer count.
     static int PrefixBytes(TypeExpr *t) { return LenWidth(t) ? LenWidth(t) : 1; }
     static bool SignedLen(TypeExpr *t) {
         auto ls = t->arr->lenstorage;
         return ls == IS_I8 || ls == IS_I16 || ls == IS_I32 || ls == IS_I64;
     }
-    // A by-value parameter of an image or resizable type (or a value in a global's or result's stack).
+    // A by-value parameter of an image or resizable type; also what a global's stack or a result may hold.
     bool RzParam(TypeExpr *t) {
         return RzOk(t) || VarImgOk(t) || RcOk(t) || VeOk(t) || VsOk(t) || VrOk(t) || VmOk(t) || VvOk(t) ||
                FoOk(t) || RsOk(t) || RbOk(t);
     }
-    // Every type a result, a free variable or a global's value may have.
+    // Every type a parameter, a result or a free variable may have.
     bool Held(TypeExpr *t) { return TypeOk(t) || RzParam(t); }
 
     static tyg_scalar ScalOfBytes(int w) { return w == 1 ? TYG_I8 : w == 2 ? TYG_I16 : w == 4 ? TYG_I32 : TYG_I64; }
-    // log2 of a scalar's size, 0..3.
-    static int SizeClass(int size) { return size == 1 ? 0 : size == 2 ? 1 : size == 4 ? 2 : 3; }
-    // The unsigned integer type of w bytes.
+    static int SizeClass(int size) { return size == 1 ? 0 : size == 2 ? 1 : size == 4 ? 2 : 3; }   // log2, 0..3
     TypeExpr *UIntOf(int w) { return ast.inttypes[w == 1 ? IS_U8 : w == 2 ? IS_U16 : w == 8 ? IS_U64 : IS_U32]; }
     tyg_scalar Scal(TypeExpr *t) {
         switch (t->kind) {
@@ -528,12 +507,7 @@ struct TgModule {
         }
     }
     static int ScalSize(tyg_scalar s) {
-        switch (s) {
-            case TYG_I8: return 1;
-            case TYG_I16: return 2;
-            case TYG_I32: case TYG_F32: return 4;
-            default: return 8;
-        }
+        return s == TYG_I8 ? 1 : s == TYG_I16 ? 2 : s == TYG_I32 || s == TYG_F32 ? 4 : 8;
     }
     int64_t Size(TypeExpr *t) {
         if (IsVr(t)) return 16;   // A temporary for the value: up to ten bytes of varint.
@@ -545,19 +519,17 @@ struct TgModule {
         return cg.FixedSize(t);
     }
 
-    struct FieldAt {
-        TypeExpr *t;
-        int64_t off;
-        string_view name;
-    };
+    struct FieldAt { TypeExpr *t; int64_t off; string_view name; };
+    // The real fields of a struct or variant type with their offsets.
     vector<FieldAt> Fields(TypeExpr *t) {
-        if (t->kind == TY_VARIANT) return VariantFields(t);
-        auto si = cg.SI(t);
-        auto &lay = cg.StructLayout(si);
-        vector<FieldAt> fs;
-        for (size_t i = 0; i < si->st->fields.size(); i++)
-            if (!si->st->fields[i].ispad) fs.push_back({ si->ftypes[i], lay.offs[i], si->st->fields[i].name });
-        return fs;
+        auto var = t->kind == TY_VARIANT;
+        auto ei = var ? cg.EIVar(t) : nullptr;
+        auto fs = var ? VarFields(ei, VariantIdx(t)) : StFields(t);
+        auto &lay = var ? cg.VariantLayout(ei, VariantIdx(t)) : cg.StructLayout(cg.SI(t));
+        vector<FieldAt> r;
+        for (size_t i = 0; i < fs.f.size(); i++)
+            if (!fs.f[i].ispad) r.push_back({ fs.t[i], lay.offs[i], fs.f[i].name });
+        return r;
     }
 
     // The type the C calling convention sees: packed structs are records of their fields at their packed
@@ -587,7 +559,6 @@ struct TgModule {
         for (auto &f : Fields(t)) fs.push_back({ AT(f.t), f.off });
         return atypes[key] = tyg_type_record(m, cg.FixedSize(t), 1, fs.data(), (int)fs.size());
     }
-
     // A frame object's C struct: its fixed fields, then the tail's header.
     const tyg_type *FoAT(TypeExpr *t) {
         auto key = cg.Mangle(t);
@@ -604,12 +575,12 @@ struct TgModule {
     bool Resz(TypeExpr *t) {
         return IsGrow(t) || IsRs(t) || IsRb(t) || (t && t->kind == TY_STRUCT && cg.IsFrameObj(t));
     }
-
-    // { ptr, <second> at 8 }: the u8 slice of the extern boundary (sl_u8: data and length), and a fat
-    // reference (gs_rref: the header's address and the stack's).
+    // { ptr, <second> at 8 }: the extern boundary's u8 slice sl_u8 (data, length), and a fat reference
+    // gs_rref (the header's address, the stack's).
     const tyg_type *PtrPairAT(const tyg_type *&cache, bool lenSecond) {
         if (cache) return cache;
-        tyg_field fs[2] = { { tyg_type_ptr(m), 0 }, { lenSecond ? tyg_type_int(m, TYG_I64, 1) : tyg_type_ptr(m), 8 } };
+        tyg_field fs[2] = { { tyg_type_ptr(m), 0 },
+                            { lenSecond ? tyg_type_int(m, TYG_I64, 1) : tyg_type_ptr(m), 8 } };
         return cache = tyg_type_record(m, 16, 1, fs, 2);
     }
     const tyg_type *sliceat = nullptr, *pairat = nullptr;
@@ -632,7 +603,7 @@ struct TgModule {
         tyg_dt_record_complete(m, rec, size, 1);
         return rec;
     }
-    // { first: elem *, len: i64 }: a slice, a gs_rhdr, or the header of a resizable value (elem null: u8).
+    // { first: elem *, len: i64 }: a slice, a gs_rhdr, or a resizable value's header (elem null: u8).
     const tyg_dtype *DHdr(const string &name, const char *first, TypeExpr *elem, Line ln = {}) {
         auto rec = DRec(name, ln);
         DMem(rec, first, tyg_dt_pointer(m, DT(elem ? elem : ast.inttypes[IS_U8])), 0);
@@ -644,9 +615,8 @@ struct TgModule {
     const tyg_dtype *DT(TypeExpr *t) {
         auto name = Name(t);
         if (auto it = dtypes.find(name); it != dtypes.end()) return it->second;
-        // A scalar is a typedef of the C type of its size, by its Goose name: lldb reads DWARF through
-        // clang's type system, which gives a base type a C name of its own choosing (an i64 shows as
-        // `long`) but keeps a typedef's.
+        // A scalar is a typedef of the C type of its size: lldb names a base type its own way (an i64 shows
+        // as `long`) but keeps a typedef's name.
         auto scalar = [&](const char *cname, tyg_dt_encoding enc) {
             auto base = tyg_dt_base(m, cname, ScalSize(Scal(t)), enc);
             return dtypes[name] = tyg_dt_typedef(m, name.c_str(), base, File(0), 0);
@@ -662,15 +632,15 @@ struct TgModule {
             case TY_BOOL: return scalar("_Bool", TYG_DT_BOOL);
             case TY_REF: {
                 if (IsRel(t)) {   // The offset the slot holds, under the reference's name.
-                    static const char *un[] = { "unsigned char", "unsigned short", "unsigned int", "unsigned long long" };
-                    return scalar(un[SizeClass(IsVr(t) ? 1 : ScalSize(Scal(t)))], TYG_DT_UNSIGNED);   // A varint: its first byte.
+                    static const char *un[] = { "unsigned char", "unsigned short", "unsigned int",
+                                                "unsigned long long" };
+                    return scalar(un[SizeClass(IsVr(t) ? 1 : ScalSize(Scal(t)))], TYG_DT_UNSIGNED);   // A varint: its first byte
                 }
-                if (!cg.IsFatRef(t)) {   // An optional is a typedef under its Goose name over the pointer the C half has.
+                if (!cg.IsFatRef(t)) {   // An optional: a typedef under its Goose name over the C half's pointer.
                     auto p = tyg_dt_pointer(m, DT(t->ref->sub));
                     return dtypes[name] = OptRef(t) ? tyg_dt_typedef(m, name.c_str(), p, File(0), 0) : p;
                 }
-                // gs_rref: the header and the stack its elements grow on.
-                auto rec = DRec(name);
+                auto rec = DRec(name);   // gs_rref: the header and the stack its elements grow on.
                 DMem(rec, "hdr", tyg_dt_pointer(m, DT(t->ref->sub)), 0);
                 DMem(rec, "stk", tyg_dt_pointer(m, StackDT()), 8);
                 return DEnd(rec, 16);
@@ -680,14 +650,13 @@ struct TgModule {
                     return dtypes[name] = tyg_dt_array(m, DT(t->arr->sub), std::max<int64_t>(cg.ArrSize(t->arr), 1));
                 if (IsLim(t)) return LimDT(t, name);
                 if (t->arr->akind != A_VAR) return DHdr(name, "base", t->arr->sub);   // gs_rhdr
-                // The image: its length prefix, then the elements, as many as it says.
-                auto rec = DRec(name);
+                auto rec = DRec(name);   // The image: its length prefix, then as many elements as it says.
                 auto w = PrefixBytes(t);
                 DMem(rec, "len", DT(UIntOf(w)), 0);
                 DMem(rec, "data", tyg_dt_array(m, DT(t->arr->sub), -1), w);
                 return DEnd(rec, w);
             }
-            case TY_SLICE: return DHdr(name, "data", t->sub);   // tinygen has no array whose count is another member
+            case TY_SLICE: return DHdr(name, "data", t->sub);   // tinygen has no array whose count is a member
             case TY_STRUCT: {
                 if (IsRb(t)) return DHdr(name, "base", nullptr);
                 if (IsVs(t)) return VsDT(t, name);
@@ -705,24 +674,22 @@ struct TgModule {
     }
 
     // ---- Limited arrays T[..k] -------------------------------------------------
-    //
-    // A static-capacity limited array (CodeGen::IsStaticLimited) is a fixed value: the C half's struct { lenT
-    // len; T e[k]; }, packed, its length in the smallest unsigned type that fits k (CodeGen::LenStore), then k
-    // slots, the ones past the length unused. It is held wherever a fixed array is. A runtime-capacity T[..]
-    // is a variable-size value and is not.
+
+    // A static-capacity limited array (CodeGen::IsStaticLimited) is a fixed value: the C half's packed struct
+    // { lenT len; T e[k]; }, lenT the smallest unsigned type that fits k (CodeGen::LenStore).
     static bool IsLim(TypeExpr *t) { return t && t->kind == TY_ARRAY && t->arr->akind == A_LIMITED; }
-    // A runtime-capacity T[..] is an image: [cap u32][len u32][cap slots].
+    // A runtime-capacity T[..]: [cap u32][len u32][cap slots].
     bool IsRc(TypeExpr *t) { return IsLim(t) && cg.ArrSize(t->arr) < 0; }
     bool RcOk(TypeExpr *t, int depth = 0) {
         return IsRc(t) && depth <= 32 && cg.IsFix(t->arr->sub) && TypeOk(t->arr->sub, depth + 1);
     }
     // A limited array this backend holds, of either kind.
     bool LimHeld(TypeExpr *t) { return TypeOk(t) || RcOk(t); }
-    // A T[0] or T[..0] (§3.4): C gives the one element its struct needs, so as a value of its own it is a
-    // slot's worth bigger than its layout, and only that (a parameter, a result, a local, a global, behind
-    // a reference) is held: a field or an element's layout has no such slot.
+    // A T[0] or T[..0] (§3.4): C gives it one element's slot, so as a value of its own it is that much bigger
+    // than its layout; held only so (not as a field or element).
     bool ZeroArr(TypeExpr *t) {
-        return t && t->kind == TY_ARRAY && (t->arr->akind == A_FIXED || cg.IsStaticLimited(t)) && cg.ArrSize(t->arr) == 0;
+        return t && t->kind == TY_ARRAY && (t->arr->akind == A_FIXED || cg.IsStaticLimited(t)) &&
+               cg.ArrSize(t->arr) == 0;
     }
     bool ZeroOk(TypeExpr *t, int depth) {
         return ZeroArr(t) && cg.IsFix(t) && depth <= 32 && TypeOk(t->arr->sub, depth + 1);
@@ -733,16 +700,15 @@ struct TgModule {
     // The length field's bytes: where the slots start.
     int LimWidth(TypeExpr *t) { return IsRc(t) ? 8 : (int)CodeGen::IntSize(cg.LenStore(t->arr)); }
     tyg_scalar LimLenScal(TypeExpr *t) { return IsRc(t) ? TYG_I32 : ScalOfBytes(LimWidth(t)); }
-    // For the ABI: a record of the length and an array of the k slots.
-    const tyg_type *LimAT(TypeExpr *t) {
+    const tyg_type *LimAT(TypeExpr *t) {   // A record of the length and an array of the k slots.
         auto key = cg.Mangle(t);
         if (auto it = atypes.find(key); it != atypes.end()) return it->second;
-        tyg_field fs[2] = { { tyg_type_int(m, LimLenScal(t), 0), 0 },
-                            { tyg_type_array(m, AT(t->arr->sub), std::max<int64_t>(cg.ArrSize(t->arr), 1)), LimWidth(t) } };
+        auto slots = tyg_type_array(m, AT(t->arr->sub), std::max<int64_t>(cg.ArrSize(t->arr), 1));
+        tyg_field fs[2] = { { tyg_type_int(m, LimLenScal(t), 0), 0 }, { slots, LimWidth(t) } };
         return atypes[key] = tyg_type_record(m, Size(t), 1, fs, 2);
     }
-    // For the debugger: the C half's layout, `len` and the slots `e` (all k of them: tinygen has no array
-    // whose count is another member, gap 3); a runtime-capacity one is its header, the count being in the image.
+    // `len` and all k slots `e` (tinygen has no array whose count is a member, gap 3); a runtime-capacity
+    // one is its header.
     const tyg_dtype *LimDT(TypeExpr *t, const string &name) {
         auto rec = DRec(name);
         if (IsRc(t)) {
@@ -768,10 +734,8 @@ struct TgModule {
 
     // ---- Frame objects --------------------------------------------------------
 
-    // A frame object (C.2, CodeGen::IsFrameObj): a struct whose last field is a resizable, the C struct of
-    // its fixed fields, packed, with the tail's header { base, len } behind them (EmitCFields), the tail's
-    // elements on a data stack. Held where the fixed fields are ones this backend holds and the tail is a
-    // resizable of fixed elements.
+    // A frame object (C.2, CodeGen::IsFrameObj): a struct whose last field is a resizable: its fixed fields,
+    // packed, then the tail's header { base, len } (EmitCFields), the elements on a data stack.
     struct FoLay {
         vector<int64_t> offs;   // Per fixed field.
         int64_t tail;           // The tail header's offset.
@@ -822,17 +786,15 @@ struct TgModule {
 
     // ---- Variable-size structs ----------------------------------------------
 
-    // A struct with a variable-size field (bytes class, §6.1): one image of its fields in declaration
-    // order, packed, each variable-size one (a T[], or such a struct) inline at its own size, which a
-    // uint8_t * points at, as a T[]'s does. Frame objects (a resizable field) are another representation.
+    // A struct with a variable-size field (bytes class, §6.1): one image of its fields in declaration order,
+    // packed, each variable-size one inline at its own size; a uint8_t * points at it, as at a T[].
     bool IsVs(TypeExpr *t) { return t && t->kind == TY_STRUCT && cg.Cls(t) == SC_VARIABLE; }
-    // A resizable struct that is not a frame object: its fields before the tail are not all fixed, so they
-    // are bytes as a variable-size struct's are, and the tail's elements follow them on the data stack. The
-    // value is a gs_rhdr { base, len }, base the start of the image, len the tail's count
-    // (CodeGen::FieldLocAt, BytesLoc).
+    // A resizable struct that is no frame object: its fields before the tail are not all fixed, so they are
+    // bytes as a variable-size struct's are, the tail's elements follow on the data stack. The value is a
+    // gs_rhdr { base, len }: the image's start, the tail's count (CodeGen::FieldLocAt, BytesLoc).
     bool IsRs(TypeExpr *t) { return t && t->kind == TY_STRUCT && cg.IsResz(t) && !cg.IsFrameObj(t) && !IsRb(t); }
-    // One this backend holds: the fields before the tail as a variable-size struct's (FieldsOk), the tail a
-    // resizable of fixed elements.
+    // Held: the fields before the tail as a variable-size struct's (FieldsOk), the tail a resizable of fixed
+    // elements.
     bool RsOk(TypeExpr *t, int depth = 0) {
         if (!IsRs(t) || depth > 32) return false;
         return Within(t, true, [&] {
@@ -854,8 +816,7 @@ struct TgModule {
     bool IsImg(TypeExpr *t) {
         return IsVarArr(t) || IsVs(t) || ((IsVm(t) || IsVv(t)) && !IsRb(t)) || IsRc(t) || IsVr(t);
     }
-    // One this backend holds: its fields fixed values it holds, T[]s of fixed elements (RzOk), or such
-    // structs; no relative references.
+    // Held: its fields are fixed values held, T[]s of fixed elements (RzOk), or such structs.
     bool VsOk(TypeExpr *t, int depth = 0) {
         if (!IsVs(t) || depth > 32 || cg.SI(t)->sclass != SC_VARIABLE) return false;
         return Within(t, true, [&] { return FieldsOk(StFields(t), depth); });
@@ -878,8 +839,8 @@ struct TgModule {
         return off;
     }
     // Declares an image's fields at their offsets up to and including the first variable-size one (a T[]'s
-    // `len` and `data`), where the offsets of those after it stop being constants; returns the offset
-    // reached, and that field's type in *var. A variable of it is a pointer to the record, as for a T[].
+    // `len` and `data`), where later offsets stop being constants; returns the offset reached, and that
+    // field's type in *var. A variable of it is a pointer to the record, as for a T[].
     int64_t ImageMembers(tyg_dtype *rec, const FieldSet &fs, TypeExpr **var = nullptr) {
         int64_t off = 0;
         for (size_t i = 0; i < fs.f.size(); i++) {
@@ -900,14 +861,10 @@ struct TgModule {
     }
 
     // ---- ADTs ----------------------------------------------------------------
-    //
-    // As the C backend lays them out (CodeGen::CT, docs/implementation.md): a fixed-mode ADT is the packed
-    // struct { tag; union { v_<Variant> } }, its tag the variant's declaration index in a u8 (a u16 past 256
-    // variants), every non-empty variant's payload behind it, the size the tag's plus the largest payload's;
-    // a variant type is a packed struct of its payload's fields, and a payload-less one, as a value of its
-    // own, C's one gs_empty byte. Variable-mode ADTs (`Shape..`) are not held: each value is its own
-    // variant's size.
 
+    // As the C backend lays them out (CodeGen::CT): a fixed-mode ADT is the packed struct { tag; union {
+    // v_<Variant> } }, the tag a u8 (u16 past 256 variants); a variant type is a packed struct of its
+    // payload's fields, a payload-less one C's gs_empty byte.
     EnumInst *EI(TypeExpr *t) { return t->kind == TY_VARIANT ? cg.EIVar(t) : cg.EIOf(t); }
     int VariantIdx(TypeExpr *vt) { return cg.EIVar(vt)->en->VariantIndex(vt->var->variant); }
     int64_t TagSize(TypeExpr *t) { return cg.TagSize(EI(t)->en); }
@@ -922,7 +879,7 @@ struct TgModule {
     // A fixed-mode ADT or a fixed variant whose payload fields it holds.
     bool AdtOk(TypeExpr *t, int depth) {
         if ((t->kind == TY_ENUM && t->enu->varmode) || !cg.IsFix(t)) return false;
-        return Within(t, true, [&] {   // Reentered: through a reference or a slice.
+        return Within(t, true, [&] {
             auto ei = EI(t);
             auto [lo, hi] = VarSpan(t);
             for (auto vi = lo; vi < hi; vi++)
@@ -939,21 +896,10 @@ struct TgModule {
             auto [lo, hi] = VarSpan(t);
             for (auto vi = lo; vi < hi; vi++) {
                 auto b = VarFields(ei, vi).First([&](size_t, TypeExpr *ft) { return Blocker(ft, depth + 1); });
-                // An ADT reached through its own payload is one class.
-                if (!b.empty()) return b.rfind("ADT", 0) == 0 ? b : cat("ADT with ", b);
+                if (!b.empty()) return b.rfind("ADT", 0) == 0 ? b : cat("ADT with ", b);   // One class.
             }
             return string();
         });
-    }
-    vector<FieldAt> VariantFields(TypeExpr *vt) {
-        auto ei = cg.EIVar(vt);
-        auto vi = VariantIdx(vt);
-        auto &v = ei->en->variants[(size_t)vi];
-        auto &lay = cg.VariantLayout(ei, vi);
-        vector<FieldAt> fs;
-        for (size_t i = 0; i < v.fields.size(); i++)
-            if (!v.fields[i].ispad) fs.push_back({ ei->vftypes[(size_t)vi][i], lay.offs[i], v.fields[i].name });
-        return fs;
     }
     // The tag, and each non-empty variant's payload record behind it, overlapping as the union's members do.
     const tyg_type *AdtAT(TypeExpr *t) {
@@ -963,8 +909,8 @@ struct TgModule {
             if (cg.VariantLayout(ei, (int)vi).size) fs.push_back({ AT(cg.VariantType(t, (int)vi)), TagSize(t) });
         return tyg_type_record(m, cg.FixedSize(t), 1, fs.data(), (int)fs.size());
     }
-    // The debugger's view, the C's under Goose names: `Shape` a struct of `tag`, an enum of the variants'
-    // names, and `u`, a union of the payloads by variant name; `Shape.Circle` a struct of its fields.
+    // The C's debugger view under Goose names: `Shape` a struct of `tag`, an enum of the variants' names,
+    // and `u`, a union of the payloads by variant name; `Shape.Circle` a struct of its fields.
     const tyg_dtype *AdtDT(TypeExpr *t, const string &name) {
         if (t->kind == TY_VARIANT) {
             auto fs = Fields(t);
@@ -982,7 +928,7 @@ struct TgModule {
             tyg_dt_enumerator(m, tag, string(en->variants[vi].name).c_str(), (int64_t)vi);
         DMem(rec, "tag", tag, 0);
         auto full = IsVm(t) ? VmMaxSize(t) : cg.FixedSize(t);
-        if (full - TagSize(t) > 0) {
+        if (full > TagSize(t)) {
             auto u = tyg_dt_record(m, TYG_DT_UNION, nullptr, File(0), 0);
             for (size_t vi = 0; vi < en->variants.size(); vi++) {
                 auto vt = cg.VariantType(t, (int)vi);
@@ -996,31 +942,26 @@ struct TgModule {
 
     // ---- Variable-mode ADTs -------------------------------------------------
 
-    // A variable-mode ADT (`Shape..`, §8.1) is a bytes value: its tag in its storage integer, then the
-    // variant's payload fields, packed, each value its own variant's size (CodeGen's GenStructLit for
-    // TY_ENUM). Held where every variant's payload is a fixed value of fields held.
+    // A variable-mode ADT (`Shape..`, §8.1) is a bytes value: its tag, then the variant's payload fields,
+    // packed, each value its own variant's size (CodeGen's GenStructLit).
     static bool IsVm(TypeExpr *t) { return t && t->kind == TY_ENUM && t->enu->varmode; }
     static bool IsVarint(TypeExpr *t) { return t && t->kind == TY_INT && t->intstorage == IS_VARINT; }
     // A relative reference (§3.9): an offset of a fixed width in the slot, from its pool's base less one
-    // where it is `in pool` (0 is null), else from the slot itself. Held in a slot of an aggregate, the
-    // `in pool` form only, its pointee a fixed value held; a value of one is the address it decodes to, as
-    // any reference's.
+    // where `in pool` (0 is null), else from the slot itself. A value of one is the address it decodes to.
     static bool IsRel(const TypeExpr *t) { return t && t->kind == TY_REF && t->ref->lenstorage >= 0; }
     bool RelOk(TypeExpr *t, int depth = 0) {
         if (!IsRel(t) || depth > 32) return false;
         auto w = t->ref->lenstorage;
         return (w == IS_U8 || w == IS_U16 || w == IS_U32 || w == IS_U64 || w == IS_VARINT) && RelSubOk(t, depth);
     }
-    // The varint width (`T&<varint in pool>`, `T&<varint>`): its offset is ULEB128 (zigzag when
-    // self-relative), so the value is variable-size, a bytes value a uint8_t * points at, as a T[] is
-    // (SC_VARIABLE).
+    // The varint width (`T&<varint in pool>`, `T&<varint>`): an ULEB128 offset (zigzag when self-relative),
+    // so the value is variable-size, a bytes value a uint8_t * points at, as a T[] is (SC_VARIABLE).
     static bool IsVr(const TypeExpr *t) { return IsRel(t) && t->ref->lenstorage == IS_VARINT; }
     bool VrOk(TypeExpr *t, int depth = 0) { return IsVr(t) && depth <= 32 && RelSubOk(t, depth); }
     bool RelSubOk(TypeExpr *t, int depth) {
         auto sub = t->ref->sub;
         if (cg.IsFix(sub)) return TypeOk(sub, depth + 1);
-        // An image it points at, which may hold such links to its own type.
-        if (relimg.count(sub)) return true;
+        if (relimg.count(sub)) return true;   // An image it points at, which may link to its own type.
         relimg.insert(sub);
         auto ok = ImgOk(sub, depth + 1);
         relimg.erase(sub);
@@ -1028,12 +969,8 @@ struct TgModule {
     }
     set<TypeExpr *> relimg;
     tyg_scalar RelScal(TypeExpr *t) {
-        switch (t->ref->lenstorage) {
-            case IS_U8: return TYG_I8;
-            case IS_U16: return TYG_I16;
-            case IS_U32: return TYG_I32;
-            default: return TYG_I64;
-        }
+        auto w = t->ref->lenstorage;
+        return ScalOfBytes(w == IS_U8 ? 1 : w == IS_U16 ? 2 : w == IS_U32 ? 4 : 8);
     }
     bool VmOk(TypeExpr *t, int depth = 0) {
         if (!IsVm(t) || depth > 32) return false;
@@ -1081,16 +1018,14 @@ struct TgModule {
 
     // ---- Resizable ADTs ------------------------------------------------------
 
-    // A resizable-class ADT (`Log..` with a variant ending in a T[>..]) or one of its resizable variants
-    // (`Value.A`): a gs_rhdr { base, len } and a data stack, as a T[>..] is, but the bytes at base are the
-    // value's own layout: its tag, for the ADT, then the variant's fixed fields, packed, then the tail's
-    // elements, `len` of them (CodeGen::GenStructLit, VariantBehindTag). A fixed variant of such an ADT has
-    // no tail: its header's count is zero. The C copies, binds and dispatches none of the resizable payloads.
+    // A resizable-class ADT (`Log..` with a variant ending in a T[>..]) or one of its variants: a gs_rhdr
+    // { base, len } and a data stack, the bytes at base being the value's own layout: its tag, the variant's
+    // fixed fields, packed, then the tail's `len` elements (CodeGen::GenStructLit, VariantBehindTag). A fixed
+    // variant has no tail (count zero).
     bool IsRb(TypeExpr *t) {
         if (!t) return false;
         if (t->kind == TY_ENUM) return t->enu->varmode && cg.IsResz(t);
-        // A struct that is resizable and no frame object: a fixed prefix, and a tail that is such a value.
-        if (t->kind == TY_STRUCT) {
+        if (t->kind == TY_STRUCT) {   // Resizable, no frame object: a fixed prefix, and such a value as the tail.
             if (!cg.IsResz(t) || cg.IsFrameObj(t) || !cg.SI(t)) return false;
             auto si = cg.SI(t);
             auto last = LastRealField(si->st->fields);
@@ -1098,38 +1033,51 @@ struct TgModule {
         }
         return t->kind == TY_VARIANT && cg.IsResz(t);
     }
-    // A resizable struct's fields: the fixed ones' offsets, the tail's.
-    struct RbSt {
+    // Where the fields of a resizable struct (st) or of a variant lie, and its tail: offsets per field from
+    // the payload's start, the bytes before the tail's elements, and what the tail is.
+    struct RbShape {
         vector<int64_t> offs;
-        int64_t pre = 0;   // The bytes before the tail.
+        int64_t pre = 0;
+        TypeExpr *elem = nullptr;    // The tail's element type, null without one.
         int tailfi = -1;
+        bool img = false;            // A variable-size field: an image, walked by its size (VvOk).
+        bool fo = false;             // The tail is a frame object, its fields bytes ahead of its elements.
         bool ok = true;
     };
-    RbSt RbStShape(TypeExpr *t) {
-        RbSt sh;
-        auto fs = StFields(t);
+    RbShape RbShapeIn(const FieldSet &fs, bool st) {
+        RbShape sh;
         auto last = LastRealField(fs.f);
         int64_t off = 0;
         for (size_t i = 0; i < fs.f.size(); i++) {
             sh.offs.push_back(off);
-            if (fs.f[i].ispad) {
+            auto ft = fs.t[i];
+            if (fs.f[i].ispad) {   // A bare pad aligns here, inserts nothing there.
                 if (fs.f[i].padsize < 0) sh.ok = false;
                 else off += fs.f[i].padsize;
-                continue;
-            }
-            if ((int)i == last) {
+            } else if (st && (int)i == last) {
                 sh.tailfi = (int)i;
                 break;
-            }
-            if (!cg.IsFix(fs.t[i])) {
-                sh.ok = false;
+            } else if (!st && cg.IsResz(ft)) {
+                if ((int)i != last) sh.ok = false;
+                else if (IsGrow(ft)) sh.elem = ft->arr->sub, sh.tailfi = (int)i;
+                else if (cg.IsFrameObj(ft)) {   // As bytes (CodeGen::FoBytes): its fixed fields, then its tail.
+                    sh.elem = cg.FoTailArr(ft)->arr->sub, sh.tailfi = (int)i, sh.fo = true;
+                    off += cg.FoBytesPrefix(ft);
+                } else sh.ok = false;
                 break;
-            }
-            off += cg.FixedSize(fs.t[i]);
+            } else if (!cg.IsFix(ft)) {   // A variable-size field: a size to walk, no offset.
+                sh.img = !st;
+                if (st) sh.ok = false;
+                for (auto j = i + 1; !st && j < fs.f.size(); j++)
+                    if (!fs.f[j].ispad && cg.IsResz(fs.t[j])) sh.ok = false;
+                break;
+            } else off += cg.FixedSize(ft);
         }
         sh.pre = off;
         return sh;
     }
+    RbShape RbStShape(TypeExpr *t) { return RbShapeIn(StFields(t), true); }
+    RbShape RbShapeOf(EnumInst *ei, int vi) { return RbShapeIn(VarFields(ei, vi), false); }
     bool RbStOk(TypeExpr *t, int depth) {
         auto sh = RbStShape(t);
         if (!sh.ok || sh.tailfi < 0) return false;
@@ -1138,49 +1086,7 @@ struct TgModule {
         return fs.All([&](TypeExpr *ft) { return TypeOk(ft, depth + 1); }, (size_t)sh.tailfi) &&
                tail->kind != TY_ARRAY && IsRb(tail) && RbOk(tail, depth + 1);
     }
-    // Where a variant's fields lie behind its tag, and its tail.
-    struct RbShape {
-        vector<int64_t> offs;        // Per field, from the payload's start.
-        int64_t pre = 0;             // The payload's bytes before its tail's elements.
-        TypeExpr *elem = nullptr;    // The tail's element type, null without one.
-        int tailfi = -1;
-        bool img = false;            // A variable-size field: an image, walked by its size (VvOk).
-        bool fo = false;             // The tail is a frame object, its fields bytes ahead of its elements.
-        bool ok = true;
-    };
-    RbShape RbShapeOf(EnumInst *ei, int vi) {
-        RbShape sh;
-        auto fs = VarFields(ei, vi);
-        int64_t off = 0;
-        for (size_t i = 0; i < fs.f.size(); i++) {
-            sh.offs.push_back(off);
-            if (fs.f[i].ispad) {
-                if (fs.f[i].padsize < 0) sh.ok = false;   // A bare pad aligns here, inserts nothing there.
-                else off += fs.f[i].padsize;
-                continue;
-            }
-            auto ft = fs.t[i];
-            if (cg.IsResz(ft)) {
-                if ((int)i != LastRealField(fs.f)) sh.ok = false;
-                else if (IsGrow(ft)) sh.elem = ft->arr->sub, sh.tailfi = (int)i;
-                else if (cg.IsFrameObj(ft)) {   // A frame object as bytes (CodeGen::FoBytes): its fixed fields, then its tail's elements.
-                    sh.elem = cg.FoTailArr(ft)->arr->sub, sh.tailfi = (int)i, sh.fo = true;
-                    off += cg.FoBytesPrefix(ft);
-                } else sh.ok = false;
-                break;
-            }
-            if (!cg.IsFix(ft)) {   // A variable-size field: a size to walk, no offset.
-                sh.img = true;
-                for (auto j = i + 1; j < fs.f.size(); j++)
-                    if (!fs.f[j].ispad && cg.IsResz(fs.t[j])) sh.ok = false;
-                break;
-            }
-            off += cg.FixedSize(ft);
-        }
-        sh.pre = off;
-        return sh;
-    }
-    // The variant vi of the ADT or variant type t, which a resizable ADT holds: a fixed one, a variable-size
+    // Variant vi of the ADT or variant type t, which a resizable ADT holds: a fixed one, a variable-size
     // one (an image, no tail), or one ending in a T[>..].
     bool RbVarOk(TypeExpr *t, int vi, int depth) {
         auto ei = EI(t);
@@ -1191,9 +1097,9 @@ struct TgModule {
         for (size_t i = 0; i < fs.f.size(); i++) {
             if (fs.f[i].ispad) continue;
             auto ft = fs.t[i];
-            if ((int)i == sh.tailfi) {
-                if (sh.fo ? !(FoOk(ft, depth + 1) && RzOk(cg.FoTailArr(ft), depth + 1)) : !RzOk(ft, depth + 1)) return false;
-            } else if (!cg.IsFix(ft) || !TypeOk(ft, depth + 1)) {
+            if ((int)i != sh.tailfi) {
+                if (!cg.IsFix(ft) || !TypeOk(ft, depth + 1)) return false;
+            } else if (sh.fo ? !(FoOk(ft, depth + 1) && RzOk(cg.FoTailArr(ft), depth + 1)) : !RzOk(ft, depth + 1)) {
                 return false;
             }
         }
@@ -1244,8 +1150,8 @@ struct TgModule {
     }
 
     // The render procedures of types that reach themselves, one per type (CodeGen::RenderFn): named by the
-    // type's mangled name, queued as they are asked for and built once the function asking is done, as only
-    // one procedure is built at a time (TinyGenBackend::BuildRenders).
+    // type's mangled name, queued as asked for and built once the asking function is done, as only one
+    // procedure is built at a time (TinyGenBackend::BuildRenders).
     map<string, string> renderfns;
     vector<pair<string, TypeExpr *>> renderq;
     string RenderFn(TypeExpr *t) {
@@ -1256,15 +1162,14 @@ struct TgModule {
         renderq.emplace_back(name, t);
         return name;
     }
-    // The verifier procedure of an image's element type (CodeGen::VerifyFn): int64(payload, n, bitmap),
-    // queued like a render procedure.
+    // The verifier procedure of an image's element type (CodeGen::VerifyFn): int64(payload, n, bitmap).
     string VerifyFn(TypeExpr *elem) {
         auto name = cat("gs_tg_verify_", cg.Mangle(elem));
         if (renderfns.emplace(name, name).second) renderq.emplace_back(name, elem);
         return name;
     }
-    // Whether a render procedure can take the type: a fixed struct or ADT whose parts are all held (TypeOk),
-    // or an image of one (a variable-size struct, a variable-mode ADT), handed the address of its value.
+    // Whether a render procedure can take the type: a fixed struct or ADT whose parts are all held, or an
+    // image of one (a variable-size struct, a variable-mode ADT), handed the address of its value.
     bool RenderFnOk(TypeExpr *t) {
         if (t->kind == TY_ENUM && IsVm(t)) return VmOk(t);
         if (t->kind == TY_STRUCT && (VsOk(t) || FoOk(t) || RsOk(t))) return true;
@@ -1273,15 +1178,12 @@ struct TgModule {
 
     // ---- Globals -----------------------------------------------------------
 
-    // A global this backend reaches: a fixed value it holds, not a pool's. In a mixed build every global
-    // stays the C half's (gs_globals_t, initialized by gs_init_globals as for any build), and is reached
-    // through an accessor the C half exports, which returns its address in the running thread's instance
-    // (GS_GL; Global); a whole program's object defines the accessors and the globals itself
-    // (TinyGenBackend::EmitGlobalStorage). A `let` of a const type with a compile-time initializer, which
-    // the C makes static data (CodeGen::EmitGlobalDecls), is static data in this object too, read where it
-    // lies (StaticGlobal). A resizable or T[] global of fixed elements (RzOk) lives on a dedicated stack of
-    // its own (CodeGen::gstks), which a second accessor gives (StackAccessor): its header, or its image's
-    // address, in the instance, and that stack beside it.
+    // A global this backend reaches: a fixed value it holds, not a pool's. In a mixed build it stays the C
+    // half's and is reached through an exported accessor returning its address in the running thread's
+    // instance (GS_GL; Global); a whole program's object defines both (TinyGenBackend::EmitGlobalStorage).
+    // A const `let` with a compile-time initializer is static data here too (StaticGlobal, as in
+    // CodeGen::EmitGlobalDecls). A resizable or T[] global lives on its own stack (CodeGen::gstks), which
+    // a second accessor gives (StackAccessor).
     bool GlobalOk(VarDef *d) {
         if (!d->isglobal || !cg.gnames.count(d)) return false;
         if (cg.PrefVar(d)) return cg.IsFatRef(d->type) && TypeOk(d->type);   // A gs_pref.
@@ -1289,7 +1191,7 @@ struct TgModule {
         return TypeOk(d->type) || (RzParam(d->type) && cg.gstks.count(d));
     }
 
-    // The accessor name of d in names, numbered in the order of first use, prefix + n.
+    // The accessor name of d in names, numbered in the order of first use.
     string AccessorName(map<const VarDef *, string> &names, VarDef *d, const char *prefix) {
         auto it = names.find(d);
         return it != names.end() ? it->second : (names[d] = cat(prefix, names.size()));
@@ -1314,8 +1216,7 @@ struct TgModule {
         NeedShim(r.second, cat("void *", r.second, "(void) { return (void *)", cg.gpools[d].second, "; }\n"));
         return r;
     }
-    // The `return from` channels' accessors (gs_tg_lret_<tid>_<i>, and gs_tg_fdst_, gs_tg_fval_), with the
-    // size of each channel.
+    // The `return from` channels' accessors (gs_tg_lret_<tid>_<i>, gs_tg_fdst_, gs_tg_fval_), with sizes.
     map<string, int64_t> channels;
 
     // The static copy of a global the C makes static data, with its debug entry under its Goose name;
@@ -1353,19 +1254,14 @@ struct TgModule {
         switch (t->kind) {
             case TY_INT: {
                 auto i = Is<IntLit>(n);
-                if (!i || t->intstorage == IS_VARINT) return false;
-                auto v = (uint64_t)i->val;   // Little-endian: the low bytes.
-                return put(&v, ScalSize(Scal(t)));
+                auto v = i ? (uint64_t)i->val : 0;   // Little-endian: the low bytes.
+                return i && t->intstorage != IS_VARINT && put(&v, ScalSize(Scal(t)));
             }
             case TY_FLT: {
                 auto f = Is<FltLit>(n);
-                if (!f) return false;
-                if (Scal(t) == TYG_F32) {
-                    auto v = (float)f->val;
-                    return put(&v, 4);
-                }
-                auto v = (double)f->val;
-                return put(&v, 8);
+                auto s = f ? (float)f->val : 0.0f;
+                auto d = f ? (double)f->val : 0.0;
+                return f && (Scal(t) == TYG_F32 ? put(&s, 4) : put(&d, 8));
             }
             case TY_BOOL: {
                 auto b = Is<BoolLit>(n);
@@ -1388,11 +1284,13 @@ struct TgModule {
                 auto k = cg.ArrSize(t->arr);
                 auto et = t->arr->sub;
                 auto esz = cg.FixedSize(et);
-                if (auto str = Is<StrLit>(n)) return IsU8(et) && (int64_t)str->val.size() == k && put(str->val.data(), k);
+                if (auto str = Is<StrLit>(n))
+                    return IsU8(et) && (int64_t)str->val.size() == k && put(str->val.data(), k);
                 auto al = Is<ArrayLit>(n);
                 if (!al || (!al->fillval && (int64_t)al->elems.size() != k)) return false;
                 for (int64_t e = 0; e < k; e++)
-                    if (!StaticBytes(al->fillval ? al->fillval : al->elems[(size_t)e], et, out, off + e * esz)) return false;
+                    if (!StaticBytes(al->fillval ? al->fillval : al->elems[(size_t)e], et, out, off + e * esz))
+                        return false;
                 return true;
             }
             default: return false;
@@ -1402,13 +1300,11 @@ struct TgModule {
     // ---- Signatures --------------------------------------------------------
 
     // Whether a call to sp, or sp's own definition (`define`), has a C interface this backend can match
-    // (CodeGen::SigParams): declared parameters it holds, then a channel per result -- the C return value
-    // for the first fixed one (cret), an out-pointer `T *gs_r<i>` for every other fixed one, a destination
-    // stack and count out-parameter (`gs_stack *gs_dst<i>, int64_t *gs_rl<i>`) for a resizable one, and a
-    // destination stack alone for a T[] image (built there whole) -- then gs_sp, where the C gives it one.
-    // Free variables of a type it holds (FvOk) come after the declared parameters. A `return from` travels
-    // outside the signature, in the C half's thread-locals; this backend defines a target of one whose
-    // results are all fixed (their channels are plain thread-locals, no destination stacks).
+    // (CodeGen::SigParams): the declared parameters, free variables (FvOk), then a channel per result: the
+    // return value for the first fixed one (cret), `T *gs_r<i>` for other fixed ones, `gs_stack *gs_dst<i>,
+    // int64_t *gs_rl<i>` for a resizable one, a destination stack alone for a T[] image; then gs_sp. A
+    // `return from` travels in the C half's thread-locals; only a target whose results are all fixed is
+    // defined here.
     bool SigOk(FnSpec *sp, bool define, string &why) {
         auto &si = cg.sinfo[sp];
         if (sp->sf->isextern) { why = "extern"; return false; }
@@ -1416,21 +1312,24 @@ struct TgModule {
             if (!FvOk(fv)) { why = cat("free variable of type ", fv->type ? NameWhy(fv->type) : "?"); return false; }
         for (auto r : sp->rets)
             if (!RetOk(r)) {
-                why = cat(define && cg.fromids.count(sp) ? "return from target with result type " : "result type ", NameWhy(r));
+                why = cat(define && cg.fromids.count(sp) ? "return from target with result type " : "result type ",
+                          NameWhy(r));
                 return false;
             }
-        for (size_t i = 0; i < sp->argtypes.size(); i++)
-            if (cg.IsPoolParam(sp, i) ? !(cg.IsFatRef(sp->argtypes[i]) && TypeOk(sp->argtypes[i])) : !Held(sp->argtypes[i])) {
-                why = cat("parameter type ", NameWhy(sp->argtypes[i]));
+        for (size_t i = 0; i < sp->argtypes.size(); i++) {
+            auto t = sp->argtypes[i];
+            if (cg.IsPoolParam(sp, i) ? !(cg.IsFatRef(t) && TypeOk(t)) : !Held(t)) {
+                why = cat("parameter type ", NameWhy(t));
                 return false;
             }
+        }
         return true;
     }
     // A result this backend holds: a fixed value, or a resizable array or a T[] image of fixed elements,
     // built at the caller's destination stack.
     bool RetOk(TypeExpr *t) { return !IsRel(t) && Held(t); }
     // A free variable of a nested function (§7.5), as SigParams passes it: a fixed variable by its address,
-    // a T[] by its image's address, and a resizable by its header's address and then its stack. A pool
+    // a T[] by its image's address, a resizable by its header's address and then its stack, a pool
     // reference by its gs_pref's address.
     bool FvOk(const VarDef *fv) {
         if (!fv->type) return false;
@@ -1447,16 +1346,13 @@ struct TgModule {
         for (size_t i = 0; i < sp->argtypes.size(); i++) {
             auto t = sp->argtypes[i];
             if (cg.IsPoolParam(sp, i)) ptrs(4);   // A pool reference, gs_pref, as its four members (ParamFields).
-            else if (RzParam(t) && !Resz(t)) ptrs(1);   // A by-value T[] is its image's address.
-            else {   // A by-value T[>..] is its header, then its stack; a large fixed value its copy's address.
+            else if (RzParam(t) && !Resz(t)) ptrs(1);   // A by-value T[]: its image's address.
+            else {   // A by-value T[>..]: its header, then its stack; a large fixed value: its copy's address.
                 ps.push_back(cg.IsLargeFixed(t) ? tyg_type_ptr(m) : AT(t));
                 if (RzParam(t)) ptrs(1);
             }
         }
-        for (auto fv : si.freevars) {
-            if (fv->reusable) ptrs(4);   // gs_pref's members
-            else ptrs(Resz(fv->type) ? 2 : 1);   // The address, and its stack.
-        }
+        for (auto fv : si.freevars) ptrs(fv->reusable ? 4 : Resz(fv->type) ? 2 : 1);   // gs_pref; header, stack.
         for (size_t i = 0; i < sp->rets.size(); i++) {
             if (Resz(sp->rets[i])) ptrs(2);   // gs_dst<i>, gs_rl<i>
             else if (IsImg(sp->rets[i]) || (int)i != si.cret) ptrs(1);   // gs_dst<i>: the image at its top; gs_r<i>
