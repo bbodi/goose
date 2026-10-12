@@ -885,19 +885,19 @@ call each other either way:
   `Employee&` a plain pointer to the image; a free variable its address.
   The code is the `T[]`'s, which now asks `IsImg` where it asked
   `IsVarArr`.
-* **fields** (`TgFn::VsField`, `CodeGen::FieldPtr`): a constant offset
+* **fields** (`TgFn::FieldPlace`, `CodeGen::FieldPtr`): a constant offset
   until a variable-size field intervenes, then a cursor past each one by
   its size (`ImgSize`: a `T[]`'s prefix and elements, a struct's fields
   walked, `CodeGen::SizeX`); a field read, written (a fixed one), passed
   on, iterated, rendered where it lies.
-* **building** (`GenVs`, `VsLit`): a literal field by field in layout
+* **building** (`GenVs`, `RunLit`): a literal field by field in layout
   order at the destination's top (`CodeGen::GenFieldInits`): a fixed
   field evaluated, then stored; a `T[]` or nested struct built there; an
   explicit `pad n` zeroed. A call returning one is handed the
   destination; anything else (`copy(x)`, a variable, a field, a
   pointee) is copied whole, `ImgSize` bytes.
 * **text**: `print` and `str` render one as `Name { a, b }`, a `u8[]`
-  field quoted (`VsRender`).
+  field quoted (`RenderInto`).
 
 Not yet: assigning a whole value to a variable or field of a variable-
 size type (the C moves the bytes behind it, as for a `u8[]`), equality,
@@ -960,13 +960,13 @@ passes, returns and reads the other's values (the ADT section of
   non-empty payload behind it, the size the tag's plus the largest
   payload's. For the calling convention it is a record of the tag and
   each payload's record at the tag's size, overlapping as a union's
-  members do (`AdtAT`). A variant type (`Shape.Circle`) is a packed
+  members do (`TgModule::AT`). A variant type (`Shape.Circle`) is a packed
   struct of its fields at `VariantLayout`'s offsets, and a payload-less
   one, as a value of its own, C's one `gs_empty` byte. Held when every
-  payload field is (`AdtOk`), by value and behind plain references, as
+  payload field is (`TgModule::TypeOk`), by value and behind plain references, as
   parameters, results, locals, fields, elements and free variables.
 * **Values.** Variant literals, built as the variant or straight as
-  the ADT with its tag (`GenVariantLit`); payload-less constants
+  the ADT with its tag (`GenStructLit`, and `GenVm` for a variable-mode ADT); payload-less constants
   (`Dot::variantconst`); a variant, a call's variant result included,
   adapted to its ADT where one is wanted (`Fit`, as
   `CodeGen::AdaptToFixed`: its tag, its value the payload); payload

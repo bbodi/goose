@@ -271,13 +271,15 @@ struct TgModule {
     tyg_sym FileName(int fileidx) {
         if (auto it = filenames.find(fileidx); it != filenames.end()) return it->second;
         auto f = SourceName(fileidx);
-        for (auto &c : f) if (c == '\\') c = '/';
+        for (auto &c : f)
+            if (c == '\\') c = '/';
         f.push_back('\0');
         return filenames[fileidx] = Bytes(f);
     }
 
     void NeedShim(const string &name, const string &text) {
-        for (auto &s : shims) if (s.first == name) return;
+        for (auto &s : shims)
+            if (s.first == name) return;
         shims.emplace_back(name, text);
     }
     // One of the shims that do not depend on the program (TgFixedShim).
@@ -3955,7 +3957,9 @@ struct TgFn {
                 LimSetLen(pl, Sub(ol, nn));
                 return V {};
             }
-            case B_CLEAR: LimSetLen(pl, I64(0)); return V {};
+            case B_CLEAR:
+                LimSetLen(pl, I64(0));
+                return V {};
             default: break;
         }
         // resize(n) / resize(n, fill): the count, the fill, then the length.
@@ -5315,7 +5319,8 @@ struct TgFn {
     V GenExternCall(Call *c, FnSpec *callee, vector<Node *> &an) {
         if (callee->rets.size() > 1) No(c->line, "extern results");
         lastrets.clear();
-        for (auto r : callee->rets) if (!M.TypeOk(r)) No(c->line, "extern result type");
+        for (auto r : callee->rets)
+            if (!M.TypeOk(r)) No(c->line, "extern result type");
         vector<tyg_arg> args;
         for (size_t i = 0; i < an.size(); i++) {
             auto pt = callee->argtypes[i];
@@ -6097,9 +6102,15 @@ struct TgFn {
                 SetBlock(done);
                 return;
             }
-            case NK_LoopExpr: GenLoopX(static_cast<LoopExpr *>(n), true); return;
-            case NK_EarlyBlock: GenEarly(static_cast<EarlyBlock *>(n), true); return;
-            case NK_MatchExpr: GenMatch(static_cast<MatchExpr *>(n), true); return;
+            case NK_LoopExpr:
+                GenLoopX(static_cast<LoopExpr *>(n), true);
+                return;
+            case NK_EarlyBlock:
+                GenEarly(static_cast<EarlyBlock *>(n), true);
+                return;
+            case NK_MatchExpr:
+                GenMatch(static_cast<MatchExpr *>(n), true);
+                return;
             case NK_ForLoop: return StmtFor(static_cast<ForLoop *>(n));
             case NK_Return: {
                 auto r = static_cast<Return *>(n);
@@ -6130,8 +6141,12 @@ struct TgFn {
                 return;
             }
             case NK_FnDecl: case NK_StructDecl: case NK_EnumDecl: case NK_AliasDecl: return;
-            case NK_Block: GenBlock(static_cast<Block *>(n), true); return;
-            case NK_IfExpr: GenIf(static_cast<IfExpr *>(n), true); return;
+            case NK_Block:
+                GenBlock(static_cast<Block *>(n), true);
+                return;
+            case NK_IfExpr:
+                GenIf(static_cast<IfExpr *>(n), true);
+                return;
             default: {
                 auto pc = Is<Call>(n);
                 discardpush = pc && pc->builtin == B_PUSH;
@@ -7377,7 +7392,9 @@ struct TgFn {
                 auto &a = *t->arr;
                 auto nl = Slot();
                 switch (a.akind) {
-                    case A_FIXED: Loop(I64(0), I64(cg.ArrSize(t->arr)), walk(a.sub)); return;
+                    case A_FIXED:
+                        Loop(I64(0), I64(cg.ArrSize(t->arr)), walk(a.sub));
+                        return;
                     case A_VAR: {
                         auto ls = cg.LenStore(t->arr);
                         if (ls == IS_VARINT) {
