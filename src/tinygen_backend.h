@@ -1411,6 +1411,11 @@ struct TgFn {
     tyg_val Sub(tyg_val a, tyg_val b) { return Bin(TYG_SUB, a, b); }
     tyg_val Mul(tyg_val a, tyg_val b) { return Bin(TYG_MUL, a, b); }
     tyg_val AndK(tyg_val v, int64_t k) { return Bin(TYG_AND, v, I64(k)); }
+    tyg_val I8(int v) { return tyg_iconst(p, TYG_I8, v); }
+    tyg_val I32(int64_t v) { return tyg_iconst(p, TYG_I32, v); }
+    tyg_val AddrOf(tyg_addr a) { return tyg_addr_of(p, a); }
+    // The address of the read-only bytes b (a string literal's, or a file name's).
+    tyg_val BytesAddr(const string &b) { return AddrOf(tyg_at_sym(M.Bytes(b), 0)); }
     // An uninitialised 8-byte (i64) or 16-byte (header) local.
     tyg_local Slot() { return tyg_local_new(p, 8, 8); }
     tyg_local Slot16() { return tyg_local_new(p, 16, 8); }
@@ -1512,7 +1517,7 @@ struct TgFn {
         if (d.mode == 1 && M.IsVm(t) && !same()) return (void)VmFrom(d.stk, src.a, src.t, t, l);
         if (M.IsRs(t) || (d.mode == 1 && (M.IsVs(t) || M.IsVm(t) || M.IsVv(t)))) {
             if (!same()) No(l, cat("value of type ", M.NameWhy(src.t), " as ", M.Name(t)));
-            if (d.mode == 1) ImgCopy(d.stk, tyg_addr_of(p, src.a), t);
+            if (d.mode == 1) ImgCopy(d.stk, AddrOf(src.a), t);
             else RsCopy(d.stk, d.hdr, src, l);
             return;
         }
@@ -1857,8 +1862,7 @@ struct TgFn {
             if (tobytes) ToBytesInto(stk, len, an[0], l);
             else if (c) TextInto(stk, len, c, an, 0);
             else
-                CopyRun(stk, len, et, tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)),
-                        I64((int64_t)s->val.size()));
+                CopyRun(stk, len, et, BytesAddr(s->val), I64((int64_t)s->val.size()));
             return;
         }
         if (DestSpec(c) && IsGrow(DestSpec(c)->rets[0])) {
@@ -1990,7 +1994,7 @@ struct TgFn {
         St(len, I64(0));
         if (!cg.IsFix(x.t)) {   // A variable-size variant's image, behind the tag.
             SetTop(stk, at);
-            ImgCopy(stk, tyg_addr_of(p, x.a), x.t);
+            ImgCopy(stk, AddrOf(x.a), x.t);
             return;
         }
         auto sz = cg.FixedSize(x.t);
@@ -2048,12 +2052,12 @@ struct TgFn {
                    [&] { StoreByte(pre, cnt()); },
                    [&] {
                        auto tmp = Slot16();
-                       auto msl = Local(UlebWrite(tyg_addr_of(p, AtL(tmp)), cnt()));
+                       auto msl = Local(UlebWrite(AddrOf(AtL(tmp)), cnt()));
                        auto msv = [&] { return LdL(msl); };
                        auto elems = Add(pre, I64(1));
                        auto top = Top(stk);
                        tyg_move_dyn(p, Add(elems, Sub(msv(), I64(1))), elems, Sub(top, elems));
-                       tyg_copy_dyn(p, pre, tyg_addr_of(p, AtL(tmp)), msv());
+                       tyg_copy_dyn(p, pre, AddrOf(AtL(tmp)), msv());
                        SetTop(stk, Add(top, Sub(msv(), I64(1))));
                    });
             return;
@@ -2062,8 +2066,7 @@ struct TgFn {
         if (w < 8) {
             If(Cmp(TYG_UGT, n, I64((int64_t)((1ull << (8 * w)) - 1))), [&] {
                 auto msg = string("array length exceeds storage range") + '\0';
-                CallC("gs_panic", { tyg_type_ptr(m) }, { tyg_addr_of(p, tyg_at_sym(M.Bytes(msg), 0)) },
-                      nullptr);
+                CallC("gs_panic", { tyg_type_ptr(m) }, { BytesAddr(msg) }, nullptr);
                 tyg_unreachable(p);
             });
             n = tyg_convert(p, TYG_TRUNC, s, n);
@@ -2147,7 +2150,7 @@ struct TgFn {
             !n->exprtype || !cg.TEq(n->exprtype, t))
             return false;
         auto src = Deref(Place(n));
-        if (!Ended()) ImgCopy(stk, tyg_addr_of(p, src.a), t);
+        if (!Ended()) ImgCopy(stk, AddrOf(src.a), t);
         return true;
     }
 
@@ -2160,8 +2163,8 @@ struct TgFn {
         StL(sl, v.elems);
         StL(sl, RunBytes(v), 8);
         auto pfx = Slot16();
-        auto pn = Local(UlebWrite(tyg_addr_of(p, AtL(pfx)), LdL(sl, 8)));
-        append(tyg_addr_of(p, AtL(pfx)), LdL(pn));
+        auto pn = Local(UlebWrite(AddrOf(AtL(pfx)), LdL(sl, 8)));
+        append(AddrOf(AtL(pfx)), LdL(pn));
         append(LdL(sl), LdL(sl, 8));
     }
     // Appended at the top of stk to the u8 count at len.
@@ -2206,13 +2209,12 @@ struct TgFn {
 
     // ---- Conversions -------------------------------------------------------
 
-    tyg_val I8(int v) { return tyg_iconst(p, TYG_I8, v); }
     // A two-word header (a, then b) on a temporary.
     V PairV(TypeExpr *t, tyg_val a, tyg_val b) { return MemV(t, AtL(PairLocal(a, b))); }
     tyg_val BytesEq(tyg_val a, tyg_val b, tyg_val n) {
         auto d = CallC("memcmp", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64, false) }, { a, b, n },
                        IT(TYG_I32));
-        return Cmp(TYG_EQ, d, tyg_iconst(p, TYG_I32, 0));
+        return Cmp(TYG_EQ, d, I32(0));
     }
     // arm(vi), in a block entered when the tag in `tag` is variant vi, for each of n variants.
     template <class F> void TagSwitch(tyg_local tag, size_t n, F arm) {
@@ -2311,7 +2313,7 @@ struct TgFn {
     V Load(const P &pl, Line l) {
         V x;
         x.t = pl.t;
-        if (pl.enc) x.v = ZigRead(tyg_addr_of(p, pl.a));
+        if (pl.enc) x.v = ZigRead(AddrOf(pl.a));
         else if (TgModule::IsRel(pl.t)) x.v = RelLoad(pl, l);
         else if (M.IsScalar(pl.t)) x.v = tyg_load(p, M.Scal(pl.t), pl.a, 0);
         else if (!M.TypeOk(pl.t) && (M.ImgOk(pl.t) || M.RsOk(pl.t) || M.FoOk(pl.t))) {
@@ -2368,7 +2370,7 @@ struct TgFn {
     // reference's pool base less one, so that 0 stays null.
     tyg_val RelOrigin(const P &pl, Line l) {
         auto pool = pl.t->ref->pool;
-        if (!pool) return tyg_addr_of(p, pl.a);
+        if (!pool) return AddrOf(pl.a);
         return Sub(Ld(VarPlace(const_cast<VarDef *>(pool), l).a), I64(1));
     }
     // The address the slot at pl decodes to, null for a 0 offset.
@@ -2377,7 +2379,7 @@ struct TgFn {
         // Signed from the slot, unsigned from a pool (CodeGen::RelParts).
         tyg_val off;
         if (TgModule::IsVr(pl.t)) {
-            auto at = tyg_addr_of(p, pl.a);
+            auto at = AddrOf(pl.a);
             off = pl.t->ref->pool ? UlebRead(at) : ZigRead(at);
         } else {
             off = tyg_load(p, s, pl.a, 0);
@@ -2403,7 +2405,7 @@ struct TgFn {
     // zigzag for a self-relative one; no range to check.
     tyg_val RelOffsetInto(const P &pl, tyg_val v, Line l) {
         auto off = RelOffset(pl, v, l);
-        auto at = tyg_addr_of(p, pl.a);
+        auto at = AddrOf(pl.a);
         return pl.t->ref->pool ? UlebWrite(at, off) : ZigWrite(at, off);
     }
     // The address v as the slot's offset, range-checked (EmitRelStoreAt).
@@ -2543,7 +2545,7 @@ struct TgFn {
             auto esz = cg.FixedSize(et);
             if (al->fillval) {
                 auto leaves = FillCapture(al);
-                if (!Ended()) FillStore(leaves, tyg_addr_of(p, pl.a), cg.ArrSize(t->arr), al);
+                if (!Ended()) FillStore(leaves, AddrOf(pl.a), cg.ArrSize(t->arr), al);
                 return;
             }
             for (size_t i = 0; i < al->elems.size() && !Ended(); i++)
@@ -2552,7 +2554,7 @@ struct TgFn {
         }
         auto sl = Is<StructLit>(lit);
         auto outer = selfbase;
-        selfbase = tyg_addr_of(p, pl.a);
+        selfbase = AddrOf(pl.a);
         struct Back {
             tyg_val &at, was;
             ~Back() { at = was; }
@@ -2694,12 +2696,12 @@ struct TgFn {
             auto pl = Deref(Place(n));
             if (Ended()) return Dummy(t);
             if (!pl.stk || pl.tmphdr) No(n->line, "reference to an array of this kind");
-            return PairV(t, tyg_addr_of(p, pl.a), pl.stk);
+            return PairV(t, AddrOf(pl.a), pl.stk);
         }
         if (t && IsAddrRef(t) && n->exprtype && IsImg(n->exprtype) && M.ImgOk(t->ref->sub)) {
             // A T[] (or variable-size struct) where a reference is wanted: its image's address.
             auto pl = Deref(Place(n));
-            return ValV(t, Ended() ? I64(0) : tyg_addr_of(p, pl.a));
+            return ValV(t, Ended() ? I64(0) : AddrOf(pl.a));
         }
         return Fit(Gen(n), t, n->line);
     }
@@ -2754,7 +2756,7 @@ struct TgFn {
                     (int64_t)val.size() == cg.FixedSize(t))
                     return MemV(t, tyg_at_sym(M.Bytes(val), 0));
                 if (!t || t->kind != TY_SLICE || !IsU8(t->sub)) No(n->line, "string of this type");
-                return PairV(t, tyg_addr_of(p, tyg_at_sym(M.Bytes(val), 0)), I64((int64_t)val.size()));
+                return PairV(t, BytesAddr(val), I64((int64_t)val.size()));
             }
             case NK_Unary: return GenUnary(static_cast<Unary *>(n));
             case NK_Binary: return GenBinary(static_cast<Binary *>(n));
@@ -2790,12 +2792,12 @@ struct TgFn {
                     pl.rbase ||
                     pl.tmphdr)
                     No(u->line, "reference to an array of this kind");
-                return PairV(et, tyg_addr_of(p, pl.a), pl.stk);
+                return PairV(et, AddrOf(pl.a), pl.stk);
             }
             if (et && et->kind == TY_REF) {
                 if (!IsPlainRef(et) && !M.OptRef(et) && !(TgModule::IsRel(et) && M.RelOk(et, 1)))
                     No(u->line, "reference kind");
-                return ValV(et, tyg_addr_of(p, Deref(Place(u->child)).a));
+                return ValV(et, AddrOf(Deref(Place(u->child)).a));
             }
             return Load(Deref(Place(u->child)), u->line);
         }
@@ -2833,8 +2835,8 @@ struct TgFn {
     }
 
     // A file name and line for the runtime's abort messages.
-    tyg_val FileArg(Line l) { return tyg_addr_of(p, tyg_at_sym(M.FileName(l.fileidx), 0)); }
-    tyg_val LineArg(Line l) { return tyg_iconst(p, TYG_I32, l.line); }
+    tyg_val FileArg(Line l) { return AddrOf(tyg_at_sym(M.FileName(l.fileidx), 0)); }
+    tyg_val LineArg(Line l) { return I32(l.line); }
 
     // Calls a C shim or runtime function by name with scalar arguments (types for the signature).
     tyg_val CallC(const string &name, const vector<const tyg_type *> &pts,
@@ -2955,11 +2957,11 @@ struct TgFn {
             if (!EqBitwise(t)) {
                 // Floats or pads among its bytes: walked field by field,
                 // over a cursor in each (CodeGen::EmitEqWalk).
-                auto ca = Local(tyg_addr_of(p, a.a)), cb = Local(tyg_addr_of(p, b.a));
+                auto ca = Local(AddrOf(a.a)), cb = Local(AddrOf(b.a));
                 EqWalk(t, ca, cb, fail, l);
                 return;
             }
-            auto pa = tyg_addr_of(p, a.a), pb = tyg_addr_of(p, b.a);
+            auto pa = AddrOf(a.a), pb = AddrOf(b.a);
             ContinueIf(Cmp(TYG_EQ, ImgSize(t, pa), ImgSize(t, pb)), fail);
             ContinueIf(BytesEq(pa, pb, ImgSize(t, pa)), fail);
             return;
@@ -3109,7 +3111,7 @@ struct TgFn {
         tyg_local loc;
     };
     tyg_addr ElemAt(tyg_addr a, int64_t off, const ElemDyn &dy) {
-        return dy.on ? AtV(Add(tyg_addr_of(p, a), LdL(dy.loc)), off) : AddrPlus(a, off);
+        return dy.on ? AtV(Add(AddrOf(a), LdL(dy.loc)), off) : AddrPlus(a, off);
     }
     // F(leaf type, offset, ElemDyn) for each scalar leaf: an array's elements unrolled up to 256,
     // beyond that in a counted loop (as CodeGen).
@@ -3280,7 +3282,7 @@ struct TgFn {
         tyg_val r;
         if (st->kind == TY_FLT) {
             auto d = M.Scal(st) == TYG_F32 ? tyg_convert(p, TYG_FEXT, TYG_F64, x.v) : x.v;
-            auto isf32 = tyg_iconst(p, TYG_I32, M.Scal(st) == TYG_F32);
+            auto isf32 = I32(M.Scal(st) == TYG_F32);
             if (c->unchecked) {
                 M.NeedShim("gs_tg_f2iwrap");
                 r = CallC("gs_tg_f2iwrap", { f64 }, { d }, IT(TYG_I64));
@@ -3310,7 +3312,7 @@ struct TgFn {
         return ValV(tt, Conv(r, i64t, tt, c->line));
     }
     tyg_val TypeNameArg(IntStorage is) {
-        return tyg_addr_of(p, tyg_at_sym(M.Bytes(cat(IntStorageName(is), string(1, '\0'))), 0));
+        return BytesAddr(cat(IntStorageName(is), string(1, '\0')));
     }
 
     V GenStructLit(StructLit *sl) {
@@ -3339,7 +3341,7 @@ struct TgFn {
         pl = Deref(pl);
         if (pl.t->kind == TY_ARRAY && pl.t->arr->akind == A_FIXED && M.TypeOk(pl.t)) {
             auto k = cg.ArrSize(pl.t->arr);
-            return { tyg_addr_of(p, pl.a), I64(k), pl.t->arr->sub, k };
+            return { AddrOf(pl.a), I64(k), pl.t->arr->sub, k };
         }
         auto a8 = pl.a;
         a8.offset += 8;
@@ -3357,7 +3359,7 @@ struct TgFn {
     // A T[] image at pl: the length prefix, the elements behind it.
     View VarArrView(const P &pl) {
         auto w = TgModule::LenWidth(pl.t);
-        auto base = tyg_addr_of(p, pl.a);
+        auto base = AddrOf(pl.a);
         if (w == 0) return { Add(base, UlebSize(base)), UlebRead(base), pl.t->arr->sub, -1 };
         auto s = w == 1 ? TYG_I8 : w == 2 ? TYG_I16 : w == 4 ? TYG_I32 : TYG_I64;
         auto n = tyg_load(p, s, pl.a, 0);
@@ -3443,7 +3445,7 @@ struct TgFn {
             Into(P { AtL(one), et }, al->fillval);
             if (!Ended())
                 Loop(I64(0), I64(il->val), [&](tyg_val i) {
-                    tyg_copy(p, AtV(Add(tyg_addr_of(p, dst), Mul(i, I64(esz)))), AtL(one), esz);
+                    tyg_copy(p, AtV(Add(AddrOf(dst), Mul(i, I64(esz)))), AtL(one), esz);
                 });
             return il->val;
         }
@@ -3533,7 +3535,7 @@ struct TgFn {
             LitTypeGuard guard(al, M.ast.ArrayOf(t->sub, A_FIXED, al->line, count));
             auto av = GenArrayLit(al);
             if (Ended() || !av.mem) return Dummy(t);
-            return PairV(t, tyg_addr_of(p, av.a), I64(count));
+            return PairV(t, AddrOf(av.a), I64(count));
         }
         if (!t || t->kind != TY_ARRAY || t->arr->akind != A_FIXED || !M.TypeOk(t) || al->capexpr)
             No(al->line, cat("array literal of type ", t ? M.NameWhy(t) : "?"));
@@ -3575,7 +3577,7 @@ struct TgFn {
             I64(LimCap(pl.t));
     }
     View LimView(const P &pl) {
-        return { Add(tyg_addr_of(p, pl.a), I64(M.LimWidth(pl.t))), LimLen(pl), pl.t->arr->sub, -1 };
+        return { Add(AddrOf(pl.a), I64(M.LimWidth(pl.t))), LimLen(pl), pl.t->arr->sub, -1 };
     }
     tyg_val LimElemAddr(const P &pl, tyg_val i) { return ElemAddr(LimView(pl), i); }
     P LimTemp(TypeExpr *t) { return P { MemTemp(t, true).a, t }; }
@@ -3610,7 +3612,7 @@ struct TgFn {
         if (!M.TypeOk(t) || !IsU8(t->arr->sub) || (int64_t)s->val.size() > LimCap(t))
             No(s->line, "string of this type");
         auto dst = LimTemp(t);
-        LimAppendView(dst, { tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)),
+        LimAppendView(dst, { BytesAddr(s->val),
                              I64((int64_t)s->val.size()), t->arr->sub, -1 }, s->line);
         return MemV(t, dst.a);
     }
@@ -3741,7 +3743,7 @@ struct TgFn {
         auto spans = [&](const string &fn, vector<tyg_val> args, bool ret) {
             vector<const tyg_type *> ts(args.size(), IT(TYG_I64));
             ts.insert(ts.begin(), { pt, pt, pt });
-            args.insert(args.begin(), { Ld(R.fl), tyg_addr_of(p, R.fllen), R.flstk });
+            args.insert(args.begin(), { Ld(R.fl), AddrOf(R.fllen), R.flstk });
             return CallC("gs_spans_" + fn, ts, args, ret ? IT(TYG_I64) : nullptr);
         };
         auto elems = [&] { return Ld(pl.a); };
@@ -3803,8 +3805,7 @@ struct TgFn {
             if (!esz) return;
             if (!cg.HasFieldDefaults(elem)) {
                 CallC("memset", { pt, IT(TYG_I32), IT(TYG_I64, false) },
-                      { Add(elems(), Mul(first, I64(esz))), tyg_iconst(p, TYG_I32, 0),
-                        Mul(count, I64(esz)) }, pt);
+                      { Add(elems(), Mul(first, I64(esz))), I32(0), Mul(count, I64(esz)) }, pt);
                 return;
             }
             if (!c->defaultinit) No(c->line, "slice pool defaults");
@@ -3926,7 +3927,7 @@ struct TgFn {
         }
         if (auto s = Is<StrLit>(src)) {
             if (!IsU8(et)) No(c->line, "string of this type");
-            v = { tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)), I64((int64_t)s->val.size()), et, -1 };
+            v = { BytesAddr(s->val), I64((int64_t)s->val.size()), et, -1 };
         } else {
             if (Is<Call>(src) && src->exprtype && (IsGrow(src->exprtype) || IsVarArr(src->exprtype)))
                 No(c->line, "append of this call");
@@ -4037,7 +4038,7 @@ struct TgFn {
         if (Ended()) return tyg_arg {};
         auto cp = Temp(pt);
         tyg_copy(p, AtL(cp), x.a, M.Size(pt));
-        return ArgOfVal(tyg_addr_of(p, AtL(cp)));
+        return ArgOfVal(AddrOf(AtL(cp)));
     }
 
     // Every result of the latest call (GenCall): the first as the call's value, the others where
@@ -4175,7 +4176,7 @@ struct TgFn {
                 auto et = dt->arr->sub;
                 auto esz = I64(cg.FixedSize(et));
                 Loop(I64(0), I64(cg.ArrSize(dt->arr)), [&](tyg_val i) {
-                    Into(P { AtV(Add(tyg_addr_of(p, pl.a), Mul(i, esz))), et }, c->defaultinit);
+                    Into(P { AtV(Add(AddrOf(pl.a), Mul(i, esz))), et }, c->defaultinit);
                 });
             } else if (c->defaultinit) {
                 Into(pl, c->defaultinit);
@@ -4189,7 +4190,7 @@ struct TgFn {
             // A read-only view of static data (CodeGen's B_EMBED_FILE): the data and length.
             auto &blob = *c->shaderblob;
             auto t = Temp(c->rettypes[0]);
-            StL(t, tyg_addr_of(p, tyg_at_sym(M.Bytes(blob), 0)));
+            StL(t, BytesAddr(blob));
             StL(t, I64((int64_t)blob.size()), 8);
             return MemV(c->rettypes[0], AtL(t));
         }
@@ -4252,7 +4253,7 @@ struct TgFn {
             } else if (M.FoOk(r.t)) {
                 r = FoTemp(r.t, l);
                 args.push_back(ArgOfVal(r.stk));
-                args.push_back(ArgOfVal(tyg_addr_of(p, r.a)));
+                args.push_back(ArgOfVal(AddrOf(r.a)));
             } else if (IsGrow(r.t) || M.IsRs(r.t) || M.IsRb(r.t)) {
                 if (i == 0 && dst) r = MemV(r.t, dst->hdr, dst->stk);
                 else r = RzTemp(r.t, l);
@@ -4260,10 +4261,10 @@ struct TgFn {
                 St(r.a, Top(r.stk));
                 St(len, I64(0));
                 args.push_back(ArgOfVal(r.stk));
-                args.push_back(ArgOfVal(tyg_addr_of(p, len)));
+                args.push_back(ArgOfVal(AddrOf(len)));
             } else if ((int)i != ci.cret) {
                 r.a = AtL(Temp(r.t));
-                args.push_back(ArgOfVal(tyg_addr_of(p, r.a)));
+                args.push_back(ArgOfVal(AddrOf(r.a)));
                 if (!M.IsScalar(r.t)) r.mem = true;
             }
         }
@@ -4283,7 +4284,7 @@ struct TgFn {
         tyg_val flstk;
         PoolAt(const_cast<VarDef *>(vd), l, pl, fl, flstk);
         if (!pl.stk) No(l, "pool without its stack");
-        return { tyg_addr_of(p, pl.a), pl.stk, tyg_addr_of(p, fl), flstk };
+        return { AddrOf(pl.a), pl.stk, AddrOf(fl), flstk };
     }
 
     // Whether a variable holds a gs_pref: a pool reference variable, or a parameter handed a pool.
@@ -4333,7 +4334,7 @@ struct TgFn {
     void ValArg(Node *n, TypeExpr *pt, vector<tyg_arg> &args) {
         auto x = BuildTemp(n, pt, n->line);
         // A T[]: by the image's address.
-        if (!x.stk) return args.push_back(ArgOfVal(tyg_addr_of(p, x.a)));
+        if (!x.stk) return args.push_back(ArgOfVal(AddrOf(x.a)));
         args.push_back(ArgOfMem(x.a));
         args.push_back(ArgOfVal(x.stk));
     }
@@ -4346,7 +4347,7 @@ struct TgFn {
                 continue;
             }
             auto pl = VarPlace(v, c->line);
-            args.push_back(ArgOfVal(tyg_addr_of(p, pl.a)));
+            args.push_back(ArgOfVal(AddrOf(pl.a)));
             if (M.Resz(v->type)) {
                 if (!pl.stk) No(c->line, "free variable without its stack");
                 args.push_back(ArgOfVal(pl.stk));
@@ -4493,7 +4494,7 @@ struct TgFn {
 
     // Literal bytes of element type et appended as CopyRun appends.
     void CopyLit(tyg_val stk, tyg_addr len, TypeExpr *et, const string &text) {
-        CopyRun(stk, len, et, tyg_addr_of(p, tyg_at_sym(M.Bytes(text), 0)), I64((int64_t)text.size()));
+        CopyRun(stk, len, et, BytesAddr(text), I64((int64_t)text.size()));
     }
     void TextLit(tyg_val stk, tyg_addr len, const string &s) {
         CopyLit(stk, len, M.ast.inttypes[IS_U8], s);
@@ -4507,7 +4508,7 @@ struct TgFn {
         auto &ci = cg.sinfo[sp];
         if (!ci.freevars.empty()) No(l, "format overload with free variables");
         auto pt = sp->argtypes[1];
-        auto r = PairLocal(tyg_addr_of(p, AddrPlus(len, -8)), stk);
+        auto r = PairLocal(AddrOf(AddrPlus(len, -8)), stk);
         vector<tyg_arg> args { ArgOfMem(AtL(r)) };
         if (pl.enc || TgModule::IsVarint(pl.t)) {
             // A varint holds no i64: the overload is handed a temporary holding its value (RefArg).
@@ -4519,9 +4520,9 @@ struct TgFn {
         tyg_arg v {};
         if (pt->kind == TY_REF && cg.IsFatRef(pt)) {   // A resizable by reference: gs_rref.
             if (!pl.stk) No(l, "format overload taking a resizable without its stack");
-            v = ArgOfMem(AtL(PairLocal(tyg_addr_of(p, pl.a), pl.stk)));
+            v = ArgOfMem(AtL(PairLocal(AddrOf(pl.a), pl.stk)));
         } else if (pt->kind == TY_REF) {
-            v = ArgOfVal(tyg_addr_of(p, pl.a));
+            v = ArgOfVal(AddrOf(pl.a));
         } else if (M.IsScalar(pt)) {
             v = ArgOfVal(Load(P { pl.a, pt }, l).v);
         } else if (M.RzParam(pt)) {
@@ -4529,7 +4530,7 @@ struct TgFn {
         } else if (cg.IsLargeFixed(pt)) {   // The address of a copy of its own (SigParams).
             auto cp = Temp(pt);
             tyg_copy(p, AtL(cp), pl.a, M.Size(pt));
-            v = ArgOfVal(tyg_addr_of(p, AtL(cp)));
+            v = ArgOfVal(AddrOf(AtL(cp)));
         } else {
             v = ArgOfMem(pl.a);
         }
@@ -4702,9 +4703,7 @@ struct TgFn {
                 auto ptr = tyg_type_ptr(m);
                 // A frame object that is bytes is read as the C one first.
                 if (pl.bfo) pl = FoView(pl);
-                CallC(M.RenderFn(t), { ptr, ptr, ptr },
-                      { stk, tyg_addr_of(p, len), tyg_addr_of(p, pl.a) },
-                      nullptr);
+                CallC(M.RenderFn(t), { ptr, ptr, ptr }, { stk, AddrOf(len), AddrOf(pl.a) }, nullptr);
                 return;
             }
         }
@@ -5201,7 +5200,7 @@ struct TgFn {
                     auto at = StackReserve(stk, I64(size));
                     if (size) tyg_copy(p, AtV(at), pl.a, size);
                 } else if (!M.Resz(d->type)) {
-                    ImgCopy(stk, tyg_addr_of(p, pl.a), d->type);
+                    ImgCopy(stk, AddrOf(pl.a), d->type);
                 } else {
                     RzImage(stk, pl, d->type);
                     if (!d->reusable) return;
@@ -5211,7 +5210,7 @@ struct TgFn {
                     tyg_val flstk;
                     PoolAt(d, c->line, hp, fl, flstk);
                     auto top = Top(stk);
-                    auto flen = Ld(AtV(tyg_addr_of(p, fl), 8));
+                    auto flen = Ld(AtV(AddrOf(fl), 8));
                     St(AtV(top), flen);
                     auto bytes = Mul(flen, I64(FlEntry(d)));
                     tyg_move_dyn(p, Add(top, I64(8)), Ld(fl), bytes);
@@ -5233,7 +5232,7 @@ struct TgFn {
             // A fixed aggregate is read where it lies: a temporary of it could overflow a worker's
             // stack.
             auto pl = Place(an[0]);
-            ptr = tyg_addr_of(p, pl.a);
+            ptr = AddrOf(pl.a);
             size = I64(cg.FixedSize(t));
         } else if (M.Resz(t)) {
             auto src = RzValue(an[0], t, c->line);
@@ -5249,7 +5248,7 @@ struct TgFn {
             auto x = GenAs(an[0], t);
             auto tmp = Temp(t);
             if (!Ended()) Store(P { AtL(tmp), t }, x);
-            ptr = tyg_addr_of(p, AtL(tmp));
+            ptr = AddrOf(AtL(tmp));
             size = I64(cg.FixedSize(t));
         }
         if (Ended()) return V {};
@@ -5332,7 +5331,7 @@ struct TgFn {
             }
             if (!IsU8(pt->sub)) No(c->line, "slice argument");
             auto t = Slot16();
-            StL(t, tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)));
+            StL(t, BytesAddr(s->val));
             StL(t, I64((int64_t)s->val.size()), 8);
             tyg_arg a {};
             a.mem = AtL(t);
@@ -5403,7 +5402,7 @@ struct TgFn {
         };
         for (auto a : an) {
             if (auto s = Is<StrLit>(a)) {
-                bytes(tyg_addr_of(p, tyg_at_sym(M.Bytes(s->val), 0)), I64((int64_t)s->val.size()));
+                bytes(BytesAddr(s->val), I64((int64_t)s->val.size()));
             } else if (PrintsAsBytes(PlainPointee(a->exprtype))) {
                 auto v = ViewOf(Place(a), a->line);
                 bytes(v.elems, v.len);
@@ -5893,11 +5892,11 @@ struct TgFn {
             No(me->line, "match arm binding of a resizable ADT");
         if (a.pat.byref) {
             if (!M.IsVm(adt)) No(me->line, "match arm binding by reference");
-            locals[a.binder] = Local(tyg_addr_of(p, pay));
+            locals[a.binder] = Local(AddrOf(pay));
             if (!IsAddrRef(a.binder->type)) indirect.insert(a.binder);
         } else if (!cg.IsFix(vt)) {
             Declare(a.binder, me->line);   // A variable payload, copied onto the binder's own stack.
-            StL(locals[a.binder], ImgCopy(LdL(rzstk[a.binder]), tyg_addr_of(p, pay), vt));
+            StL(locals[a.binder], ImgCopy(LdL(rzstk[a.binder]), AddrOf(pay), vt));
         } else {
             Declare(a.binder, me->line);
             CopyPayload(s, vi, AtL(locals[a.binder]));
@@ -5948,7 +5947,7 @@ struct TgFn {
                     return k->argtypes[pos]->kind != TY_REF;
                 }))
                 return;
-            copied = Local(ImgCopy(Stk(AllocStk(false, c->line), c->line), tyg_addr_of(p, s.v.a), adt));
+            copied = Local(ImgCopy(Stk(AllocStk(false, c->line), c->line), AddrOf(s.v.a), adt));
             havecopy = true;
         };
         for (size_t i = 0; i < an.size(); i++) {
@@ -5973,7 +5972,7 @@ struct TgFn {
                 if (M.IsScalar(pt)) tyg_store(p, M.Scal(pt), AtL(l), x.v, 0);
                 else tyg_copy(p, AtL(l), x.a, M.Size(pt));
                 shared[i].push_back(M.IsScalar(pt) ? ArgOfVal(tyg_load(p, M.Scal(pt), AtL(l), 0))
-                                    : cg.IsLargeFixed(pt) ? ArgOfVal(tyg_addr_of(p, AtL(l))) :
+                                    : cg.IsLargeFixed(pt) ? ArgOfVal(AddrOf(AtL(l))) :
                                         ArgOfMem(AtL(l)));
             }
         }
@@ -6003,7 +6002,7 @@ struct TgFn {
             for (size_t i = 0; i < an.size(); i++) {
                 auto pt = sp->argtypes[i];
                 if (i == pos && pt->kind == TY_REF && pt->ref->sub->kind == TY_VARIANT) {
-                    args.push_back(ArgOfVal(Add(tyg_addr_of(p, s.v.a), I64(M.TagSize(adt)))));
+                    args.push_back(ArgOfVal(Add(AddrOf(s.v.a), I64(M.TagSize(adt)))));
                 } else if (i == pos && M.IsVv(pt)) {
                     args.push_back(ArgOfVal(Add(LdL(copied), I64(M.TagSize(adt)))));
                 } else if (i == pos) {
@@ -6012,8 +6011,7 @@ struct TgFn {
                     auto cs = s;
                     if (havecopy) cs.v.a = AtV(LdL(copied));
                     CopyPayload(cs, (int)vi, AtL(t));
-                    args.push_back(cg.IsLargeFixed(pt) ? ArgOfVal(tyg_addr_of(p, AtL(t))) :
-                                   ArgOfMem(AtL(t)));
+                    args.push_back(cg.IsLargeFixed(pt) ? ArgOfVal(AddrOf(AtL(t))) : ArgOfMem(AtL(t)));
                 } else {
                     args.insert(args.end(), shared[i].begin(), shared[i].end());
                 }
@@ -6296,7 +6294,7 @@ struct TgFn {
             }
             if (Ended()) return;
         }
-        tyg_store(p, TYG_I32, AtV(RfAddr()), tyg_iconst(p, TYG_I32, cg.fromids[t]), 0);
+        tyg_store(p, TYG_I32, AtV(RfAddr()), I32(cg.fromids[t]), 0);
         Propagate();
     }
     // The value a catching frame returns as its own for result i: it lies on our destination behind
@@ -6323,7 +6321,7 @@ struct TgFn {
         if (!cg.sinfo[callee].hasrf || cg.norfcheck || Ended()) return;
         auto rfa = RfAddr();
         auto rf = tyg_load(p, TYG_I32, AtV(rfa), 0);
-        auto i32 = [&](int v) { return tyg_iconst(p, TYG_I32, v); };
+        auto i32 = [&](int v) { return I32(v); };
         If(Cmp(TYG_NE, rf, i32(0)), [&] {
             if (sp && callee->needs.count(sp))
                 If(Cmp(TYG_EQ, rf, i32(cg.fromids[sp])), [&] {
@@ -6477,7 +6475,7 @@ struct TgFn {
             return;
         }
         if (pl.bfo && pl.stk) {   // A frame object tail of a resizable struct, as bytes (GenFoAsBytes).
-            rebuild(tyg_addr_of(p, pl.a), InPlace { 4, pl.stk, t, AddrPlus(pl.ohdr, 8) });
+            rebuild(AddrOf(pl.a), InPlace { 4, pl.stk, t, AddrPlus(pl.ohdr, 8) });
             return;
         }
         if (M.FoOk(t) && pl.stk) {   // Its innermost tail's elements given back.
@@ -6832,7 +6830,7 @@ struct TgFn {
         tyg_zero(p, tmp, M.Size(t));
         FoBytesCopy(t, tmp, src.a, false);
         auto hb = AddrPlus(tmp, M.FoHdrOff(t));
-        St(hb, Add(tyg_addr_of(p, src.a), I64(cg.FoBytesPrefix(t))));
+        St(hb, Add(AddrOf(src.a), I64(cg.FoBytesPrefix(t))));
         St(AddrPlus(hb, 8), Ld(AddrPlus(src.ohdr, 8)));
         return P { tmp, t, src.stk };
     }
@@ -7003,14 +7001,14 @@ struct TgFn {
         if (M.FoOk(t)) {
             if (base.bfo) {
                 auto at = AddrPlus(base.a, fs.off[(size_t)fi]);
-                return tail ? tailat(tyg_addr_of(p, at), base.ohdr) : P { at, ft };
+                return tail ? tailat(AddrOf(at), base.ohdr) : P { at, ft };
             }
             if (tail && !base.stk && !read) No(l, "frame object without its stack");
             return P { AddrPlus(base.a, fs.coff[(size_t)fi]), ft, tail ? base.stk : 0 };
         }
         if (!cg.IsFix(t)) {
             if (!M.VsOk(t) && !M.VvOk(t)) No(l, "field of this type");
-            return plain(FieldAddr(t, tyg_addr_of(p, base.a), fi));
+            return plain(FieldAddr(t, AddrOf(base.a), fi));
         }
         if (!M.TypeOk(t)) No(l, "field of this type");
         return P { AddrPlus(base.a, fs.off[(size_t)fi]), ft };
@@ -7037,7 +7035,7 @@ struct TgFn {
         if (srct->kind == TY_VARIANT) {
             StoreTag(AtV(base), t, M.VariantIdx(srct));
             if (cg.IsFix(srct)) copyfix(cg.FixedSize(srct), src);
-            else ImgCopy(stk, tyg_addr_of(p, src), srct);
+            else ImgCopy(stk, AddrOf(src), srct);
             return LdL(start);
         }
         auto tag = Local(LoadTag(src, srct));
