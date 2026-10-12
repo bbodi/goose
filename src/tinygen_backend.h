@@ -2925,16 +2925,14 @@ struct TgFn {
         if (LimAdapts(x, want)) return LimFrom(x, want, l);
         if (want->kind == TY_ENUM && M.IsVm(want) && x.mem && M.VmOk(want) && x.t->kind != TY_REF &&
             (x.t->kind == TY_VARIANT || (x.t->kind == TY_ENUM && !M.IsVm(x.t))) && M.EI(x.t) == M.EI(want)) {
-            // A variant, or a fixed-mode ADT, wanted as a variable-mode one:
-            // its image on a temporary's stack.
+            // A variant or fixed-mode ADT as a variable-mode one: its image on a temporary's stack.
             auto stk = Stk(AllocStk(false, l), l);
             return MemV(want, AtV(VmFrom(stk, x.a, x.t, want, l)));
         }
         if (x.t->kind == TY_VARIANT && want->kind == TY_ENUM && x.mem) return AdaptToAdt(x, want, l);
         if (x.t->kind == TY_ENUM && want->kind == TY_ENUM && x.mem && M.IsVm(x.t) && !M.IsVm(want) &&
             M.EI(x.t) == M.EI(want) && M.TypeOk(want)) {
-            // A variable-mode value read as fixed-mode (CodeGen::AdaptToFixed):
-            // its tag, then the variant's payload copied.
+            // A variable-mode value as fixed-mode (CodeGen::AdaptToFixed): its tag, then the payload.
             auto r = MemTemp(want, true);
             auto ei = cg.EIOf(want);
             auto tag = Local(LoadTag(x.a, x.t));
@@ -2945,19 +2943,14 @@ struct TgFn {
             });
             return r;
         }
-        if (want->kind == TY_SLICE && x.t->kind == TY_ARRAY && x.t->arr->akind == A_FIXED && x.mem &&
-            cg.Mangle(x.t->arr->sub) == cg.Mangle(want->sub)) {
-            // A fixed array where a slice is wanted: a view of where it lies.
-            auto v = ViewOf(P { x.a, x.t }, l);
-            return SliceValue(want, v.elems, v.len);
-        }
-        if (OptFit(x, want)) return x;
-        if (x.mem && x.t->kind == TY_ARRAY && want->kind == TY_SLICE && M.TypeOk(want) &&
-            (IsGrow(x.t) || IsVarArr(x.t)) && cg.Mangle(x.t->arr->sub) == cg.Mangle(want->sub)) {
-            // An array temporary (a call's result) where a slice is wanted: a view of it (§6.4).
+        // A fixed array where a slice is wanted: a view of where it lies; an array
+        // temporary (a call's result) too: a view of it (§6.4).
+        if (x.mem && x.t->kind == TY_ARRAY && want->kind == TY_SLICE && cg.Mangle(x.t->arr->sub) == cg.Mangle(want->sub) &&
+            (x.t->arr->akind == A_FIXED || (M.TypeOk(want) && (IsGrow(x.t) || IsVarArr(x.t))))) {
             auto v = ViewOf(P { x.a, x.t, x.stk }, l);
             return SliceValue(want, v.elems, v.len);
         }
+        if (OptFit(x, want)) return x;
         if (M.IsScalar(x.t) != M.IsScalar(want) || !cg.TEq(x.t, want))
             No(l, cat("value conversion from ", TyStr(x.t), " to ", TyStr(want)));
         return x;
@@ -3009,8 +3002,7 @@ struct TgFn {
         if (cg.IsFatRef(pl.t)) r.stk = Ld(AddrOff(pl.a, 8));
         return r;
     }
-    // Through references to what they refer to: an optional one is
-    // narrowed wherever the checker lets a path through it (§3.8).
+    // Through references to what they refer to (§3.8; an optional one only where the checker narrowed it).
     P Deref(P pl) {
         while (IsAddrRef(pl.t) || TgModule::IsRel(pl.t)) pl = Step(pl);
         return pl;
@@ -3018,9 +3010,8 @@ struct TgFn {
 
     // ---- Relative references (§3.9) ----------------------------------------
 
-    // What an offset measures from (CodeGen::RelOrigin): the slot itself,
-    // or for an `in pool` reference the pool's base less one, so that 0
-    // stays null (PoolBase).
+    // What an offset measures from (CodeGen::RelOrigin): the slot itself, or an `in pool`
+    // reference's pool base less one, so that 0 stays null.
     tyg_val RelOrigin(const P &pl, Line l) {
         auto pool = pl.t->ref->pool;
         if (!pool) return tyg_addr_of(p, pl.a);
@@ -3042,8 +3033,7 @@ struct TgFn {
         if (!pl.t->ref->optional) return at;
         return tyg_select(p, Cmp(TYG_EQ, off, I64(0)), I64(0), at);
     }
-    // The offset the slot at pl holds for the address v: its distance
-    // from the origin, zero for a null (CodeGen::RelOffset).
+    // The offset the slot at pl holds for the address v, zero for a null (CodeGen::RelOffset).
     tyg_val RelOffset(const P &pl, tyg_val v, Line l) {
         auto off = Sub(v, RelOrigin(pl, l));
         if (pl.t->ref->optional) {
@@ -3055,9 +3045,8 @@ struct TgFn {
         }
         return off;
     }
-    // The address v as a varint-width offset written at the top of stk:
-    // ULEB128 of an `in pool` one, zigzag of a self-relative one
-    // (CodeGen::EmitRelStore); no range to check.
+    // The address v as a varint-width offset (CodeGen::EmitRelStore): ULEB128 for an `in pool` one,
+    // zigzag for a self-relative one; no range to check.
     tyg_val RelOffsetInto(const P &pl, tyg_val v, Line l) {
         auto off = RelOffset(pl, v, l);
         auto at = tyg_addr_of(p, pl.a);
@@ -3163,9 +3152,8 @@ struct TgFn {
         return loc;
     }
 
-    // A literal of a fixed struct or array with a non-null self-relative
-    // link stored in it at any depth: the C builds it where it lies
-    // (CodeGen::FixedLitAtLv), whose slots the offsets measure from.
+    // A fixed struct or array literal storing a non-null self-relative link at any depth: built
+    // where it lies, as the C does (CodeGen::FixedLitAtLv), for the offsets to measure from.
     bool SelfRelLit(Node *n) {
         if (!SelfRelLitOk(n)) return false;
         auto stores = [&](TypeExpr *ft, Node *init) {
@@ -3187,8 +3175,7 @@ struct TgFn {
             if (stores(et, e)) return true;
         return false;
     }
-    // The fields of a struct, variant or fixed-mode ADT literal, their
-    // types and offsets from the value's start (a tag first, for the ADT).
+    // A struct, variant or fixed-mode ADT literal's fields, types and offsets (a tag first, for the ADT).
     struct LitSh {
         const vector<Field> *fields;
         const vector<TypeExpr *> *ftypes;
@@ -3219,8 +3206,7 @@ struct TgFn {
         return al && !al->capexpr && al->exprtype && al->exprtype->kind == TY_ARRAY &&
                al->exprtype->arr->akind == A_FIXED && M.TypeOk(al->exprtype);
     }
-    // The value a literal being built in place starts at, which `self` in
-    // its fields refers to (§3.9), or 0.
+    // The start of the literal being built in place, which `self` in its fields is (§3.9), or 0.
     tyg_val selfbase = 0;
     // Such a literal built at pl: zero bytes, then its fields where they lie.
     void SelfRelInto(const P &pl, Node *lit) {
@@ -3234,7 +3220,8 @@ struct TgFn {
                 if (!Ended()) FillStore(leaves, tyg_addr_of(p, pl.a), cg.ArrSize(t->arr), al);
                 return;
             }
-            for (size_t i = 0; i < al->elems.size() && !Ended(); i++) Into(P { AddrOff(pl.a, (int64_t)i * esz), et }, al->elems[i]);
+            for (size_t i = 0; i < al->elems.size() && !Ended(); i++)
+                Into(P { AddrOff(pl.a, (int64_t)i * esz), et }, al->elems[i]);
             return;
         }
         auto sl = Is<StructLit>(lit);
@@ -3251,16 +3238,15 @@ struct TgFn {
             if (init) Into(P { AddrOff(pl.a, sh.offs[i]), (*sh.ftypes)[i] }, init);
         }
     }
-    // A fill [v; k] of a value linking to itself (CodeGen::FreezeFill): the
-    // leaves of v evaluated once, in order; then each slot built in place,
-    // its links measured from it (FillStore).
+    // A fill [v; k] of a value linking to itself (CodeGen::FreezeFill): v's leaves evaluated once,
+    // then each slot built in place (FillStore).
     struct FillLeaf {
         TypeExpr *ft;
         int64_t off;
         bool self;
         tyg_local tmp;
-        shared_ptr<vector<FillLeaf>> sub;   // An inner fill: its leaves,
-        ArrayLit *inner = nullptr;          // repeated for the inner literal.
+        vector<FillLeaf> sub;   // An inner fill's leaves, repeated for the inner literal.
+        ArrayLit *inner = nullptr;
     };
     vector<FillLeaf> FillCapture(ArrayLit *al) {
         vector<FillLeaf> leaves;
@@ -3272,7 +3258,7 @@ struct TgFn {
             }
             if (auto il = Is<ArrayLit>(init); il && il->fillval && SelfRelLit(init) && Is<IntLit>(il->fillcount)) {
                 FillLeaf lf { ft, off, false, 0 };
-                lf.sub = make_shared<vector<FillLeaf>>(FillCapture(il));
+                lf.sub = FillCapture(il);
                 lf.inner = il;
                 leaves.push_back(lf);
                 return;
@@ -3302,9 +3288,8 @@ struct TgFn {
     }
     // The elements a literal has: its elements', or its fill's count.
     int64_t LitCount(ArrayLit *al) { return al->fillval ? Is<IntLit>(al->fillcount)->val : (int64_t)al->elems.size(); }
-    // A literal's run of k elements built where it stays, at the address in
-    // base: zeroed, then each element in place (its fill's leaves, if any,
-    // captured already).
+    // k elements of a literal built where they stay, at the address in base: zeroed, then in place
+    // (a fill's leaves captured already).
     void LitRunAt(ArrayLit *al, TypeExpr *et, tyg_local base, int64_t k, const vector<FillLeaf> &leaves) {
         auto esz = cg.FixedSize(et);
         auto at = [&](int64_t off) { return AtV(LdL(base), off); };
@@ -3320,14 +3305,15 @@ struct TgFn {
             auto slot = Add(base, Mul(i, I64(esz)));
             for (auto &lf : leaves) {
                 if (lf.inner) {
-                    FillStore(*lf.sub, Add(slot, I64(lf.off)), cg.ArrSize(lf.inner->exprtype->arr), lf.inner);
+                    FillStore(lf.sub, Add(slot, I64(lf.off)), cg.ArrSize(lf.inner->exprtype->arr), lf.inner);
                     continue;
                 }
-                auto ld = [&] { return tyg_load(p, TgModule::IsRel(lf.ft) ? TYG_I64 : M.Scal(lf.ft), AtL(lf.tmp), 0); };
+                auto ld = [&] {
+                    return tyg_load(p, TgModule::IsRel(lf.ft) ? TYG_I64 : M.Scal(lf.ft), AtL(lf.tmp), 0);
+                };
                 Store(P { AtV(slot, lf.off), lf.ft },
                       lf.self ? ValV(lf.ft, slot)
-                      : M.IsScalar(lf.ft) || TgModule::IsRel(lf.ft) ? ValV(lf.ft, ld())
-                                                                      : MemV(lf.ft, AtL(lf.tmp)));
+                      : M.IsScalar(lf.ft) || TgModule::IsRel(lf.ft) ? ValV(lf.ft, ld()) : MemV(lf.ft, AtL(lf.tmp)));
             }
         });
     }
@@ -3341,8 +3327,7 @@ struct TgFn {
             al && !al->fillval && !al->capexpr && pl.t->kind == TY_ARRAY && cg.HasRelRef(pl.t) &&
             cg.TEq(n->exprtype, pl.t) && M.TypeOk(pl.t) && cg.ArrSize(pl.t->arr) > 0 &&
             (pl.t->arr->akind == A_FIXED || cg.IsStaticLimited(pl.t))) {
-            // An array of links built where it lies, so each offset measures
-            // from its own slot (CodeGen::GenArrayLit's in-place path).
+            // Links built where they lie, so each offset measures from its slot (CodeGen::GenArrayLit).
             auto lim = pl.t->arr->akind != A_FIXED;
             auto et = pl.t->arr->sub;
             auto esz = cg.FixedSize(et);
@@ -3363,8 +3348,7 @@ struct TgFn {
 
     V Gen(Node *n) {
         auto x = Gen1(n);
-        // After a return or break the rest is unreachable, but the code using
-        // this value is still built: it needs a value, not none.
+        // After a return or break the code using this value is still built: it needs a value.
         if (Ended() && !x.v && !x.mem && n->exprtype && M.IsScalar(n->exprtype)) return Dummy(n->exprtype);
         if (Ended() || !x.t || !n->exprtype || n->exprtype->kind == TY_VOID) return x;
         return Fit(x, n->exprtype, n->line);
@@ -3374,16 +3358,14 @@ struct TgFn {
         if (t && t->kind == TY_REF && Is<NullLit>(n)) return Null(t, n->line);
         if (t && t->kind == TY_REF && cg.IsFatRef(t) && n->exprtype &&
             (IsGrow(n->exprtype) || M.FoOk(n->exprtype) || M.RsOk(n->exprtype) || M.IsRb(n->exprtype))) {
-            // A resizable where a reference to one is wanted: gs_rref, its
-            // header's address and its stack.
+            // A resizable where a reference to one is wanted: gs_rref, header address and stack.
             auto pl = Deref(Place(n));
             if (Ended()) return Dummy(t);
             if (!pl.stk || pl.tmphdr) No(n->line, "reference to an array of this kind");
             return PairV(t, tyg_addr_of(p, pl.a), pl.stk);
         }
         if (t && IsAddrRef(t) && n->exprtype && IsImg(n->exprtype) && M.ImgOk(t->ref->sub)) {
-            // A T[] (or a variable-size struct) where a reference to one is
-            // wanted, plain or optional: its image's address.
+            // A T[] (or variable-size struct) where a reference is wanted: its image's address.
             auto pl = Deref(Place(n));
             return ValV(t, Ended() ? I64(0) : tyg_addr_of(p, pl.a));
         }
@@ -3485,15 +3467,11 @@ struct TgFn {
         auto ot = cg.OperandT(u->child->exprtype);
         if (u->op == T_MINUS && (ot->kind == TY_STRUCT || ot->kind == TY_ARRAY)) {
             // Elementwise (CodeGen::GenElemwiseNegInto).
-            auto x = GenAs(u->child, ot);
+            auto o = ElemOperand(u->child, ot);
             if (Ended()) return Dummy(ot);
-            if (!x.mem || !M.TypeOk(ot)) No(u->line, "unary operand type");
-            auto src = Temp(ot);
-            tyg_copy(p, AtL(src), x.a, M.Size(ot));
             auto r = MemTemp(ot, false);
             ElemLeaves(ot, 0, u->line, [&](TypeExpr *tt, int64_t off, const ElemDyn &dy) {
-                auto v = tyg_load(p, M.Scal(tt), ElemAt(AtL(src), off, dy), 0);
-                tyg_store(p, M.Scal(tt), ElemAt(r.a, off, dy), ScalarNeg(tt, v, u->line), 0);
+                tyg_store(p, M.Scal(tt), ElemAt(r.a, off, dy), ScalarNeg(tt, ElemLeaf(o, tt, off, dy, u->line), u->line), 0);
             });
             return r;
         }
@@ -3520,24 +3498,18 @@ struct TgFn {
     tyg_val FileArg(Line l) { return tyg_addr_of(p, tyg_at_sym(M.FileName(l.fileidx), 0)); }
     tyg_val LineArg(Line l) { return tyg_iconst(p, TYG_I32, l.line); }
 
-    // Calls a C function by name with scalar arguments (types for the
-    // signature), a C shim or a runtime function.
+    // Calls a C shim or runtime function by name with scalar arguments (types for the signature).
     tyg_val CallC(const string &name, const vector<const tyg_type *> &pts,
                   const vector<tyg_val> &args, const tyg_type *ret) {
         auto sig = tyg_sig_new(m, ret, pts.data(), (int)pts.size(), 0);
-        vector<tyg_arg> as;
-        for (auto a : args) {
-            tyg_arg x {};
-            x.val = a;
-            as.push_back(x);
-        }
+        vector<tyg_arg> as(args.size());
+        for (size_t i = 0; i < args.size(); i++) as[i].val = args[i];
         return tyg_call(p, sig, tyg_direct(M.Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL)), as.data(),
                         (int)as.size(), nullptr, nullptr);
     }
     const tyg_type *IT(tyg_scalar s, bool sgn = true) { return tyg_type_int(m, s, sgn); }
 
-    // The runtime.h helper gs_<op>_<sfx> for t (checked arithmetic,
-    // division), through a shim of the same signature.
+    // The runtime.h helper gs_<op>_<sfx> for t (checked arithmetic, division), through a shim.
     tyg_val CheckedShim(const string &op, TypeExpr *t, vector<tyg_val> args, Line l) {
         auto name = cat("gs_tg_", op, "_", CodeGen::IntSfx(t->intstorage));
         M.NeedShim(name);
@@ -3552,7 +3524,6 @@ struct TgFn {
 
     V GenBinary(Binary *b) {
         auto op = b->op;
-        V x;
         if (op == T_ANDAND || op == T_OROR) {
             auto t = tyg_local_new(p, 1, 1);
             auto lb = Cmp(TYG_NE, Truth(b->left), I8(0));
@@ -3598,32 +3569,20 @@ struct TgFn {
         auto l = GenAs(b->left, lt);
         auto r = GenAs(b->right, lt);
         if (Ended()) return Dummy(lt);
-        x.t = lt;
-        auto cmp = [&](tyg_cond si, tyg_cond un, tyg_cond fl) {
-            x.t = M.ast.booltype;
-            x.v = Cmp(isflt ? fl : sgn ? si : un, l.v, r.v);
-            return x;
-        };
-        switch (op) {
-            case T_LT: return cmp(TYG_SLT, TYG_ULT, TYG_FLT);
-            case T_GT: return cmp(TYG_SGT, TYG_UGT, TYG_FGT);
-            case T_LTEQ: return cmp(TYG_SLE, TYG_ULE, TYG_FLE);
-            case T_GTEQ: return cmp(TYG_SGE, TYG_UGE, TYG_FGE);
-            case T_EQ: return cmp(TYG_EQ, TYG_EQ, TYG_FEQ);
-            case T_NEQ: return cmp(TYG_NE, TYG_NE, TYG_FNE);
-            default: break;
-        }
+        static const struct { TType op; tyg_cond sgn, uns, flt; } cmps[] = {
+            { T_LT, TYG_SLT, TYG_ULT, TYG_FLT }, { T_GT, TYG_SGT, TYG_UGT, TYG_FGT },
+            { T_LTEQ, TYG_SLE, TYG_ULE, TYG_FLE }, { T_GTEQ, TYG_SGE, TYG_UGE, TYG_FGE },
+            { T_EQ, TYG_EQ, TYG_EQ, TYG_FEQ }, { T_NEQ, TYG_NE, TYG_NE, TYG_FNE } };
+        for (auto &c : cmps)
+            if (op == c.op) return ValV(M.ast.booltype, Cmp(isflt ? c.flt : sgn ? c.sgn : c.uns, l.v, r.v));
         if (isflt) {
             if (!arith) No(b->line, "float operator");
-            x.v = ScalarArith(op, lt, l.v, r.v, b->line);
-        } else if (lt->kind == TY_INT) {
-            x.v = IntOp(op, lt, l.v, r.v, b->line);
-        } else if (lt->kind == TY_BOOL && (op == T_BITAND || op == T_BITOR || op == T_XOR)) {
-            x.v = tyg_bin(p, op == T_BITAND ? TYG_AND : op == T_BITOR ? TYG_OR : TYG_XOR, l.v, r.v);
-        } else {
-            No(b->line, "operator on this type");
+            return ValV(lt, ScalarArith(op, lt, l.v, r.v, b->line));
         }
-        return x;
+        if (lt->kind == TY_INT) return ValV(lt, IntOp(op, lt, l.v, r.v, b->line));
+        if (lt->kind == TY_BOOL && (op == T_BITAND || op == T_BITOR || op == T_XOR))
+            return ValV(lt, tyg_bin(p, op == T_BITAND ? TYG_AND : op == T_BITOR ? TYG_OR : TYG_XOR, l.v, r.v));
+        No(b->line, "operator on this type");
     }
 
     // A bool from a body that jumps to `fail` on the first difference; != negates it.
@@ -3641,10 +3600,9 @@ struct TgFn {
     }
     V EqResult(Binary *b, tyg_val v) { return ValV(M.ast.booltype, b->op == T_NEQ ? Cmp(TYG_EQ, v, I8(0)) : v); }
 
-    // Structural equality (§4.5; CodeGen::EqX): on the first difference
-    // a jump to fail, else on past. Fixed values field by field, element
-    // by element, an ADT's tag then its variant's payload; floats as
-    // floats; a bytes value of exact encodings by its bytes.
+    // Structural equality (§4.5; CodeGen::EqX): a jump to fail on the first difference, else on
+    // past. Fixed values field by field, an ADT's tag then its payload; floats as floats; a bytes
+    // value of exact encodings by its bytes.
     void EqJump(const P &a, const P &b, tyg_block fail, Line l) {
         auto t = a.t;
         auto cmpw = [&](int64_t off, tyg_scalar s, tyg_cond c) {
@@ -3673,7 +3631,8 @@ struct TgFn {
         }
         if (!M.TypeOk(t)) No(l, cat("comparison of type ", M.NameWhy(t)));
         if (t->kind == TY_STRUCT || t->kind == TY_VARIANT) {
-            for (auto &f : M.Fields(t)) EqJump(P { AddrOff(a.a, f.off), f.t }, P { AddrOff(b.a, f.off), f.t }, fail, l);
+            for (auto &f : M.Fields(t))
+                EqJump(P { AddrOff(a.a, f.off), f.t }, P { AddrOff(b.a, f.off), f.t }, fail, l);
             return;
         }
         if (t->kind == TY_ENUM) {
@@ -3687,25 +3646,17 @@ struct TgFn {
             return;
         }
         if (t->kind == TY_ARRAY) {
-            View va, vb;
-            if (TgModule::IsLim(t)) {
-                va = LimView(a);
-                vb = LimView(b);
-                EqNext(Cmp(TYG_EQ, va.len, vb.len), fail);
-            } else {
-                va = ViewOf(a, l);
-                vb = ViewOf(b, l);
-            }
+            auto lim = TgModule::IsLim(t);
+            auto va = lim ? LimView(a) : ViewOf(a, l), vb = lim ? LimView(b) : ViewOf(b, l);
+            if (lim) EqNext(Cmp(TYG_EQ, va.len, vb.len), fail);
             EqElems(va, vb, fail, l);
             return;
         }
         No(l, cat("comparison of type ", M.NameWhy(t)));
     }
-    // The bytes value at each cursor compared with the other's, both
-    // cursors left behind it (CodeGen::EmitEqWalk): fixed parts by value,
-    // a varint by its canonical bytes, an array by its length and then
-    // its elements, a struct by its fields in order, an ADT by its tag and
-    // then its variant's payload.
+    // The bytes value at each cursor compared, both cursors left behind it (CodeGen::EmitEqWalk):
+    // fixed parts by value, a varint by its bytes, an array by length then elements, a struct by
+    // its fields, an ADT by tag then payload.
     void EqWalk(TypeExpr *t, tyg_local ca, tyg_local cb, tyg_block fail, Line l) {
         auto A = [&] { return LdL(ca); };
         auto B = [&] { return LdL(cb); };
@@ -3748,7 +3699,8 @@ struct TgFn {
                         } else {
                             auto sc = w == 1 ? TYG_I8 : w == 2 ? TYG_I16 : w == 4 ? TYG_I32 : TYG_I64;
                             auto n = tyg_load(p, sc, AtV(at()), 0);
-                            StL(len, sc == TYG_I64 ? n : tyg_convert(p, TgModule::SignedLen(t) ? TYG_SEXT : TYG_ZEXT, TYG_I64, n));
+                            auto ext = TgModule::SignedLen(t) ? TYG_SEXT : TYG_ZEXT;
+                            StL(len, sc == TYG_I64 ? n : tyg_convert(p, ext, TYG_I64, n));
                             StL(c, Add(at(), I64(w)));
                         }
                     } else if (rc) {
@@ -3818,12 +3770,10 @@ struct TgFn {
         return EqViaFail(b, [&](tyg_block fail) { EqJump(pa, P { pb.a, pa.t, pb.stk }, fail, b->line); });
     }
 
-    // Elementwise arithmetic on structs and fixed arrays (§6.1;
-    // CodeGen::GenElemwiseInto): each numeric leaf of the result from the
-    // same leaf of each operand, or from a scalar operand itself.
-    // A leaf's place in the value its operand lies in: the constant offset
-    // from the leaf's callback, and for an element of an array too big to
-    // unroll, the bytes to it from the array's start, kept in a local.
+    // Elementwise arithmetic on structs and fixed arrays (§6.1; CodeGen::GenElemwiseInto): each
+    // numeric leaf of the result from the same leaf of each operand, or from a scalar operand.
+    // A leaf's place: the constant offset from the callback, plus for an element of an array too
+    // big to unroll the bytes from the array's start, kept in a local.
     struct ElemDyn {
         bool on;
         tyg_local loc;
@@ -3831,13 +3781,10 @@ struct TgFn {
     tyg_addr ElemAt(tyg_addr a, int64_t off, const ElemDyn &dy) {
         return dy.on ? AtV(Add(tyg_addr_of(p, a), LdL(dy.loc)), off) : AddrOff(a, off);
     }
-    // F(leaf type, offset, ElemDyn) for each scalar leaf, in order: the
-    // elements of an array of up to 256 unrolled, those of a bigger one
-    // (CodeGen's loop over it) in a counted loop.
-    template <class F> void ElemLeaves(TypeExpr *t, int64_t off, Line l, F leaf) {
-        ElemLeaves(t, off, l, leaf, ElemDyn { false, 0 });
-    }
-    template <class F> void ElemLeaves(TypeExpr *t, int64_t off, Line l, F leaf, ElemDyn dy) {
+    // F(leaf type, offset, ElemDyn) for each scalar leaf: an array's elements unrolled up to 256,
+    // beyond that in a counted loop (as CodeGen).
+    template <class F>
+    void ElemLeaves(TypeExpr *t, int64_t off, Line l, F leaf, ElemDyn dy = ElemDyn { false, 0 }) {
         switch (t->kind) {
             case TY_INT: case TY_FLT:
                 if (t->kind == TY_INT && t->intstorage == IS_VARINT) No(l, "elementwise varint");
@@ -3948,9 +3895,8 @@ struct TgFn {
         return EqResult(b, tyg_load(p, TYG_I8, AtL(res), 0));
     }
 
-    // An integer operation at t's width: unsigned and release-build signed
-    // arithmetic wraps, a debug build's signed arithmetic checks (runtime.h),
-    // and division and modulo check in every build (§6.2).
+    // An integer operation at t's width: unsigned and release-build signed arithmetic wraps, a
+    // debug build's signed arithmetic checks (runtime.h), division and modulo check always (§6.2).
     tyg_val IntOp(TType op, TypeExpr *t, tyg_val l, tyg_val r, Line ln) {
         switch (op) {
             case T_PLUS: case T_MINUS: case T_MUL:
@@ -3972,67 +3918,57 @@ struct TgFn {
         auto x = GenAs(c->child, cg.OperandT(st));
         st = x.t;
         if (!M.IsScalar(st) || !M.IsScalar(tt) || st->kind == TY_REF || tt->kind == TY_REF) No(c->line, "cast types");
-        V y;
-        y.t = tt;
         if (tt->kind == TY_FLT) {
             if (st->kind == TY_BOOL) No(c->line, "bool cast");
-            y.v = Conv(x.v, st, tt, c->line);
-            return y;
+            return ValV(tt, Conv(x.v, st, tt, c->line));
         }
         if (tt->kind != TY_INT || tt->intstorage == IS_VARINT) No(c->line, "cast target");
+        if (st->kind == TY_BOOL) No(c->line, "bool cast");
         auto is = tt->intstorage;
         auto i64t = M.ast.inttypes[IS_I64];
         auto rng = IntRange(is);
         auto lo = rng.first, hi = rng.second;
-        auto ptr = tyg_type_ptr(m), i32 = IT(TYG_I32);
-        // The abort message's file and line follow the arguments.
-        auto args = [&](vector<tyg_val> v) {
-            v.push_back(FileArg(c->line));
-            v.push_back(LineArg(c->line));
-            return v;
+        auto ptr = tyg_type_ptr(m), i32 = IT(TYG_I32), f64 = tyg_type_scalar(m, TYG_F64);
+        // A runtime shim taking the abort message's file and line after the arguments.
+        auto shim = [&](const char *name, vector<const tyg_type *> pts, vector<tyg_val> as, bool sgn) {
+            M.NeedShim(name);
+            pts.push_back(ptr);
+            pts.push_back(i32);
+            as.push_back(FileArg(c->line));
+            as.push_back(LineArg(c->line));
+            return CallC(name, pts, as, IT(TYG_I64, sgn));
         };
+        tyg_val r;
         if (st->kind == TY_FLT) {
             auto d = M.Scal(st) == TYG_F32 ? tyg_convert(p, TYG_FEXT, TYG_F64, x.v) : x.v;
-            auto f64 = tyg_type_scalar(m, TYG_F64);
             auto isf32 = tyg_iconst(p, TYG_I32, M.Scal(st) == TYG_F32);
-            tyg_val r;
             if (c->unchecked) {
                 M.NeedShim("gs_tg_f2iwrap");
                 r = CallC("gs_tg_f2iwrap", { f64 }, { d }, IT(TYG_I64));
             } else if (is == IS_U64) {
-                M.NeedShim("gs_tg_f2u");
-                r = CallC("gs_tg_f2u", { f64, i32, ptr, i32 }, args({ d, isf32 }), IT(TYG_I64, false));
+                r = shim("gs_tg_f2u", { f64, i32 }, { d, isf32 }, false);
             } else {
-                M.NeedShim("gs_tg_f2i");
-                r = CallC("gs_tg_f2i", { f64, i32, IT(TYG_I64), IT(TYG_I64), ptr, ptr, i32 },
-                          args({ d, isf32, I64(lo), I64(hi), TypeNameArg(is) }), IT(TYG_I64));
+                r = shim("gs_tg_f2i", { f64, i32, IT(TYG_I64), IT(TYG_I64), ptr },
+                         { d, isf32, I64(lo), I64(hi), TypeNameArg(is) }, true);
             }
-            y.v = Conv(r, i64t, tt, c->line);
-            return y;
+            return ValV(tt, Conv(r, i64t, tt, c->line));
         }
-        if (st->kind == TY_BOOL) No(c->line, "bool cast");
         auto fits = [&] {
             auto sr = IntRange(st->intstorage);
             return st->intstorage != IS_U64 && sr.first >= lo && sr.second <= hi;
         };
-        if (c->unchecked || cg.TEq(st, tt) || fits() || (st->intstorage == IS_U64 && is == IS_U64)) {
-            y.v = Conv(x.v, st, tt, c->line);
-            return y;
-        }
+        if (c->unchecked || cg.TEq(st, tt) || fits() || (st->intstorage == IS_U64 && is == IS_U64))
+            return ValV(tt, Conv(x.v, st, tt, c->line));
         // The checked narrowings of GS_RANGE and GS_RANGE_U: identities in a release build.
-        tyg_val r;
         if (st->intstorage == IS_U64) {
-            M.NeedShim("gs_tg_range_u");
-            r = CallC("gs_tg_range_u", { IT(TYG_I64, false), IT(TYG_I64, false), ptr, ptr, i32 },
-                      args({ x.v, I64(hi), TypeNameArg(is) }), IT(TYG_I64, false));
-            y.v = Conv(r, M.ast.inttypes[IS_U64], tt, c->line);
-            return y;
+            auto u64 = IT(TYG_I64, false);
+            r = shim("gs_tg_range_u", { u64, u64, ptr }, { x.v, I64(hi), TypeNameArg(is) }, false);
+            return ValV(tt, Conv(r, M.ast.inttypes[IS_U64], tt, c->line));
         }
-        M.NeedShim("gs_tg_range");
-        r = CallC("gs_tg_range", { IT(TYG_I64), IT(TYG_I64), IT(TYG_I64), ptr, ptr, i32 },
-                  args({ Conv(x.v, st, i64t, c->line), I64(lo), I64(hi), TypeNameArg(is) }), IT(TYG_I64));
-        y.v = Conv(r, i64t, tt, c->line);
-        return y;
+        auto i64 = IT(TYG_I64);
+        r = shim("gs_tg_range", { i64, i64, i64, ptr },
+                 { Conv(x.v, st, i64t, c->line), I64(lo), I64(hi), TypeNameArg(is) }, true);
+        return ValV(tt, Conv(r, i64t, tt, c->line));
     }
     tyg_val TypeNameArg(IntStorage is) {
         return tyg_addr_of(p, tyg_at_sym(M.Bytes(cat(IntStorageName(is), string(1, '\0'))), 0));
