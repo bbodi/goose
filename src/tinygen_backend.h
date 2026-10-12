@@ -203,14 +203,11 @@ struct TgModule {
         // The C library's math functions are plain symbols (never macros, unlike isnan), so no trampoline.
         static const set<string> libm = [] {
             set<string> r;
-            for (auto f : { "acos", "asin", "atan", "atan2", "cbrt", "ceil", "copysign", "cos", "cosh",
-                            "erf", "exp", "exp2", "expm1", "fabs", "fdim", "floor", "fma", "fmax",
-                            "fmin", "fmod", "hypot", "lgamma", "log", "log10", "log1p", "log2",
-                            "nearbyint", "pow", "remainder", "rint", "round", "sin", "sinh", "sqrt",
-                            "tan", "tanh", "tgamma", "trunc" }) {
-                r.insert(f);
-                r.insert(cat(f, "f"));
-            }
+            string names = "acos asin atan atan2 cbrt ceil copysign cos cosh erf exp exp2 expm1 fabs fdim floor "
+                           "fma fmax fmin fmod hypot lgamma log log10 log1p log2 nearbyint pow remainder rint "
+                           "round sin sinh sqrt tan tanh tgamma trunc ";
+            for (size_t b = 0, e; (e = names.find(' ', b)) != string::npos; b = e + 1)
+                r.insert(names.substr(b, e - b)), r.insert(names.substr(b, e - b) + "f");
             return r;
         }();
         if (libm.count(name)) return rtapi[name] = true;
