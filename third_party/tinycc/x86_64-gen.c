@@ -1071,11 +1071,33 @@ static X86_64_Mode classify_x86_64_merge(X86_64_Mode a, X86_64_Mode b)
         return x86_64_mode_sse;
 }
 
+/* Goose local change: a field off its natural alignment (in a packed struct)
+   makes the whole value MEMORY, as the psABI and clang say. `off` is the
+   field's offset in the value being passed. */
+static int classify_x86_64_misaligned(CType *ty, int off)
+{
+    Sym *f;
+    int align;
+
+    if ((ty->t & VT_BTYPE) != VT_STRUCT)
+        return 0;
+    for (f = ty->ref->next; f; f = f->next) {
+        if (f->type.t & VT_BITFIELD)
+            continue;
+        type_size(&f->type, &align);
+        if (align > 1 && (off + f->c) % align)
+            return 1;
+        if (classify_x86_64_misaligned(&f->type, off + f->c))
+            return 1;
+    }
+    return 0;
+}
+
 static X86_64_Mode classify_x86_64_inner(CType *ty)
 {
     X86_64_Mode mode;
     Sym *f;
-    
+
     switch (ty->t & VT_BTYPE) {
     case VT_VOID: return x86_64_mode_none;
     
@@ -1123,7 +1145,7 @@ static X86_64_Mode classify_x86_64_arg(CType *ty, CType *ret, int *psize, int *p
         *palign = (align + 7) & ~7;
         *reg_count = 0; /* avoid compiler warning */
 
-        if (size > 16) {
+        if (size > 16 || classify_x86_64_misaligned(ty, 0)) {
             mode = x86_64_mode_memory;
         } else {
             mode = classify_x86_64_inner(ty);
