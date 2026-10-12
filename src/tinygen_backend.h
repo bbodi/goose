@@ -1554,7 +1554,7 @@ struct TgFn {
         TypeExpr *t;
         tyg_val stk = 0;
         bool enc = false;   // A varint in a bytes value: zigzag ULEB128 (ZigRead).
-        // The tail of a resizable struct (RsFieldPlace): its elements start here, not where the header's base
+        // The tail of a resizable struct (FieldPlace): its elements start here, not where the header's base
         // says, and the header is the owner's, whose count it is.
         tyg_val rbase = 0;
         // A frame object that is the tail of a resizable struct (C.2): bytes as the other fields are, its fixed
@@ -1945,30 +1945,6 @@ struct TgFn {
         if (sz) tyg_copy(p, AtV(at), x.a, sz);
         SetTop(stk, Add(at, I64(sz)));
     }
-    // A field of a resizable struct: a fixed one where it lies; the tail, a resizable ADT, through
-    // a header made for it (its base, the struct's count) that reads see as the struct's own (tmphdr).
-    P RbStFieldPlace(const P &base, int fi) {
-        auto si = cg.SI(base.t);
-        auto sh = M.RbStShape(base.t);
-        auto at = Add(Ld(base.a), I64(sh.offs[(size_t)fi]));
-        auto ft = si->ftypes[(size_t)fi];
-        if (fi != sh.tailfi) return P { AtV(at), ft };
-        auto th = tyg_local_new(p, 16, 8);
-        StL(th, at);
-        StL(th, Ld(CountAt(base.a)), 8);
-        P r { AtL(th), ft, base.stk };
-        r.tmphdr = true;
-        r.ohdr = base.tmphdr ? base.ohdr : base.a;   // The struct's own header, whose count it is.
-        return r;
-    }
-    P RbFieldPlace(const P &base, int fi, Line l) {
-        auto ei = cg.EIVar(base.t);
-        auto vi = M.VariantIdx(base.t);
-        auto sh = M.RbShapeOf(ei, vi);
-        if (fi == sh.tailfi) No(l, "tail of a resizable variant");
-        return P { AtV(Ld(base.a), sh.offs[(size_t)fi]), ei->vftypes[(size_t)vi][(size_t)fi] };
-    }
-
     // The place whose elements an array is built from. The checker types a popped or default fixed
     // array, to_bytes, from_bytes as the T[] they adapt to, but their own array lies there (CodeGen::EmitPop).
     static bool IsStrCall(Node *n) { auto c = Is<Call>(n); return c && c->builtin == B_STR; }
@@ -2367,22 +2343,7 @@ struct TgFn {
         }
         if (auto d = Is<Dot>(n); d && d->IsField()) {
             auto base = Deref(Place(d->obj));
-            if (M.VsOk(base.t)) return VsFieldPlace(base, d->fieldidx);
-            if (M.FoOk(base.t)) return FoFieldPlace(base, d->fieldidx, n->line);
-            if (M.RsOk(base.t)) return RsFieldPlace(base, d->fieldidx, n->line);
-            if (M.IsRb(base.t) && base.t->kind == TY_VARIANT) return RbFieldPlace(base, d->fieldidx, n->line);
-            if (M.IsRb(base.t) && base.t->kind == TY_STRUCT && M.RbOk(base.t)) return RbStFieldPlace(base, d->fieldidx);
-            if (M.VvOk(base.t)) {
-                auto ei = cg.EIVar(base.t);
-                auto ft = ei->vftypes[(size_t)ei->en->VariantIndex(base.t->var->variant)][(size_t)d->fieldidx];
-                P r { AtV(VvField(base.t, tyg_addr_of(p, base.a), d->fieldidx)), ft };
-                r.enc = TgModule::IsVarint(ft);
-                return r;
-            }
-            if (base.t->kind == TY_VARIANT && M.TypeOk(base.t)) return VariantField(base, d->fieldidx);
-            if (base.t->kind != TY_STRUCT || !M.TypeOk(base.t)) No(n->line, "field of this type");
-            auto si = cg.SI(base.t);
-            return P { AddrPlus(base.a, cg.StructLayout(si).offs[d->fieldidx]), si->ftypes[d->fieldidx] };
+            return FieldPlace(base, d->fieldidx, n->line);
         }
         if (auto ix = Is<Index>(n)) return IndexPlace(ix);
         if (auto se = Is<SliceExpr>(n)) {
@@ -4561,17 +4522,16 @@ struct TgFn {
         Counted(stk, len, n);
     }
 
-    // `Name { a, b }`: field i of fs (pads skipped) rendered from place(i).
-    template <class Fields, class Place>
-    void RenderFields(tyg_val stk, tyg_addr len, string_view name, const Fields &fs, Place place, Line l,
-                      int depth) {
+    // `Name { a, b }`: the fields of pl's struct or variant, each where FieldPlace finds it.
+    void RenderRun(tyg_val stk, tyg_addr len, string_view name, const P &pl, Line l, int depth) {
+        auto &fs = M.RunOfType(pl.t);
         TextLit(stk, len, cat(name, " { "));
         auto first = true;
-        for (size_t i = 0; i < fs.size(); i++) {
-            if (fs[i].ispad) continue;
+        for (size_t i = 0; i < fs.f.size(); i++) {
+            if (fs.f[i].ispad) continue;
             if (!first) TextLit(stk, len, ", ");
             first = false;
-            RenderInto(stk, len, place(i), true, l, depth + 1);
+            RenderInto(stk, len, FieldPlace(pl, (int)i, l, true), true, l, depth + 1);
         }
         TextLit(stk, len, " }");
     }
@@ -4647,21 +4607,10 @@ struct TgFn {
             case TY_FLT: case TY_BOOL:
                 FmtScalar(stk, len, t, Load(pl, l).v);
                 return;
-            case TY_STRUCT: {
-                if (M.VsOk(t)) {
-                    VsRender(stk, len, pl, l, depth);
-                    return;
-                }
-                auto rs = M.RsOk(t), fo = !rs && M.FoOk(t);
-                if (!rs && !fo && !M.TypeOk(t)) break;
-                auto si = cg.SI(t);
-                RenderFields(stk, len, TextName(t), si->st->fields, [&](size_t i) -> P {
-                    if (rs) return RsFieldPlace(pl, (int)i, l, true);
-                    if (fo) return FoFieldPlace(pl, (int)i, l, true);
-                    return P { AddrPlus(pl.a, cg.StructLayout(si).offs[i]), si->ftypes[i] };
-                }, l, depth);
+            case TY_STRUCT:
+                if (!M.VsOk(t) && !M.RsOk(t) && !M.FoOk(t) && !M.TypeOk(t)) break;
+                RenderRun(stk, len, TextName(t), pl, l, depth);
                 return;
-            }
             case TY_ARRAY: case TY_SLICE: {
                 auto v = ViewOf(pl, l);
                 if (IsU8(v.elem)) {
@@ -4692,41 +4641,17 @@ struct TgFn {
     // once, as its literal; each field where the walk finds it (CodeGen::RenderLoc).
     void RenderRb(tyg_val stk, tyg_addr len, const P &pl, Line l, int depth) {
         auto t = pl.t;
-        if (t->kind == TY_STRUCT) {
-            RenderFields(stk, len, TextName(t), cg.SI(t)->st->fields,
-                         [&](size_t i) { return RbStFieldPlace(pl, (int)i); }, l, depth);
-            return;
-        }
-        auto ei = M.EI(t);
-        auto variant = [&](int vi, int64_t pay) {
-            auto &v = ei->en->variants[(size_t)vi];
-            if (v.fields.empty()) {
-                TextLit(stk, len, cat(ei->en->name, ".", v.name));
-                return;
-            }
-            auto sh = M.RbShapeOf(ei, vi);
-            if (sh.img) {   // A variable-size variant: where it lies, its fields walked.
-                RenderVariant(stk, len, P { AtV(Add(Ld(pl.a), I64(pay))),
-                                            t->kind == TY_VARIANT ? t : cg.VariantType(t, vi) }, l, depth);
-                return;
-            }
-            RenderFields(stk, len, v.name, v.fields, [&](size_t i) {
-                auto ft = ei->vftypes[(size_t)vi][i];
-                auto at = Add(Ld(pl.a), I64(pay + sh.offs[i]));
-                if ((int)i != sh.tailfi) return P { AtV(at), ft };
-                if (!sh.fo) return P { AtL(PairLocal(at, Ld(AddrPlus(pl.a, 8)))), ft };
-                P fp { AtV(at), ft };
-                fp.bfo = true;
-                fp.ohdr = pl.a;
-                return fp;
-            }, l, depth);
-        };
-        if (t->kind == TY_VARIANT) {
-            variant(M.VariantIdx(t), 0);
+        if (t->kind != TY_ENUM) {
+            if (t->kind == TY_STRUCT) RenderRun(stk, len, TextName(t), pl, l, depth);
+            else RenderVariant(stk, len, pl, l, depth);
             return;
         }
         auto tag = Local(LoadTag(AtV(Ld(pl.a)), t));
-        TagSwitch(tag, ei->en->variants.size(), [&](size_t vi) { variant((int)vi, M.TagSize(t)); });
+        TagSwitch(tag, M.EI(t)->en->variants.size(), [&](size_t vi) {   // The variant's payload behind the tag.
+            P vp { AtL(PairLocal(Add(Ld(pl.a), I64(M.TagSize(t))), Ld(AddrPlus(pl.a, 8)))), cg.VariantType(t, (int)vi) };
+            vp.tmphdr = true;
+            RenderVariant(stk, len, vp, l, depth);
+        });
     }
 
     // A variant's positional literal (CodeGen::RenderVariant): `E.V` for one without fields, else
@@ -4734,21 +4659,13 @@ struct TgFn {
     void RenderVariant(tyg_val stk, tyg_addr len, const P &pl, Line l, int depth) {
         auto t = pl.t;
         auto ei = cg.EIVar(t);
-        auto vi = (size_t)ei->en->VariantIndex(t->var->variant);
-        auto &v = ei->en->variants[vi];
+        auto &v = ei->en->variants[(size_t)M.VariantIdx(t)];
         if (v.fields.empty()) {
             TextLit(stk, len, cat(ei->en->name, ".", v.name));
             return;
         }
-        auto fixed = cg.IsFix(t);
-        if (fixed ? !M.TypeOk(t) : !M.VvOk(t)) No(l, cat("text of type ", M.NameWhy(t)));
-        RenderFields(stk, len, v.name, v.fields, [&](size_t i) {
-            if (fixed) return VariantField(pl, (int)i);
-            auto ft = ei->vftypes[vi][i];
-            P fp { AtV(VvField(t, tyg_addr_of(p, pl.a), (int)i)), ft };
-            fp.enc = TgModule::IsVarint(ft);
-            return fp;
-        }, l, depth);
+        if (!pl.tmphdr && !M.IsRb(t) && !(cg.IsFix(t) ? M.TypeOk(t) : M.VvOk(t))) No(l, cat("text of type ", M.NameWhy(t)));
+        RenderRun(stk, len, v.name, pl, l, depth);
     }
 
     // gs_abort(GS_E_<what>) with the Goose file and line, through a shim; the block ends there.
@@ -5742,11 +5659,6 @@ struct TgFn {
         if (t->kind == TY_ENUM) StoreTag(x.a, t, d->einst->en->VariantIndex(d->variantconst));
         return x;
     }
-    P VariantField(const P &base, int fieldidx) {
-        auto ei = cg.EIVar(base.t);
-        auto vi = M.VariantIdx(base.t);
-        return P { AddrPlus(base.a, cg.VariantLayout(ei, vi).offs[fieldidx]), ei->vftypes[vi][fieldidx] };
-    }
     // Past the last variant: a corrupt tag, reported under --debug (GS_UNREACHABLE), else assumed away.
     void BadTag(Line l) {
         if (M.checks) Abort("TAG", l);
@@ -6646,18 +6558,6 @@ struct TgFn {
         }
     }
 
-    // A fixed field at its offset in the C struct; the tail, a resizable whose header is its last
-    // member, on the frame object's stack.
-    P FoFieldPlace(const P &base, int fi, Line l, bool read = false) {
-        if (base.bfo) return BfoFieldPlace(base, fi, l, read);
-        auto fl = M.FoLayout(base.t);
-        auto si = cg.SI(base.t);
-        if (fi == fl.tailfi) {
-            if (!base.stk && !read) No(l, "frame object without its stack");
-            return P { AddrPlus(base.a, fl.tail), si->ftypes[(size_t)fi], base.stk };
-        }
-        return P { AddrPlus(base.a, fl.offs[(size_t)fi]), si->ftypes[(size_t)fi] };
-    }
     // A frame object built at pl, its tail on pl.stk (CodeGen's GenConstruct).
     void GenFo(Node *n, P pl, Line l) {
         InPlace d { 3, pl.stk, pl.t, pl.a, &pl };
@@ -6676,7 +6576,7 @@ struct TgFn {
         for (size_t i = 0; i < si->st->fields.size() && !Ended(); i++) {
             if (si->st->fields[i].ispad) continue;
             auto init = sl->InitFor((int)i);
-            auto fp = FoFieldPlace(pl, (int)i, l);
+            auto fp = FieldPlace(pl, (int)i, l);
             if ((int)i != fl.tailfi) {
                 if (init) Into(fp, init);
                 else tyg_zero(p, fp.a, M.Size(fp.t));
@@ -6696,10 +6596,10 @@ struct TgFn {
         if (src.bfo) return FoCopy(dst, FoView(src), l);
         auto fl = M.FoLayout(dst.t);
         if (!dst.stk || !src.stk) No(l, "frame object without its stack");
-        auto tl = FoFieldPlace(src, fl.tailfi, l);
+        auto tl = FieldPlace(src, fl.tailfi, l);
         if (M.FoOk(tl.t)) {
             if (fl.tail) tyg_move(p, dst.a, src.a, fl.tail);
-            FoCopy(FoFieldPlace(dst, fl.tailfi, l), tl, l);
+            FoCopy(FieldPlace(dst, fl.tailfi, l), tl, l);
             return;
         }
         auto v = ViewOf(tl, l);
@@ -6710,7 +6610,7 @@ struct TgFn {
         // Elements of variable size (varints) by their bytes.
         if (!cg.IsFix(v.elem)) StL(el, Sub(RunEnd(v), v.elems), 16);
         if (fl.tail) tyg_move(p, dst.a, src.a, fl.tail);
-        auto dt = FoFieldPlace(dst, fl.tailfi, l);
+        auto dt = FieldPlace(dst, fl.tailfi, l);
         auto len = AddrPlus(dt.a, 8);
         St(dt.a, Top(dst.stk));
         St(len, I64(0));
@@ -6720,30 +6620,6 @@ struct TgFn {
 
     // ---- Frame objects as bytes ---------------------------------------------------
 
-    // Field fi of the frame object at base.a laid out as bytes (CodeGen::FoBytes): fixed fields packed
-    // in order, an explicit pad taking its bytes, the tail where they end.
-    P BfoFieldPlace(const P &base, int fi, Line l, bool read = false) {
-        auto si = cg.SI(base.t);
-        auto fl = M.FoLayout(base.t);
-        auto &fields = si->st->fields;
-        int64_t off = 0;
-        for (int i = 0; i < fi; i++)
-            off += fields[(size_t)i].ispad ? std::max<int64_t>(fields[(size_t)i].padsize, 0)
-                                           : cg.FixedSize(si->ftypes[(size_t)i]);
-        auto a = AddrPlus(base.a, off);
-        auto ft = si->ftypes[(size_t)fi];
-        if (fi != fl.tailfi) return P { a, ft };
-        if (M.FoOk(ft)) {
-            P r { a, ft, base.stk };
-            r.bfo = true;
-            r.ohdr = base.ohdr;
-            return r;
-        }
-        if (!base.stk && !read) No(l, "frame object without its stack");
-        P r { base.ohdr, ft, base.stk };
-        r.rbase = tyg_addr_of(p, a);
-        return r;
-    }
     // Frame object `obj`'s fixed fields stored to the bytes at `at` (pads zeroed) or loaded from them.
     void FoBytesCopy(TypeExpr *t, tyg_addr obj, tyg_addr at, bool tobytes) {
         auto si = cg.SI(t);
@@ -6818,28 +6694,6 @@ struct TgFn {
     // data stack, its header a gs_rhdr: the prefix packed as a variable-size struct's, the tail's
     // elements behind it, the count in the header.
 
-    // Field fi of the struct at pl (its header): a prefix field where the walk lands
-    // (CodeGen::FieldPtr), the tail where it ends, its count the header's (CodeGen::BytesLoc).
-    P RsFieldPlace(const P &base, int fi, Line l, bool read = false) {
-        auto si = cg.SI(base.t);
-        auto ft = si->ftypes[(size_t)fi];
-        auto at = VsField(base.t, Ld(base.a), fi);
-        if (fi == LastRealField(si->st->fields)) {
-            if (!base.stk && !read) No(l, "resizable struct without its stack");
-            if (M.FoOk(ft)) {
-                P r { AtV(at), ft, base.stk };
-                r.bfo = true;
-                r.ohdr = base.a;
-                return r;
-            }
-            P r { base.a, ft, base.stk };
-            r.rbase = at;
-            return r;
-        }
-        P r { AtV(at), ft };
-        r.enc = TgModule::IsVarint(ft);
-        return r;
-    }
     // A resizable struct built at the top of stk, its header at hdr (CodeGen::GenConstruct).
     void GenRs(Node *n, tyg_val stk, tyg_addr hdr, TypeExpr *t, Line l) {
         n = StripCopy(n);
@@ -6863,7 +6717,7 @@ struct TgFn {
         auto from = Ld(src.a);
         auto n = Ld(AddrPlus(src.a, 8));
         // To where the elements start: past a frame object tail's fields.
-        auto estart = VsField(src.t, from, last);
+        auto estart = FieldAddr(src.t, from, last);
         if (M.FoOk(tail)) estart = Add(estart, I64(cg.FoBytesPrefix(tail)));
         auto bytes = Add(Sub(estart, from), Mul(n, I64(cg.FixedSize(M.RsElem(src.t)))));
         auto top = Top(stk);
@@ -6883,7 +6737,7 @@ struct TgFn {
     tyg_val ImgSize(TypeExpr *t, tyg_val at) {
         if (cg.IsFix(t)) return I64(cg.FixedSize(t));
         if (TgModule::IsVarint(t) || TgModule::IsVr(t)) return UlebSize(at);   // Zigzag has ULEB128's shape.
-        if (M.IsVv(t)) return Sub(VvField(t, at, -1), at);
+        if (M.IsVv(t)) return Sub(FieldAddr(t, at, -1), at);
         if (M.IsVm(t)) {
             // The tag, and its variant's payload: a variable one walked, only on its own tag's path.
             auto ei = cg.EIOf(t);
@@ -6904,29 +6758,18 @@ struct TgFn {
             if (!cg.IsFix(t->arr->sub)) return Sub(RunEnd(v), at);
             return Add(Sub(v.elems, at), Mul(v.len, I64(cg.FixedSize(t->arr->sub))));
         }
-        return Sub(VsField(t, at, -1), at);
+        return Sub(FieldAddr(t, at, -1), at);
     }
-    // The address of field fi of the struct t's image at `at`, or its end where fi < 0
+    // The address of field fi of the image of t (a struct or variant) at `at`, or its end where fi < 0
     // (CodeGen::FieldPtr): a constant offset until a variable-size field, then a cursor past each.
-    tyg_val VsField(TypeExpr *t, tyg_val at, int fi) {
-        auto si = cg.SI(t);
-        return RunField(si->st->fields, si->ftypes, at, fi);
-    }
-    // A variable-size variant's field: its payload's run walked.
-    tyg_val VvField(TypeExpr *t, tyg_val at, int fi) {
-        auto ei = cg.EIVar(t);
-        auto vi = (size_t)ei->en->VariantIndex(t->var->variant);
-        return RunField(ei->en->variants[vi].fields, ei->vftypes[vi], at, fi);
-    }
-    // The same over any run of fields: a struct's, a variant's payload.
-    tyg_val RunField(const vector<Field> &fields, const vector<TypeExpr *> &ftypes, tyg_val at, int fi) {
-        auto n = fi < 0 ? (int)fields.size() : fi;
+    tyg_val FieldAddr(TypeExpr *t, tyg_val at, int fi) {
+        auto &fs = M.RunOfType(t);
+        auto n = fi < 0 ? (int)fs.f.size() : fi;
         int64_t off = 0;
         auto cur = at;
         for (int i = 0; i < n; i++) {
-            auto &f = fields[(size_t)i];
-            if (f.ispad) { off += f.padsize > 0 ? f.padsize : 0; continue; }
-            auto ft = ftypes[(size_t)i];
+            if (fs.f[(size_t)i].ispad) { off += TgModule::PadSize(fs.f[(size_t)i]); continue; }
+            auto ft = fs.t[(size_t)i];
             if (cg.IsFix(ft)) { off += cg.FixedSize(ft); continue; }
             if (off) cur = Add(cur, I64(off));
             off = 0;
@@ -6934,12 +6777,70 @@ struct TgFn {
         }
         return off ? Add(cur, I64(off)) : cur;
     }
-    P VsFieldPlace(const P &base, int fi) {
-        auto si = cg.SI(base.t);
-        auto ft = si->ftypes[(size_t)fi];
-        P r { AtV(VsField(base.t, tyg_addr_of(p, base.a), fi)), ft };
-        r.enc = TgModule::IsVarint(ft);
-        return r;
+    // Field fi of the struct or variant at base, whatever its representation: a fixed one at its C offset;
+    // a bytes value's (image's) walked (CodeGen::FieldPtr, BytesLoc); a resizable's, behind the header
+    // base.a, at its offset in the bytes at its base; a frame object's at its C offset, or packed in bytes
+    // (base.bfo). A resizable's tail is a place of its own (CodeGen::FieldLocAt). `read`: a tail needs no
+    // stack, and a resizable ADT's variant has one.
+    P FieldPlace(const P &base, int fi, Line l, bool read = false) {
+        auto t = base.t;
+        if (t->kind != TY_STRUCT && t->kind != TY_VARIANT) No(l, "field of this type");
+        auto &fs = M.RunOfType(t);
+        auto ft = fs.t[(size_t)fi];
+        auto tail = cg.IsResz(ft);
+        auto plain = [&](tyg_val at) {
+            P r { AtV(at), ft };
+            r.enc = TgModule::IsVarint(ft);
+            return r;
+        };
+        // The tail at `at` in bytes whose count is in the header hdr: a frame object as bytes, a resizable's
+        // elements, or a resizable ADT through a header made for it (the struct's count, which is not its own).
+        auto tailat = [&](tyg_val at, tyg_addr hdr) {
+            if (M.IsRb(ft)) {
+                auto th = tyg_local_new(p, 16, 8);
+                StL(th, at);
+                StL(th, Ld(CountAt(hdr)), 8);
+                P r { AtL(th), ft, base.stk };
+                r.tmphdr = true;
+                r.ohdr = base.tmphdr ? base.ohdr : hdr;
+                return r;
+            }
+            if (M.FoOk(ft)) {
+                P r { AtV(at), ft, base.stk };
+                r.bfo = true;
+                r.ohdr = hdr;
+                return r;
+            }
+            if (!base.stk && !read) No(l, "resizable without its stack");
+            P r { hdr, ft, base.stk };
+            r.rbase = at;
+            return r;
+        };
+        if (base.tmphdr || (M.IsRb(t) && (t->kind == TY_VARIANT || M.RbOk(t)))) {
+            if (tail && t->kind == TY_VARIANT && !read) No(l, "tail of a resizable variant");
+            auto at = FieldAddr(t, Ld(base.a), fi);
+            return tail ? tailat(at, base.a) : plain(at);
+        }
+        if (M.RsOk(t)) {
+            auto at = FieldAddr(t, Ld(base.a), fi);
+            return tail ? tailat(at, base.a) : plain(at);
+        }
+        if (M.FoOk(t)) {
+            if (base.bfo) {
+                auto at = AddrPlus(base.a, fs.off[(size_t)fi]);
+                return tail ? tailat(tyg_addr_of(p, at), base.ohdr) : P { at, ft };
+            }
+            auto fl = M.FoLayout(t);
+            if (!tail) return P { AddrPlus(base.a, fl.offs[(size_t)fi]), ft };
+            if (!base.stk && !read) No(l, "frame object without its stack");
+            return P { AddrPlus(base.a, fl.tail), ft, base.stk };
+        }
+        if (!cg.IsFix(t)) {
+            if (!M.VsOk(t) && !M.VvOk(t)) No(l, "field of this type");
+            return plain(FieldAddr(t, tyg_addr_of(p, base.a), fi));
+        }
+        if (!M.TypeOk(t)) No(l, "field of this type");
+        return P { AddrPlus(base.a, fs.off[(size_t)fi]), ft };
     }
 
     // Copies the image of type t at src (maybe on stk, below its top) to the top of stk; its address.
@@ -7058,20 +6959,6 @@ struct TgFn {
             else if (TgModule::IsVr(ft)) PushZero(stk, 1);   // An omitted optional: the one zero byte.
             else No(sl->line, "omitted variable-size field");
         }
-    }
-
-    // `Name { a, b }` (CodeGen::RenderLoc), each field where the walk finds it.
-    void VsRender(tyg_val stk, tyg_addr len, const P &pl, Line l, int depth) {
-        auto si = cg.SI(pl.t);
-        TextLit(stk, len, cat(TextName(pl.t), " { "));
-        auto first = true;
-        for (size_t i = 0; i < si->st->fields.size(); i++) {
-            if (si->st->fields[i].ispad) continue;
-            if (!first) TextLit(stk, len, ", ");
-            first = false;
-            RenderInto(stk, len, VsFieldPlace(pl, (int)i), true, l, depth + 1);
-        }
-        TextLit(stk, len, " }");
     }
 
     // ---- The procedure -------------------------------------------------------
