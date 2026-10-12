@@ -6740,26 +6740,27 @@ struct TgFn {
 
     // ---- Threads and queues (§11.2) ------------------------------------------
 
+    static tyg_addr AddrPlus(tyg_addr a, int64_t off) {
+        a.offset += off;
+        return a;
+    }
     // The address of the queue for elements of type t.
     tyg_val QueueAddr(TypeExpr *t) {
         cg.usesthreads = true;
         return CallC(M.QueueAccessor(t), {}, {}, tyg_type_ptr(m));
     }
-    // Whether a value of type t crosses a queue as this backend holds it: a
-    // fixed value or a T[] / T[..] image (CodeGen's IsBytesT), by its bytes.
+    // Whether a value of type t crosses a queue as this backend holds it (CodeGen's IsBytesT): a fixed
+    // value by its bytes, a resizable or frame object or T[] / T[..] as a flat image.
     bool QueueOk(TypeExpr *t) {
         if (!t || t->kind == TY_REF) return false;
         if (cg.IsFix(t)) return M.TypeOk(t);
-        // A resizable, or a frame object, crosses as a flat image (RzImage).
         if (M.Resz(t)) return (IsGrow(t) && (M.RzOk(t) || M.VeOk(t))) || M.FoOk(t);
         return (M.IsRc(t) && M.RcOk(t)) || (IsVarArr(t) && M.RzOk(t)) || (M.IsVs(t) && M.VsOk(t));
     }
-    // The bytes of one freelist unit of pool d (CodeGen::FlEntrySize,
-    // GS_SPAN_NODE of a slice pool's tree).
+    // The bytes of one freelist unit of pool d (CodeGen::FlEntrySize, GS_SPAN_NODE of a slice pool).
     static int64_t FlEntry(const VarDef *d) { return d->reusable == RU_SLICES ? 512 : 8; }
-    // Whether a thread program's global is one a spawn image carries: a
-    // fixed value, a resizable or frame object (a pool with its
-    // freelist), or a T[] image.
+    // Whether a thread program's global is one a spawn image carries: a fixed value, a resizable or
+    // frame object (a pool with its freelist), or a T[] image.
     bool ThreadGlobalOk(VarDef *d) {
         if (!M.GlobalOk(d) || cg.PrefVar(d)) return false;
         auto t = d->type;
@@ -6767,11 +6768,10 @@ struct TgFn {
         if (M.Resz(t)) return (IsGrow(t) && (M.RzOk(t) || M.VeOk(t)) && (!d->reusable || M.RzOk(t))) || M.FoOk(t);
         return IsImg(t) && !d->reusable;
     }
-    // node's value bytes follow its gs_qnode header (next, size).
+    // A node's value bytes follow its gs_qnode header (next, size).
     static constexpr int64_t QNODE = 16;
 
-    // The resizable (or frame object) n of type t built in a temporary of
-    // its own: its header, or the frame object, and its stack.
+    // The resizable (or frame object) n of type t built in a temporary of its own.
     P RzValue(Node *n, TypeExpr *t, Line l) {
         if (M.FoOk(t)) {
             P x { AtL(tyg_local_new(p, M.Size(t), 8)), t, Stk(AllocStk(false, l), l) };
@@ -6782,9 +6782,8 @@ struct TgFn {
         GenRz(n, x.stk, x.a, t, l);
         return P { x.a, t, x.stk };
     }
-    // The flat image of the resizable or frame object at src, at the top
-    // of stk: [int64 count][a frame object's fixed fields][tail elements]
-    // (CodeGen::EmitRzImage); its address.
+    // The flat image of the resizable or frame object at src, at the top of stk: [int64 count][a frame
+    // object's fixed fields][tail elements] (CodeGen::EmitRzImage); its address.
     tyg_val RzImage(tyg_val stk, const P &src, TypeExpr *t) {
         auto start = Top(stk);
         auto cnt = AtV(start);
@@ -6802,9 +6801,7 @@ struct TgFn {
         } else {
             et = t->arr->sub;
         }
-        auto hl = h;
-        hl.offset += 8;
-        View v { Ld(h), Ld(hl), et, -1 };
+        View v { Ld(h), Ld(AddrPlus(h, 8)), et, -1 };
         CopyView(stk, cnt, et, v);
         return start;
     }
@@ -6814,15 +6811,13 @@ struct TgFn {
         cg.usesthreads = true;
         auto id = GenAs(an[0], M.ast.inttypes[IS_I64]).v;
         if (Ended()) return V {};
-        CallC("gs_thread_wait", { IT(TYG_I64), tyg_type_ptr(m), IT(TYG_I32) },
-              { id, FileArg(c->line), LineArg(c->line) }, nullptr);
+        CallC("gs_thread_wait", { IT(TYG_I64), tyg_type_ptr(m), IT(TYG_I32) }, { id, FileArg(c->line), LineArg(c->line) },
+              nullptr);
         return V {};
     }
 
-    // thread_spawn(worker, args...) (CodeGen::EmitThreadSpawn): the
-    // arguments contiguous on a stack of the statement's, handed to the
-    // worker's thunk, which unpacks them. A worker that names globals needs
-    // the spawn image of them, which this backend does not build.
+    // thread_spawn(worker, args...) (CodeGen::EmitThreadSpawn): the arguments and the globals the worker
+    // names contiguous on a stack of the statement's, handed to the worker's thunk, which unpacks them.
     V GenThreadSpawn(Call *c) {
         auto w = c->spec;
         auto an = c->ArgNodes();
@@ -6830,12 +6825,8 @@ struct TgFn {
         string why;
         if (!M.SigOk(w, false, why)) No(c->line, cat("thread program: ", why));
         if (!cg.sinfo[w].freevars.empty()) No(c->line, "thread program with free variables");
-        // The globals the worker names, copied as the C packs them: each
-        // as [int64 size][bytes]. Fixed values only; a resizable's or a
-        // T[]'s image is the C half's to build.
         for (auto d : cg.ThreadGlobals(w))
-            if (!ThreadGlobalOk(d))
-                No(c->line, cat("thread program with a global of type ", M.NameWhy(d->type)));
+            if (!ThreadGlobalOk(d)) No(c->line, cat("thread program with a global of type ", M.NameWhy(d->type)));
         for (size_t i = 0; i < w->argtypes.size(); i++) {
             auto pt = w->argtypes[i];
             if (cg.IsPoolParam(w, i) || (M.RzParam(pt) ? !(QueueOk(pt) || (M.IsRs(pt) && M.RsOk(pt))) : !M.TypeOk(pt)))
@@ -6845,88 +6836,77 @@ struct TgFn {
         auto thunk = CallC(M.ThunkAccessor(w), {}, {}, tyg_type_ptr(m));
         auto stk = Stk(AllocStk(false, c->line), c->line);
         auto base = Top(stk);
+        auto i64t = M.ast.inttypes[IS_I64];
+        // [int64 size][payload]: the size patched in once `body` has appended the payload.
+        auto sized = [&](auto body) {
+            auto szp = Top(stk);
+            SetTop(stk, Add(szp, I64(8)));
+            body();
+            if (!Ended()) St(AtV(szp), Sub(Top(stk), Add(szp, I64(8))));
+        };
         for (size_t i = 0; i < w->argtypes.size(); i++) {
             auto pt = w->argtypes[i];
-            if (M.Resz(pt)) {
-                // [int64 size][flat image]: the worker's thunk rebuilds the
-                // header on a stack of its own (CodeGen::EmitThreadSpawn).
-                if (M.IsRs(pt)) {
-                    // A variable-prefix struct: built straight into the
-                    // packet, prefix and tail elements as they lie, the
-                    // count from its header (CodeGen::EmitThreadSpawn).
-                    auto szp = Top(stk);
-                    auto cntp = AtV(Add(szp, I64(8)));
-                    SetTop(stk, Add(szp, I64(16)));
+            auto arg = an[1 + i];
+            if (M.IsRs(pt)) {
+                // Built straight into the packet, prefix and tail as they lie, the count from its header.
+                sized([&] {
+                    auto cntp = AtV(Top(stk));
+                    SetTop(stk, Add(Top(stk), I64(8)));
                     auto hdr = AtL(tyg_local_new(p, 16, 8));
-                    auto hlen = hdr;
-                    hlen.offset += 8;
-                    GenRs(an[1 + i], stk, hdr, pt, c->line);
-                    if (Ended()) return Dummy(M.ast.inttypes[IS_I64]);
-                    St(cntp, Ld(hlen));
-                    St(AtV(szp), Sub(Top(stk), Add(szp, I64(8))));
-                    continue;
-                }
-                auto src = RzValue(an[1 + i], pt, c->line);
-                if (Ended()) return Dummy(M.ast.inttypes[IS_I64]);
-                auto szp = Top(stk);
-                SetTop(stk, Add(szp, I64(8)));
-                RzImage(stk, src, pt);
-                St(AtV(szp), Sub(Top(stk), Add(szp, I64(8))));
-                continue;
+                    GenRs(arg, stk, hdr, pt, c->line);
+                    if (!Ended()) St(cntp, Ld(AddrPlus(hdr, 8)));
+                });
+            } else if (M.Resz(pt)) {
+                // The worker's thunk rebuilds the header on a stack of its own.
+                sized([&] {
+                    auto src = RzValue(arg, pt, c->line);
+                    if (!Ended()) RzImage(stk, src, pt);
+                });
+            } else if (M.RzParam(pt)) {
+                GenImg(arg, stk, pt, c->line);   // The packet holds the image whole.
+            } else {
+                auto top = Top(stk);
+                Into(P { AtV(top), pt }, arg);
+                if (!Ended()) SetTop(stk, Add(top, I64(cg.FixedSize(pt))));
             }
-            if (M.RzParam(pt)) {
-                // An image, built at the top: the packet holds it whole.
-                GenImg(an[1 + i], stk, pt, c->line);
-                if (Ended()) return Dummy(M.ast.inttypes[IS_I64]);
-                continue;
-            }
-            auto top = Top(stk);
-            Into(P { AtV(top), pt }, an[1 + i]);
-            if (Ended()) return Dummy(M.ast.inttypes[IS_I64]);
-            SetTop(stk, Add(top, I64(cg.FixedSize(pt))));
+            if (Ended()) return Dummy(i64t);
         }
         for (auto d : cg.ThreadGlobals(w)) {
-            if (!cg.IsFix(d->type)) {
-                // [int64 size][image]: a resizable's flat image (with a
-                // pool's freelist after it), or a T[]'s bytes.
-                auto szp = Top(stk);
-                SetTop(stk, Add(szp, I64(8)));
-                auto pl = VarPlace(d, c->line);
-                if (M.Resz(d->type)) {
-                    RzImage(stk, pl, d->type);
-                    if (d->reusable) {
-                        // The freelist: its count, then its entries.
-                        P hp;
-                        tyg_addr fl;
-                        tyg_val flstk;
-                        PoolAt(d, c->line, hp, fl, flstk);
-                        auto top = Top(stk);
-                        auto flen = Ld(AtV(tyg_addr_of(p, fl), 8));
-                        St(AtV(top), flen);
-                        auto bytes = Mul(flen, I64(FlEntry(d)));
-                        auto at = Add(top, I64(8));
-                        tyg_move_dyn(p, at, Ld(fl), bytes);
-                        SetTop(stk, Add(at, bytes));
-                    }
-                } else {
-                    ImgCopy(stk, tyg_addr_of(p, pl.a), d->type);
-                }
-                St(AtV(szp), Sub(Top(stk), Add(szp, I64(8))));
+            if (cg.IsFix(d->type)) {
+                auto top = Top(stk);
+                auto size = cg.FixedSize(d->type);
+                St(AtV(top), I64(size));
+                auto at = Add(top, I64(8));
+                if (size) tyg_copy(p, AtV(at), VarPlace(d, c->line).a, size);
+                SetTop(stk, Add(at, I64(size)));
                 continue;
             }
-            auto top = Top(stk);
-            auto size = cg.FixedSize(d->type);
-            St(AtV(top), I64(size));
-            auto at = Add(top, I64(8));
-            if (size) tyg_copy(p, AtV(at), VarPlace(d, c->line).a, size);
-            SetTop(stk, Add(at, I64(size)));
+            // A resizable's flat image (with a pool's freelist after it), or a T[]'s bytes.
+            sized([&] {
+                auto pl = VarPlace(d, c->line);
+                if (!M.Resz(d->type)) {
+                    ImgCopy(stk, tyg_addr_of(p, pl.a), d->type);
+                    return;
+                }
+                RzImage(stk, pl, d->type);
+                if (!d->reusable) return;
+                // The freelist: its count, then its entries.
+                P hp;
+                tyg_addr fl;
+                tyg_val flstk;
+                PoolAt(d, c->line, hp, fl, flstk);
+                auto top = Top(stk);
+                auto flen = Ld(AtV(tyg_addr_of(p, fl), 8));
+                St(AtV(top), flen);
+                auto bytes = Mul(flen, I64(FlEntry(d)));
+                auto at = Add(top, I64(8));
+                tyg_move_dyn(p, at, Ld(fl), bytes);
+                SetTop(stk, Add(at, bytes));
+            });
         }
         M.NeedShim("gs_tg_thread_spawn");
-        V x;
-        x.t = M.ast.inttypes[IS_I64];
-        x.v = CallC("gs_tg_thread_spawn", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64) },
-                    { thunk, base, Sub(Top(stk), base) }, IT(TYG_I64));
-        return x;
+        return ValV(i64t, CallC("gs_tg_thread_spawn", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64) },
+                                { thunk, base, Sub(Top(stk), base) }, IT(TYG_I64)));
     }
 
     // qput(v): the value's bytes copied into a node of the queue.
@@ -6934,98 +6914,76 @@ struct TgFn {
         auto an = c->ArgNodes();
         auto t = an[0]->exprtype;
         if (!QueueOk(t)) No(c->line, cat("queue element of type ", M.NameWhy(t)));
-        // A fixed aggregate is read where it lies, not copied: it may be
-        // large (a native temporary of it could overflow a worker's stack).
-        if (cg.IsFix(t) && !M.IsScalar(t) && cg.TEq(an[0]->exprtype, t)) {
-            auto pl = Place(an[0]);
-            if (Ended()) return V {};
-            CallC("gs_qput", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64) },
-                  { QueueAddr(t), tyg_addr_of(p, pl.a), I64(cg.FixedSize(t)) }, nullptr);
-            return V {};
-        }
         tyg_val ptr, size;
-        if (M.Resz(t)) {
-            // Flat: the count, the fixed fields, the elements.
+        if (cg.IsFix(t) && !M.IsScalar(t)) {
+            // A fixed aggregate is read where it lies: a temporary of it could overflow a worker's stack.
+            auto pl = Place(an[0]);
+            ptr = tyg_addr_of(p, pl.a);
+            size = I64(cg.FixedSize(t));
+        } else if (M.Resz(t)) {
             auto src = RzValue(an[0], t, c->line);
             if (Ended()) return V {};
             auto stk = Stk(AllocStk(false, c->line), c->line);
             ptr = RzImage(stk, src, t);
             size = Sub(Top(stk), ptr);
         } else if (!cg.IsFix(t)) {
-            // An image, built on a stack of the statement's.
             auto stk = Stk(AllocStk(false, c->line), c->line);
             ptr = GenImg(an[0], stk, t, c->line);
-            if (Ended()) return V {};
-            size = Sub(Top(stk), ptr);
+            if (!Ended()) size = Sub(Top(stk), ptr);
         } else {
             auto x = GenAs(an[0], t);
-            if (Ended()) return V {};
             auto tmp = Temp(t);
-            Store(P { AtL(tmp), t }, x);
+            if (!Ended()) Store(P { AtL(tmp), t }, x);
             ptr = tyg_addr_of(p, AtL(tmp));
             size = I64(cg.FixedSize(t));
         }
-        CallC("gs_qput", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64) }, { QueueAddr(t), ptr, size },
-              nullptr);
+        if (Ended()) return V {};
+        CallC("gs_qput", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64) }, { QueueAddr(t), ptr, size }, nullptr);
         return V {};
     }
 
-    // qget<T>() and qpoll<T>() (CodeGen's B_QGET): the oldest node's bytes
-    // as the value, the node freed; a missed poll gives the zero value and
-    // false. An image is built at idst's top (or a stack of the
+    // qget<T>() and qpoll<T>() (CodeGen's B_QGET): the oldest node's bytes as the value, the node freed;
+    // a missed poll gives the zero value and false. An image is built at idst's top (or a stack of the
     // statement's), so a poll of one is left to C.
     V GenQget(Call *c, tyg_val idst) {
         auto t = c->rettypes[0];
         auto poll = c->builtin == B_QPOLL;
         if (!QueueOk(t) || (poll && !cg.IsFix(t) && !M.Resz(t))) No(c->line, cat("queue element of type ", M.NameWhy(t)));
         auto node = CallC(poll ? "gs_qpoll" : "gs_qget", { tyg_type_ptr(m) }, { QueueAddr(t) }, IT(TYG_I64));
-        auto freenode = [&] { CallC("free", { tyg_type_ptr(m) }, { node }, nullptr); };
-        auto src = [&] { return AtV(Add(node, I64(QNODE))); };
-        V x;
-        x.t = t;
+        auto got = [&] { return Cmp(TYG_NE, node, I64(0)); };
+        // The node is taken and freed where there is one.
+        auto take = [&](auto body) {
+            auto once = [&] {
+                body();
+                CallC("free", { tyg_type_ptr(m) }, { node }, nullptr);
+            };
+            if (poll) If(got(), once);
+            else once();
+        };
+        auto result = [&](V x) {
+            lastrets = { x };
+            if (poll) lastrets.push_back(ValV(M.ast.booltype, got()));
+            return x;
+        };
         if (M.Resz(t)) {
-            // Rebuilt from the image on a stack of the statement's: the
-            // zero value until a node is read (a missed poll leaves it).
+            // Rebuilt from the image on a stack of the statement's: the zero value until a node is read.
             auto stk = Stk(AllocStk(false, c->line), c->line);
             auto fo = M.FoOk(t);
             auto pre = fo ? M.FoHdrOff(t) : 0;
-            auto obj = AtL(tyg_local_new(p, fo ? M.Size(t) : 16, 8));
-            tyg_zero(p, obj, fo ? M.Size(t) : 16);
-            auto hdr = obj;
-            hdr.offset += pre;
-            auto hlen = hdr;
-            hlen.offset += 8;
-            St(hdr, Top(stk));
-            tyg_block have = 0, done = 0;
-            if (poll) {
-                have = NewBlock();
-                done = NewBlock();
-                Branch(Cmp(TYG_NE, node, I64(0)), have, done);
-                SetBlock(have);
-            }
-            auto image = Add(node, I64(QNODE + 8));
-            auto size = Ld(AtV(node, 8));
-            St(hlen, Ld(AtV(node, QNODE)));
-            if (pre) tyg_copy(p, obj, AtV(image), pre);
-            auto n = Sub(size, I64(8 + pre));
-            auto top = Top(stk);
-            tyg_move_dyn(p, top, Add(image, I64(pre)), n);
-            SetTop(stk, Add(top, n));
-            freenode();
-            if (poll) {
-                tyg_jump(p, done);
-                SetBlock(done);
-            }
-            x.mem = true;
-            x.a = obj;
-            x.stk = stk;
-            lastrets.clear();
-            lastrets.push_back(x);
-            if (poll) {
-                V got = ValV(M.ast.booltype, Cmp(TYG_NE, node, I64(0)));
-                lastrets.push_back(got);
-            }
-            return x;
+            auto osz = fo ? M.Size(t) : 16;
+            auto obj = AtL(tyg_local_new(p, osz, 8));
+            tyg_zero(p, obj, osz);
+            St(AddrPlus(obj, pre), Top(stk));
+            take([&] {
+                auto image = Add(node, I64(QNODE + 8));
+                St(AddrPlus(obj, pre + 8), Ld(AtV(node, QNODE)));
+                if (pre) tyg_copy(p, obj, AtV(image), pre);
+                auto n = Sub(Ld(AtV(node, 8)), I64(8 + pre));
+                auto top = Top(stk);
+                tyg_move_dyn(p, top, Add(image, I64(pre)), n);
+                SetTop(stk, Add(top, n));
+            });
+            return result(MemV(t, obj, stk));
         }
         if (!cg.IsFix(t)) {
             auto stk = idst ? idst : Stk(AllocStk(false, c->line), c->line);
@@ -7033,45 +6991,16 @@ struct TgFn {
             auto size = Ld(AtV(node, 8));
             tyg_move_dyn(p, top, Add(node, I64(QNODE)), size);
             SetTop(stk, Add(top, size));
-            freenode();
-            x.mem = true;
-            x.a = AtV(top);
-            lastrets.clear();
-            lastrets.push_back(x);
-            return x;
+            CallC("free", { tyg_type_ptr(m) }, { node }, nullptr);
+            return result(MemV(t, AtV(top)));
         }
         auto size = cg.FixedSize(t);
-        auto tmp = Temp(t);
-        auto at = AtL(tmp);
-        V got;
-        got.t = M.ast.booltype;
-        if (poll) {
-            tyg_zero(p, at, std::max<int64_t>(size, 1));
-            auto have = NewBlock(), done = NewBlock();
-            Branch(Cmp(TYG_NE, node, I64(0)), have, done);
-            // The result of the poll as a bool, kept past the join.
-            SetBlock(have);
-            if (size) tyg_copy(p, at, src(), size);
-            freenode();
-            tyg_jump(p, done);
-            SetBlock(done);
-        } else {
-            if (size) tyg_copy(p, at, src(), size);
-            freenode();
-        }
-        if (M.IsScalar(t)) {
-            x = Load(P { at, t }, c->line);
-        } else {
-            x.mem = true;
-            x.a = at;
-        }
-        lastrets.clear();
-        lastrets.push_back(x);
-        if (poll) {
-            got.v = Cmp(TYG_NE, node, I64(0));
-            lastrets.push_back(got);
-        }
-        return x;
+        auto at = AtL(Temp(t));
+        if (poll) tyg_zero(p, at, std::max<int64_t>(size, 1));
+        take([&] {
+            if (size) tyg_copy(p, at, AtV(Add(node, I64(QNODE))), size);
+        });
+        return result(M.IsScalar(t) ? Load(P { at, t }, c->line) : MemV(t, at));
     }
 
     // An extern fn, through a trampoline the C half defines: the C function
