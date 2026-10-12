@@ -21,6 +21,12 @@ struct ProcessResult {
 // live line (progress.h) sees it.
 ProcessResult RunProcess(const vector<string> &argv, const string &cwd = "", bool echo = false);
 
+// Runs argv (argv[0] a path) with this process's standard streams and
+// environment, and waits for it: what it prints goes straight to this
+// process's stdout and stderr. Its exit code, 128 + the signal's number if a
+// signal ended it, or -1 with `err` saying why it could not be started.
+int RunInherited(const vector<string> &argv, string &err);
+
 // The full path of the program `name` on PATH, or on `path` (a list in PATH's
 // form) where that is given, or "" when there is none. On Windows a name
 // without an extension is tried with the ones PATHEXT lists (.exe, .cmd,

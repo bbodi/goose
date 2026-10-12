@@ -8,6 +8,7 @@ with debug info. The backend lowers each Goose function to that IR.
     goose build --backend=tinygen prog.goose          # debug build, -O0
     goose build --backend=tinygen --debug prog.goose  # with GS_DEBUG's checks
     goose build --backend=tinygen -v prog.goose       # says what went to C, and why
+    goose run --backend=tinygen prog.goose -- args    # builds, then runs it
 
 ## Why
 
@@ -198,6 +199,19 @@ the compiler has the C backend only, and `--backend=tinygen` says so.
 `--backend=tinygen` makes `-O0` the default, so no function is inlined away
 in the debugger. `-O1` and `-O2` still work.
 
+## `goose run`
+
+`goose run --backend=tinygen` builds the executable in the program's build
+directory, as `goose build` would, and runs it as a child process. The
+program shares Goose's standard streams, gets the arguments after `--`, and
+its exit code becomes the run's. Build messages go to stderr.
+
+A program finds its resources next to its executable. A run through TinyCC
+uses the entry source's directory instead. To match it, Goose sets
+`GOOSE_RESOURCE_DIR` to that directory, and `gs_os_resource_dir` prefers the
+variable when it is set. Unlike a TinyCC run, this path also runs programs
+with threads.
+
 ## Testing
 
 * `test/tinygen/` holds fixtures for each area: scalars, structs, arrays,
@@ -253,8 +267,9 @@ catch.
 
 ## What tinygen lacks
 
-1. **In-memory loading.** `goose run` runs programs in-process. tinygen
-   cannot map and relocate its own code, so `goose run` cannot use it.
+1. **In-memory loading.** tinygen cannot map and relocate its own code in
+   the running process. So `goose run --backend=tinygen` builds and links
+   an executable, which costs a link step that a TinyCC run does not have.
 2. **Counted arrays in debug info.** A slice's or a resizable's elements need
    an array type whose count is another member. A field after a
    variable-size field needs a member location expression. tinygen has
@@ -278,7 +293,8 @@ catch.
 
 * Faster loop code, which is where the gap to `cc -O2` is.
 * Linux and Windows: run tinygen's ABI test and this suite there.
-* `goose run --backend=tinygen`, once tinygen can load code in memory.
+* An in-memory `goose run --backend=tinygen`, once tinygen can load code
+  in memory, if its faster start is worth losing the debugger.
 * Let `--stack-reserve` take the whole-program path.
 * Direct globals for programs with threads, through a context pointer passed
   beside `gs_sp`.
@@ -291,4 +307,6 @@ catch.
 * **The C backend's conventions stay.** Mixed builds depend on them. A
   measurement found that a convention of our own would gain under 1% on
   every benchmark.
-* **`goose build` only**, until tinygen can load code in memory.
+* **`goose run` builds an executable.** It reuses the build path whole, and
+  a debugger can attach to it. In-memory loading would skip the link, but
+  a debugger could not see the code.

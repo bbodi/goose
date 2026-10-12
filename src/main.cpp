@@ -777,8 +777,8 @@ int Main(int argc, char **argv) {
                             "(TINYGEN_DIR, CMakeLists.txt)\n");
             return 1;
         #endif
-        if (verb != "build") {
-            fprintf(stderr, "--backend=tinygen works with goose build only so far\n");
+        if (verb != "build" && verb != "run") {
+            fprintf(stderr, "--backend=tinygen works with goose build and goose run\n");
             return 1;
         }
         // A debug build: no inlining unless asked for, so that every Goose
@@ -806,13 +806,22 @@ int Main(int argc, char **argv) {
     // C goes to the program's build directory (build.h).
     BuildOptions buildopts;
     string builddir;
+    // goose run --backend=tinygen: tinygen writes an object, which only a link makes runnable, so
+    // the program is built into its build directory as goose build would build it, then started
+    // as a child that shares this process's streams.
+    auto tgrun = false;
     if (verb == "run") {
         if (!outname.empty()) {
             fprintf(stderr, "goose run takes no -o: it compiles and runs the program in this "
                             "process\n");
             return 1;
         }
-        forcejit = true;
+        if (tinygen) {
+            tgrun = true;
+            buildopts = BuildOptions { ccrequest, true, verbose, dryrun, false, "" };
+        } else {
+            forcejit = true;
+        }
     } else if (verb == "check") {
         nocgen = true;
     } else if (verb == "fetch") {
@@ -858,7 +867,8 @@ int Main(int argc, char **argv) {
                         "--multi-test [options] file.goose... | --emit-runtime runtime.c | "
                         "--gen-runtime-header | "
                         "--<package>-link msvc|cc\n");
-        fprintf(stderr, "without -o the program is compiled and run in this process by TinyCC.\n");
+        fprintf(stderr, "without -o the program is compiled and run in this process by TinyCC;\n"
+                        "goose run --backend=tinygen builds it and runs the executable.\n");
         fprintf(stderr, "the .c that -o writes links with the runtime that --emit-runtime "
                         "writes, compiled once;\n--standalone writes one that holds the "
                         "runtime itself.\n");
@@ -874,7 +884,8 @@ int Main(int argc, char **argv) {
     // With no output file the program is compiled into this process and run,
     // which is what --jit asks for explicitly; a build writes the C to its
     // build directory instead.
-    auto jit = verb != "build" && (forcejit || outname.empty());
+    auto building = verb == "build" || tgrun;
+    auto jit = !building && (forcejit || outname.empty());
     if (!headername.empty() && (jit || multitest)) {
         fprintf(stderr, "--header requires C output for a single input file\n");
         return 1;
@@ -890,8 +901,8 @@ int Main(int argc, char **argv) {
                         "--dump-file, --jit or program arguments\n");
         return 1;
     }
-    // The program shares stdout in JIT mode; progress goes to stderr.
-    auto msgs = jit ? stderr : stdout;
+    // The program shares stdout in a run; progress goes to stderr.
+    auto msgs = jit || tgrun ? stderr : stdout;
     // The file being compiled, the C file it goes to, if any, and the
     // --include headers as that C file names them.
     string filename, outfile;
@@ -1027,7 +1038,7 @@ int Main(int argc, char **argv) {
                 // that needs nothing of the C half beyond the support object,
                 // puts its main into the object and compiles no C.
                 string whynot;
-                if (verb != "build") whynot = "not goose build";
+                if (!building) whynot = "not goose build";
                 else if (standalone) whynot = "--standalone";
                 else if (!includenames.empty()) whynot = "--include";
                 else if (tinygenmixed) whynot = "--tinygen-mixed";
@@ -1139,7 +1150,7 @@ int Main(int argc, char **argv) {
                 outfile.replace(pos, 1, stem);
         }
         includes = includenames;
-        if (verb == "build") {
+        if (building) {
             builddir = ProgramBuildDir(file);
             std::error_code ec;
             filesystem::create_directories(filesystem::path(builddir), ec);
@@ -1167,7 +1178,7 @@ int Main(int argc, char **argv) {
             // (CMakeLists.txt).
             auto code = RunOnCompilerStack(compile);
             if (code) return code;
-            if (verb == "build") {
+            if (building) {
                 if (nocgen) return 0;
                 // The native parts first, so that the link can take their
                 // response files: a builtin package's from the compiler's
@@ -1192,12 +1203,31 @@ int Main(int argc, char **argv) {
                     tgsupport = { cat("goose_tgsupport", tgchecks ? "_checks-" : "-", Hex8(src)),
                                   [src] { return src; } };
                 }
-                return BuildExecutable(filename, tgwhole ? string() : outfile, builddir, tc,
-                                       buildopts, DirOf(exe), msgs, rsps,
-                                       astp->packages[0].output,
-                                       tgobject.empty() ? vector<string> {}
-                                                        : vector<string> { tgobject },
-                                       tgsupport);
+                // A run's executable stays in the build directory, out of the source's.
+                if (tgrun) {
+                    buildopts.exe = cat(builddir, "/", PathStem(filename));
+                    #ifdef _WIN32
+                        buildopts.exe += ".exe";
+                    #endif
+                }
+                auto built = BuildExecutable(filename, tgwhole ? string() : outfile, builddir, tc,
+                                             buildopts, DirOf(exe), msgs, rsps,
+                                             astp->packages[0].output,
+                                             tgobject.empty() ? vector<string> {}
+                                                              : vector<string> { tgobject },
+                                             tgsupport);
+                if (built || !tgrun || buildopts.dryrun) return built;
+                fflush(msgs);
+                fflush(stdout);
+                // Its resources are the entry source's, as in a run through TinyCC, not the
+                // build cache's (gs_os_resource_dir).
+                SetEnvVar("GOOSE_RESOURCE_DIR", DirOf(AbsolutePath(filename)));
+                vector<string> progargv { buildopts.exe };
+                progargv.insert(progargv.end(), progargs.begin(), progargs.end());
+                string err;
+                auto ran = RunInherited(progargv, err);
+                if (ran < 0) fprintf(stderr, "%s\n", err.c_str());
+                return ran < 0 ? 1 : ran;
             }
             if (program.empty()) return code;
             // The native parts the program reaches hand the run their

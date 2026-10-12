@@ -350,10 +350,41 @@ def check_tinygen_backend(exe, base, ok, fail, say):
             fail(f"{label}: {done} of {total} functions, whole program expected", log)
             continue
         ok(f"{label} ({done} of {total} functions, whole program)")
+    check_run(exe, base, ok, fail)
     check_lldb(exe, base, ok, fail, say)
     check_lldb_limited(exe, base, ok, fail)
     check_lldb_adts(exe, base, ok, fail)
     check_lldb_optionals(exe, base, ok, fail)
+
+
+def check_run(exe, base, ok, fail):
+    """goose run --backend=tinygen builds the program in its build cache and
+    runs it: the program's output and exit code are the run's, its
+    arguments are the ones after --, its resources are its source's
+    directory, and a program with threads runs too (a TinyCC run refuses
+    one)."""
+    exe = Path(exe).resolve()
+    for rel in ("test/tinygen/tinygen_text.goose", "test/threads/thread_globals.goose"):
+        source = ROOT / rel
+        want, _, _ = expected(source)
+        code, got, err = tc.run_capture([exe, "run", "--backend=tinygen", source],
+                                        cwd=source.parent)
+        if code != 0 or got.rstrip("\n") != want.rstrip("\n"):
+            fail(f"goose run --backend=tinygen {source.name} (exit {code})",
+                 f"{err}\n--- got:\n{got}\n--- want:\n{want}")
+            return
+    probe = base / "run_probe.goose"
+    tc.write_text(probe, "import os;\n\nfn main() {\n    let a = args();\n"
+                         "    for i in 1..a.len { print(a[i]); }\n"
+                         "    print(resource_dir());\n    exit(a.len as i32 + 2);\n}\n")
+    code, got, err = tc.run_capture([exe, "run", "--backend=tinygen", probe, "--", "two words",
+                                     "x"], cwd=ROOT)
+    want = f"two words\nx\n{probe.parent}/\n"
+    if code != 5 or got.replace("\\", "/") != want.replace("\\", "/"):
+        fail(f"goose run --backend=tinygen arguments (exit {code})",
+             f"{err}\n--- got:\n{got}\n--- want:\n{want}")
+        return
+    ok("goose run --backend=tinygen: output, arguments, exit code, resources, threads")
 
 
 def check_lldb_limited(exe, base, ok, fail):

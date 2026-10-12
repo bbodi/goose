@@ -100,7 +100,9 @@ Windows and macOS (`CMakeLists.txt`); on Linux it has the stack limit the
 process started with (`ulimit -s`), which nothing in the executable sets.
 
 **Verbs** (`Main` in `main.cpp`). `goose run file.goose [options] [-- args]`
-compiles the program in this process and runs it (`--jit`), `goose build
+compiles the program in this process and runs it (`--jit`); with
+`--backend=tinygen` it builds the executable in the build directory and runs
+it as a child instead (`RunInherited` in `process.h`), `goose build
 file.goose` writes the C to the program's build directory under
 `GOOSE_HOME` and compiles and links it into an executable beside the source
 (`build.h`: the runtime object compiled once per toolchain and
@@ -153,7 +155,7 @@ the slow steps (a line each, and on a terminal a live line below).
 | `--<name>-link msvc\|cc` | print the response file of link inputs a program using the blessed package imported as `name` (`gfx`, `audio`, `ui`, `physics`) needs, when the package is compiled into this compiler (`builtin.h`, `BuiltinLinkFile`) |
 | `--multi-test a.goose b.goose ...` | compile each file in turn with the other flags, as a process of its own on it would (an `Ast` and a compile thread each, which is all the state a compile has), each file's output on both streams ending in a line `==== goose --multi-test: exit <code> <file>`; an `-o` names each file's C with `%` for its name. It runs no programs and writes no dump files. The test runner's batches of compiler runs (`docs/testing.md`) |
 | `--compile-shader f [--shader-source msl\|hlsl]` | hidden: what a shader compiles to, without a program around it |
-| `--backend=c\|tinygen` | with `goose build`: `tinygen` compiles the specializations the tinygen backend supports into an object of its own, with debug info naming the Goose source, and leaves the rest to the C (`tinygen_backend.h`, `docs/design/tinygen_backend.md`); `-O0` unless an `-O` is given. `--tinygen-skip=f,g` (hidden) leaves those functions to C; `--tinygen-mixed` (hidden) keeps the C half for a program tinygen could build whole; `-v` says which path a build took |
+| `--backend=c\|tinygen` | with `goose build` or `goose run`: `tinygen` compiles the specializations the tinygen backend supports into an object of its own, with debug info naming the Goose source, and leaves the rest to the C (`tinygen_backend.h`, `docs/design/tinygen_backend.md`); `-O0` unless an `-O` is given. `--tinygen-skip=f,g` (hidden) leaves those functions to C; `--tinygen-mixed` (hidden) keeps the C half for a program tinygen could build whole; `-v` says which path a build took |
 
 The debug build of the *generated* C is `-DGS_DEBUG=1` on the C compiler (or
 `-DGS_DEBUG=1` to `goose`, which writes it into the file): it enables the
