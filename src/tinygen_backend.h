@@ -1274,10 +1274,9 @@ struct TgModule {
                 auto sl = Is<StructLit>(n);
                 auto si = cg.SI(t);
                 if (!sl || sl->sinst != si) return false;
-                auto &lay = cg.StructLayout(si);
-                for (size_t fi = 0; fi < si->st->fields.size(); fi++)
-                    if (!si->st->fields[fi].ispad &&
-                        !StaticBytes(sl->InitFor((int)fi), si->ftypes[fi], out, off + lay.offs[fi]))
+                auto &fs = StFields(t);
+                for (size_t fi = 0; fi < fs.f.size(); fi++)
+                    if (!fs.f[fi].ispad && !StaticBytes(sl->InitFor((int)fi), fs.t[fi], out, off + fs.off[fi]))
                         return false;
                 return true;
             }
@@ -2444,10 +2443,9 @@ struct TgFn {
             return SelfRelLit(init) && cg.TEq(init->exprtype, ft);
         };
         if (auto sl = Is<StructLit>(n)) {
-            auto sh = LitShape(sl);
-            for (size_t i = 0; i < sh.fields->size(); i++)
-                if (!(*sh.fields)[i].ispad && stores((*sh.ftypes)[i], sl->InitFor((int)i))) return true;
-            return false;
+            auto any = false;
+            EachLitInit(sl, [&](Node *init, TypeExpr *ft, int64_t) { any = any || stores(ft, init); });
+            return any;
         }
         auto al = Is<ArrayLit>(n);
         auto et = al->exprtype->arr->sub;
@@ -2456,24 +2454,16 @@ struct TgFn {
             if (stores(et, e)) return true;
         return false;
     }
-    // A struct, variant or fixed-mode ADT literal's fields, types and offsets (a tag first, for the ADT).
-    struct LitSh {
-        const vector<Field> *fields;
-        const vector<TypeExpr *> *ftypes;
-        vector<int64_t> offs;
-    };
-    LitSh LitShape(StructLit *sl) {
+    // fn(init, type, offset) for the initialised fields of a struct, variant or fixed-mode ADT literal (the
+    // offset past the tag, for the ADT), while the code goes on.
+    template <class F> void EachLitInit(StructLit *sl, F fn) {
         auto t = sl->exprtype;
-        if (t->kind == TY_STRUCT) {
-            auto si = cg.SI(t);
-            return { &si->st->fields, &si->ftypes, cg.StructLayout(si).offs };
-        }
-        auto ei = M.EI(t);
-        auto vi = t->kind == TY_VARIANT ? M.VariantIdx(t) : ei->en->VariantIndex(sl->variant);
-        auto offs = cg.VariantLayout(ei, vi).offs;
-        if (t->kind == TY_ENUM)
-            for (auto &o : offs) o += M.TagSize(t);
-        return { &ei->en->variants[(size_t)vi].fields, &ei->vftypes[(size_t)vi], offs };
+        auto ei = t->kind == TY_STRUCT ? nullptr : M.EI(t);
+        auto &fs = ei ? M.VarFields(ei, t->kind == TY_VARIANT ? M.VariantIdx(t) : ei->en->VariantIndex(sl->variant))
+                      : M.StFields(t);
+        auto base = t->kind == TY_ENUM ? M.TagSize(t) : 0;
+        for (size_t i = 0; i < fs.f.size() && !Ended(); i++)
+            if (auto init = fs.f[i].ispad ? nullptr : sl->InitFor((int)i)) fn(init, fs.t[i], base + fs.off[i]);
     }
     // A struct or array literal SelfRelInto can build.
     bool SelfRelLitOk(Node *n) {
@@ -2512,12 +2502,8 @@ struct TgFn {
             tyg_val &at, was;
             ~Back() { at = was; }
         } back { selfbase, outer };
-        auto sh = LitShape(sl);
         if (t->kind == TY_ENUM) StoreTag(pl.a, t, M.EI(t)->en->VariantIndex(sl->variant));
-        for (size_t i = 0; i < sh.fields->size() && !Ended(); i++) {
-            auto init = (*sh.fields)[i].ispad ? nullptr : sl->InitFor((int)i);
-            if (init) Into(P { AddrPlus(pl.a, sh.offs[i]), (*sh.ftypes)[i] }, init);
-        }
+        EachLitInit(sl, [&](Node *init, TypeExpr *ft, int64_t off) { Into(P { AddrPlus(pl.a, off), ft }, init); });
     }
     // A fill [v; k] of a value linking to itself (CodeGen::FreezeFill): v's leaves evaluated once,
     // then each slot built in place (FillStore).
@@ -2557,11 +2543,7 @@ struct TgFn {
             leaves.push_back(lf);
         };
         if (auto sl = Is<StructLit>(al->fillval); sl && SelfRelLitOk(sl) && sl->exprtype->kind == TY_STRUCT) {
-            auto sh = LitShape(sl);
-            for (size_t i = 0; i < sh.fields->size() && !Ended(); i++) {
-                if (auto init = (*sh.fields)[i].ispad ? nullptr : sl->InitFor((int)i))
-                    capture(init, (*sh.ftypes)[i], sh.offs[i]);
-            }
+            EachLitInit(sl, capture);
         } else {
             capture(al->fillval, al->exprtype->arr->sub, 0);
         }
@@ -3258,23 +3240,19 @@ struct TgFn {
     V GenStructLit(StructLit *sl) {
         auto t = sl->exprtype;
         if (V x; InPlaceValue(sl, t, sl->line, x)) return x;
-        if (t->kind == TY_VARIANT || t->kind == TY_ENUM) return GenVariantLit(sl);
-        if (!sl->sinst || sl->variant || t->kind != TY_STRUCT || !M.TypeOk(t)) No(sl->line, "literal of this type");
-        auto tmp = Temp(t);
-        tyg_zero(p, AtL(tmp), M.Size(t));
-        auto si = cg.SI(t);
-        auto &lay = cg.StructLayout(si);
-        for (size_t i = 0; i < si->st->fields.size(); i++) {
-            auto init = si->st->fields[i].ispad ? nullptr : sl->InitFor((int)i);
-            if (!init) continue;
-            // A self-relative link measures from the slot it lies in, which a
-            // literal built here and copied out of is not.
-            auto ft = si->ftypes[i];
-            if (TgModule::IsRel(ft) && !ft->ref->pool && !Is<NullLit>(init))
+        auto adt = t->kind == TY_VARIANT || t->kind == TY_ENUM;
+        if (!M.TypeOk(t) || (adt ? t->kind == TY_ENUM && !sl->variant : !sl->sinst || sl->variant || t->kind != TY_STRUCT))
+            No(sl->line, "literal of this type");
+        auto x = MemTemp(t, true);
+        if (t->kind == TY_ENUM) StoreTag(x.a, t, M.EI(t)->en->VariantIndex(sl->variant));
+        EachLitInit(sl, [&](Node *init, TypeExpr *ft, int64_t off) {
+            // A self-relative link measures from the slot it lies in, which a literal built here and copied
+            // out of is not.
+            if (!adt && TgModule::IsRel(ft) && !ft->ref->pool && !Is<NullLit>(init))
                 No(sl->line, "self-relative link in a literal");
-            Into(P { AtL(tmp, lay.offs[i]), ft }, init);
-        }
-        return MemV(t, AtL(tmp));
+            Into(P { AddrPlus(x.a, off), ft }, init);
+        });
+        return x;
     }
 
     // ---- Arrays and slices -------------------------------------------------
@@ -5750,26 +5728,6 @@ struct TgFn {
         StoreTag(r.a, adt, M.VariantIdx(x.t));
         if (cg.FixedSize(x.t)) tyg_copy(p, AddrPlus(r.a, M.TagSize(adt)), x.a, cg.FixedSize(x.t));
         return r;
-    }
-    // Shape.Circle { r: 1.0 }, as the variant or as its ADT.
-    V GenVariantLit(StructLit *sl) {
-        auto t = sl->exprtype;
-        if (!M.TypeOk(t) || (t->kind == TY_ENUM && !sl->variant)) No(sl->line, "literal of this type");
-        auto ei = M.EI(t);
-        auto vi = t->kind == TY_VARIANT ? M.VariantIdx(t) : ei->en->VariantIndex(sl->variant);
-        auto x = MemTemp(t, true);
-        int64_t base = 0;
-        if (t->kind == TY_ENUM) {
-            StoreTag(x.a, t, vi);
-            base = M.TagSize(t);
-        }
-        auto &v = ei->en->variants[vi];
-        auto &lay = cg.VariantLayout(ei, vi);
-        for (size_t i = 0; i < v.fields.size(); i++) {
-            if (v.fields[i].ispad) continue;
-            if (auto init = sl->InitFor((int)i)) Into(P { AddrPlus(x.a, base + lay.offs[i]), ei->vftypes[vi][i] }, init);
-        }
-        return x;
     }
     // A payload-less variant constant (Dot::CgX).
     V GenVariantConst(Dot *d) {
