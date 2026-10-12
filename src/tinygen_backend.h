@@ -900,7 +900,11 @@ struct TgModule {
         for (size_t vi = 0; vi < en->variants.size(); vi++)
             tyg_dt_enumerator(m, tag, string(en->variants[vi].name).c_str(), (int64_t)vi);
         DMem(rec, "tag", tag, 0);
-        auto full = IsVm(t) ? VmMaxSize(t) : cg.FixedSize(t);
+        auto full = IsVm(t) ? TagSize(t) : cg.FixedSize(t);   // Variable-mode: the largest payload.
+        for (size_t vi = 0; IsVm(t) && vi < en->variants.size(); vi++) {
+            auto vt = cg.VariantType(t, (int)vi);
+            if (cg.IsFix(vt)) full = std::max(full, TagSize(t) + cg.FixedSize(vt));
+        }
         if (full > TagSize(t)) {
             auto u = tyg_dt_record(m, TYG_DT_UNION, nullptr, File(0), 0);
             for (size_t vi = 0; vi < en->variants.size(); vi++) {
@@ -968,16 +972,6 @@ struct TgModule {
     // fields, as a variable-size struct is.
     bool IsVv(TypeExpr *t) { return t && t->kind == TY_VARIANT && !cg.IsFix(t); }
     bool VvOk(TypeExpr *t, int depth = 0) { return IsVv(t) && depth <= 32 && PayloadsOk(t, depth); }
-    // The largest value: the tag and the largest payload.
-    int64_t VmMaxSize(TypeExpr *t) {
-        auto ei = cg.EIOf(t);
-        int64_t mx = 0;
-        for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
-            auto vt = cg.VariantType(t, (int)vi);
-            if (cg.IsFix(vt)) mx = std::max(mx, cg.FixedSize(vt));
-        }
-        return TagSize(t) + mx;
-    }
 
     // ---- Resizable ADTs ------------------------------------------------------
 
@@ -1563,12 +1557,6 @@ struct TgFn {
     void PushZero(tyg_val stk, int64_t k) {
         if (k > 0) tyg_zero(p, AtV(StackReserve(stk, I64(k))), k);
     }
-    // A tail built from init behind a header of its own, its count stored at len.
-    void BuildTail(Node *init, tyg_val stk, TypeExpr *ft, tyg_addr len, Line l) {
-        auto th = NewHdr();
-        TailHdr(init, stk, th, ft, l);
-        if (!Ended()) St(len, Ld(CountAt(th)));
-    }
     void PushVal(tyg_val stk, TypeExpr *ft, const V &v) {
         auto top = Top(stk);
         Store(P { AtV(top), ft }, v);
@@ -2118,7 +2106,14 @@ struct TgFn {
             auto stk = Stk(AllocStk(false, l), l);
             return MemV(want, AtV(VmFrom(stk, x.a, x.t, want, l)));
         }
-        if (x.t->kind == TY_VARIANT && want->kind == TY_ENUM && x.mem) return AdaptToAdt(x, want, l);
+        if (x.t->kind == TY_VARIANT && want->kind == TY_ENUM && x.mem) {   // As its fixed-mode ADT.
+            if (want->enu->varmode || !M.TypeOk(want) || M.EI(x.t) != M.EI(want))
+                No(l, "ADT adaptation");
+            auto r = MemTemp(want, true);
+            StoreTag(r.a, want, M.VariantIdx(x.t));
+            if (cg.FixedSize(x.t)) tyg_copy(p, AddrPlus(r.a, M.TagSize(want)), x.a, cg.FixedSize(x.t));
+            return r;
+        }
         if (x.t->kind == TY_ENUM && want->kind == TY_ENUM && x.mem && M.IsVm(x.t) && !M.IsVm(want) &&
             M.EI(x.t) == M.EI(want) && M.TypeOk(want)) {
             // A variable-mode value as fixed-mode (CodeGen::AdaptToFixed): its tag, then the payload.
@@ -5515,14 +5510,6 @@ struct TgFn {
     tyg_val LoadTag(tyg_addr a, TypeExpr *adt) {
         return tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, M.TagScal(adt), a, 0));
     }
-    // A variant's value as its fixed-mode ADT: the variant's tag, the payload behind it.
-    V AdaptToAdt(const V &x, TypeExpr *adt, Line l) {
-        if (adt->enu->varmode || !M.TypeOk(adt) || M.EI(x.t) != M.EI(adt)) No(l, "ADT adaptation");
-        auto r = MemTemp(adt, true);
-        StoreTag(r.a, adt, M.VariantIdx(x.t));
-        if (cg.FixedSize(x.t)) tyg_copy(p, AddrPlus(r.a, M.TagSize(adt)), x.a, cg.FixedSize(x.t));
-        return r;
-    }
     // A payload-less variant constant (Dot::CgX).
     V GenVariantConst(Dot *d) {
         auto t = d->exprtype;
@@ -6527,7 +6514,11 @@ struct TgFn {
         auto init = sl->InitFor(tail);
         if (!init && (M.FoOk(tt) || M.IsRb(tt))) No(l, "omitted tail");
         if (M.FoOk(tt)) GenFoBytes(init, stk, tt, len, l);
-        else BuildTail(init, stk, tt, len, l);
+        else {   // Behind a header of its own, its count stored at len.
+            auto th = NewHdr();
+            TailHdr(init, stk, th, tt, l);
+            if (!Ended()) St(len, Ld(CountAt(th)));
+        }
     }
     // Builds n's value, of frame object type t, at the top of stk as the tail of a value that is not
     // one: its fields as bytes, its innermost tail's count into olen (CodeGen::GenFoAsBytes). Anything
@@ -7013,26 +7004,6 @@ struct TgFn {
         else check();
     }
 
-    // The fields of struct or variant t (CodeGen::EmitVerifyFields). A fixed one's offsets may include padding
-    // a sequential walk would miss; a bytes layout's are walked in turn.
-    void VFields(TypeExpr *t, bool links) {
-        auto &fs = M.RunOfType(t);
-        auto fix = cg.IsFix(t);
-        auto total = fix ? cg.FixedSize(t) : 0;
-        tyg_local start = fix ? Local(VQ()) : 0;
-        if (fix) VNeed(total);
-        for (size_t i = 0; i < fs.f.size(); i++) {
-            if (fs.f[i].ispad) {
-                if (!fix && fs.f[i].padsize > 0) VAddQ(I64(fs.f[i].padsize));
-                continue;
-            }
-            if (fix && !cg.NeedsVerifyWalk(fs.t[i])) continue;
-            if (fix) VSetQ(Add(LdL(start), I64(fs.off[i])));
-            VWalk(fs.t[i], links);
-        }
-        if (fix) VSetQ(Add(LdL(start), I64(total)));
-    }
-
     // The checks and cursor advance for one value of type t at q (CodeGen::EmitVerifyWalk).
     void VWalk(TypeExpr *t, bool links) {
         if (!cg.NeedsVerifyWalk(t)) {
@@ -7120,9 +7091,24 @@ struct TgFn {
                 }
                 return;
             }
-            case TY_STRUCT: case TY_VARIANT:
-                VFields(t, links);
+            case TY_STRUCT: case TY_VARIANT: {   // The fields (CodeGen::EmitVerifyFields).
+                // A fixed one's offsets may include padding a walk would miss; bytes lay out in turn.
+                auto &fs = M.RunOfType(t);
+                auto fix = cg.IsFix(t);
+                tyg_local start = fix ? Local(VQ()) : 0;
+                if (fix) VNeed(cg.FixedSize(t));
+                for (size_t i = 0; i < fs.f.size(); i++) {
+                    if (fs.f[i].ispad) {
+                        if (!fix && fs.f[i].padsize > 0) VAddQ(I64(fs.f[i].padsize));
+                        continue;
+                    }
+                    if (fix && !cg.NeedsVerifyWalk(fs.t[i])) continue;
+                    if (fix) VSetQ(Add(LdL(start), I64(fs.off[i])));
+                    VWalk(fs.t[i], links);
+                }
+                if (fix) VSetQ(Add(LdL(start), I64(cg.FixedSize(t))));
                 return;
+            }
             case TY_ENUM: {   // The tag is range-checked in both modes (a match has no default).
                 auto ei = cg.EIOf(t);
                 auto tsz = CodeGen::IntSize(cg.TagStore(ei->en));
