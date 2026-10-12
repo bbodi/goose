@@ -7016,10 +7016,6 @@ struct TgFn {
         }
     }
 
-    static tyg_addr AddrPlus(tyg_addr a, int64_t off) {
-        a.offset += off;
-        return a;
-    }
     // A plain `=` into pl (Assign::CgStmt): a resizable's stack top goes back to where its elements
     // start, the new value is built there.
     void AssignWhole(Assign *a, P pl) {
