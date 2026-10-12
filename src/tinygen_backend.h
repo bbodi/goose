@@ -7736,6 +7736,13 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         return "";
     }
 
+    vector<FnSpec *> Externs() override {
+        vector<FnSpec *> r;
+        if (mod)
+            for (auto list : { &mod->externs, &mod->direct }) r.insert(r.end(), list->begin(), list->end());
+        return r;
+    }
+
     // The specializations whose body compiles, built straight into the module; the rest are left to C.
     // The halves call each other with gs_sp as two C functions do, so what one takes does not depend on
     // the other.

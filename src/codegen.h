@@ -1326,6 +1326,8 @@ struct CodeGen {
     struct SpecBackend {
         virtual ~SpecBackend() {}
         virtual set<FnSpec *> Choose(CodeGen &cg, const vector<FnSpec *> &specs) = 0;
+        // The extern fns the specializations it took call, after Choose.
+        virtual vector<FnSpec *> Externs() { return {}; }
     };
     SpecBackend *backend = nullptr;
     set<FnSpec *> foreign;   // The specializations the other backend defines.
@@ -1394,6 +1396,19 @@ struct CodeGen {
         for (auto sp : usedexterns) {
             if (runtime_ext_text.find(cat(" ", sp->sf->cname, "(")) != string_view::npos) continue;
             externs += ExternProto(sp);
+        }
+        // An --include header is C written against the program's types, and
+        // reads a struct an extern takes by reference. Nothing else may need
+        // that struct's body when the other backend makes the extern's callers.
+        if (!headers.empty()) {
+            auto all = usedexterns;
+            if (backend)
+                for (auto sp : backend->Externs()) all.push_back(sp);
+            for (auto sp : all)
+                for (auto t : sp->argtypes)
+                    if (t->kind == TY_REF && StructLike(t->ref->sub) && !IsResz(t->ref->sub) &&
+                        !IsBytesT(t->ref->sub))
+                        CT(t->ref->sub);
         }
         string includes;
         for (auto inc : headers) {

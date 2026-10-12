@@ -122,6 +122,9 @@ PROGRAMS = [
      ["--tinygen-skip=dig,bad,split_fail,forward,inner_leave,deep2,each,leave_nest"]),
     ("test/tinygen/tinygen_retfrom.goose", False,
      ["--tinygen-skip=deep,outer,after_owner,give,nest,point"]),
+    # An --include header reads a struct its extern takes by reference, while every Goose
+    # function, the extern's callers among them, is tinygen's.
+    ("samples/24_call_c.goose", True, ["--include", str(ROOT / "samples" / "call_c.h")]),
     ("test/tinygen/tinygen_render.goose", True, []),
     ("test/tinygen/tinygen_render.goose", True, ["--debug"]),
     ("test/tinygen/tinygen_render.goose", False, ["--tinygen-skip=main"]),
