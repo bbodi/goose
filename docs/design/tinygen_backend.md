@@ -309,17 +309,17 @@ Run time of `bench/goose` programs at medium size, in milliseconds:
 
 | Program | tinygen | C `--debug` (`cc -O0`) | C default (`cc -O2`) |
 |---|---|---|---|
-| sum | 76 | 626 | 34 |
-| push | 58 | 311 | 36 |
-| calc | 190 | 694 | 108 |
-| sexp | 601 | 2011 | 333 |
-| lru | 356 | 945 | 136 |
-| graph | 422 | 897 | 384 |
-| scene | 122 | 1158 | 38 |
-| blur | 99 | 2678 | 14 |
-| particles | 357 | 797 | 141 |
+| sum | 75 | 626 | 34 |
+| push | 54 | 311 | 36 |
+| calc | 186 | 694 | 108 |
+| sexp | 595 | 2011 | 333 |
+| lru | 336 | 945 | 136 |
+| graph | 402 | 897 | 384 |
+| scene | 106 | 1158 | 38 |
+| blur | 92 | 2678 | 14 |
+| particles | 274 | 797 | 141 |
 
-tinygen beats `cc -O0` on every benchmark, by 2 to 27 times. It is 1.1 to 7
+tinygen beats `cc -O0` on every benchmark, by 2 to 29 times. It is 1.05 to 7
 times slower than `cc -O2`, most of all in tight loops such as blur's.
 
 ## What tinygen lacks
