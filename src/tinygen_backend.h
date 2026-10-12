@@ -1962,8 +1962,7 @@ struct TgFn {
     int AllocStk(bool forlocal, Line l) {
         auto k = live++;
         maxown = std::max(maxown, live);
-        auto mark = tyg_local_new(p, 8, 8);
-        StL(mark, Top(Stk(k, l)));
+        auto mark = Local(Top(Stk(k, l)));
         auto i = sscopes.size() - 1;
         while (forlocal && i > 0 && sscopes[i].stmt) i--;
         sscopes[i].marks.push_back({ k, mark });
@@ -2096,8 +2095,7 @@ struct TgFn {
             if (Ended()) return;
             begin();
             auto top = Top(stk);
-            auto i = tyg_local_new(p, 8, 8);
-            StL(i, I64(0));
+            auto i = Local(I64(0));
             auto head = NewBlock(), body = NewBlock(), done = NewBlock();
             tyg_jump(p, head);
             SetBlock(head);
@@ -2538,8 +2536,7 @@ struct TgFn {
         if (w == 0) {
             // A varint: one byte reserved, the elements moved up behind a
             // count that needs more.
-            auto nl = tyg_local_new(p, 8, 8);
-            StL(nl, n);
+            auto nl = Local(n);
             auto cnt = [&] { return LdL(nl); };
             auto small = NewBlock(), big = NewBlock(), done = NewBlock();
             Branch(Cmp(TYG_ULT, cnt(), I64(128)), small, big);
@@ -2549,8 +2546,7 @@ struct TgFn {
             SetBlock(big);
             auto tmp = tyg_local_new(p, 16, 8);
             auto ms = UlebWrite(tyg_addr_of(p, AtL(tmp)), cnt());
-            auto msl = tyg_local_new(p, 8, 8);
-            StL(msl, ms);
+            auto msl = Local(ms);
             auto msv = [&] { return LdL(msl); };
             auto elems = Add(pre, I64(1));
             auto top = Top(stk);
@@ -2594,26 +2590,22 @@ struct TgFn {
         if (auto ie = n && !from ? Is<IfExpr>(n) : nullptr; ie && ie->elseb) {
             // Each arm builds its value at the same top (CodeGen's
             // GenConstruct of an if): the image starts where the top was.
-            auto start = tyg_local_new(p, 8, 8);
-            StL(start, Top(stk));
+            auto start = Local(Top(stk));
             BuildIf(ie, l, [&](Node *v) { GenImg(v, stk, t, l); });
             return LdL(start);
         }
         if (auto b = n && !from ? Is<Block>(n) : nullptr; b && b->tail) {
-            auto start = tyg_local_new(p, 8, 8);
-            StL(start, Top(stk));
+            auto start = Local(Top(stk));
             BuildArm(b, l, [&](Node *v) { GenImg(v, stk, t, l); });
             return LdL(start);
         }
         if (n && !from && (Is<MatchExpr>(n) || Is<EarlyBlock>(n) || Is<LoopExpr>(n))) {
-            auto start = tyg_local_new(p, 8, 8);
-            StL(start, Top(stk));
+            auto start = Local(Top(stk));
             BuildExpr(n, InPlace { 1, stk, t, {} }, l);
             return LdL(start);
         }
         if (auto c = n && !from ? Is<Call>(n) : nullptr; c && c->fvbody && c->fvbody->tail) {
-            auto start = tyg_local_new(p, 8, 8);
-            StL(start, Top(stk));
+            auto start = Local(Top(stk));
             BuildFv(c, l, [&](Node *v) { GenImg(v, stk, t, l); });
             return LdL(start);
         }
@@ -2643,8 +2635,7 @@ struct TgFn {
             if (!n || from) No(l, cat("value of type ", M.NameWhy(t)));
             return GenVs(n, stk, t, l);
         }
-        auto start = tyg_local_new(p, 8, 8);
-        StL(start, Top(stk));
+        auto start = Local(Top(stk));
         auto at = [&] { return LdL(start); };
         if (auto c = Is<Call>(n); DestSpec(c) && cg.Mangle(DestSpec(c)->rets[0]) == cg.Mangle(t)) {
             imgdst = stk;
@@ -2738,8 +2729,7 @@ struct TgFn {
         auto at = [&] { return LdL(start); };
         auto et = t->arr->sub;
         SetTop(stk, Add(at(), I64(TgModule::PrefixBytes(t))));
-        auto cnt = tyg_local_new(p, 8, 8);
-        StL(cnt, I64(0));
+        auto cnt = Local(I64(0));
         View v {};
         auto al = n ? Is<ArrayLit>(n) : nullptr;
         if (al && al->fillval && !al->capexpr) {
@@ -2754,10 +2744,8 @@ struct TgFn {
             if (fc->val == 0) {
                 SetTop(stk, saved);
             } else if (fc->val > 1) {
-                auto fl = tyg_local_new(p, 8, 8);
-                StL(fl, first);
-                auto ctr = tyg_local_new(p, 8, 8);
-                StL(ctr, I64(1));
+                auto fl = Local(first);
+                auto ctr = Local(I64(1));
                 auto head = NewBlock(), body = NewBlock(), done = NewBlock();
                 tyg_jump(p, head);
                 SetBlock(head);
@@ -2824,11 +2812,9 @@ struct TgFn {
         auto src = [&] { return LdL(sl); };
         auto sz = [&] { return LdL(sl, 8); };
         auto pfx = tyg_local_new(p, 16, 8);
-        auto pn = tyg_local_new(p, 8, 8);
-        StL(pn, UlebWrite(tyg_addr_of(p, AtL(pfx)), sz()));
+        auto pn = Local(UlebWrite(tyg_addr_of(p, AtL(pfx)), sz()));
         auto append = [&](tyg_val from, tyg_val n) {
-            auto ol = tyg_local_new(p, 8, 8);
-            StL(ol, LimLen(out));
+            auto ol = Local(LimLen(out));
             auto o = [&] { return LdL(ol); };
             AbortUnless(Cmp(TYG_SLE, Add(o(), n), LimCapOf(out)), "CAPACITY", l);
             tyg_move_dyn(p, ElemAddr(LimView(out), o()), from, n);
@@ -2915,8 +2901,7 @@ struct TgFn {
             // its tag, then the variant's payload copied.
             auto r = MemTemp(want, true);
             auto ei = cg.EIOf(want);
-            auto tag = tyg_local_new(p, 8, 8);
-            StL(tag, LoadTag(x.a, x.t));
+            auto tag = Local(LoadTag(x.a, x.t));
             tyg_store(p, M.TagScal(want), r.a, tyg_convert(p, TYG_TRUNC, M.TagScal(want), LdL(tag)), 0);
             auto done = NewBlock();
             for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
@@ -3374,8 +3359,7 @@ struct TgFn {
     // k slots at base (zeroed), each built from the captured leaves.
     void FillStore(const vector<FillLeaf> &leaves, tyg_val base, int64_t k, ArrayLit *al) {
         auto esz = cg.FixedSize(al->exprtype->arr->sub);
-        auto i = tyg_local_new(p, 8, 8);
-        StL(i, I64(0));
+        auto i = Local(I64(0));
         auto head = NewBlock(), body = NewBlock(), done = NewBlock();
         tyg_jump(p, head);
         SetBlock(head);
@@ -3934,8 +3918,7 @@ struct TgFn {
         switch (t->kind) {
             case TY_INT: case TY_REF: {
                 if (!TgModule::IsVarint(t) && !TgModule::IsVr(t)) No(l, cat("comparison of type ", M.NameWhy(t)));
-                auto na = tyg_local_new(p, 8, 8);
-                StL(na, UlebSize(A()));
+                auto na = Local(UlebSize(A()));
                 auto n = [&] { return LdL(na); };
                 next(Cmp(TYG_EQ, UlebSize(B()), n()));
                 auto d = CallC("memcmp", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64, false) }, { A(), B(), n() }, IT(TYG_I32));
@@ -3977,8 +3960,7 @@ struct TgFn {
                 auto la = [&] { return LdL(lena); };
                 auto lb = [&] { return LdL(lenb); };
                 next(Cmp(TYG_EQ, la(), lb()));
-                auto il = tyg_local_new(p, 8, 8);
-                StL(il, i64(0));
+                auto il = Local(i64(0));
                 auto hd = NewBlock(), body = NewBlock(), done = NewBlock();
                 tyg_jump(p, hd);
                 SetBlock(hd);
@@ -4008,8 +3990,7 @@ struct TgFn {
                 auto ts = M.TagSize(t);
                 auto ta = LoadTag(AtV(A()), t);
                 next(Cmp(TYG_EQ, ta, LoadTag(AtV(B()), t)));
-                auto tag = tyg_local_new(p, 8, 8);
-                StL(tag, LoadTag(AtV(A()), t));
+                auto tag = Local(LoadTag(AtV(A()), t));
                 adv(i64(ts));
                 auto done = NewBlock();
                 for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
@@ -4030,10 +4011,8 @@ struct TgFn {
     // The first n elements of two views, n their (equal) count.
     void EqElems(const View &va, const View &vb, tyg_block fail, Line l) {
         auto et = va.elem;
-        auto il = tyg_local_new(p, 8, 8);
-        StL(il, I64(0));
-        auto nl = tyg_local_new(p, 8, 8);
-        StL(nl, va.len);
+        auto il = Local(I64(0));
+        auto nl = Local(va.len);
         auto ca = tyg_local_new(p, 8, 8), cb = tyg_local_new(p, 8, 8);
         StL(ca, va.elems);
         StL(cb, vb.elems);
@@ -4595,8 +4574,7 @@ struct TgFn {
             auto one = Temp(et);
             Into(P { AtL(one), et }, al->fillval);
             if (Ended()) return Dummy(t);
-            auto il = tyg_local_new(p, 8, 8);
-            StL(il, I64(0));
+            auto il = Local(I64(0));
             auto head = NewBlock(), body = NewBlock(), done = NewBlock();
             tyg_jump(p, head);
             SetBlock(head);
@@ -4718,8 +4696,7 @@ struct TgFn {
                 for (int64_t i = 0; i < k; i++)
                     tyg_copy(p, AtL(tmp, i * esz), AtL(one), esz);
             } else {
-                auto ctr = tyg_local_new(p, 8, 8);
-                StL(ctr, I64(0));
+                auto ctr = Local(I64(0));
                 auto head = NewBlock(), body = NewBlock(), done = NewBlock();
                 tyg_jump(p, head);
                 SetBlock(head);
@@ -4822,8 +4799,7 @@ struct TgFn {
     void LimCopyInto(const P &dst, const View &v, Line l) {
         auto et = dst.t->arr->sub;
         if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
-        auto nl = tyg_local_new(p, 8, 8);
-        StL(nl, v.len);
+        auto nl = Local(v.len);
         auto n = [&] { return LdL(nl); };
         AbortUnless(Cmp(TYG_SLE, n(), LimCapOf(dst)), "CAPACITY", l);
         auto to = LimView(dst).elems;
@@ -4920,8 +4896,7 @@ struct TgFn {
             if (!M.IsScalar(et) && !x.mem) No(c->line, "aggregate value");
         }
         auto v = LimView(pl);
-        auto nl = tyg_local_new(p, 8, 8);
-        StL(nl, v.len);
+        auto nl = Local(v.len);
         auto n = [&] { return LdL(nl); };
         AbortUnless(Cmp(TYG_SLT, n(), LimCapOf(pl)), "CAPACITY", c->line);
         auto at = ElemAddr(LimView(pl), n());
@@ -5254,14 +5229,12 @@ struct TgFn {
             // A literal of elements holding relative references builds its
             // run in the free slots, once the capacity is checked.
             auto k = LitCount(al);
-            auto ol = tyg_local_new(p, 8, 8);
-            StL(ol, LimLen(pl));
+            auto ol = Local(LimLen(pl));
             auto o = [&] { return LdL(ol); };
             AbortUnless(Cmp(TYG_SLE, Add(o(), I64(k)), LimCapOf(pl)), "CAPACITY", c->line);
             auto leaves = FillCapture(al);
             if (Ended()) return V {};
-            auto base = tyg_local_new(p, 8, 8);
-            StL(base, ElemAddr(LimView(pl), o()));
+            auto base = Local(ElemAddr(LimView(pl), o()));
             LitRunAt(al, et, base, k, leaves);
             if (Ended()) return V {};
             LimSetLen(pl, Add(o(), I64(k)));
@@ -5279,11 +5252,9 @@ struct TgFn {
             v = ViewOf(from, c->line);
         }
         if (cg.Mangle(v.elem) != cg.Mangle(et)) No(c->line, "append of another element type");
-        auto nl = tyg_local_new(p, 8, 8);
-        StL(nl, v.len);
+        auto nl = Local(v.len);
         auto n = [&] { return LdL(nl); };
-        auto ol = tyg_local_new(p, 8, 8);
-        StL(ol, LimLen(pl));
+        auto ol = Local(LimLen(pl));
         auto o = [&] { return LdL(ol); };
         auto total = [&] { return Add(o(), n()); };
         AbortUnless(Cmp(TYG_SLE, total(), LimCapOf(pl)), "CAPACITY", c->line);
@@ -5326,11 +5297,9 @@ struct TgFn {
             if (!M.IsScalar(et) && !fv.mem && !Ended()) No(c->line, "aggregate value");
         }
         if (Ended()) return V {};
-        auto nl = tyg_local_new(p, 8, 8);
-        StL(nl, nn);
+        auto nl = Local(nn);
         auto n = [&] { return LdL(nl); };
-        auto ol = tyg_local_new(p, 8, 8);
-        StL(ol, LimLen(pl));
+        auto ol = Local(LimLen(pl));
         auto o = [&] { return LdL(ol); };
         AbortUnless(Cmp(TYG_SGE, n(), i64(0)), "RESIZENEG", c->line);
         auto shrink = NewBlock(), notshrink = NewBlock(), grow = NewBlock(),
@@ -5346,8 +5315,7 @@ struct TgFn {
             Abort("RESIZEFILL", c->line);
         } else {
             AbortUnless(Cmp(TYG_SLE, n(), LimCapOf(pl)), "CAPACITY", c->line);
-            auto il = tyg_local_new(p, 8, 8);
-            StL(il, o());
+            auto il = Local(o());
             auto i = [&] { return LdL(il); };
             auto head = NewBlock(), body = NewBlock(), out = NewBlock();
             tyg_jump(p, head);
@@ -5595,8 +5563,7 @@ struct TgFn {
             tyg_zero(p, pl.a, M.Size(t));
             if (c->defaultinit && t->kind == TY_ARRAY && t->arr->akind == A_FIXED) {
                 auto et = t->arr->sub;
-                auto il = tyg_local_new(p, 8, 8);
-                StL(il, I64(0));
+                auto il = Local(I64(0));
                 auto head = NewBlock(), body = NewBlock(), done = NewBlock();
                 tyg_jump(p, head);
                 SetBlock(head);
@@ -5989,8 +5956,7 @@ struct TgFn {
         if ((SelfRelLit(an[1]) || (cg.HasRelRef(et) && SelfRelLitOk(an[1]))) && cg.TEq(an[1]->exprtype, et)) {
             // Built in its slot at the top, then counted.
             auto slot = Top(pl.stk);
-            auto sv = tyg_local_new(p, 8, 8);
-            StL(sv, slot);
+            auto sv = Local(slot);
             SelfRelInto(P { AtV(slot), et }, an[1]);
             if (Ended()) return Dummy(c->exprtype);
             auto at = LdL(sv);
@@ -6372,8 +6338,7 @@ struct TgFn {
                 if (!M.TypeOk(t) && !M.VmOk(t)) break;
                 auto ei = cg.EIOf(t);
                 auto varmode = M.IsVm(t);
-                auto tag = tyg_local_new(p, 8, 8);
-                StL(tag, LoadTag(pl.a, t));
+                auto tag = Local(LoadTag(pl.a, t));
                 auto done = NewBlock();
                 for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
                     auto hit = NewBlock(), next = NewBlock();
@@ -6562,8 +6527,7 @@ struct TgFn {
             variant(M.VariantIdx(t), 0);
             return;
         }
-        auto tag = tyg_local_new(p, 8, 8);
-        StL(tag, LoadTag(AtV(Ld(pl.a)), t));
+        auto tag = Local(LoadTag(AtV(Ld(pl.a)), t));
         auto done = NewBlock();
         for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
             auto hit = NewBlock(), next = NewBlock();
@@ -6686,11 +6650,9 @@ struct TgFn {
             if (!M.IsScalar(et) && !fv.mem && !Ended()) No(c->line, "aggregate value");
         }
         if (Ended()) return V {};
-        auto nl = tyg_local_new(p, 8, 8);
-        StL(nl, nn);
+        auto nl = Local(nn);
         auto n = [&] { return LdL(nl); };
-        auto ol = tyg_local_new(p, 8, 8);
-        StL(ol, Ld(len));
+        auto ol = Local(Ld(len));
         auto o = [&] { return LdL(ol); };
         AbortUnless(Cmp(TYG_SGE, n(), i64(0)), "RESIZENEG", c->line);
         auto shrink = NewBlock(), notshrink = NewBlock(), grow = NewBlock(),
@@ -6707,8 +6669,7 @@ struct TgFn {
             Abort("RESIZEFILL", c->line);
         } else {
             // The new slots through a cursor, the top written once after.
-            auto cur = tyg_local_new(p, 8, 8);
-            StL(cur, Top(pl.stk));
+            auto cur = Local(Top(pl.stk));
             auto head = NewBlock(), body = NewBlock(), out = NewBlock();
             tyg_jump(p, head);
             SetBlock(head);
@@ -7615,8 +7576,7 @@ struct TgFn {
     }
     // The bytes of the ULEB128 at `at` (gs_uleb_size).
     tyg_val UlebSize(tyg_val at) {
-        auto q = tyg_local_new(p, 8, 8);
-        StL(q, at);
+        auto q = Local(at);
         auto head = NewBlock(), more = NewBlock(), done = NewBlock();
         tyg_jump(p, head);
         SetBlock(head);
@@ -7907,8 +7867,7 @@ struct TgFn {
         auto uns = IsUnsigned(ot->intstorage);
         auto x0 = Conv(GenAs(me->scrutinee, ot).v, ot, M.ast.inttypes[IS_I64], me->line);
         if (Ended()) return valued ? Dummy(et) : V {};
-        auto xl = tyg_local_new(p, 8, 8);
-        StL(xl, x0);
+        auto xl = Local(x0);
         auto x = [&] { return LdL(xl); };
         auto k = [&](int64_t v) { return I64(v); };
         auto done = NewBlock();
@@ -8150,8 +8109,7 @@ struct TgFn {
                 if (a.pat.byref) {
                     // Variable-mode payloads only (§8.1): its address.
                     if (!M.IsVm(adt)) No(me->line, "match arm binding by reference");
-                    auto slot = tyg_local_new(p, 8, 8);
-                    StL(slot, tyg_addr_of(p, pay));
+                    auto slot = Local(tyg_addr_of(p, pay));
                     locals[a.binder] = slot;
                     if (!IsAddrRef(a.binder->type)) indirect.insert(a.binder);
                 } else if (!cg.IsFix(vt)) {
@@ -8419,8 +8377,7 @@ struct TgFn {
                         // moves down to where the exit's value starts
                         // (CodeGen::GenExitValue, LandValue).
                         InPlace ip { t.inplace, t.dstk, t.dt, t.hdr };
-                        auto st = tyg_local_new(p, 8, 8);
-                        StL(st, Top(t.dstk));
+                        auto st = Local(Top(t.dstk));
                         BuildTo(b->val, ip, b->line);
                         if (!Ended()) {
                             auto start = LdL(st);
@@ -8738,8 +8695,7 @@ struct TgFn {
             // A resizable local: its header, and a stack of its own, empty.
             auto stk = Stk(AllocStk(true, l), l);
             auto hdr = tyg_local_new(p, 16, 8);
-            auto sl = tyg_local_new(p, 8, 8);
-            StL(sl, stk);
+            auto sl = Local(stk);
             StL(hdr, Top(stk));
             StL(hdr, I64(0), 8);
             locals[d] = hdr;
@@ -8750,8 +8706,7 @@ struct TgFn {
                 // Its freelist: free slot indices on a stack of their own.
                 auto flstk = Stk(AllocStk(true, l), l);
                 auto fl = tyg_local_new(p, 16, 8);
-                auto fsl = tyg_local_new(p, 8, 8);
-                StL(fsl, flstk);
+                auto fsl = Local(flstk);
                 StL(fl, Top(flstk));
                 StL(fl, I64(0), 8);
                 poolfl[d] = { fl, fsl };
@@ -8763,8 +8718,7 @@ struct TgFn {
             // on a stack of its own, the tail empty.
             auto stk = Stk(AllocStk(true, l), l);
             auto fo = tyg_local_new(p, M.Size(d->type), 8);
-            auto sl = tyg_local_new(p, 8, 8);
-            StL(sl, stk);
+            auto sl = Local(stk);
             tyg_zero(p, AtL(fo), M.Size(d->type));
             StL(fo, Top(stk), M.FoHdrOff(d->type));
             locals[d] = fo;
@@ -9000,8 +8954,7 @@ struct TgFn {
             }
             if (Ended()) return;
             if (cg.Mangle(v.elem) != cg.Mangle(pl.t->arr->sub)) No(a->line, "array of another element type");
-            auto nl = tyg_local_new(p, 8, 8);
-            StL(nl, v.len);
+            auto nl = Local(v.len);
             auto n = [&] { return LdL(nl); };
             AbortUnless(Cmp(TYG_SLE, n(), LimCapOf(pl)), "CAPACITY", a->line);
             auto esz = I64(cg.FixedSize(pl.t->arr->sub));
@@ -9154,8 +9107,7 @@ struct TgFn {
         auto path = CheckFreePath(f->iter);
         if (!path) once = Place(f->iter);
         auto at = [&]() { return path ? Place(f->iter) : once; };
-        auto gi = tyg_local_new(p, 8, 8);
-        StL(gi, I64(0));
+        auto gi = Local(I64(0));
         // Elements of variable size are walked with a cursor, each one's
         // bytes on from the last (StepElem); the loop variable is the
         // element's address, as a T[] local is its image's.
@@ -9202,8 +9154,7 @@ struct TgFn {
             SetBlock(moved);
             StL(wb, v.elems);
             StL(cl, v.elems);
-            auto k = tyg_local_new(p, 8, 8);
-            StL(k, I64(0));
+            auto k = Local(I64(0));
             tyg_jump(p, rewalk);
             SetBlock(rewalk);
             Branch(Cmp(TYG_SLT, LdL(k), LdL(gi)), more, same);
@@ -9559,8 +9510,7 @@ struct TgFn {
         if (auto sl = Is<StructLit>(n); sl && sl->sinst && !sl->variant && cg.TEq(sl->exprtype, t)) {
             auto si = cg.SI(t);
             auto last = LastRealField(si->st->fields);
-            auto start = tyg_local_new(p, 8, 8);
-            StL(start, Top(stk));
+            auto start = Local(Top(stk));
             RunLit(sl, stk, si->st->fields, si->ftypes, (size_t)last);
             if (Ended()) return;
             auto th = AtL(tyg_local_new(p, 16, 8));
@@ -9641,8 +9591,7 @@ struct TgFn {
             auto ei = cg.EIOf(t);
             auto ts = M.TagSize(t);
             auto res = tyg_local_new(p, 8, 8);
-            auto tag = tyg_local_new(p, 8, 8);
-            StL(tag, LoadTag(AtV(at), t));
+            auto tag = Local(LoadTag(AtV(at), t));
             auto done = NewBlock();
             for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
                 auto vt = cg.VariantType(t, (int)vi);
@@ -9728,8 +9677,7 @@ struct TgFn {
     // lying at `src`, adapted to t at the top of stk (CodeGen::
     // GenVarEnumFromLoc): the tag, then the payload; its address.
     tyg_val VmFrom(tyg_val stk, tyg_addr src, TypeExpr *srct, TypeExpr *t, Line l) {
-        auto start = tyg_local_new(p, 8, 8);
-        StL(start, Top(stk));
+        auto start = Local(Top(stk));
         auto at = [&] { return LdL(start); };
         {
             if (M.EI(srct) != M.EI(t) || (srct->kind != TY_VARIANT && !(srct->kind == TY_ENUM && !srct->enu->varmode)))
@@ -9750,8 +9698,7 @@ struct TgFn {
                 else ImgCopy(stk, tyg_addr_of(p, src), srct);
                 return at();
             }
-            auto tag = tyg_local_new(p, 8, 8);
-            StL(tag, LoadTag(src, srct));
+            auto tag = Local(LoadTag(src, srct));
             tyg_store(p, M.TagScal(t), AtV(base), tyg_convert(p, TYG_TRUNC, M.TagScal(t), LdL(tag)), 0);
             auto done = NewBlock();
             for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
@@ -9779,8 +9726,7 @@ struct TgFn {
     // address. A variant literal as its tag then its payload fields, a call
     // returning one handed stk, anything else copied whole.
     tyg_val GenVm(Node *n, tyg_val stk, TypeExpr *t, Line l) {
-        auto start = tyg_local_new(p, 8, 8);
-        StL(start, Top(stk));
+        auto start = Local(Top(stk));
         auto at = [&] { return LdL(start); };
         if (auto c = Is<Call>(n); DestSpec(c) && cg.Mangle(DestSpec(c)->rets[0]) == cg.Mangle(t)) {
             imgdst = stk;
@@ -9849,8 +9795,7 @@ struct TgFn {
     // A variable-size variant's value at the top of stk: a literal's fields
     // in turn, a call's built there, anything else copied whole.
     tyg_val GenVv(Node *n, tyg_val stk, TypeExpr *t, Line l) {
-        auto start = tyg_local_new(p, 8, 8);
-        StL(start, Top(stk));
+        auto start = Local(Top(stk));
         auto at = [&] { return LdL(start); };
         if (auto sl = Is<StructLit>(n); sl && cg.TEq(sl->exprtype, t)) {
             auto ei = cg.EIVar(t);
@@ -9872,8 +9817,7 @@ struct TgFn {
     }
 
     tyg_val GenVs(Node *n, tyg_val stk, TypeExpr *t, Line l) {
-        auto start = tyg_local_new(p, 8, 8);
-        StL(start, Top(stk));
+        auto start = Local(Top(stk));
         auto at = [&] { return LdL(start); };
         if (auto c = Is<Call>(n); c && c->builtin == B_COPY && c->ArgNodes().size() == 1) n = c->ArgNodes()[0];
         if (auto sl = Is<StructLit>(n); sl && sl->sinst && !sl->variant && cg.TEq(sl->exprtype, t)) {
@@ -9997,8 +9941,7 @@ struct TgFn {
             pi += cg.IsPoolParam(sp, i) ? 4 : M.RzParam(t) && M.Resz(t) ? 2 : 1;
         }
         auto param = [&] {
-            auto loc = tyg_local_new(p, 8, 8);
-            StL(loc, tyg_param(p, pi++));
+            auto loc = Local(tyg_param(p, pi++));
             return loc;
         };
         // Free variables (§7.5), each the address of the variable in the
@@ -10070,8 +10013,7 @@ struct TgFn {
                             M.File(vd->line.fileidx), vd->line.line);
             if (M.RzParam(t)) {
                 // A by-value T[>..]: its header, then its stack.
-                auto sl = tyg_local_new(p, 8, 8);
-                StL(sl, tyg_param(p, pi++));
+                auto sl = Local(tyg_param(p, pi++));
                 rzstk[vd] = sl;
             }
         }
@@ -10107,8 +10049,7 @@ struct TgFn {
             for (size_t i = 0; i < sp->rets.size(); i++) {
                 if (!IsImg(sp->rets[i]) && !M.Resz(sp->rets[i])) continue;
                 auto at = ChanAt(sp, i, "fdst");
-                auto sav = tyg_local_new(p, 8, 8);
-                StL(sav, Ld(at));
+                auto sav = Local(Ld(at));
                 St(at, LdL(chans[i].a));
                 fdstsaves.emplace_back(at, sav);
             }
