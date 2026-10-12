@@ -1725,7 +1725,7 @@ struct TgFn {
         auto len = HdrLen(hdr);
         if (BuildCtl(n, InPlace { 2, stk, t, hdr }, l)) return;
         if (auto al = Is<ArrayLit>(n)) {
-            if (al->capexpr || (al->fillval && !fix)) No(l, "array literal of this kind");
+            if (al->capexpr) No(l, "array literal of this kind");
             if (!al->fillval) {   // Elements (images each built behind the last) counted one by one.
                 StartHdr(stk, hdr);
                 for (auto e : al->elems) {
@@ -1737,6 +1737,19 @@ struct TgFn {
             // [v; k] (CodeGen::GenArrayLit): v built once, then copied k times; k is a constant (§4.2).
             auto fc = Is<IntLit>(al->fillcount);
             if (!fc || fc->val < 0) No(l, "fill count");
+            if (!fix) {   // v built once even for none (CodeGen::FreezeFill), then copied behind itself.
+                StartHdr(stk, hdr);
+                auto saved = Top(stk);
+                auto first = GenImg(al->fillval, stk, et, l);
+                if (Ended()) return;
+                if (fc->val == 0) SetTop(stk, saved);
+                else if (fc->val > 1) {
+                    auto fl = Local(first);
+                    Loop(I64(1), I64(fc->val), [&](tyg_val) { ImgCopy(stk, LdL(fl), et); });
+                }
+                St(len, I64(fc->val));
+                return;
+            }
             auto esz = cg.FixedSize(et);
             // A relative element is built in each slot where it lies, its links measured from it.
             auto rel = SelfRelLit(al->fillval) || (TgModule::IsRel(et) && !et->ref->pool && !Is<NullLit>(al->fillval));
@@ -2063,9 +2076,10 @@ struct TgFn {
             return M.IsVm(t) ? GenVm(n, stk, t, l) : GenVs(n, stk, t, l);
         }
         if (CallAt(n, InPlace { 1, stk, t })) return at();
-        if (M.VarImgOk(t)) return GenImgOfImgs(n, stk, t, l, from, start);
-        if (M.IsRc(t)) { GenRc(n, stk, t, l, from, at()); return at(); }
-        SetTop(stk, Add(at(), I64(TgModule::PrefixBytes(t))));
+        if (!n && !from && M.VarImgOk(t)) No(l, "array of images without a value");
+        auto rc = M.IsRc(t);
+        if (rc && n && !from && RcPrelude(n, stk, t, l, at())) return at();
+        SetTop(stk, Add(at(), I64(rc ? 8 : TgModule::PrefixBytes(t))));
         auto hdr = NewHdr();
         auto len = HdrLen(hdr);
         if (n) {
@@ -2074,102 +2088,38 @@ struct TgFn {
             StartHdr(stk, hdr);
             if (from) {
                 SameElem(from->elem, t->arr->sub, l);
-                CopyRun(stk, len, t->arr->sub, from->elems, from->len);
+                CopyView(stk, len, t->arr->sub, *from);
             }
         }
         if (Ended()) return at();
-        PatchPrefix(at(), t, Ld(len), stk);
+        if (rc) RcSet(at(), t, Ld(len), Ld(len), l);
+        else PatchPrefix(at(), t, Ld(len), stk);
         return at();
     }
 
-    // A T[..] built at the top of stk, at `at` (CodeGen::GenArrayLit): [..cap] its capacity, no
-    // elements; another T[..] copied whole; any other array or literal its elements, capacity their count.
-    void GenRc(Node *n, tyg_val stk, TypeExpr *t, Line l, const View *from, tyg_val at) {
-        auto et = t->arr->sub;
-        P pl { AtV(at), t };
-        auto al = n && !from ? Is<ArrayLit>(n) : nullptr;
-        auto setcap = [&](tyg_val cap, tyg_val cnt) {
-            AbortUnless(Cmp(TYG_ULE, cap, I64(0xffffffffll)), "CAPRANGE", l);
-            tyg_store(p, TYG_I32, pl.a, tyg_convert(p, TYG_TRUNC, TYG_I32, cap), 0);
-            LimSetLen(pl, cnt);
-        };
-        if (al && al->capexpr) {
+    // A T[..] at `at`: its capacity and length stored.
+    void RcSet(tyg_val at, TypeExpr *t, tyg_val cap, tyg_val cnt, Line l) {
+        AbortUnless(Cmp(TYG_ULE, cap, I64(0xffffffffll)), "CAPRANGE", l);
+        tyg_store(p, TYG_I32, AtV(at), tyg_convert(p, TYG_TRUNC, TYG_I32, cap), 0);
+        LimSetLen(P { AtV(at), t }, cnt);
+    }
+    // A T[..] built at `at` at the top of stk (CodeGen::GenArrayLit): [..cap] its capacity, no elements; another
+    // T[..] copied whole. True if n was one of them; any other array or literal is built as a resizable's elements.
+    bool RcPrelude(Node *n, tyg_val stk, TypeExpr *t, Line l, tyg_val at) {
+        if (auto al = Is<ArrayLit>(n); al && al->capexpr) {
             auto cap = Index64(al->capexpr);
-            if (Ended()) return;
-            setcap(cap, I64(0));
-            SetTop(stk, Add(at, Add(I64(8), Mul(cap, I64(cg.FixedSize(et))))));
-            return;
-        }
-        if (n && !from && !al && !Is<StrLit>(n) && !LimCallResult(n) && !OwnTypedCall(n) && !IsStrCall(n) &&
-            n->exprtype && cg.TEq(n->exprtype, t)) {
-            auto src = Deref(Place(n));
-            if (!Ended()) ImgCopy(stk, tyg_addr_of(p, src.a), t);
-            return;
-        }
-        // The elements behind an 8-byte header, built as a resizable's; capacity = length = count.
-        SetTop(stk, Add(at, I64(8)));
-        auto hdr = NewHdr();
-        auto len = HdrLen(hdr);
-        StartHdr(stk, hdr);
-        auto fromview = [&](const View &v) {
-            SameElem(v.elem, et, l);
-            CopyView(stk, len, et, v);
-        };
-        if (from) {
-            fromview(*from);
-        } else if (al || Is<StrLit>(n) || IsStrCall(n)) {
-            GenRz(n, stk, hdr, t, l);
-        } else if (n) {
-            auto src = ElemsSource(StripCopy(n), l);
-            if (Ended()) return;
-            fromview(ViewOf(src, l));
-        }
-        if (Ended()) return;
-        auto cnt = Ld(len);
-        setcap(cnt, cnt);
-    }
-
-    // A T[] of images built at the top of stk (its start in `start`): the length prefix, then a
-    // literal's elements each built behind the last, or another such array's copied as one run of bytes.
-    tyg_val GenImgOfImgs(Node *n, tyg_val stk, TypeExpr *t, Line l, const View *from, tyg_local start) {
-        auto at = [&] { return LdL(start); };
-        auto et = t->arr->sub;
-        SetTop(stk, Add(at(), I64(TgModule::PrefixBytes(t))));
-        auto cnt = Local(I64(0));
-        auto len = AtL(cnt);
-        auto al = n ? Is<ArrayLit>(n) : nullptr;
-        if (al && al->fillval && !al->capexpr) {
-            // [v; k]: v built once even for none (CodeGen::FreezeFill), then copied behind itself.
-            auto fc = Is<IntLit>(al->fillcount);
-            if (!fc || fc->val < 0) No(l, "fill count");
-            auto saved = Top(stk);
-            auto first = GenImg(al->fillval, stk, et, l);
-            if (Ended()) return at();
-            if (fc->val == 0) {
-                SetTop(stk, saved);
-            } else if (fc->val > 1) {
-                auto fl = Local(first);
-                Loop(I64(1), I64(fc->val), [&](tyg_val) { ImgCopy(stk, LdL(fl), et); });
+            if (!Ended()) {
+                RcSet(at, t, cap, I64(0), l);
+                SetTop(stk, Add(at, Add(I64(8), Mul(cap, I64(cg.FixedSize(t->arr->sub))))));
             }
-            StL(cnt, I64(fc->val));
-        } else if (al && !al->fillval && !al->capexpr) {
-            for (auto e : al->elems) {
-                GenImg(e, stk, et, l);
-                if (Ended()) return at();
-                StL(cnt, Add(LdL(cnt), I64(1)));
-            }
-        } else {
-            n = StripCopy(n);
-            View v {};
-            if (from) v = *from;
-            else if (n) v = ViewOf(LimCallResult(n) ? LimCallPlace(n) : Place(n), l);
-            else No(l, "array of images without a value");
-            if (Ended()) return at();
-            SameElem(v.elem, et, l);
-            CopyView(stk, len, et, v);
+            return true;
         }
-        PatchPrefix(at(), t, LdL(cnt), stk);
-        return at();
+        if (Is<ArrayLit>(n) || Is<StrLit>(n) || LimCallResult(n) || OwnTypedCall(n) || IsStrCall(n) || !n->exprtype ||
+            !cg.TEq(n->exprtype, t))
+            return false;
+        auto src = Deref(Place(n));
+        if (!Ended()) ImgCopy(stk, tyg_addr_of(p, src.a), t);
+        return true;
     }
 
     // to_bytes (CodeGen::EmitToBytes, AppendBytes): the payload's size ULEB128, then its bytes, each handed to append.
