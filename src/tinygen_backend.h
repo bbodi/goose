@@ -7163,32 +7163,31 @@ struct TgFn {
 
     // ---- Control -----------------------------------------------------------
 
+    // The body in a stack scope of its own (a binder's or a block's stacks are given back on this path).
+    template <class F> void InScope(F body) {
+        tyg_scope_begin(p);
+        OpenScope(false);
+        body();
+        CloseScope();
+        tyg_scope_end(p);
+    }
     // A block's value is its tail's (none in statement position); a function body's tail with a result
     // is returned (tailret).
     TypeExpr *armwant = nullptr;   // What GenArm wants of a block arm's tail.
     V GenBlock(Block *b, bool discard, bool tailret = false) {
         auto want = armwant;
         armwant = nullptr;
-        tyg_scope_begin(p);
-        OpenScope(false);
-        for (auto s : b->stmts) Stmt(s);
         V x;
-        if (b->tail) {
-            if (tailret) {
-                Open();
-                Loc(b->tail->line);
-                DoReturn({ b->tail }, b->tail->line);
-            } else if (discard) {
-                Stmt(b->tail);
-            } else {
-                Open();
-                Loc(b->tail->line);
-                x = want ? GenSliceAs(b->tail, want) : Gen(b->tail);
-                if (x.t && (IsGrow(x.t) || (IsImg(x.t) && !TgModule::IsVr(x.t)))) No(b->tail->line, "array value of a block");
-            }
-        }
-        CloseScope();
-        tyg_scope_end(p);
+        InScope([&] {
+            for (auto s : b->stmts) Stmt(s);
+            if (!b->tail) return;
+            if (discard && !tailret) return Stmt(b->tail);
+            Open();
+            Loc(b->tail->line);
+            if (tailret) return DoReturn({ b->tail }, b->tail->line);
+            x = want ? GenSliceAs(b->tail, want) : Gen(b->tail);
+            if (x.t && (IsGrow(x.t) || (IsImg(x.t) && !TgModule::IsVr(x.t)))) No(b->tail->line, "array value of a block");
+        });
         return x;
     }
 
@@ -7260,17 +7259,14 @@ struct TgFn {
     // of its own.
     template <class F> void BuildArm(Node *n, Line l, F build) {
         if (auto b = Is<Block>(n)) {
-            tyg_scope_begin(p);
-            OpenScope(false);
-            for (auto st : b->stmts) Stmt(st);
-            if (!Ended()) {
+            InScope([&] {
+                for (auto st : b->stmts) Stmt(st);
+                if (Ended()) return;
                 if (!b->tail) No(l, "arm without a value");
                 Open();
                 Loc(b->tail->line);
                 build(b->tail);
-            }
-            CloseScope();
-            tyg_scope_end(p);
+            });
             return;
         }
         OpenScope(true);
@@ -7281,15 +7277,13 @@ struct TgFn {
     // then its body as an arm.
     template <class F> void BuildFv(Call *c, Line l, F build) {
         if (c->fvparams.size() > c->args.size()) No(c->line, "function value parameters");
-        tyg_scope_begin(p);
-        OpenScope(false);
-        for (size_t i = 0; i < c->fvparams.size(); i++) {
-            Declare(c->fvparams[i], c->args[i]->line);
-            Init(c->fvparams[i], c->args[i], c->args[i]->line);
-        }
-        if (!Ended()) BuildArm(c->fvbody, l, build);
-        CloseScope();
-        tyg_scope_end(p);
+        InScope([&] {
+            for (size_t i = 0; i < c->fvparams.size(); i++) {
+                Declare(c->fvparams[i], c->args[i]->line);
+                Init(c->fvparams[i], c->args[i], c->args[i]->line);
+            }
+            if (!Ended()) BuildArm(c->fvbody, l, build);
+        });
     }
     // An if with an else whose arms each build a value in place.
     template <class F> void BuildIf(IfExpr *ie, Line l, F build) {
@@ -7597,14 +7591,11 @@ struct TgFn {
             auto next = NewBlock();
             if (!wild) tyg_jump(p, next);
             SetBlock(hit);
-            tyg_scope_begin(p);
-            // The arm's own stack scope: a binder's stack is taken and given back on this path only.
-            OpenScope(false);
-            if (a.binder) BindAdtArm(me, adt, s, a);
-            Loc(a.body->line);   // A breakpoint on the arm's line stops here, bound.
-            CtlArm(k, ip, a.body, me->line);
-            CloseScope();
-            tyg_scope_end(p);
+            InScope([&] {
+                if (a.binder) BindAdtArm(me, adt, s, a);
+                Loc(a.body->line);   // A breakpoint on the arm's line stops here, bound.
+                CtlArm(k, ip, a.body, me->line);
+            });
             Jump(done);
             SetBlock(next);
             if (wild) break;
