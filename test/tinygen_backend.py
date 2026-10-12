@@ -353,6 +353,7 @@ def check_tinygen_backend(exe, base, ok, fail, say):
             continue
         ok(f"{label} ({done} of {total} functions, whole program)")
     check_run(exe, base, ok, fail)
+    check_debug(exe, base, ok, fail)
     check_lldb(exe, base, ok, fail, say)
     check_lldb_limited(exe, base, ok, fail)
     check_lldb_adts(exe, base, ok, fail)
@@ -387,6 +388,29 @@ def check_run(exe, base, ok, fail):
              f"{err}\n--- got:\n{got}\n--- want:\n{want}")
         return
     ok("goose run --backend=tinygen: output, arguments, exit code, resources, threads")
+
+
+def check_debug(exe, base, ok, fail):
+    """goose debug builds as goose run --backend=tinygen does and starts the
+    program under lldb, with the Goose formatters loaded and the arguments
+    after -- set: an ADT shows as its active variant."""
+    if not shutil.which("lldb"):
+        return
+    exe = Path(exe).resolve()
+    cmds = base / "debug_cmds.txt"
+    # Piped commands run asynchronously unless lldb is told otherwise.
+    tc.write_text(cmds, "script lldb.debugger.SetAsync(False)\nb scaled\nrun\n"
+                        "frame variable s\nkill\nquit\n")
+    source = HERE / "tinygen" / "tinygen_adts.goose"
+    code, o, e = tc.run_capture([exe, "debug", source, "--", "an arg"], cwd=ROOT,
+                                stdin_path=cmds)
+    text = o + e
+    wants = [r'run-args\s+"an arg"', r"\(Shape\) s = Shape\.Rect\(w = 3, h = 4\)"]
+    missing = [w for w in wants if not re.search(w, text)]
+    if missing:
+        fail("goose debug", f"missing {missing}:\n{text}")
+        return
+    ok("goose debug: lldb with the Goose formatters and the program's arguments")
 
 
 def check_lldb_limited(exe, base, ok, fail):

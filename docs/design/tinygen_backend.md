@@ -9,6 +9,7 @@ with debug info. The backend lowers each Goose function to that IR.
     goose build --backend=tinygen --debug prog.goose  # with GS_DEBUG's checks
     goose build --backend=tinygen -v prog.goose       # says what went to C, and why
     goose run --backend=tinygen prog.goose -- args    # builds, then runs it
+    goose debug prog.goose -- args                    # builds, then starts lldb on it
 
 ## Why
 
@@ -232,10 +233,12 @@ dSYM's `Contents/Resources/Python/<prog>.py`, but Apple's lldb defaults
 only from a dSYM with a trusted code signature, and for any other it only
 prints the command that would load it. A build would then also pay for
 `dsymutil` and a bundle beside the program, and the user would still have
-to type the command or change the setting. So the build writes no dSYM, and
-the user imports the script once per session, or adds the import to
-`~/.lldbinit`. `goose build --backend=tinygen -v` prints the line, with the
-script's path. The compiler looks for the script in `lldb/` beside its
+to type the command or change the setting. So the build writes no dSYM.
+`goose debug prog.goose -- args` builds as `goose run --backend=tinygen`
+does, then starts lldb with the script imported and the program's arguments
+set. With lldb started some other way, the user imports the script once per
+session, or adds the import to `~/.lldbinit`. `goose build --backend=tinygen
+-v` prints the line, with the script's path. The compiler looks for the script in `lldb/` beside its
 executable, and then in the source tree it was built from.
 
 A null optional of a struct shows as `NULL`. For a null pointer to a

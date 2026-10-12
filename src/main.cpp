@@ -638,15 +638,15 @@ CodeGen::StackConfig StackConfigOf(const vector<string> &cdefines) {
 
 int Main(int argc, char **argv) {
     auto exe = ExePath(argv[0]);
-    // The verb forms, `goose run|build|check|fetch|toolchain|version ...`. A
+    // The verb forms, `goose run|debug|build|check|fetch|toolchain|version ...`. A
     // first argument that is none of them is read as an option or a file, as
     // it always was, so `goose foo.goose` is `goose run foo.goose`.
     string verb;
     auto firstarg = 1;
     if (argc > 1) {
         string v = argv[1];
-        if (v == "run" || v == "build" || v == "check" || v == "fetch" || v == "toolchain" ||
-            v == "version") {
+        if (v == "run" || v == "debug" || v == "build" || v == "check" || v == "fetch" ||
+            v == "toolchain" || v == "version") {
             verb = v;
             firstarg = 2;
         }
@@ -782,6 +782,12 @@ int Main(int argc, char **argv) {
         else files.push_back(arg);
     }
     if (verbose || dryrun) ProgressPlain();
+    // goose debug: goose run --backend=tinygen, with lldb starting the program.
+    auto debugverb = verb == "debug";
+    if (debugverb) {
+        verb = "run";
+        backendname = "tinygen";
+    }
     if (backendname != "c" && backendname != "tinygen") {
         fprintf(stderr, "unknown backend: %s (c or tinygen)\n", backendname.c_str());
         return 1;
@@ -868,6 +874,7 @@ int Main(int argc, char **argv) {
     }
     if (files.empty()) {
         fprintf(stderr, "usage: goose run file.goose [options] [-- program args...] | "
+                        "goose debug file.goose [options] [-- program args...] | "
                         "goose check file.goose [options] | goose fetch [--update] file.goose | "
                         "goose version |\n"
                         "       goose build file.goose [options] [-o exe] [--debug] [--standalone] "
@@ -1252,6 +1259,18 @@ int Main(int argc, char **argv) {
                 SetEnvVar("GOOSE_RESOURCE_DIR", DirOf(AbsolutePath(filename)));
                 vector<string> progargv { buildopts.exe };
                 progargv.insert(progargv.end(), progargs.begin(), progargs.end());
+                if (debugverb) {
+                    auto lldb = FindOnPath("lldb");
+                    if (lldb.empty()) {
+                        fprintf(stderr, "goose debug needs lldb on PATH\n");
+                        return 1;
+                    }
+                    vector<string> dbg { lldb };
+                    if (auto py = FindLldbFormatters(exe); !py.empty())
+                        dbg.insert(dbg.end(), { "-o", cat("command script import \"", py, "\"") });
+                    dbg.push_back("--");
+                    progargv.insert(progargv.begin(), dbg.begin(), dbg.end());
+                }
                 string err;
                 auto ran = RunInherited(progargv, err);
                 if (ran < 0) fprintf(stderr, "%s\n", err.c_str());

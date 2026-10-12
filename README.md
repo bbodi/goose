@@ -468,8 +468,10 @@ Goose functions, `.goose` lines, and locals with their Goose names and types.
 A program that tinygen compiles whole needs no C compiler except to link. A
 function tinygen does not support goes through C, and `-v` says why.
 `goose run --backend=tinygen` builds the program the same way and runs it.
-In lldb, `command script import src/lldb/goose_lldb.py` shows arrays as their
-elements, text as strings, optionals and ADTs as Goose values.
+`goose debug prog.goose -- args` builds it the same way and starts lldb on it,
+with Goose's formatters loaded: arrays show as their elements, text as
+strings, and optionals and ADTs as Goose values. In an lldb started some
+other way, `command script import src/lldb/goose_lldb.py` loads them.
 
 A program with C of its own names it in a sidecar beside the source,
 `foo.build` beside `foo.goose`: `c_sources = ["impl.c"];`, with `c_include`,

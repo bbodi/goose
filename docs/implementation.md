@@ -102,7 +102,10 @@ process started with (`ulimit -s`), which nothing in the executable sets.
 **Verbs** (`Main` in `main.cpp`). `goose run file.goose [options] [-- args]`
 compiles the program in this process and runs it (`--jit`); with
 `--backend=tinygen` it builds the executable in the build directory and runs
-it as a child instead (`RunInherited` in `process.h`), `goose build
+it as a child instead (`RunInherited` in `process.h`); `goose debug
+file.goose [-- args]` builds it the same way and starts lldb on it with the
+formatters of `src/lldb/goose_lldb.py` imported (`FindLldbFormatters`),
+`goose build
 file.goose` writes the C to the program's build directory under
 `GOOSE_HOME` and compiles and links it into an executable beside the source
 (`build.h`: the runtime object compiled once per toolchain and
