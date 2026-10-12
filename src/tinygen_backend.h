@@ -762,12 +762,13 @@ struct TgModule {
                    fs.All(fixed, (size_t)fs.var);
         });
     }
-    // The tail's bytes: a resizable's header, or a nested frame object's struct, which ends in its own tail.
-    int64_t FoTailSize(TypeExpr *t) {
-        auto tail = StFields(t).t[(size_t)StFields(t).var];
-        return IsGrow(tail) ? 16 : Size(tail);
+    // The C struct's bytes: the fixed fields, then the tail: a resizable's header, or a nested frame
+    // object's struct, which ends in its own tail.
+    int64_t FoSize(TypeExpr *t) {
+        auto &fs = StFields(t);
+        auto tail = fs.t[(size_t)fs.var];
+        return fs.coff[(size_t)fs.var] + (IsGrow(tail) ? 16 : Size(tail));
     }
-    int64_t FoSize(TypeExpr *t) { return StFields(t).coff[(size_t)StFields(t).var] + FoTailSize(t); }
     // Where the innermost tail's header lies in the struct.
     int64_t FoHdrOff(TypeExpr *t) {
         auto &fs = StFields(t);
@@ -795,11 +796,6 @@ struct TgModule {
             return ((IsGrow(tail) && RzOk(tail, depth + 1)) || FoOk(tail, depth + 1)) &&
                    FieldsOk(fs, depth + 1, (size_t)fs.last);
         });
-    }
-    // The tail's elements' type: a resizable's, or a frame object's innermost.
-    TypeExpr *RsElem(TypeExpr *t) {
-        auto tail = StFields(t).t[(size_t)StFields(t).last];
-        return IsGrow(tail) ? tail->arr->sub : cg.FoTailArr(tail)->arr->sub;
     }
     // An image: a T[] or such a struct. (A resizable ADT is a header and a stack, IsRb, not an image.)
     bool IsImg(TypeExpr *t) {
@@ -1040,37 +1036,29 @@ struct TgModule {
     }
     RbShape RbStShape(TypeExpr *t) { return RbShapeIn(StFields(t), true); }
     RbShape RbShapeOf(EnumInst *ei, int vi) { return RbShapeIn(VarFields(ei, vi), false); }
-    bool RbStOk(TypeExpr *t, int depth) {
-        auto sh = RbStShape(t);
-        if (!sh.ok || sh.tailfi < 0) return false;
-        auto &fs = StFields(t);
-        auto tail = fs.t[(size_t)sh.tailfi];
-        return fs.All([&](TypeExpr *ft) { return TypeOk(ft, depth + 1); }, (size_t)sh.tailfi) &&
-               tail->kind != TY_ARRAY && IsRb(tail) && RbOk(tail, depth + 1);
-    }
     // Variant vi of the ADT or variant type t, which a resizable ADT holds: a fixed one, a variable-size
     // one (an image, no tail), or one ending in a T[>..].
     bool RbVarOk(TypeExpr *t, int vi, int depth) {
-        auto ei = EI(t);
-        auto sh = RbShapeOf(ei, vi);
+        auto &fs = VarFields(EI(t), vi);
+        auto sh = RbShapeIn(fs, false);
         if (!sh.ok) return false;
         if (sh.img) return VvOk(t->kind == TY_VARIANT ? t : cg.VariantType(t, vi), depth + 1);
-        auto &fs = VarFields(ei, vi);
-        for (size_t i = 0; i < fs.f.size(); i++) {
-            if (fs.f[i].ispad) continue;
-            auto ft = fs.t[i];
-            if ((int)i != sh.tailfi) {
-                if (!cg.IsFix(ft) || !TypeOk(ft, depth + 1)) return false;
-            } else if (sh.fo ? !(FoOk(ft, depth + 1) && RzOk(cg.FoTailArr(ft), depth + 1)) : !RzOk(ft, depth + 1)) {
-                return false;
-            }
-        }
-        return true;
+        auto d = depth + 1;
+        auto tail = sh.tailfi < 0 ? nullptr : fs.t[(size_t)sh.tailfi];
+        auto fixed = [&](TypeExpr *ft) { return cg.IsFix(ft) && TypeOk(ft, d); };
+        return fs.All(fixed, tail ? (size_t)sh.tailfi : SIZE_MAX) &&
+               (!tail || (sh.fo ? FoOk(tail, d) && RzOk(cg.FoTailArr(tail), d) : RzOk(tail, d)));
     }
     bool RbOk(TypeExpr *t, int depth = 0) {
         if (!IsRb(t) || depth > 32) return false;
         return Within(t, true, [&] {
-            if (t->kind == TY_STRUCT) return RbStOk(t, depth);
+            if (t->kind == TY_STRUCT) {   // Its fixed fields held, its tail a resizable ADT.
+                auto sh = RbStShape(t);
+                auto &fs = StFields(t);
+                return sh.ok && sh.tailfi >= 0 && fs.t[(size_t)sh.tailfi]->kind != TY_ARRAY &&
+                       fs.All([&](TypeExpr *ft) { return TypeOk(ft, depth + 1); }, (size_t)sh.tailfi) &&
+                       IsRb(fs.t[(size_t)sh.tailfi]) && RbOk(fs.t[(size_t)sh.tailfi], depth + 1);
+            }
             return AllVariants(t, [&](int vi, const FieldSet &) { return RbVarOk(t, vi, depth); });
         });
     }
@@ -4480,7 +4468,10 @@ struct TgFn {
             }
         }
         if (M.OptRef(t) || (IsOptional(t) && M.RelOk(t))) {
-            RenderOpt(stk, len, pl, nested, l, depth);
+            // `null`, or the pointee's text; a relative link's offset decodes to its address.
+            auto at = TgModule::IsRel(t) ? RelLoad(pl, l) : Ld(pl.a);
+            IfElse(Cmp(TYG_EQ, at, I64(0)), [&] { TextLit(stk, len, "null"); },
+                   [&] { RenderInto(stk, len, Step(pl), nested, l, depth + 1); });
             return;
         }
         // A struct that reaches itself is rendered by a procedure of its own (CodeGen::EmitRenderCall),
@@ -4499,25 +4490,23 @@ struct TgFn {
                 return;
             }
         }
-        if (M.IsRb(t)) {
-            if (!M.RbOk(t) || pl.enc) No(l, cat("text of type ", M.NameWhy(t)));
-            RenderRb(stk, len, pl, l, depth);
-            return;
-        }
+        auto rb = M.IsRb(t);   // A resizable ADT or one of its variants, at its header.
+        if (rb && (!M.RbOk(t) || pl.enc)) No(l, cat("text of type ", M.NameWhy(t)));
         switch (t->kind) {
             case TY_VARIANT:
                 RenderVariant(stk, len, pl, l, depth);
                 return;
             case TY_ENUM: {   // The variant the tag says, as its literal (CodeGen::RenderLoc).
-                if (!M.TypeOk(t) && !M.VmOk(t)) break;
-                auto ei = cg.EIOf(t);
-                auto varmode = M.IsVm(t);
-                auto tag = Local(LoadTag(pl.a, t));
-                TagSwitch(tag, ei->en->variants.size(), [&](size_t vi) {
+                if (!rb && !M.TypeOk(t) && !M.VmOk(t)) break;
+                auto tag = Local(LoadTag(rb ? AtV(Ld(pl.a)) : pl.a, t));
+                TagSwitch(tag, M.EI(t)->en->variants.size(), [&](size_t vi) {
                     auto vt = cg.VariantType(t, (int)vi);
                     auto pa = AddrPlus(pl.a, M.TagSize(t));
                     P vp { pa, vt };
-                    if (!varmode && fmtc && !fmtc->fmtspecs.empty() && cg.FixedSize(vt)) {
+                    if (rb) {   // The payload behind the tag, its tail counted by the header's.
+                        vp.a = AtL(PairLocal(Add(Ld(pl.a), I64(M.TagSize(t))), Ld(AddrPlus(pl.a, 8))));
+                        vp.tmphdr = true;
+                    } else if (!M.IsVm(t) && fmtc && !fmtc->fmtspecs.empty() && cg.FixedSize(vt)) {
                         // An overload may overwrite the value: its parts rendered from a copy.
                         auto cp = Temp(vt);
                         tyg_copy(p, AtL(cp), pa, cg.FixedSize(vt));
@@ -4537,7 +4526,7 @@ struct TgFn {
                 FmtScalar(stk, len, t, Load(pl, l).v);
                 return;
             case TY_STRUCT:
-                if (!M.VsOk(t) && !M.RsOk(t) && !M.FoOk(t) && !M.TypeOk(t)) break;
+                if (!rb && !M.VsOk(t) && !M.RsOk(t) && !M.FoOk(t) && !M.TypeOk(t)) break;
                 RenderRun(stk, len, TextName(t), pl, l, depth);
                 return;
             case TY_ARRAY: case TY_SLICE: {
@@ -4564,23 +4553,6 @@ struct TgFn {
             default: break;
         }
         No(l, cat("text of type ", M.NameWhy(t)));
-    }
-
-    // A resizable ADT, or one of its variants, at the header pl: the variant the tag says, read
-    // once, as its literal; each field where the walk finds it (CodeGen::RenderLoc).
-    void RenderRb(tyg_val stk, tyg_addr len, const P &pl, Line l, int depth) {
-        auto t = pl.t;
-        if (t->kind != TY_ENUM) {
-            if (t->kind == TY_STRUCT) RenderRun(stk, len, TextName(t), pl, l, depth);
-            else RenderVariant(stk, len, pl, l, depth);
-            return;
-        }
-        auto tag = Local(LoadTag(AtV(Ld(pl.a)), t));
-        TagSwitch(tag, M.EI(t)->en->variants.size(), [&](size_t vi) {   // The variant's payload behind the tag.
-            P vp { AtL(PairLocal(Add(Ld(pl.a), I64(M.TagSize(t))), Ld(AddrPlus(pl.a, 8)))), cg.VariantType(t, (int)vi) };
-            vp.tmphdr = true;
-            RenderVariant(stk, len, vp, l, depth);
-        });
     }
 
     // A variant's positional literal (CodeGen::RenderVariant): `E.V` for one without fields, else
@@ -5256,14 +5228,6 @@ struct TgFn {
         auto r = RefAddr(b->right);
         return ValV(M.ast.booltype, Cmp(b->op == T_EQ || b->op == T_DOTEQ ? TYG_EQ : TYG_NE, l, r));
     }
-    // An optional's text (CodeGen::RenderLoc): `null`, or its pointee's.
-    void RenderOpt(tyg_val stk, tyg_addr len, const P &pl, bool nested, Line l, int depth) {
-        // A relative link's offset decodes to its address, null for 0.
-        auto at = TgModule::IsRel(pl.t) ? RelLoad(pl, l) : Ld(pl.a);
-        IfElse(Cmp(TYG_EQ, at, I64(0)), [&] { TextLit(stk, len, "null"); },
-               [&] { RenderInto(stk, len, Step(pl), nested, l, depth + 1); });
-    }
-
     // ---- Control -----------------------------------------------------------
 
     // The body in a stack scope of its own (a binder's or a block's stacks are given back on this path).
@@ -6638,7 +6602,8 @@ struct TgFn {
         // To where the elements start: past a frame object tail's fields.
         auto estart = FieldAddr(src.t, from, last);
         if (M.FoOk(tail)) estart = Add(estart, I64(cg.FoBytesPrefix(tail)));
-        auto bytes = Add(Sub(estart, from), Mul(n, I64(cg.FixedSize(M.RsElem(src.t)))));
+        auto elem = IsGrow(tail) ? tail->arr->sub : cg.FoTailArr(tail)->arr->sub;
+        auto bytes = Add(Sub(estart, from), Mul(n, I64(cg.FixedSize(elem))));
         auto top = Top(stk);
         tyg_move_dyn(p, top, from, bytes);
         SetTop(stk, Add(top, bytes));
