@@ -490,6 +490,22 @@ string FindRuntimeDir(const char *exe) {
                          "set GOOSE_RUNTIME" };
 }
 
+// The lldb formatters for tinygen builds (src/lldb/goose_lldb.py), as an
+// absolute path: in lldb/ beside an installed compiler, else in the source
+// tree the compiler was built in. Empty where there is none.
+string FindLldbFormatters(const string &exe) {
+    auto exedir = DirOf(exe);
+    for (auto rel : { "lldb/", "../src/lldb/", "../../src/lldb/", "../../../src/lldb/" }) {
+        auto path = cat(exedir, rel, "goose_lldb.py");
+        if (!FileExists(path)) continue;
+        auto parts = PathParts(path);
+        string norm;
+        for (size_t i = 0; i < parts.size(); i++) Append(norm, i ? "/" : "", parts[i]);
+        return norm;
+    }
+    return "";
+}
+
 // Regenerates src/runtime_inline.h from src/runtime/, so the compiler binary
 // is self-contained. Anyone editing the runtime re-runs this and rebuilds.
 void GenRuntimeHeader(const char *exe) {
@@ -1061,6 +1077,12 @@ int Main(int argc, char **argv) {
                     fprintf(msgs, tgwhole ? "tinygen: whole program: no C compiled for it\n"
                                           : "tinygen: mixed: the C half compiled by the C compiler (%s)\n",
                             whynot.c_str());
+                // lldb loads no script on its own (load-script-from-symbol-file
+                // defaults to trusted, signed dSYMs only), so say how to.
+                if (verbose)
+                    if (auto py = FindLldbFormatters(exe); !py.empty())
+                        fprintf(msgs, "tinygen: lldb formatters: command script import \"%s\"\n",
+                                py.c_str());
                 if (!tgb->taken.empty() && !outfile.empty()) {
                     tgobject = cat(DirOf(outfile), PathStem(outfile), ".tg.o");
                     string err;

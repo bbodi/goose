@@ -13,7 +13,7 @@ ui, audio and physics fixtures run headless; the windowed samples
 (BUILD_ONLY) are only built. Where lldb is installed, several fixtures run
 under it to check that the debugger finds Goose functions by name and shows
 their Goose source lines, and their parameters, locals and globals by their
-Goose types.
+Goose types, and, with src/lldb/goose_lldb.py imported, as Goose values.
 
 Called by run_tests.py; `python test/tinygen_backend.py <goose>` runs it on
 its own."""
@@ -645,6 +645,57 @@ def check_lldb_whole(exe, base, lldb, ok, fail):
         fail("tinygen whole program debug info under lldb", f"missing {missing}:\n{text}")
         return
     ok("tinygen debug info under lldb: a whole program's main and its caller")
+    check_lldb_formatters(exe, base, lldb, ok, fail)
+
+
+FORMATTERS = ROOT / "src" / "lldb" / "goose_lldb.py"
+
+
+def check_lldb_formatters(exe, base, lldb, ok, fail):
+    """With src/lldb/goose_lldb.py imported, values as Goose shows them:
+    a slice, a resizable and a limited array as their live elements, text
+    as a string, i8 and u8 as numbers, an optional as null or its value,
+    an ADT as its active variant. A -v build names the script to import."""
+    runs = [
+        ("tinygen_arrays.goose", ["b weighted", "run", "frame variable s"],
+         [r"\(i64\[:\]\) s = len=5 \{\s*\[0\] = 3\s*\[1\] = 1\s*\[2\] = 4\s*\[3\] = 1\s*"
+          r"\[4\] = 5\s*\}"]),
+        ("tinygen_strings.goose", ["b first_last", "b total", "run", "frame variable s", "p *s",
+                                   "continue", "frame variable v"],
+         [r"\(u8\[\] \*\) s = 0x[0-9a-f]+ \"hello\"\n", r"\(u8\[\]\) \"hello\"\n",
+          r"\(i64\[>\.\.\]&\) v = len=3 \{\s*\[0\] = 1\s*\[1\] = 2\s*\[2\] = 3\s*\}"]),
+        ("tinygen_structs.goose", ["b mixed_sum", "b tinygen_structs.goose:44", "run",
+                                   "frame variable r", "continue", "frame variable m"],
+         [r"\(Box\) r = \{.*tag = 7\n", r"\(Mixed\) m = \(a = -3, b = 3000,"]),
+        ("tinygen_optionals.goose", ["b or_zero", "run", "frame variable o", "continue",
+                                     "frame variable o"],
+         [r"\(i64\?\) o = 9\n.*\(i64\?\) o = null\n"]),
+        ("tinygen_adts.goose", ["b scaled", "b turn", "run", "frame variable s", "continue",
+                                "frame variable d"],
+         [r"\(Shape\) s = Shape\.Rect\(w = 3, h = 4\)\n", r"\(Dir\) d = Dir\.West\n"]),
+        ("tinygen_limited.goose", ["b tinygen_limited.goose:89", "b tinygen_limited.goose:100",
+                                   "run", "frame variable a n", "continue", "frame variable s"],
+         [r"\(i64\[\.\.8\]\) a = len=2 \{\s*\[0\] = 8\s*\[1\] = 7\s*\}",
+          r"\(Name\) n = \{\s*tag = 7\s*text = \"tiny\"\s*\}", r"\(u8\[\.\.8\]\) s = \"Hey!!\""]),
+    ]
+    for i, (name, cmds, wants) in enumerate(runs):
+        out = base / f"lldb-fmt-{i}{tc.EXE_SUFFIX}"
+        good, log, _, _ = build(exe, HERE / "tinygen" / name, out, [])
+        if not good:
+            fail(f"tinygen lldb formatters {name} build", log)
+            return
+        if f'command script import "{FORMATTERS}"' not in log:
+            fail("tinygen -v names the lldb formatters", log)
+            return
+        args = [lldb, "-b", "-o", f'command script import "{FORMATTERS}"']
+        for c in cmds + ["kill"]:
+            args += ["-o", c]
+        code, o, e = tc.run_capture([*args, out])
+        missing = [w for w in wants if not re.search(w, o + e, re.S)]
+        if missing or "Traceback" in o + e:
+            fail(f"tinygen lldb formatters on {name}", f"missing {missing}:\n{o + e}")
+            return
+    ok("tinygen lldb formatters: arrays' elements, text, i8/u8, optionals, ADTs, limited arrays")
 
 
 def check_lldb_optionals(exe, base, ok, fail):

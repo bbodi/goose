@@ -193,6 +193,54 @@ Breakpoint 1: where = prog`mixed_sum_g + 40 at tinygen_structs.goose:27
 (Dir) d = (tag = West)
 ```
 
+### lldb formatters
+
+DWARF cannot say that a slice's `data` holds `len` elements, and lldb reads
+every language through clang's types, so `u8` shows as a character. Goose
+ships lldb formatters in Python, `src/lldb/goose_lldb.py`, that show the
+values as Goose does:
+
+| Value | Without | With the formatters |
+|---|---|---|
+| `T[:]`, `T[]`, `T[>..]`, `T[>..]&`, `T[..k]` | `{ data, len }`, `{ len, data }`, `{ base, len }`, `{ hdr, stk }`, `{ len, e = all k slots }` | `len=3 { [0] = .. [2] = .. }`, the live elements only |
+| text: the same arrays of `u8` | as above | `"hello"`, or its bytes where it is not UTF-8 |
+| `i8`, `u8`, alone, in fields and arrays | `'\xfd'`, `"hi\0"` | `-3`, `([0] = 104, [1] = 105, [2] = 0)` |
+| `T?` | `0x000000016fdfe600`, `0x0000000000000000` | what it refers to, or `null` |
+| an ADT | `{ tag = Rect, u = { every payload } }` | `Shape.Rect(w = 3, h = 4)`, expanding to its fields |
+
+```
+(lldb) command script import /path/to/goose/src/lldb/goose_lldb.py
+(lldb) frame variable
+(i64[:]) s = len=3 {
+  [0] = 3
+  [1] = 1
+  [2] = 4
+}
+(u8[] *) name = 0x0000007000000000 "hello"
+(i64?) o = 9
+(Shape) sh = Shape.Rect(w = 3, h = 4)
+```
+
+They match types by their Goose names (`[:]$`, `\?$`, and so on), so they
+apply to every instantiation. An ADT is matched by its shape instead, a
+first member `tag` whose enum is named `<ADT>.tag`. They live in the type
+category `goose`, which `type category disable goose` turns off.
+
+**Loading.** lldb does not load the script by itself. It could come from a
+dSYM's `Contents/Resources/Python/<prog>.py`, but Apple's lldb defaults
+`target.load-script-from-symbol-file` to `trusted`. It loads such a script
+only from a dSYM with a trusted code signature, and for any other it only
+prints the command that would load it. A build would then also pay for
+`dsymutil` and a bundle beside the program, and the user would still have
+to type the command or change the setting. So the build writes no dSYM, and
+the user imports the script once per session, or adds the import to
+`~/.lldbinit`. `goose build --backend=tinygen -v` prints the line, with the
+script's path. The compiler looks for the script in `lldb/` beside its
+executable, and then in the source tree it was built from.
+
+A null optional of a struct shows as `NULL`. For a null pointer to a
+record, lldb prints its own nil marker and does not ask the formatter.
+
 ## Building tinygen into goose
 
 `CMakeLists.txt` takes a `TINYGEN_DIR` cache path, by default `../tinygen`.
@@ -230,7 +278,9 @@ with threads.
 * It checks that the `WHOLE_PROGRAM` fixtures compile no C, and that
   `--tinygen-mixed` gives the same output.
 * Where lldb is installed, it checks breakpoints by Goose name, Goose lines,
-  and parameters, locals and globals with Goose types.
+  and parameters, locals and globals with Goose types. With the formatters
+  imported, it checks arrays' elements, text, `i8` and `u8`, optionals,
+  ADTs and limited arrays as Goose values.
 * goose_in_goose built through tinygen compiles itself to C that is byte for
   byte the C backend's.
 * On an arm64 Mac, an x86-64 compiler (`-DCMAKE_OSX_ARCHITECTURES=x86_64`)
@@ -277,10 +327,13 @@ catch.
 2. **Counted arrays in debug info.** A slice's or a resizable's elements need
    an array type whose count is another member. A field after a
    variable-size field needs a member location expression. tinygen has
-   neither, so the debugger shows `data` and `len` separately.
-3. **lldb shows `i8` and `u8` as characters.** lldb reads every language
-   through clang's types. Goose would need lldb formatters shipped with the
-   compiler.
+   neither, so the DWARF has `data` and `len` separately. lldb shows the
+   elements only through the formatters (see "lldb formatters"). Another
+   debugger, or lldb without them, shows the records.
+3. **Goose values in the debugger without a script.** lldb reads every
+   language through clang's types, so without the formatters `i8` and `u8`
+   show as characters and an ADT as all its payloads. lldb does not load
+   the formatters by itself (see "Loading").
 4. **Packed records on Windows x64.** On arm64 and on SysV x86-64 (checked on
    macOS under Rosetta), tinygen passes packed records as clang does: a
    misaligned field sends the record to memory. tinygen's `test/abi.c` and
