@@ -15,13 +15,15 @@ references rebound);
 the other programs are ones the backend covers in part. A program
 tinygen covers whole that needs nothing of a C half (WHOLE_PROGRAM) must
 build without the C compiler compiling any C of its own, and again on the
-mixed path (--tinygen-mixed) to the same output. Where lldb is installed, one program is run under it to see
+mixed path (--tinygen-mixed) to the same output. The gfx, ui, audio and
+physics fixtures run whole and headless; the windowed samples are only built. Where lldb is installed, one program is run under it to see
 that the debugger finds a Goose function by name and shows its Goose source
 line, its parameters and its locals with their Goose types.
 
 Called by run_tests.py; `python test/tinygen_backend.py <goose>` runs it on
 its own."""
 from pathlib import Path
+import os
 import re
 import shutil
 import sys
@@ -220,6 +222,22 @@ PROGRAMS += [
 WHOLE_PROGRAM |= {"tinygen_optionals"}
 WHOLE_PROGRAM |= {"tinygen_extern", "21_raytrace"}   # libm and package externs called directly
 
+# The native modules' fixtures (gfx, ui, audio, physics): whole programs that
+# call into the packages' C layers. They run headless, as the suite runs
+# them; one is skipped where the compiler lacks its package, or for gfx
+# where there is no GPU device. Their rejection tests (`// error:`) are not
+# programs.
+NATIVE_DIRS = ("gfx", "ui", "audio", "physics")
+NATIVE = sorted(p for d in NATIVE_DIRS for p in (HERE / d).glob("*.goose")
+                if "// error:" not in tc.decode(p.read_bytes()))
+PROGRAMS += [(str(p.relative_to(ROOT)), True, []) for p in NATIVE]
+WHOLE_PROGRAM |= {p.stem for p in NATIVE}
+
+# The windowed samples: built whole and not run, since they loop until their
+# window closes.
+BUILD_ONLY = ["samples/27_gfx_cube.goose", "samples/28_physics_boxes.goose", "samples/29_ui_todo.goose",
+              "samples/30_mini_minecraft.goose", "samples/31_mini_doom.goose"]
+
 
 def expected(source):
     """The blessed stdout of a program, whether its run aborts, and the
@@ -259,9 +277,16 @@ def check_tinygen_backend(exe, base, ok, fail, say):
     if "built without tinygen" in o + e:
         say("skip tinygen backend (the compiler was built without tinygen)")
         return
+    # A gfx program asking for a window draws off screen instead.
+    os.environ["GOOSE_GFX_HEADLESS"] = "1"
+    builtin = tc.builtin_modules(exe)
     for i, (rel, whole, flags) in enumerate(PROGRAMS):
         source = ROOT / rel
         label = f"tinygen {source.name}{' ' + ' '.join(flags) if flags else ''}"
+        modules = tc.native_imports(tc.decode(source.read_bytes()))
+        if any(m not in builtin for m in modules):
+            say(f"skip {label} (the compiler was built without {', '.join(modules)})")
+            continue
         out = base / f"{source.stem}-{i}{tc.EXE_SUFFIX}"
         good, log, done, total = build(exe, source, out, flags)
         if not good:
@@ -281,7 +306,12 @@ def check_tinygen_backend(exe, base, ok, fail, say):
             fail(f"{label}: expected the {'whole program' if alone else 'mixed'} path", log)
             continue
         want, aborts, markers = expected(source)
-        code, got, err = tc.run_capture([out], cwd=source.parent)
+        # The native fixtures name their data files from the repository's
+        # root, where the suite runs them.
+        code, got, err = tc.run_capture([out], cwd=ROOT if modules else source.parent)
+        if code != 0 and any(tc.native_unavailable(m, err) for m in modules):
+            say(f"skip {label} (no device for {', '.join(modules)})")
+            continue
         if (code != 0) != aborts:
             fail(f"{label} (exit {code})", err)
             continue
@@ -293,6 +323,17 @@ def check_tinygen_backend(exe, base, ok, fail, say):
             fail(label, f"--- got:\n{got}\n--- want:\n{want}")
             continue
         ok(f"{label} ({done} of {total} functions{', whole program' if alone else ''})")
+    for rel in BUILD_ONLY:
+        source = ROOT / rel
+        label = f"tinygen {source.name} (built, not run)"
+        if any(m not in builtin for m in tc.native_imports(tc.decode(source.read_bytes()))):
+            say(f"skip {label} (the compiler lacks its packages)")
+            continue
+        good, log, done, total = build(exe, source, base / f"{source.stem}{tc.EXE_SUFFIX}", [])
+        if not good or done != total or "tinygen: whole program" not in log:
+            fail(f"{label}: {done} of {total} functions, whole program expected", log)
+            continue
+        ok(f"{label} ({done} of {total} functions, whole program)")
     check_lldb(exe, base, ok, fail, say)
     check_lldb_limited(exe, base, ok, fail)
     check_lldb_adts(exe, base, ok, fail)
