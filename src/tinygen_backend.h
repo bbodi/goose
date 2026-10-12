@@ -305,11 +305,12 @@ struct TgModule {
     // The ordered fields of a struct or of one ADT variant's payload, built once per type: their types, each
     // one's offset (the C layout if all are fixed, else the packed bytes one, where a bare pad adds nothing)
     // up to the first variable-size field `var`, `pre` the bytes before it (the size if none), `last` the
-    // last real field (a resizable's tail). Pads are skipped by the walkers.
+    // last real field (a resizable's tail). A frame object's C struct has `coff`: its fixed fields
+    // aligned, the tail's header at coff[var]. Pads are skipped by the walkers.
     struct FieldSet {
         const vector<Field> &f;
         const vector<TypeExpr *> &t;
-        vector<int64_t> off;
+        vector<int64_t> off, coff;
         int64_t pre = 0;
         int var = -1, last = -1;
         FieldSet(const vector<Field> &_f, const vector<TypeExpr *> &_t) : f(_f), t(_t) {}
@@ -328,7 +329,8 @@ struct TgModule {
         }
     };
     map<pair<const void *, int>, FieldSet> fieldsets;
-    const FieldSet &RunOf(const void *key, int vi, const vector<Field> &f, const vector<TypeExpr *> &t) {
+    const FieldSet &RunOf(const void *key, int vi, const vector<Field> &f, const vector<TypeExpr *> &t,
+                          bool fo = false) {
         auto [it, fresh] = fieldsets.try_emplace({ key, vi }, f, t);
         auto &fs = it->second;
         if (!fresh) return fs;
@@ -346,11 +348,16 @@ struct TgModule {
             else if (!cg.IsFix(t[i])) fs.var = (int)i;
             else fs.pre += cg.FixedSize(t[i]);
         }
+        if (fo && fs.var >= 0) {
+            auto n = (long)fs.var;
+            auto lo = cg.LayoutFields({ f.begin(), f.begin() + n }, { t.begin(), t.begin() + n });
+            fs.coff = lo.offs, fs.coff.push_back(lo.size);
+        }
         return fs;
     }
     const FieldSet &StFields(TypeExpr *t) {
         auto si = cg.SI(t);
-        return RunOf(si, -1, si->st->fields, si->ftypes);
+        return RunOf(si, -1, si->st->fields, si->ftypes, cg.IsFrameObj(t));
     }
     const FieldSet &VarFields(EnumInst *ei, int vi) {
         return RunOf(ei, vi, ei->en->variants[(size_t)vi].fields, ei->vftypes[(size_t)vi]);
@@ -540,7 +547,7 @@ struct TgModule {
         if (IsScalar(t)) return ScalSize(Scal(t));
         if (t->kind == TY_VARIANT && !cg.FixedSize(t)) return 1;   // A payload-less variant: the gs_empty byte.
         if (ZeroArr(t)) return cg.FixedSize(t) + cg.FixedSize(t->arr->sub);
-        if (FoOk(t)) return FoLayout(t).tail + FoTailSize(t);
+        if (FoOk(t)) return FoSize(t);
         return cg.FixedSize(t);
     }
 
@@ -548,9 +555,10 @@ struct TgModule {
     // The real fields of a struct or variant type with their offsets.
     vector<FieldAt> Fields(TypeExpr *t) {
         auto &fs = RunOfType(t);
+        auto &off = fs.coff.empty() ? fs.off : fs.coff;
         vector<FieldAt> r;
-        for (size_t i = 0; i < fs.f.size(); i++)
-            if (!fs.f[i].ispad) r.push_back({ fs.t[i], fs.off[i], fs.f[i].name });
+        for (size_t i = 0; i < off.size(); i++)
+            if (!fs.f[i].ispad) r.push_back({ fs.t[i], off[i], fs.f[i].name });
         return r;
     }
 
@@ -561,7 +569,6 @@ struct TgModule {
         if (IsRel(t) && !IsVr(t)) return tyg_type_int(m, RelScal(t), 0);
         if (t->kind == TY_REF) return tyg_type_ptr(m);   // A varint-width relative reference: its image.
         if (IsGrow(t) || IsRs(t) || IsRb(t) || t->kind == TY_SLICE) return SliceAT();   // gs_rhdr, as a slice.
-        if (t->kind == TY_STRUCT && cg.IsFrameObj(t)) return FoAT(t);
         if (t->kind == TY_INT) return tyg_type_int(m, Scal(t), IsSigned(t));
         if (t->kind == TY_BOOL) return tyg_type_int(m, TYG_I8, 0);
         if (t->kind == TY_FLT) return tyg_type_scalar(m, Scal(t));
@@ -579,19 +586,7 @@ struct TgModule {
         }
         vector<tyg_field> fs;
         for (auto &f : Fields(t)) fs.push_back({ AT(f.t), f.off });
-        return atypes[key] = tyg_type_record(m, cg.FixedSize(t), 1, fs.data(), (int)fs.size());
-    }
-    // A frame object's C struct: its fixed fields, then the tail's header.
-    const tyg_type *FoAT(TypeExpr *t) {
-        auto key = cg.Mangle(t);
-        if (auto it = atypes.find(key); it != atypes.end()) return it->second;
-        auto si = cg.SI(t);
-        auto fl = FoLayout(t);
-        vector<tyg_field> fs;
-        for (int i = 0; i < fl.tailfi; i++)
-            if (!si->st->fields[(size_t)i].ispad) fs.push_back({ AT(si->ftypes[(size_t)i]), fl.offs[(size_t)i] });
-        fs.push_back({ AT(si->ftypes[(size_t)fl.tailfi]), fl.tail });
-        return atypes[key] = tyg_type_record(m, fl.tail + FoTailSize(t), 1, fs.data(), (int)fs.size());
+        return atypes[key] = tyg_type_record(m, CSize(t), 1, fs.data(), (int)fs.size());
     }
     // A resizable value: a T[>..]'s header, or a frame object, with a stack.
     bool Resz(TypeExpr *t) {
@@ -683,10 +678,9 @@ struct TgModule {
                 if (IsRb(t)) return DHdr(name, "base", nullptr);
                 if (IsVs(t)) return VsDT(t, name);
                 if (IsRs(t)) return DHdr(name, "base", nullptr, cg.SI(t)->st->line);
-                if (FoOk(t)) return FoDT(t, name);
                 auto rec = DRec(name, cg.SI(t)->st->line);   // A field may refer back to it through a reference.
                 for (auto &f : Fields(t)) DMem(rec, f.name, DT(f.t), f.off);
-                return DEnd(rec, cg.FixedSize(t));
+                return DEnd(rec, CSize(t));
             }
             case TY_ENUM: case TY_VARIANT:
                 if (IsRb(t)) return DHdr(name, "base", nullptr);
@@ -758,52 +752,30 @@ struct TgModule {
 
     // A frame object (C.2, CodeGen::IsFrameObj): a struct whose last field is a resizable: its fixed fields,
     // packed, then the tail's header { base, len } (EmitCFields), the elements on a data stack.
-    struct FoLay {
-        vector<int64_t> offs;   // Per fixed field.
-        int64_t tail;           // The tail header's offset.
-        int tailfi;
-    };
-    FoLay FoLayout(TypeExpr *t) {
-        auto si = cg.SI(t);
-        auto &fs = si->st->fields;
-        auto n = fs.size();
-        while (n > 0 && si->ftypes[n - 1] && cg.IsResz(si->ftypes[n - 1])) n--;
-        vector<Field> pre(fs.begin(), fs.begin() + (long)n);
-        vector<TypeExpr *> pret(si->ftypes.begin(), si->ftypes.begin() + (long)n);
-        auto lo = cg.LayoutFields(pre, pret);
-        return { vector<int64_t>(lo.offs.begin(), lo.offs.end()), lo.size, (int)n };
-    }
     bool FoOk(TypeExpr *t, int depth = 0) {
         if (!t || t->kind != TY_STRUCT || depth > 32 || !cg.IsFrameObj(t)) return false;
         return Within(t, true, [&] {
             auto &fs = StFields(t);
-            auto fl = FoLayout(t);
-            if ((size_t)fl.tailfi + 1 != fs.f.size()) return false;
-            auto tail = fs.t[(size_t)fl.tailfi];
+            if ((size_t)fs.var + 1 != fs.f.size()) return false;
+            auto tail = fs.t[(size_t)fs.var];
+            auto fixed = [&](TypeExpr *ft) { return cg.IsFix(ft) && TypeOk(ft, depth + 1); };
             return ((IsGrow(tail) && (RzOk(tail, depth + 1) || VeOk(tail, depth + 1))) || FoOk(tail, depth + 1)) &&
-                   fs.All([&](TypeExpr *ft) { return cg.IsFix(ft) && TypeOk(ft, depth + 1); }, (size_t)fl.tailfi);
+                   fs.All(fixed, (size_t)fs.var);
         });
     }
     // The tail's bytes: a resizable's header, or a nested frame object's struct, which ends in its own tail.
     int64_t FoTailSize(TypeExpr *t) {
-        auto tail = cg.SI(t)->ftypes[(size_t)FoLayout(t).tailfi];
+        auto tail = StFields(t).t[(size_t)StFields(t).var];
         return IsGrow(tail) ? 16 : Size(tail);
     }
+    int64_t FoSize(TypeExpr *t) { return StFields(t).coff[(size_t)StFields(t).var] + FoTailSize(t); }
+    // The bytes of a struct or variant's C struct (a frame object's: its fields, its tail header).
+    int64_t CSize(TypeExpr *t) { return cg.IsFrameObj(t) ? FoSize(t) : cg.FixedSize(t); }
     // Where the innermost tail's header lies in the struct.
     int64_t FoHdrOff(TypeExpr *t) {
-        auto fl = FoLayout(t);
-        auto tail = cg.SI(t)->ftypes[(size_t)fl.tailfi];
-        return IsGrow(tail) ? fl.tail : fl.tail + FoHdrOff(tail);
-    }
-    const tyg_dtype *FoDT(TypeExpr *t, const string &name) {
-        auto si = cg.SI(t);
-        auto fl = FoLayout(t);
-        auto rec = DRec(name, si->st->line);
-        for (int i = 0; i <= fl.tailfi; i++) {
-            auto &f = si->st->fields[(size_t)i];
-            if (!f.ispad) DMem(rec, f.name, DT(si->ftypes[(size_t)i]), i == fl.tailfi ? fl.tail : fl.offs[(size_t)i]);
-        }
-        return DEnd(rec, fl.tail + FoTailSize(t));
+        auto &fs = StFields(t);
+        auto tail = fs.t[(size_t)fs.var];
+        return IsGrow(tail) ? fs.coff[(size_t)fs.var] : fs.coff[(size_t)fs.var] + FoHdrOff(tail);
     }
 
     // ---- Variable-size structs ----------------------------------------------
@@ -1820,11 +1792,7 @@ struct TgFn {
             return sh.elem ? Add(n, Mul(cnt, I64(cg.FixedSize(sh.elem)))) : n;
         };
         if (t->kind == TY_VARIANT) return one(M.VariantIdx(t), false);
-        auto res = Local(I64(0));
-        auto tag = LoadTag(AtV(base), t);
-        for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
-            If(Cmp(TYG_EQ, tag, I64((int64_t)vi)), [&] { StL(res, one((int)vi, true)); });
-        return LdL(res);
+        return ByTag(t, LoadTag(AtV(base), t), [&](int vi) { return one(vi, true); });
     }
 
     // Builds n's value, a resizable ADT or variant of type t, at the top of stk, its header at hdr (CodeGen::
@@ -2136,6 +2104,13 @@ struct TgFn {
     // arm(vi), in a block entered when the tag in `tag` is variant vi, for each of n variants.
     template <class F> void TagSwitch(tyg_local tag, size_t n, F arm) {
         for (size_t vi = 0; vi < n; vi++) If(Cmp(TYG_EQ, LdL(tag), I64((int64_t)vi)), [&] { arm(vi); });
+    }
+    // The i64 that arm(vi) gives for the variant of the ADT that tag says (init for a corrupt tag).
+    template <class F> tyg_val ByTag(TypeExpr *adt, tyg_val tag, F arm, int64_t init = 0) {
+        auto res = Local(I64(init));
+        auto n = M.EI(adt)->en->variants.size();
+        TagSwitch(Local(tag), n, [&](size_t vi) { StL(res, arm((int)vi)); });
+        return LdL(res);
     }
 
     // C's conversion of a scalar between the scalar types: what an
@@ -6539,13 +6514,12 @@ struct TgFn {
             return;
         }
         if (!sl || !sl->sinst || sl->variant) No(l, cat("value of type ", M.NameWhy(pl.t)));
-        auto si = cg.SI(pl.t);
-        auto fl = M.FoLayout(pl.t);
-        for (size_t i = 0; i < si->st->fields.size() && !Ended(); i++) {
-            if (si->st->fields[i].ispad) continue;
+        auto &fs = M.StFields(pl.t);
+        for (size_t i = 0; i < fs.f.size() && !Ended(); i++) {
+            if (fs.f[i].ispad) continue;
             auto init = sl->InitFor((int)i);
             auto fp = FieldPlace(pl, (int)i, l);
-            if ((int)i != fl.tailfi) {
+            if ((int)i != fs.var) {
                 if (init) Into(fp, init);
                 else tyg_zero(p, fp.a, M.Size(fp.t));
             } else if (!M.FoOk(fp.t)) {
@@ -6562,12 +6536,13 @@ struct TgFn {
     // The frame object at src copied to dst: its fixed fields, then its tail's elements.
     void FoCopy(const P &dst, const P &src, Line l) {
         if (src.bfo) return FoCopy(dst, FoView(src), l);
-        auto fl = M.FoLayout(dst.t);
+        auto &fs = M.StFields(dst.t);
+        auto pre = fs.coff[(size_t)fs.var];
         if (!dst.stk || !src.stk) No(l, "frame object without its stack");
-        auto tl = FieldPlace(src, fl.tailfi, l);
+        auto tl = FieldPlace(src, fs.var, l);
         if (M.FoOk(tl.t)) {
-            if (fl.tail) tyg_move(p, dst.a, src.a, fl.tail);
-            FoCopy(FieldPlace(dst, fl.tailfi, l), tl, l);
+            if (pre) tyg_move(p, dst.a, src.a, pre);
+            FoCopy(FieldPlace(dst, fs.var, l), tl, l);
             return;
         }
         auto v = ViewOf(tl, l);
@@ -6577,8 +6552,8 @@ struct TgFn {
         StL(el, v.len, 8);
         // Elements of variable size (varints) by their bytes.
         if (!cg.IsFix(v.elem)) StL(el, Sub(RunEnd(v), v.elems), 16);
-        if (fl.tail) tyg_move(p, dst.a, src.a, fl.tail);
-        auto dt = FieldPlace(dst, fl.tailfi, l);
+        if (pre) tyg_move(p, dst.a, src.a, pre);
+        auto dt = FieldPlace(dst, fs.var, l);
         auto len = AddrPlus(dt.a, 8);
         St(dt.a, Top(dst.stk));
         St(len, I64(0));
@@ -6590,27 +6565,21 @@ struct TgFn {
 
     // Frame object `obj`'s fixed fields stored to the bytes at `at` (pads zeroed) or loaded from them.
     void FoBytesCopy(TypeExpr *t, tyg_addr obj, tyg_addr at, bool tobytes) {
-        auto si = cg.SI(t);
-        auto fl = M.FoLayout(t);
-        auto &fields = si->st->fields;
-        for (size_t i = 0; i < fields.size(); i++) {
-            if (fields[i].ispad) {
-                if (fields[i].padsize <= 0) continue;
-                if (tobytes) tyg_zero(p, at, fields[i].padsize);
-                at.offset += fields[i].padsize;
+        auto &fs = M.StFields(t);
+        auto packed = [&](size_t i) { return AddrPlus(at, fs.off[i]); };
+        for (size_t i = 0; i < (size_t)fs.var; i++) {
+            if (fs.f[i].ispad) {
+                if (tobytes && fs.f[i].padsize > 0) tyg_zero(p, packed(i), fs.f[i].padsize);
                 continue;
             }
-            auto ft = si->ftypes[i];
-            if (cg.IsResz(ft)) {
-                if (cg.IsFrameObj(ft)) FoBytesCopy(ft, AddrPlus(obj, fl.tail), at, tobytes);
-                return;
-            }
-            auto o = AddrPlus(obj, fl.offs[i]);
-            auto n = cg.FixedSize(ft);
-            if (tobytes) tyg_copy(p, at, o, n);
-            else tyg_copy(p, o, at, n);
-            at.offset += n;
+            auto n = cg.FixedSize(fs.t[i]);
+            auto o = AddrPlus(obj, fs.coff[i]);
+            if (tobytes) tyg_copy(p, packed(i), o, n);
+            else tyg_copy(p, o, packed(i), n);
         }
+        auto tail = fs.t[(size_t)fs.var];
+        if (cg.IsFrameObj(tail))
+            FoBytesCopy(tail, AddrPlus(obj, fs.coff[(size_t)fs.var]), AddrPlus(at, fs.pre), tobytes);
     }
     // The bytes frame object at src read as a C one (CodeGen::FoView): its innermost tail's header
     // points at the elements where they lie.
@@ -6641,7 +6610,7 @@ struct TgFn {
     void GenFoBytes(Node *n, tyg_val stk, TypeExpr *t, tyg_addr olen, Line l) {
         if (BuildCtl(n, InPlace { 4, stk, t, olen }, l)) return;
         if (auto sl = Is<StructLit>(n); sl && sl->sinst && !sl->variant && cg.TEq(sl->exprtype, t)) {
-            LitWithTail(sl, stk, M.StFields(t), M.FoLayout(t).tailfi, olen, l);
+            LitWithTail(sl, stk, M.StFields(t), M.StFields(t).var, olen, l);
             return;
         }
         auto at = Local(Top(stk));
@@ -6701,20 +6670,12 @@ struct TgFn {
     tyg_val ImgSize(TypeExpr *t, tyg_val at) {
         if (cg.IsFix(t)) return I64(cg.FixedSize(t));
         if (TgModule::IsVarint(t) || TgModule::IsVr(t)) return UlebSize(at);   // Zigzag has ULEB128's shape.
-        if (M.IsVv(t)) return Sub(FieldAddr(t, at, -1), at);
         if (M.IsVm(t)) {
             // The tag, and its variant's payload: a variable one walked, only on its own tag's path.
-            auto ei = cg.EIOf(t);
             auto ts = M.TagSize(t);
-            auto res = Local(I64(ts));
-            auto tag = Local(LoadTag(AtV(at), t));
-            for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
-                If(Cmp(TYG_EQ, LdL(tag), I64((int64_t)vi)), [&] {
-                    auto vt = cg.VariantType(t, (int)vi);
-                    auto ps = cg.IsFix(vt) ? I64(cg.FixedSize(vt)) : ImgSize(vt, Add(at, I64(ts)));
-                    StL(res, Add(ps, I64(ts)));
-                });
-            return LdL(res);
+            return ByTag(t, LoadTag(AtV(at), t), [&](int vi) {
+                return Add(ImgSize(cg.VariantType(t, vi), Add(at, I64(ts))), I64(ts));
+            }, ts);
         }
         if (M.IsRc(t)) return Add(Mul(LimCapOf(P { AtV(at), t }), I64(cg.FixedSize(t->arr->sub))), I64(8));
         if (IsVarArr(t)) {
@@ -6794,10 +6755,8 @@ struct TgFn {
                 auto at = AddrPlus(base.a, fs.off[(size_t)fi]);
                 return tail ? tailat(tyg_addr_of(p, at), base.ohdr) : P { at, ft };
             }
-            auto fl = M.FoLayout(t);
-            if (!tail) return P { AddrPlus(base.a, fl.offs[(size_t)fi]), ft };
-            if (!base.stk && !read) No(l, "frame object without its stack");
-            return P { AddrPlus(base.a, fl.tail), ft, base.stk };
+            if (tail && !base.stk && !read) No(l, "frame object without its stack");
+            return P { AddrPlus(base.a, fs.coff[(size_t)fi]), ft, tail ? base.stk : 0 };
         }
         if (!cg.IsFix(t)) {
             if (!M.VsOk(t) && !M.VvOk(t)) No(l, "field of this type");
