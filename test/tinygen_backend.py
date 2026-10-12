@@ -36,6 +36,20 @@ PROGRAMS = [
     ("test/tinygen/tinygen_structs.goose", False, ["--tinygen-skip=main"]),
     ("test/tinygen/tinygen_structs.goose", False, ["--tinygen-skip=add,area,mixed_sum,swap"]),
     ("test/tinygen/tinygen_structs.goose", False, ["--tinygen-skip=scale,dot,grow,mixed"]),
+    # Packed structs by value across the C calling convention, both ways: C returns to
+    # tinygen, tinygen passes to C and back, C calls tinygen past the registers.
+    ("test/tinygen/tinygen_abi.goose", True, []),
+    ("test/tinygen/tinygen_abi.goose", False, ["--tinygen-skip=main"]),
+    ("test/tinygen/tinygen_abi.goose", False,
+     ["--tinygen-skip=mk_b1,mk_b3,mk_f2,mk_i8m,mk_u8f,mk_fu8,mk_if12,mk_f3,mk_df12,mk_u8i64,"
+      "mk_i64u8,mk_di,mk_id,mk_d2,mk_odd16,mk_s17,mk_s24,mk_s33,mk_arr,"
+      "mk_nest,mk_nest8,ret_i8,ret_u16"]),
+    ("test/tinygen/tinygen_abi.goose", False,
+     ["--tinygen-skip=h_b1,h_b3,h_f2,h_i8m,h_u8f,h_fu8,h_if12,h_f3,h_df12,h_u8i64,h_i64u8,"
+      "h_di,h_id,h_d2,h_odd16,h_s17,h_s24,h_s33,h_arr,h_nest,h_nest8,p_b3,"
+      "p_i8m,p_u8f,p_fu8,p_if12,p_f3,p_df12,p_u8i64,p_di,p_id,p_odd16,p_s17,"
+      "p_s33,p_nest,p_nest8,small,many_int,many_sse,many_mix,many_ret,"
+      "many_ret2"]),
     ("test/tinygen/tinygen_extern.goose", True, []),
     ("test/tinygen/tinygen_divzero.goose", True, []),
     ("test/tinygen/tinygen_divzero.goose", True, ["--debug"]),
@@ -135,6 +149,7 @@ WHOLE_PROGRAM = {
     "tinygen_shrink", "tinygen_nested", "tinygen_funvals", "20_life",
     "loop_invariant_divisors", "tinygen_globals", "tinygen_gstacks", "tinygen_retfrom",
     "tinygen_render", "tinygen_strings", "tinygen_control", "tinygen_elemwise",
+    "tinygen_abi",
 }
 
 # ---- ADTs: fixed-mode values, variants, match and case-function dispatch,
