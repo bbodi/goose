@@ -885,15 +885,20 @@ struct TgModule {
         return { vi, vi + 1 };
     }
 
+    // Whether ok(vi, run) holds for each variant a value of the ADT or variant type t may be.
+    template <class F> bool AllVariants(TypeExpr *t, F ok) {
+        auto [lo, hi] = VarSpan(t);
+        for (auto vi = lo; vi < hi; vi++)
+            if (!ok(vi, VarFields(EI(t), vi))) return false;
+        return true;
+    }
     // A fixed-mode ADT or a fixed variant whose payload fields it holds.
     bool AdtOk(TypeExpr *t, int depth) {
         if ((t->kind == TY_ENUM && t->enu->varmode) || !cg.IsFix(t)) return false;
         return Within(t, true, [&] {
-            auto ei = EI(t);
-            auto [lo, hi] = VarSpan(t);
-            for (auto vi = lo; vi < hi; vi++)
-                if (!VarFields(ei, vi).All([&](TypeExpr *ft) { return TypeOk(ft, depth + 1); })) return false;
-            return true;
+            return AllVariants(t, [&](int, const FieldSet &fs) {
+                return fs.All([&](TypeExpr *ft) { return TypeOk(ft, depth + 1); });
+            });
         });
     }
     string AdtBlocker(TypeExpr *t, int depth) {
@@ -984,10 +989,7 @@ struct TgModule {
     bool VmOk(TypeExpr *t, int depth = 0) {
         if (!IsVm(t) || depth > 32) return false;
         return Within(t, true, [&] {
-            auto ei = cg.EIOf(t);
-            for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
-                if (!FieldsOk(VarFields(ei, (int)vi), depth + 1)) return false;
-            return true;
+            return AllVariants(t, [&](int, const FieldSet &fs) { return FieldsOk(fs, depth + 1); });
         });
     }
     // Whether the first n fields (all by default) are ones this backend reads and builds: fixed ones it
@@ -1111,10 +1113,7 @@ struct TgModule {
         if (!IsRb(t) || depth > 32) return false;
         return Within(t, true, [&] {
             if (t->kind == TY_STRUCT) return RbStOk(t, depth);
-            auto [lo, hi] = VarSpan(t);
-            for (auto vi = lo; vi < hi; vi++)
-                if (!RbVarOk(t, vi, depth)) return false;
-            return true;
+            return AllVariants(t, [&](int vi, const FieldSet &) { return RbVarOk(t, vi, depth); });
         });
     }
 
@@ -1139,11 +1138,7 @@ struct TgModule {
                     if (!seen.insert(cg.Mangle(x)).second) return false;
                     auto none = [&](TypeExpr *ft) { return !sub(ft); };
                     if (x->kind == TY_STRUCT) return cg.SI(x) && !StFields(x).All(none);
-                    auto ei = EI(x);
-                    auto [lo, hi] = VarSpan(x);
-                    for (auto vi = lo; vi < hi; vi++)
-                        if (!VarFields(ei, vi).All(none)) return true;
-                    return false;
+                    return !AllVariants(x, [&](int, const FieldSet &fs) { return fs.All(none); });
                 }
                 default: return false;
             }
@@ -1847,13 +1842,13 @@ struct TgFn {
             StoreTag(AtV(top), t, vi);
             SetTop(stk, Add(top, I64(ts)));
         };
-        // A literal's fields before the tail in turn, then the tail built by `tail` from its init.
-        auto fields = [&](StructLit *sl, auto &fs, auto &fts, int tailfi, auto tail) {
-            for (size_t i = 0; i < fs.size(); i++)
+        // A literal's fields in turn, then its tail.
+        auto fields = [&](StructLit *sl, const TgModule::FieldSet &fs, int tailfi) {
+            for (size_t i = 0; i < fs.f.size(); i++)
                 if (auto e = sl->InitFor((int)i); e && Is<SelfRef>(e))
                     No(l, "self reference in a resizable ADT");
-            RunLit(sl, stk, fs, fts, tailfi < 0 ? (size_t)-1 : (size_t)tailfi);
-            if (tailfi >= 0 && !Ended()) tail(sl->InitFor(tailfi), fts[(size_t)tailfi]);
+            if (tailfi < 0) RunLit(sl, stk, fs);
+            else LitWithTail(sl, stk, fs, tailfi, len, l);
         };
         if (StripCopy(n) != n) No(l, "copy of a resizable ADT");
         if (BuildCtl(n, InPlace { 2, stk, t, hdr }, l)) return;
@@ -1863,28 +1858,17 @@ struct TgFn {
         auto lit = sl && sl->exprtype && cg.TEq(sl->exprtype, t);
         if (isst) {   // Its fixed fields in turn, then its tail, a resizable ADT of its own.
             if (!lit || !sl->sinst || sl->variant) No(l, "resizable struct built from this value");
-            auto si = cg.SI(t);
             begin(0);
-            fields(sl, si->st->fields, si->ftypes, M.RbStShape(t).tailfi, [&](Node *init, TypeExpr *ft) {
-                if (!init) No(l, "resizable struct without its tail");
-                BuildTail(init, stk, ft, len, l);
-            });
+            fields(sl, M.StFields(t), M.RbStShape(t).tailfi);
             return;
         }
         if (lit && (!adt || sl->variant)) {
             auto vi = adt ? ei->en->VariantIndex(sl->variant) : M.VariantIdx(t);
-            auto &fs = ei->en->variants[(size_t)vi].fields;
+            auto &fs = M.VarFields(ei, vi);
             auto sh = M.RbShapeOf(ei, vi);
             begin(vi);
-            if (sh.img) return RunLit(sl, stk, fs, ei->vftypes[(size_t)vi]);   // As a variable-size variant's.
-            fields(sl, fs, ei->vftypes[(size_t)vi], sh.tailfi, [&](Node *init, TypeExpr *ft) {
-                if (sh.fo) {
-                    if (!init) No(l, "resizable ADT without its frame object");
-                    GenFoBytes(init, stk, ft, len, l);
-                } else if (init) {
-                    BuildTail(init, stk, ft, len, l);
-                }
-            });
+            if (sh.img) return RunLit(sl, stk, fs);   // As a variable-size variant's.
+            fields(sl, fs, sh.tailfi);
             return;
         }
         if (auto d = Is<Dot>(n); d && d->variantconst && adt && d->exprtype && cg.TEq(d->exprtype, t))
@@ -2911,29 +2895,12 @@ struct TgFn {
                 auto rc = TgModule::IsLim(t);
                 // The length (and a limited array's capacity) at a cursor, which moves past them.
                 auto head = [&](tyg_local c, tyg_local len, tyg_local cap) {
-                    auto at = [&] { return LdL(c); };
-                    auto u32 = [&](int64_t off) {
-                        return tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, TYG_I32, AtV(at(), off), 0));
-                    };
-                    if (t->arr->akind == A_VAR) {
-                        auto w = TgModule::LenWidth(t);
-                        if (w == 0) {
-                            StL(len, UlebRead(at()));
-                            StL(c, Add(at(), UlebSize(at())));
-                        } else {
-                            auto sc = w == 1 ? TYG_I8 : w == 2 ? TYG_I16 : w == 4 ? TYG_I32 : TYG_I64;
-                            auto n = tyg_load(p, sc, AtV(at()), 0);
-                            auto ext = TgModule::SignedLen(t) ? TYG_SEXT : TYG_ZEXT;
-                            StL(len, sc == TYG_I64 ? n : tyg_convert(p, ext, TYG_I64, n));
-                            StL(c, Add(at(), I64(w)));
-                        }
-                    } else if (rc) {
-                        StL(cap, u32(0));
-                        StL(len, u32(4));
-                        StL(c, Add(at(), I64(8)));
-                    } else {
-                        bad();
-                    }
+                    P at { AtV(LdL(c)), t };
+                    if (!rc && t->arr->akind != A_VAR) bad();
+                    if (rc) StL(cap, LimCapOf(at));
+                    auto v = rc ? LimView(at) : VarArrView(at);
+                    StL(len, v.len);
+                    StL(c, v.elems);
                 };
                 head(ca, lena, capa);
                 head(cb, lenb, capb);
@@ -3235,17 +3202,18 @@ struct TgFn {
         if (TgModule::IsLim(pl.t) && M.LimHeld(pl.t)) return LimView(pl);
         // Elements of variable size: walked from the first (StepElem).
         if (IsGrow(pl.t) && M.VeOk(pl.t)) return { BaseOf(pl), Ld(a8), pl.t->arr->sub, -1 };
-        if (IsArrayKind(pl.t, A_VAR) && (M.RzOk(pl.t) || M.VarImgOk(pl.t))) {
-            // A T[] image: the length prefix, the elements behind it.
-            auto w = TgModule::LenWidth(pl.t);
-            auto base = tyg_addr_of(p, pl.a);
-            if (w == 0) return { Add(base, UlebSize(base)), UlebRead(base), pl.t->arr->sub, -1 };
-            auto s = w == 1 ? TYG_I8 : w == 2 ? TYG_I16 : w == 4 ? TYG_I32 : TYG_I64;
-            auto n = tyg_load(p, s, pl.a, 0);
-            if (s != TYG_I64) n = tyg_convert(p, TgModule::SignedLen(pl.t) ? TYG_SEXT : TYG_ZEXT, TYG_I64, n);
-            return { Add(base, I64(w)), n, pl.t->arr->sub, -1 };
-        }
+        if (IsArrayKind(pl.t, A_VAR) && (M.RzOk(pl.t) || M.VarImgOk(pl.t))) return VarArrView(pl);
         No(l, "array of this kind");
+    }
+    // A T[] image at pl: the length prefix, the elements behind it.
+    View VarArrView(const P &pl) {
+        auto w = TgModule::LenWidth(pl.t);
+        auto base = tyg_addr_of(p, pl.a);
+        if (w == 0) return { Add(base, UlebSize(base)), UlebRead(base), pl.t->arr->sub, -1 };
+        auto s = w == 1 ? TYG_I8 : w == 2 ? TYG_I16 : w == 4 ? TYG_I32 : TYG_I64;
+        auto n = tyg_load(p, s, pl.a, 0);
+        if (s != TYG_I64) n = tyg_convert(p, TgModule::SignedLen(pl.t) ? TYG_SEXT : TYG_ZEXT, TYG_I64, n);
+        return { Add(base, I64(w)), n, pl.t->arr->sub, -1 };
     }
     tyg_val ElemAddr(const View &v, tyg_val i) {
         if (!cg.IsFix(v.elem)) No(Line {}, "an element of variable size by its index");
@@ -6657,19 +6625,15 @@ struct TgFn {
         return P { tmp, t, src.stk };
     }
     // A literal's fields before its tail field, then the tail (a frame object's fields as bytes, or
-    // elements behind a header of its own), its count stored at len.
-    void LitWithTail(StructLit *sl, tyg_val stk, TypeExpr *t, int tail, tyg_addr len, Line l) {
-        auto si = cg.SI(t);
-        RunLit(sl, stk, si->st->fields, si->ftypes, (size_t)tail);
+    // elements behind a header of its own, or a resizable ADT), its count stored at len.
+    void LitWithTail(StructLit *sl, tyg_val stk, const TgModule::FieldSet &fs, int tail, tyg_addr len, Line l) {
+        RunLit(sl, stk, fs, (size_t)tail);
         if (Ended()) return;
-        auto tt = si->ftypes[(size_t)tail];
+        auto tt = fs.t[(size_t)tail];
         auto init = sl->InitFor(tail);
-        if (M.FoOk(tt)) {
-            if (!init) No(l, "omitted frame object tail");
-            GenFoBytes(init, stk, tt, len, l);
-            return;
-        }
-        BuildTail(init, stk, tt, len, l);
+        if (!init && (M.FoOk(tt) || M.IsRb(tt))) No(l, "omitted tail");
+        if (M.FoOk(tt)) GenFoBytes(init, stk, tt, len, l);
+        else BuildTail(init, stk, tt, len, l);
     }
     // Builds n's value, of frame object type t, at the top of stk as the tail of a value that is not
     // one: its fields as bytes, its innermost tail's count into olen (CodeGen::GenFoAsBytes). Anything
@@ -6677,7 +6641,7 @@ struct TgFn {
     void GenFoBytes(Node *n, tyg_val stk, TypeExpr *t, tyg_addr olen, Line l) {
         if (BuildCtl(n, InPlace { 4, stk, t, olen }, l)) return;
         if (auto sl = Is<StructLit>(n); sl && sl->sinst && !sl->variant && cg.TEq(sl->exprtype, t)) {
-            LitWithTail(sl, stk, t, M.FoLayout(t).tailfi, olen, l);
+            LitWithTail(sl, stk, M.StFields(t), M.FoLayout(t).tailfi, olen, l);
             return;
         }
         auto at = Local(Top(stk));
@@ -6701,7 +6665,7 @@ struct TgFn {
         auto len = CountAt(hdr);
         if (auto sl = Is<StructLit>(n); sl && sl->sinst && !sl->variant && cg.TEq(sl->exprtype, t)) {
             auto start = Local(Top(stk));
-            LitWithTail(sl, stk, t, LastRealField(cg.SI(t)->st->fields), len, l);
+            LitWithTail(sl, stk, M.StFields(t), M.StFields(t).last, len, l);
             if (!Ended()) St(hdr, LdL(start));
             return;
         }
@@ -6902,7 +6866,6 @@ struct TgFn {
         auto ei = cg.EIOf(t);
         auto vi = (size_t)ei->en->VariantIndex(var);
         auto vt = cg.VariantType(t, (int)vi);
-        auto &fs = ei->en->variants[vi].fields;
         auto base = at();
         auto ts = M.TagSize(t);
         if (!cg.IsFix(vt)) {   // A variable payload: the tag, then its fields built in turn.
@@ -6910,7 +6873,7 @@ struct TgFn {
             SetTop(stk, Add(base, I64(ts)));
             StoreTag(AtV(base), t, (int)vi);
             SelfScope scope(selfbase, base);
-            RunLit(sl, stk, fs, ei->vftypes[vi]);
+            RunLit(sl, stk, M.VarFields(ei, (int)vi));
             return at();
         }
         // A fixed payload: the tag, the rest zero bytes, a literal's fields stored in place.
@@ -6920,10 +6883,7 @@ struct TgFn {
         StoreTag(AtV(base), t, (int)vi);
         if (!sl) return at();
         SelfScope scope(selfbase, base);
-        auto &lay = cg.VariantLayout(ei, (int)vi);
-        for (size_t i = 0; i < fs.size() && !Ended(); i++)
-            if (auto init = fs[i].ispad ? nullptr : sl->InitFor((int)i))
-                Into(P { AtV(at(), ts + lay.offs[i]), ei->vftypes[vi][i] }, init);
+        EachLitInit(sl, [&](Node *init, TypeExpr *ft, int64_t off) { Into(P { AtV(at(), off), ft }, init); });
         return at();
     }
 
@@ -6935,10 +6895,7 @@ struct TgFn {
         if (!isvv) n = StripCopy(n);
         auto sl = Is<StructLit>(n);
         if (sl && cg.TEq(sl->exprtype, t) && (isvv || (sl->sinst && !sl->variant))) {
-            auto ei = isvv ? cg.EIVar(t) : nullptr;
-            auto vi = isvv ? (size_t)ei->en->VariantIndex(t->var->variant) : 0;
-            if (isvv) RunLit(sl, stk, ei->en->variants[vi].fields, ei->vftypes[vi]);
-            else RunLit(sl, stk, cg.SI(t)->st->fields, cg.SI(t)->ftypes);
+            RunLit(sl, stk, M.RunOfType(t));
         } else if (!CallAt(n, InPlace { 1, stk, t }, false)) {
             auto pl = Deref(Place(n));
             if (!Ended()) CopyFrom(pl, InPlace { 1, stk, t }, l);
@@ -6947,12 +6904,11 @@ struct TgFn {
     }
     // A literal's fields in layout order (CodeGen::GenFieldInits), each built at the top in turn: a
     // fixed one evaluated, then stored; a variable-size one built there; explicit padding zeroed.
-    void RunLit(StructLit *sl, tyg_val stk, const vector<Field> &fields, const vector<TypeExpr *> &ftypes,
-                size_t count = (size_t)-1) {
-        for (size_t i = 0; i < fields.size() && i < count && !Ended(); i++) {
-            auto ft = ftypes[i];
+    void RunLit(StructLit *sl, tyg_val stk, const TgModule::FieldSet &fs, size_t count = (size_t)-1) {
+        for (size_t i = 0; i < fs.f.size() && i < count && !Ended(); i++) {
+            auto ft = fs.t[i];
             auto init = sl->InitFor((int)i);
-            if (fields[i].ispad) PushZero(stk, fields[i].padsize);
+            if (fs.f[i].ispad) PushZero(stk, fs.f[i].padsize);
             else if (cg.IsFix(ft) && !init) PushZero(stk, cg.FixedSize(ft));
             else if (cg.IsFix(ft)) BuildField(stk, ft, init);
             else if (init) GenImg(init, stk, ft, init->line);
@@ -7188,24 +7144,24 @@ struct TgFn {
         else check();
     }
 
-    // A run of fields of t (CodeGen::EmitVerifyFields). `lo`: the layout of a fixed struct or variant,
-    // whose offsets may include padding a sequential walk would miss; null for bytes layouts.
-    void VFields(TypeExpr *t, const vector<Field> &fields, const vector<TypeExpr *> &ftypes,
-                 const CodeGen::Layout *lo, bool links) {
-        auto total = lo ? cg.FixedSize(t) : 0;
-        tyg_local start = lo ? Local(VQ()) : 0;
-        if (lo) VNeed(total);
-        for (size_t i = 0; i < fields.size(); i++) {
-            auto &f = fields[i];
-            if (f.ispad) {
-                if (!lo && f.padsize > 0) VAddQ(I64(f.padsize));
+    // The fields of struct or variant t (CodeGen::EmitVerifyFields). A fixed one's offsets may include padding
+    // a sequential walk would miss; a bytes layout's are walked in turn.
+    void VFields(TypeExpr *t, bool links) {
+        auto &fs = M.RunOfType(t);
+        auto fix = cg.IsFix(t);
+        auto total = fix ? cg.FixedSize(t) : 0;
+        tyg_local start = fix ? Local(VQ()) : 0;
+        if (fix) VNeed(total);
+        for (size_t i = 0; i < fs.f.size(); i++) {
+            if (fs.f[i].ispad) {
+                if (!fix && fs.f[i].padsize > 0) VAddQ(I64(fs.f[i].padsize));
                 continue;
             }
-            if (lo && !cg.NeedsVerifyWalk(ftypes[i])) continue;
-            if (lo) VSetQ(Add(LdL(start), I64(lo->offs[i])));
-            VWalk(ftypes[i], links);
+            if (fix && !cg.NeedsVerifyWalk(fs.t[i])) continue;
+            if (fix) VSetQ(Add(LdL(start), I64(fs.off[i])));
+            VWalk(fs.t[i], links);
         }
-        if (lo) VSetQ(Add(LdL(start), I64(total)));
+        if (fix) VSetQ(Add(LdL(start), I64(total)));
     }
 
     // The checks and cursor advance for one value of type t at q (CodeGen::EmitVerifyWalk).
@@ -7295,18 +7251,9 @@ struct TgFn {
                 }
                 return;
             }
-            case TY_STRUCT: {
-                auto si = cg.SI(t);
-                VFields(t, si->st->fields, si->ftypes, cg.IsFix(t) ? &cg.StructLayout(si) : nullptr, links);
+            case TY_STRUCT: case TY_VARIANT:
+                VFields(t, links);
                 return;
-            }
-            case TY_VARIANT: {
-                auto ei = cg.EIVar(t);
-                auto vi = ei->en->VariantIndex(t->var->variant);
-                auto lo = cg.IsFix(t) ? &cg.VariantLayout(ei, vi) : nullptr;
-                VFields(t, ei->en->variants[vi].fields, ei->vftypes[vi], lo, links);
-                return;
-            }
             case TY_ENUM: {   // The tag is range-checked in both modes (a match has no default).
                 auto ei = cg.EIOf(t);
                 auto tsz = CodeGen::IntSize(cg.TagStore(ei->en));
