@@ -9927,10 +9927,12 @@ struct TgFn {
             VFail(TYG_SGE, LdL(offl), Sub(vN, LdL(v)));
             StL(v, Add(LdL(v), LdL(offl)));
             if (cg.IsFix(velem)) {
-                VFail(TYG_NE, VBin(TYG_SREM, LdL(v), I64(std::max<int64_t>(cg.FixedSize(velem), 1))), I64(0));
+                auto esz = I64(std::max<int64_t>(cg.FixedSize(velem), 1));
+                VFail(TYG_NE, VBin(TYG_SREM, LdL(v), esz), I64(0));
             } else {   // GS_BM_GET(bm, v)
                 auto byte = VLoad(Add(vBM, VBin(TYG_LSHR, LdL(v), I64(3))), 1, false);
-                VFail(TYG_EQ, VBin(TYG_AND, VBin(TYG_LSHR, byte, VBin(TYG_AND, LdL(v), I64(7))), I64(1)), I64(0));
+                auto bit = VBin(TYG_AND, VBin(TYG_LSHR, byte, VBin(TYG_AND, LdL(v), I64(7))), I64(1));
+                VFail(TYG_EQ, bit, I64(0));
             }
             if (variant) {
                 VFail(TYG_SLT, Sub(vN, LdL(v)), I64(skip));
@@ -9967,14 +9969,14 @@ struct TgFn {
             if (cg.FixedSize(t) > 0) VSkip(cg.FixedSize(t));
             return;
         }
-        auto walk = [this, links](TypeExpr *e) { return [this, e, links](tyg_val) { VWalk(e, links); }; };
+        auto walk = [this, links](TypeExpr *e) { return [=](tyg_val) { VWalk(e, links); }; };
         switch (t->kind) {
             case TY_BOOL:
                 VNeed(1);
                 VFail(TYG_UGT, VLoad(VAt(), 1, false), I64(1));
                 VAddQ(I64(1));
                 return;
-            case TY_INT: VAddQ(LdL(VUleb().k)); return;   // a varint: only its length matters to the walk
+            case TY_INT: VAddQ(LdL(VUleb().k)); return;   // a varint: only its length matters
             case TY_REF: {
                 auto w = (IntStorage)t->ref->lenstorage;
                 auto off = VNew(), k = VNew();
@@ -10092,7 +10094,7 @@ struct TgFn {
     void EmitVerify(const string &name, TypeExpr *elem) {
         auto i64t = IT(TYG_I64);
         const tyg_type *pts[3] = { i64t, i64t, i64t };
-        NewProcBegin(M.Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL), tyg_sig_new(m, i64t, pts, 3, 0), Line {});
+        NewProcBegin(M.Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL), tyg_sig_new(m, i64t, pts, 3, 0), {});
         NewProcBody();
         velem = elem;
         vP = tyg_param(p, 0);
@@ -10113,8 +10115,8 @@ struct TgFn {
                 if (!fixed && rel) {   // GS_BM_SET(bm, q)
                     auto at = Add(vBM, VBin(TYG_LSHR, VQ(), I64(3)));
                     auto bit = VBin(TYG_SHL, I64(1), VBin(TYG_AND, VQ(), I64(7)));
-                    auto bits = tyg_convert(p, TYG_TRUNC, TYG_I8, VBin(TYG_OR, VLoad(at, 1, false), bit));
-                    tyg_store(p, TYG_I8, AtV(at), bits, 0);
+                    auto old = VLoad(at, 1, false);
+                    tyg_store(p, TYG_I8, AtV(at), tyg_convert(p, TYG_TRUNC, TYG_I8, VBin(TYG_OR, old, bit)), 0);
                 }
                 VWalk(elem, fixed && rel);
                 StL(cnt, Add(LdL(cnt), I64(1)));
@@ -10228,17 +10230,24 @@ struct TinyGenBackend : CodeGen::SpecBackend {
           runtime_decls(std::move(_decls)) {}
 
     // What a procedure asked of the module for the C half, to take back.
-    struct Mark {
-        size_t shims, externs, direct;
-    };
-    Mark Take() { return { mod->shims.size(), mod->externs.size(), mod->direct.size() }; }
-    void Undo(Mark k) {
-        mod->shims.resize(k.shims);
-        mod->externs.resize(k.externs);
-        mod->direct.resize(k.direct);
-    }
     static string Why(const TgUnsupported &u) {
         return u.line.line > 0 ? cat(u.why, " (line ", u.line.line, ")") : u.why;
+    }
+    // Runs emit() building fn's procedure: "" when it compiled, else why not. A construct not supported
+    // anywhere in the body abandons the procedure (tyg_proc_abort) and takes back what it asked of the
+    // module for the C half (shims, trampolines), so the whole body goes to C.
+    template <class F> string Attempt(TgFn &fn, F emit) {
+        auto nshims = mod->shims.size(), nexterns = mod->externs.size(), ndirect = mod->direct.size();
+        try {
+            emit();
+        } catch (TgUnsupported &u) {
+            if (fn.p) tyg_proc_abort(fn.p);
+            mod->shims.resize(nshims);
+            mod->externs.resize(nexterns);
+            mod->direct.resize(ndirect);
+            return Why(u);
+        }
+        return "";
     }
 
     tyg_sym FSym(const string &name) { return mod->Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL); }
@@ -10312,23 +10321,14 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         }
     }
 
-    // Builds sp into the module: "" when it compiled, else why not. A construct not supported anywhere
-    // in the body abandons the procedure (tyg_proc_abort) and takes back what it asked of the module,
-    // so the whole body goes to C. A body that compiled tells the C half's stack accounting
-    // (codegen_stacks.h) the stacks it owns and what it hands its callees.
+    // Builds sp into the module: "" when it compiled, else why not. A body that compiled tells the C
+    // half's stack accounting (codegen_stacks.h) the stacks it owns and what it hands its callees.
     string Build(CodeGen &cg, FnSpec *sp) {
         string why;
         // A simd function is its baseline version here (§7.12).
         if (!mod->SigOk(sp, true, why)) return cat("interface: ", why);
-        auto mark = Take();
         TgFn fn(*mod, sp);
-        try {
-            fn.Emit();
-        } catch (TgUnsupported &u) {
-            if (fn.p) tyg_proc_abort(fn.p);
-            Undo(mark);
-            return Why(u);
-        }
+        if (auto w = Attempt(fn, [&] { fn.Emit(); }); !w.empty()) return w;
         cg.stackown[sp] = fn.maxown;
         cg.stackcalls[sp] = fn.stackcalls;
         return "";
@@ -10638,11 +10638,9 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     bool GlobalsOk(CodeGen &cg, string &why) {
         for (auto g : ast.globals)
             for (auto d : g->defs) {
-                if (!cg.gstatic.count(d)) {
-                    if (!mod->GlobalOk(d)) return why = cat("global ", d->name, " of this kind"), false;
-                } else if (mod->accessors.count(d)) {   // Static data reached through an accessor.
-                    return why = cat("global ", d->name, " as static data"), false;
-                }
+                bool stat = cg.gstatic.count(d);   // Its bytes are not laid out: no accessor can reach it.
+                if (stat ? mod->accessors.count(d) > 0 : !mod->GlobalOk(d))
+                    return why = cat("global ", d->name, stat ? " as static data" : " of this kind"), false;
             }
         return true;
     }
@@ -10651,13 +10649,14 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     // channel.
     bool OwnAccessor(const string &name) {
         if (mod->channels.count(name) || mod->queueacc.count(name) || mod->thunkacc.count(name)) return true;
-        for (auto &[d, n] : mod->accessors)
-            if (n == name) return true;
-        for (auto &[d, n] : mod->stkaccessors)
-            if (n == name) return true;
+        auto has = [&](auto &table) {
+            for (auto &[d, n] : table)
+                if (n == name) return true;
+            return false;
+        };
         for (auto &[d, n] : mod->flaccessors)
             if (n.first == name || n.second == name) return true;
-        return false;
+        return has(mod->accessors) || has(mod->stkaccessors);
     }
 
     // gs_init_globals into the object, if its initializers compile and need no more data stacks than
@@ -10665,7 +10664,6 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     tyg_sym initsym = TYG_NO_SYM;
     int64_t initstacks = 0;   // The data stacks gs_tg_init_globals uses at once.
     bool BuildInit(CodeGen &cg, string &why) {
-        auto mark = Take();
         auto sym = mod->Sym("gs_tg_init_globals", TYG_SYM_FUNC);
         TgFn fn(*mod, nullptr);
         Line line;
@@ -10674,13 +10672,8 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                 line = g->line;
                 break;
             }
-        try {
-            fn.EmitInit(sym, line);
-        } catch (TgUnsupported &u) {
-            if (fn.p) tyg_proc_abort(fn.p);
-            Undo(mark);
-            return why = cat("global initializer: ", Why(u)), false;
-        }
+        if (auto w = Attempt(fn, [&] { fn.EmitInit(sym, line); }); !w.empty())
+            return why = cat("global initializer: ", w), false;
         int64_t need = fn.maxown;
         for (auto &c : fn.stackcalls) need = std::max(need, c.offset + cg.stackneed[c.callee]);
         // This one's temporaries may need more than the C's count; main asks the runtime for them.
