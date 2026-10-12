@@ -3946,11 +3946,9 @@ struct TgFn {
             while (rt && IsAddrRef(rt)) rt = rt->ref->sub;
             if (!rt || (rt->kind != TY_ARRAY && rt->kind != TY_SLICE))
                 No(line, "bytes_of of this type");
-            auto elem = rt->kind == TY_SLICE ? rt->sub : rt->arr->sub;
             auto v = ViewOf(Place(an[0]), line);
             if (Ended()) return Dummy(c->exprtype);
-            if (!cg.IsFix(elem)) return PairV(c->exprtype, v.elems, Sub(RunEnd(v), v.elems));
-            return PairV(c->exprtype, v.elems, Mul(v.len, I64(cg.FixedSize(elem))));
+            return PairV(c->exprtype, v.elems, RunBytes(v));
         }
         auto dt = b == B_DEFAULT && c->rettypes.size() == 1 ? c->rettypes[0] : nullptr;
         if (dt && cg.IsFix(dt) && M.TypeOk(dt)) {
@@ -6492,15 +6490,13 @@ struct TgFn {
         auto el = tyg_local_new(p, 24, 8);
         StL(el, v.elems);
         StL(el, v.len, 8);
-        // Elements of variable size (varints) by their bytes.
-        if (!cg.IsFix(v.elem)) StL(el, Sub(RunEnd(v), v.elems), 16);
+        StL(el, RunBytes(v), 16);
         if (pre) tyg_move(p, dst.a, src.a, pre);
         auto dt = FieldPlace(dst, fs.var, l);
         auto len = AddrPlus(dt.a, 8);
         St(dt.a, Top(dst.stk));
         St(len, I64(0));
-        auto bytes = cg.IsFix(v.elem) ? Mul(LdL(el, 8), I64(cg.FixedSize(v.elem))) : LdL(el, 16);
-        CopyBytes(dst.stk, len, LdL(el), bytes, LdL(el, 8));
+        CopyBytes(dst.stk, len, LdL(el), LdL(el, 16), LdL(el, 8));
     }
 
     // ---- Frame objects as bytes ---------------------------------------------------
@@ -6620,8 +6616,7 @@ struct TgFn {
         if (M.IsRc(t)) return Add(Mul(LimCapOf(P { AtV(at), t }), I64(cg.FixedSize(t->arr->sub))), I64(8));
         if (IsVarArr(t)) {
             auto v = ViewOf(P { AtV(at), t }, Line {});
-            if (!cg.IsFix(t->arr->sub)) return Sub(RunEnd(v), at);
-            return Add(Sub(v.elems, at), Mul(v.len, I64(cg.FixedSize(t->arr->sub))));
+            return Add(Sub(v.elems, at), RunBytes(v));
         }
         return Sub(FieldAddr(t, at, -1), at);
     }
