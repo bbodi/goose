@@ -170,8 +170,10 @@ inline string TgSupportBody(string_view runtimeh) {
          "}\n"
          "static uint8_t gs_tg_noglobals;\n"
          "void gs_tg_start(int argc, char **argv, int64_t mainstacks, int64_t mainregions,\n"
-         "                 int64_t workerregions) {\n"
-         "    gs_rt_init(argc, argv, mainstacks, mainregions, workerregions);\n"
+         "                 int64_t workerregions, uint64_t reserve, uint64_t gap,\n"
+         "                 uint64_t budget) {\n"
+         "    gs_rt_start(argc, argv, reserve, gap, budget, mainregions, workerregions);\n"
+         "    gs_stack_block(mainstacks);\n"
          "    gs_tg_tstks = gs_stks;\n"
          "    gs_gl = &gs_tg_noglobals;\n"
          "}\n"
@@ -3841,7 +3843,7 @@ struct TgFn {
         };
         auto slicelen = [&](Node *n) {
             auto nl = Local(Index64(n));
-            auto max = esz ? Cmp(TYG_ULE, LdL(nl), I64((int64_t)((2048ull << 20) / (uint64_t)esz)))
+            auto max = esz ? Cmp(TYG_ULE, LdL(nl), I64((int64_t)(cg.stackcfg.reserve / (uint64_t)esz)))
                            : Cmp(TYG_SGE, LdL(nl), I64(0));
             AbortUnless(max, "SLICELEN", c->line);
             return nl;
@@ -5089,7 +5091,7 @@ struct TgFn {
                 auto bstk = Stk(AllocStk(false, c->line), c->line);
                 bm = Top(bstk);
                 auto bn = Local(Bin(TYG_SDIV, Add(LdL(pn), I64(7)), I64(8)));
-                If(Cmp(TYG_SGT, LdL(bn), I64(2048ll << 20)), [&] {
+                If(Cmp(TYG_SGT, LdL(bn), I64((int64_t)cg.stackcfg.reserve)), [&] {
                     StL(bn, I64(0));
                     StL(okl, I64(0));
                 });
@@ -8287,9 +8289,14 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         fn.p = p;
         // The main program's stacks, or what the initializers use if more.
         auto stacks = std::max(cg.rtinit[0], initstacks);
-        fn.CallC("gs_tg_start", { i32, ptr, i64, i64, i64 },
+        // The data stacks' reservation, as the C's GS_STACK_RESERVE and the others would give it.
+        auto &sc = cg.stackcfg;
+        auto u64 = tyg_type_int(m, TYG_I64, 0);
+        fn.CallC("gs_tg_start", { i32, ptr, i64, i64, i64, u64, u64, u64 },
                  { tyg_param(p, 0), tyg_param(p, 1), fn.I64(stacks),
-                   fn.I64(cg.rtinit[1] + stacks - cg.rtinit[0]), fn.I64(cg.rtinit[2]) }, nullptr);
+                   fn.I64(cg.rtinit[1] + stacks - cg.rtinit[0]), fn.I64(cg.rtinit[2]),
+                   fn.I64((int64_t)sc.reserve), fn.I64((int64_t)sc.gap), fn.I64((int64_t)sc.budget) },
+                 nullptr);
         for (auto &[acc, q] : mod->queueacc)
             fn.CallC("gs_qinit", { ptr }, { fn.CallC(acc, {}, {}, ptr) }, nullptr);
         if (initsym != TYG_NO_SYM) CallSig(p, SigOf(nullptr, {}), initsym, {});

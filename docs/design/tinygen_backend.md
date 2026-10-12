@@ -77,13 +77,17 @@ take, and the shims the object calls. `CodeGen` gives every function external
 linkage, so the two objects resolve each other's calls.
 
 A build takes the mixed path when a function or a global initializer falls
-back to C. It also takes it for `--include`, `--standalone`, a library, an `export fn` that
-`ExportOk` rejects, or any `-D` other than `GS_DEBUG`. `--stack-reserve` adds
-such a `-D`, so it forces the mixed path too. `--tinygen-mixed` (hidden)
-forces it for comparisons. `-v` names the path and the reason:
+back to C. It also takes it for `--include`, `--standalone`, a library, an
+`export fn` that `ExportOk` rejects, or a `-D` that the support object would
+need at compile time. `GS_DEBUG` picks the support object's variant. The stack
+settings (`GS_STACK_RESERVE`, `GS_STACK_GAP`, `GS_STACK_BUDGET` and
+`GS_MAX_STACKS`, so `--stack-reserve` too) keep a whole build: `main` passes
+them to `gs_tg_start`, and the backend reads them from `CodeGen::stackcfg`.
+`--tinygen-mixed` (hidden) forces the mixed path for comparisons. `-v` names
+the path and the reason:
 
     tinygen: whole program: no C compiled for it
-    tinygen: mixed: the C half compiled by the C compiler (-DGS_STACK_RESERVE=2147483648ull)
+    tinygen: mixed: the C half compiled by the C compiler (-DMY_FLAG=1)
 
 ## Conventions shared with the C backend
 
@@ -295,7 +299,6 @@ catch.
 * Linux and Windows: run tinygen's ABI test and this suite there.
 * An in-memory `goose run --backend=tinygen`, once tinygen can load code
   in memory, if its faster start is worth losing the debugger.
-* Let `--stack-reserve` take the whole-program path.
 * Direct globals for programs with threads, through a context pointer passed
   beside `gs_sp`.
 

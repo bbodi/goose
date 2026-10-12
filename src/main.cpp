@@ -1018,10 +1018,9 @@ int Main(int argc, char **argv) {
                                                   RuntimeSections({ "runtime.h", "runtime_ext.h" }));
                 tgb->skip = tinygenskip;
             }
-            CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, stackcfg.maxstacks,
-                       tgb.get());
+            CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, stackcfg, tgb.get());
         #else
-            CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, stackcfg.maxstacks);
+            CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, stackcfg);
         #endif
         if (stacks) cg.StackReport(msgs, stackcfg);
         #if GOOSE_HAVE_TINYGEN
@@ -1042,8 +1041,15 @@ int Main(int argc, char **argv) {
                 else if (standalone) whynot = "--standalone";
                 else if (!includenames.empty()) whynot = "--include";
                 else if (tinygenmixed) whynot = "--tinygen-mixed";
-                for (auto &d : cdefines)
-                    if (whynot.empty() && d != "GS_DEBUG=1") whynot = cat("-D", d);
+                // The support object is shared, so only the defines that main passes to it
+                // at run time (EmitMain) or that the compiler reads itself keep a whole build.
+                for (auto &d : cdefines) {
+                    auto name = d.substr(0, d.find('='));
+                    if (whynot.empty() && d != "GS_DEBUG=1" && name != "GS_STACK_RESERVE" &&
+                        name != "GS_STACK_GAP" && name != "GS_STACK_BUDGET" &&
+                        name != "GS_MAX_STACKS")
+                        whynot = cat("-D", d);
+                }
                 tgwhole = whynot.empty() && tgb->WholeProgram(cg, whynot);
                 tgchecks = tgb->checks;
                 if (tgwhole) tgb->EmitMain(cg);

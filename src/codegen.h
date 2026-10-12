@@ -422,6 +422,9 @@ struct CodeGen {
         uint64_t reserve, gap, budget;
         int64_t maxstacks;
     };
+    // The configuration the program is built with (main.cpp, StackConfigOf), which a backend
+    // without the C preprocessor reads instead of GS_STACK_RESERVE and the others.
+    StackConfig stackcfg { 0, 0, 0, 0 };
     void StackReport(FILE *out, const StackConfig &cfg);
 
     // Long-distance return targets (§7.9): id, per-ret TLS channels.
@@ -1336,10 +1339,10 @@ struct CodeGen {
     // process state that the driver must install before constructing us.
     // A function the extern support declares gets no prototype here.
     CodeGen(Ast &_ast, string_view runtime_ext_text, const vector<string> &headers,
-            bool _norfcheck = false, bool _library = false, int64_t _maxstacks = 0,
+            bool _norfcheck = false, bool _library = false, StackConfig _stackcfg = {},
             SpecBackend *_backend = nullptr)
-        : ast(_ast), library(_library), norfcheck(_norfcheck), maxstacks(_maxstacks),
-          backend(_backend) {
+        : ast(_ast), library(_library), norfcheck(_norfcheck), maxstacks(_stackcfg.maxstacks),
+          stackcfg(_stackcfg), backend(_backend) {
         for (auto t : ast.alltypes)
             if (t->kind == TY_REF && t->ref->pool) poolglobals.insert(t->ref->pool);
         ComputeRelRootMax();

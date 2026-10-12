@@ -77,6 +77,8 @@ PROGRAMS = [
     ("test/tinygen/tinygen_strings.goose", False, ["--tinygen-skip=walk,shout,far"]),
     ("test/tinygen/tinygen_build.goose", True, []),
     ("test/tinygen/tinygen_build.goose", True, ["--debug"]),
+    # The stack settings reach the support object at run time, so they keep a whole build.
+    ("test/tinygen/tinygen_build.goose", True, ["--stack-reserve", "64M"]),
     ("test/tinygen/tinygen_build.goose", False, ["--tinygen-skip=main"]),
     ("test/tinygen/tinygen_build.goose", False,
      ["--tinygen-skip=squares,word,evens,label,split,points"]),
