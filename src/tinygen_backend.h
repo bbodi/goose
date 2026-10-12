@@ -5769,10 +5769,47 @@ struct TgFn {
         Ctl k;
         if (CtlBegin(k, i, discard, nullptr, i->elseb != nullptr)) return k.w;
         auto arm = [&](Node *n) { CtlArm(k, nullptr, n, i->line); };
+        if (IsShortCircuit(i->cond)) {
+            auto t = NewBlock(), e = NewBlock(), done = i->elseb ? NewBlock() : e;
+            CondBranch(i->cond, t, e, false);
+            SetBlock(t);
+            arm(i->thenb);
+            if (!Ended()) tyg_jump(p, done);
+            if (i->elseb) {
+                SetBlock(e);
+                arm(i->elseb);
+                if (!Ended()) tyg_jump(p, done);
+            }
+            SetBlock(done);
+            return CtlValue(k, i->line);
+        }
         auto c = Truth(i->cond);
         if (i->elseb) IfElse(c, [&] { arm(i->thenb); }, [&] { arm(i->elseb); });
         else If(c, [&] { arm(i->thenb); });
         return CtlValue(k, i->line);
+    }
+
+    bool IsShortCircuit(Node *n) {
+        auto b = Is<Binary>(n);
+        return b && (b->op == T_ANDAND || b->op == T_OROR);
+    }
+    // To t where the condition n holds, else to f. `&&` and `||` test each operand with a branch of
+    // its own, where GenBinary keeps their value in a bool local; the right operand's temporaries
+    // exist only when it runs, as there. With `scoped`, the left one's too.
+    void CondBranch(Node *n, tyg_block t, tyg_block f, bool scoped) {
+        if (IsShortCircuit(n)) {
+            auto b = static_cast<Binary *>(n);
+            auto mid = NewBlock();
+            if (b->op == T_ANDAND) CondBranch(b->left, mid, f, scoped);
+            else CondBranch(b->left, t, mid, scoped);
+            SetBlock(mid);
+            CondBranch(b->right, t, f, true);
+            return;
+        }
+        if (scoped) OpenScope(true);
+        auto c = Truth(n);
+        if (scoped) CloseScope();
+        if (!Ended()) Branch(c, t, f);
     }
 
     // `block { ... }` (EarlyBlock::CgAny): its tail's value, or a break's.
@@ -6153,10 +6190,14 @@ struct TgFn {
                 tyg_jump(p, head);
                 SetBlock(head);
                 Loc(w->cond->line);
-                OpenScope(true);
-                auto c = Truth(w->cond);
-                CloseScope();
-                Branch(c, body, done);
+                if (IsShortCircuit(w->cond)) {
+                    CondBranch(w->cond, body, done, true);
+                } else {
+                    OpenScope(true);
+                    auto c = Truth(w->cond);
+                    CloseScope();
+                    Branch(c, body, done);
+                }
                 SetBlock(body);
                 loops.push_back({ done, head, sscopes.size() });
                 GenBlock(w->body, true);
