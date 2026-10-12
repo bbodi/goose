@@ -302,10 +302,17 @@ struct TgModule {
     }
     static bool IsSigned(TypeExpr *t) { return t->kind == TY_INT && !IsUnsigned(t->intstorage); }
 
-    // The fields of a struct or of one ADT variant with their types; pads are skipped by the walkers.
+    // The ordered fields of a struct or of one ADT variant's payload, built once per type: their types, each
+    // one's offset (the C layout if all are fixed, else the packed bytes one, where a bare pad adds nothing)
+    // up to the first variable-size field `var`, `pre` the bytes before it (the size if none), `last` the
+    // last real field (a resizable's tail). Pads are skipped by the walkers.
     struct FieldSet {
         const vector<Field> &f;
         const vector<TypeExpr *> &t;
+        vector<int64_t> off;
+        int64_t pre = 0;
+        int var = -1, last = -1;
+        FieldSet(const vector<Field> &_f, const vector<TypeExpr *> &_t) : f(_f), t(_t) {}
         // Whether ok(type) holds for each real field among the first n.
         template <class P> bool All(P ok, size_t n = SIZE_MAX) const {
             for (size_t i = 0; i < f.size() && i < n; i++)
@@ -320,12 +327,37 @@ struct TgModule {
             return "";
         }
     };
-    FieldSet StFields(TypeExpr *t) {
-        auto si = cg.SI(t);
-        return { si->st->fields, si->ftypes };
+    map<pair<const void *, int>, FieldSet> fieldsets;
+    const FieldSet &RunOf(const void *key, int vi, const vector<Field> &f, const vector<TypeExpr *> &t) {
+        auto [it, fresh] = fieldsets.try_emplace({ key, vi }, f, t);
+        auto &fs = it->second;
+        if (!fresh) return fs;
+        fs.last = LastRealField(f);
+        auto fix = true;
+        for (size_t i = 0; i < f.size(); i++) fix = fix && (f[i].ispad || cg.IsFix(t[i]));
+        if (fix) {
+            auto lo = cg.LayoutFields(f, t);
+            fs.off = lo.offs, fs.pre = lo.size;
+            return fs;
+        }
+        for (size_t i = 0; fs.var < 0; i++) {
+            fs.off.push_back(fs.pre);
+            if (f[i].ispad) fs.pre += PadSize(f[i]);
+            else if (!cg.IsFix(t[i])) fs.var = (int)i;
+            else fs.pre += cg.FixedSize(t[i]);
+        }
+        return fs;
     }
-    FieldSet VarFields(EnumInst *ei, int vi) {
-        return { ei->en->variants[(size_t)vi].fields, ei->vftypes[(size_t)vi] };
+    const FieldSet &StFields(TypeExpr *t) {
+        auto si = cg.SI(t);
+        return RunOf(si, -1, si->st->fields, si->ftypes);
+    }
+    const FieldSet &VarFields(EnumInst *ei, int vi) {
+        return RunOf(ei, vi, ei->en->variants[(size_t)vi].fields, ei->vftypes[(size_t)vi]);
+    }
+    // The run of a struct type or of a variant type.
+    const FieldSet &RunOfType(TypeExpr *t) {
+        return t->kind == TY_VARIANT ? VarFields(cg.EIVar(t), VariantIdx(t)) : StFields(t);
     }
     static int64_t PadSize(const Field &f) { return f.padsize > 0 ? f.padsize : 0; }
 
@@ -515,13 +547,10 @@ struct TgModule {
     struct FieldAt { TypeExpr *t; int64_t off; string_view name; };
     // The real fields of a struct or variant type with their offsets.
     vector<FieldAt> Fields(TypeExpr *t) {
-        auto var = t->kind == TY_VARIANT;
-        auto ei = var ? cg.EIVar(t) : nullptr;
-        auto fs = var ? VarFields(ei, VariantIdx(t)) : StFields(t);
-        auto &lay = var ? cg.VariantLayout(ei, VariantIdx(t)) : cg.StructLayout(cg.SI(t));
+        auto &fs = RunOfType(t);
         vector<FieldAt> r;
         for (size_t i = 0; i < fs.f.size(); i++)
-            if (!fs.f[i].ispad) r.push_back({ fs.t[i], lay.offs[i], fs.f[i].name });
+            if (!fs.f[i].ispad) r.push_back({ fs.t[i], fs.off[i], fs.f[i].name });
         return r;
     }
 
@@ -747,7 +776,7 @@ struct TgModule {
     bool FoOk(TypeExpr *t, int depth = 0) {
         if (!t || t->kind != TY_STRUCT || depth > 32 || !cg.IsFrameObj(t)) return false;
         return Within(t, true, [&] {
-            auto fs = StFields(t);
+            auto &fs = StFields(t);
             auto fl = FoLayout(t);
             if ((size_t)fl.tailfi + 1 != fs.f.size()) return false;
             auto tail = fs.t[(size_t)fl.tailfi];
@@ -822,30 +851,17 @@ struct TgModule {
         if (IsVarArr(t)) return PrefixBytes(t);
         if (IsRc(t)) return 8;   // cap and len.
         if (IsVm(t)) return TagSize(t);
-        auto fs = StFields(t);
-        int64_t off = 0;
-        for (size_t i = 0; i < fs.f.size(); i++) {
-            if (fs.f[i].ispad) { off += PadSize(fs.f[i]); continue; }
-            if (!cg.IsFix(fs.t[i])) return off + VsMinSize(fs.t[i]);
-            off += cg.FixedSize(fs.t[i]);
-        }
-        return off;
+        auto &fs = StFields(t);
+        return fs.pre + VsMinSize(fs.t[(size_t)fs.var]);
     }
     // Declares an image's fields at their offsets up to and including the first variable-size one (a T[]'s
     // `len` and `data`), where later offsets stop being constants; returns the offset reached, and that
     // field's type in *var. A variable of it is a pointer to the record, as for a T[].
     int64_t ImageMembers(tyg_dtype *rec, const FieldSet &fs, TypeExpr **var = nullptr) {
-        int64_t off = 0;
-        for (size_t i = 0; i < fs.f.size(); i++) {
-            if (fs.f[i].ispad) { off += PadSize(fs.f[i]); continue; }
-            DMem(rec, fs.f[i].name, DT(fs.t[i]), off);
-            if (!cg.IsFix(fs.t[i])) {
-                if (var) *var = fs.t[i];
-                break;
-            }
-            off += cg.FixedSize(fs.t[i]);
-        }
-        return off;
+        for (size_t i = 0; i < fs.off.size(); i++)
+            if (!fs.f[i].ispad) DMem(rec, fs.f[i].name, DT(fs.t[i]), fs.off[i]);
+        if (var && fs.var >= 0) *var = fs.t[(size_t)fs.var];
+        return fs.pre;
     }
     const tyg_dtype *VsDT(TypeExpr *t, const string &name) {
         auto rec = DRec(name, cg.SI(t)->st->line);
@@ -1039,34 +1055,27 @@ struct TgModule {
     };
     RbShape RbShapeIn(const FieldSet &fs, bool st) {
         RbShape sh;
-        auto last = LastRealField(fs.f);
-        int64_t off = 0;
-        for (size_t i = 0; i < fs.f.size(); i++) {
-            sh.offs.push_back(off);
-            auto ft = fs.t[i];
-            if (fs.f[i].ispad) {   // A bare pad aligns here, inserts nothing there.
-                if (fs.f[i].padsize < 0) sh.ok = false;
-                else off += fs.f[i].padsize;
-            } else if (st && (int)i == last) {
-                sh.tailfi = (int)i;
-                break;
-            } else if (!st && cg.IsResz(ft)) {
-                if ((int)i != last) sh.ok = false;
-                else if (IsGrow(ft)) sh.elem = ft->arr->sub, sh.tailfi = (int)i;
-                else if (cg.IsFrameObj(ft)) {   // As bytes (CodeGen::FoBytes): its fixed fields, then its tail.
-                    sh.elem = cg.FoTailArr(ft)->arr->sub, sh.tailfi = (int)i, sh.fo = true;
-                    off += cg.FoBytesPrefix(ft);
-                } else sh.ok = false;
-                break;
-            } else if (!cg.IsFix(ft)) {   // A variable-size field: a size to walk, no offset.
-                sh.img = !st;
-                if (st) sh.ok = false;
-                for (auto j = i + 1; !st && j < fs.f.size(); j++)
-                    if (!fs.f[j].ispad && cg.IsResz(fs.t[j])) sh.ok = false;
-                break;
-            } else off += cg.FixedSize(ft);
+        sh.offs = fs.off, sh.pre = fs.pre;
+        for (size_t i = 0; i < fs.off.size(); i++)
+            if (fs.f[i].ispad && fs.f[i].padsize < 0) sh.ok = false;   // A bare pad aligns here, inserts nothing.
+        if (fs.var < 0) return sh;
+        auto ft = fs.t[(size_t)fs.var];
+        if (st) {
+            if (fs.var == fs.last) sh.tailfi = fs.var;
+            else sh.ok = false;
+        } else if (cg.IsResz(ft)) {
+            sh.tailfi = fs.var;
+            if (fs.var != fs.last) sh.ok = false;
+            else if (IsGrow(ft)) sh.elem = ft->arr->sub;
+            else if (cg.IsFrameObj(ft)) {   // As bytes (CodeGen::FoBytes): its fixed fields, then its tail.
+                sh.elem = cg.FoTailArr(ft)->arr->sub, sh.fo = true;
+                sh.pre += cg.FoBytesPrefix(ft);
+            } else sh.ok = false;
+        } else {   // A variable-size field: a size to walk.
+            sh.img = true;
+            for (auto j = (size_t)fs.var + 1; j < fs.f.size(); j++)
+                if (!fs.f[j].ispad && cg.IsResz(fs.t[j])) sh.ok = false;
         }
-        sh.pre = off;
         return sh;
     }
     RbShape RbStShape(TypeExpr *t) { return RbShapeIn(StFields(t), true); }
@@ -1074,7 +1083,7 @@ struct TgModule {
     bool RbStOk(TypeExpr *t, int depth) {
         auto sh = RbStShape(t);
         if (!sh.ok || sh.tailfi < 0) return false;
-        auto fs = StFields(t);
+        auto &fs = StFields(t);
         auto tail = fs.t[(size_t)sh.tailfi];
         return fs.All([&](TypeExpr *ft) { return TypeOk(ft, depth + 1); }, (size_t)sh.tailfi) &&
                tail->kind != TY_ARRAY && IsRb(tail) && RbOk(tail, depth + 1);
@@ -1086,7 +1095,7 @@ struct TgModule {
         auto sh = RbShapeOf(ei, vi);
         if (!sh.ok) return false;
         if (sh.img) return VvOk(t->kind == TY_VARIANT ? t : cg.VariantType(t, vi), depth + 1);
-        auto fs = VarFields(ei, vi);
+        auto &fs = VarFields(ei, vi);
         for (size_t i = 0; i < fs.f.size(); i++) {
             if (fs.f[i].ispad) continue;
             auto ft = fs.t[i];
