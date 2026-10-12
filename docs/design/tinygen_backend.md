@@ -59,6 +59,19 @@ The code is `src/tinygen_backend.h`, compiled in only when tinygen is found
 `CodeGen::SpecBackend`, which chooses among the live specializations once
 their call interfaces are known (`Choose`).
 
+The file has two parts. `TgModule` holds what depends on types: representations,
+layouts, debug types, accessors and shims. `TgFn` builds one function. It
+starts with shorthands over tinygen's calls:
+
+* `I64`, `I32`, `Add`, `Sub`, `Mul`, `AndK` and `Bin` make integer values.
+* `AtL`, `AtV`, `Ld`, `St`, `LdL` and `StL` read and write memory at a local or at a value.
+* `LoadN` and `StoreByte` read and write an integer of a given size.
+* `AddrOf` and `BytesAddr` take the address of memory and of read-only bytes.
+* `Slot` and `Slot16` make an 8-byte and a 16-byte local, and `Local` makes a local that holds a value.
+* `Cmp`, `Branch`, `NewBlock` and `SetBlock` build control flow, and `If`, `IfElse`
+  and `Loop(from, n, body(i))` wrap them.
+* `MemV` and `ValV` make the two forms of a value, one in memory and one in a register.
+
 ## Two halves, one program
 
 Decision: **the C backend still runs for every program**, and tinygen takes
@@ -367,7 +380,8 @@ each other either way:
   (`copy(x)` included); `push` to it; `append` of a call's resizable
   result (built straight at the receiver's top, its count added), of a
   string literal, and of an array, slice or literal (evaluated whole, then
-  copied, as in the C).
+  copied, as in the C). The next paragraph says how one function reaches
+  each of these builders.
 * **results**: every result has its `SigParams` channel -- the first fixed
   one the C return value (`cret`, not necessarily result 0), other fixed
   ones out-pointers, and a resizable one `gs_stack *gs_dst<i>, int64_t
@@ -385,6 +399,16 @@ each other either way:
   matches); where it would not be, the function stays in C. A by-value
   resizable argument is copied onto a temporary's stack and passed as its
   header and stack.
+
+**Destinations.** A value built at the top of a stack has a destination, an
+`InPlace`. It holds a mode (a `T[]` image, a resizable, a frame object, or a
+frame object's bytes), the stack, the type and the header. `BuildInto(n, d, l)`
+is the one entry that builds `n` at `d`. It calls `GenImg`, `GenRz`, `GenFo` or
+`GenFoBytes` by the mode. `BuildCtl` builds an `if`, `block`, early block,
+`match`, `loop` or function value there, each arm through `BuildInto`. `CallAt`
+hands the destination to a call that returns the type. `CopyFrom` copies an
+existing value to the destination as its type needs. `BuildTemp` builds a value
+on a temporary stack of the statement and returns it.
 
 What still sends a function to C, by count over the sweep: a parameter of
 a type the backend does not hold (467: slices of variable-size elements
@@ -414,7 +438,7 @@ globals of resizable types (their dedicated stacks), and `default`/
   element-run twin, `_er`, stays a C function). Anything else is built
   as a resizable's elements behind a reserved prefix, which is then
   patched with the count, checked against the prefix's range with the
-  C's `gs_panic` message. A by-value `T[]` argument is an image copied
+  C's `gs_panic` message (`GenImg`, reached through `BuildInto`). A by-value `T[]` argument is an image copied
   onto a statement's stack and passed by its address; a `T[]` where a
   `T[]&` is wanted, its address. Not yet: assigning a new value to a
   `T[]` variable (the C moves the image down its stack).
@@ -462,10 +486,11 @@ render functions given external linkage, `default`, then free variables.
   variable is passed down a chain of nested functions and either half
   calls the other. Pools and frame objects are not held.
 * **function values** (§7.6): a call of one splices its checked body
-  (`Call::fvbody`) in, as `EmitFvCall` does: the parameters bound in
-  order as locals in a scope of their own (so a resizable one's stack
-  is given back), the body's value copied, a fixed one. Dispatched
-  calls (`Call::dispatch`, over ADTs) stay in C (`call kind: dispatch`).
+  (`Call::fvbody`) in, as `CodeGen::EmitFvCall` does (`GenFvCall`). The
+  parameters are bound in order as locals in a scope of their own, so a
+  resizable one's stack is given back. The body's value is copied, a fixed
+  one. `BuildFv` builds an image or a resizable value at a destination.
+  Dispatched calls (`Call::dispatch`) are the case functions below.
 * **globals of resizable and `u8[]` types**, which live on dedicated
   stacks in the C half's instance (`CodeGen::gstks`): the accessor gives
   the header's address, or the address of the member holding the
@@ -473,9 +498,9 @@ render functions given external linkage, `default`, then free variables.
   once per invocation like the others. Read, indexed, iterated, pushed,
   appended, popped, passed on, written in place.
 * **assigning a whole resizable** (a local, a global, one behind a
-  reference), as `Assign::CgStmt` does: the stack's top back to where
-  the elements start, the new ones built there. Not yet: assigning a
-  new image to a `T[]` variable.
+  reference), as `Assign::CgStmt` does. `AssignWhole` moves the stack's top
+  back to where the elements start. `BuildInto` builds the new elements
+  there. Not yet: assigning a new image to a `T[]` variable.
 
 Free variables are described to the debugger as the variables
 themselves, under their names, through the addresses the function is
@@ -500,14 +525,14 @@ C half's render functions, `default`, `match` over fixed-mode enums.
 
 ## What the third stage adds next: `return from`
 
-`return ... from` (§7.9) as the C backend does it (`GenFromReturn`,
-`EmitRfCheck`), so that one return passes through frames of both
-halves in any mix:
+`return ... from` (§7.9) works as in the C backend (`CodeGen::GenFromReturn`
+and `EmitRfCheck`; here `TgFn::GenFromReturn` and `RfCheck`). One return
+passes through frames of both halves in any mix:
 
 * the return site writes each value into the target's channel
   (`gs_lret_<tid>_<i>`), sets the discriminant `gs_rf` to the target's
   id (`CodeGen::fromids`), and returns at once, its stacks restored,
-  with a dummy C return value (`PropagateReturn`);
+  with a dummy C return value (`Propagate`, as `CodeGen::PropagateReturn`);
 * after every call to a function that can propagate one (`hasrf`), a
   nonzero `gs_rf` is caught where this function is the target
   (`FnSpec::needs`): cleared, the channels returned as its own results;
@@ -520,10 +545,10 @@ tinygen code reaches them through accessors the C half exports
 (`gs_tg_rf`, `gs_tg_lret_<tid>_<i>`, gap 6), each read once per
 invocation like the globals' accessors, and asks `EnsureFromChannels`
 for the channels of a target only tinygen code names. Function values'
-plain `return`s (§7.6) are the same mechanism and come along. Not yet:
-targets with a resizable or `u8[]` result, whose values travel on the
-target's destination stack (`gs_fdst_`, `gs_fval_`, moved down at the
-catch); those targets and the returns to them stay in C.
+plain `return`s (§7.6) are the same mechanism and come along. A target
+with a resizable or `u8[]` result keeps its value on the target's
+destination stack (channels `gs_fdst_` and `gs_fval_`). `BuildAt` builds it
+there with `BuildInto`. The catching frame moves it down (`LandChannel`).
 
 Coverage after this step is the last table row (0 of 582 runs differ;
 Goose-in-Goose still 172 of 172, self-compiling byte for byte, plain and
@@ -574,12 +599,12 @@ the linker driver.
   is `main` at `fn main()`'s line, so a backtrace ends in Goose source.
 * **Fallback**: the whole path is taken only when tinygen compiled every
   live specialization and the C half would hold nothing program-specific
-  (`TinyGenBackend::WholeProgram`): globals the object can hold and
-  initialize itself (next section), `return from` channels of fixed types
-  (likewise), no extern fns but the runtime's, no threads or queues, no
-  `export fn`, no `--include`, no `-D` but `GS_DEBUG`, not
-  `--standalone`. Anything else takes the mixed path as before. `-v` says
-  which, and why:
+  (`TinyGenBackend::WholeProgram`). The object holds the globals and the
+  `return from` channels (next section). It forwards the extern fns that
+  `ExternHeld` accepts. It writes the `export fn`s that `ExportOk` accepts,
+  and the queues and worker thunks (`EmitThreads`). The path also needs no
+  `--include`, no `-D` but `GS_DEBUG`, and no `--standalone`. Anything else
+  takes the mixed path as before. `-v` says which, and why:
 
       tinygen: whole program: no C compiled for it
       tinygen: mixed: the C half compiled by the C compiler (global initializer: builtin default (line 17))
@@ -760,38 +785,39 @@ fixing it can show another (after the steps below, limited arrays block
 
 * **`print` and `str` of composites.** A struct, fixed array, slice or
   resizable array of held elements renders as `CodeGen::RenderLoc` does
-  (`TgFn::RenderInto`): through references to what they refer to, a
-  scalar by `gs_fmt_*`, `u8` elements as their bytes at the top and
-  `gs_fmt_quoted` inside a larger value, other arrays as `[a, b]` with
-  their elements and count read once, a struct as `Name { a, b }`. A
-  `print` with such an argument renders the whole line into a builder
-  on a stack of the statement's and writes it at once, as the C backend
-  writes every line. The types held never reach themselves through
-  references, so no render functions (`gs_render_*`) are needed; format
-  overloads still send the function to C.
-* **`.=`** stores the new address in the reference's slot
-  (`GenRebind`); optional, relative and pooled references stay in C.
-* **`block`, `loop` values, `break` and `continue`.** A break goes to
-  the innermost loop or block (`GenBreakPath`), its value evaluated into
-  the target's result before the stacks of the scopes left are restored;
-  continue passes blocks by to the innermost loop. A `block` delivers its
-  tail's value or a break's, a `loop` a break's, of a type held.
-* **Integer `match`** (`MatchExpr::CgAny`): the scrutinee evaluated once,
-  widened to 64 bits by its signedness, the arms tested in order, each
-  listed value or range compared signed or unsigned as the scrutinee's
-  type is. ADT matches stay in C with the ADTs.
+  (`TgFn::RenderInto`). A reference renders what it refers to. A scalar
+  goes through `gs_fmt_*`. `u8` elements print as their bytes at the top
+  and through `gs_fmt_quoted` inside a larger value. Other arrays print as
+  `[a, b]`, their elements and count read once. A struct or variant
+  prints as `Name { a, b }` (`RenderRun`, which finds each field with
+  `FieldPlace`). A `print` with such an argument renders the whole line
+  into a builder on a stack of the statement's and writes it at once, as
+  the C backend writes every line. A user `format` overload is called as
+  the C calls it (`UserFormat`). A type that reaches itself has a render
+  procedure that tinygen emits (`gs_tg_render_<T>`, `EmitRender`).
+* **`.=`** stores the new address in the reference's slot (`StmtAssign`,
+  as `CodeGen::GenRebind`). A pool reference also takes its pool's
+  freelist (`PrefInto`).
+* **`block`, `loop` values, `break` and `continue`.** A break goes to the
+  innermost loop or block. `BreakValue` evaluates its value into the
+  target's result before the stacks of the scopes left are restored.
+  Continue passes blocks by to the innermost loop. A `block` delivers its
+  tail's value or a break's, and a `loop` delivers a break's.
+* **Integer `match`** (`GenMatch`, as `MatchExpr::CgAny`): the scrutinee
+  is evaluated once and widened to 64 bits by its signedness. The arms
+  are tested in order. Each listed value or range is compared signed or
+  unsigned as the scrutinee's type is. A match over an ADT goes to
+  `GenAdtMatch`.
 
-Over the sweep (0 of 580 runs differ), the whole path goes from 50
-programs to 59 with composites rendered and to 70 with the rest (the
-`block` global initializer's program among them), and per-function
-coverage from 2253 to 2334 of 3811 (59% to 61%); the strings fixture
-now builds whole. Goose-in-Goose stays whole, self-compiling byte for
-byte, plain and `--debug`. After them, 219 programs are mixed because
-of functions left to C, 116 of them by one class alone: limited arrays
-(65 programs, 24 alone), ADTs (62, 20), optionals (51, 23),
-variable-size structs (44, 16), variable-size elements (22, 5), format
-overloads (12, 5); then `return from` with `u8[]` results, SIMD
-vectors, `if` values of types not held and varints (9 or 10 each).
+**One skeleton for valued constructs.** `GenIf`, `GenEarly` (a `block`),
+`GenLoopX`, `GenMatch` and `GenAdtMatch` share a `Ctl`. `CtlBegin` first
+tries to build the whole construct in place (`WantInPlace`). Otherwise it
+makes the result temporary, or a pool-reference slot, where the construct
+has a value. `CtlArm` builds each arm, through `BuildInto` at a
+destination or into the temporary. `CtlTarget` makes the break and
+continue target of a loop or block. `CtlValue` reads the result. Each
+construct then writes only its own control flow. `BuildCtl` reaches these
+constructs when a destination asks for an image or a resizable.
 
 Code after a `return` or `break` is unreachable but still built, and
 tinygen puts it in a block that is never placed. Its expressions get a
@@ -824,7 +850,8 @@ as the C half does, so the halves call each other either way:
   other array or slice of the element type where one is wanted (an
   assignment, an argument, a result, a field, a range `s[a..b]`) is
   copied in under the capacity check, its count and elements read
-  before anything is written (`CopyIntoLimited`; `TgFn::LimFrom`).
+  before anything is written (`CodeGen::CopyIntoLimited`;
+  `TgFn::LimAppendView`, which `LimFrom` uses).
   New values have their unused slots zeroed, as the C's `{0}` does. A
   call returning one where a `T[]` or resizable is built reads the
   result where it lies.
@@ -885,23 +912,33 @@ call each other either way:
   `Employee&` a plain pointer to the image; a free variable its address.
   The code is the `T[]`'s, which now asks `IsImg` where it asked
   `IsVarArr`.
-* **fields** (`TgFn::FieldPlace`, `CodeGen::FieldPtr`): a constant offset
+* **field runs** (`TgModule::FieldSet`): the ordered fields of a struct or
+  of a variant's payload, built once per type and cached (`RunOf`). A run
+  holds the field types and each offset up to the first variable-size
+  field. It also holds the bytes before that field and the last real
+  field. Walkers skip pads. `StFields`, `VarFields` and `RunOfType` return
+  a run.
+* **fields** (`TgFn::FieldPlace`, `CodeGen::FieldPtr`): `FieldPlace` is the
+  one function that finds a field, whatever the representation. A fixed
+  struct gives a constant offset. A bytes value gives a constant offset
   until a variable-size field intervenes, then a cursor past each one by
-  its size (`ImgSize`: a `T[]`'s prefix and elements, a struct's fields
-  walked, `CodeGen::SizeX`); a field read, written (a fixed one), passed
-  on, iterated, rendered where it lies.
-* **building** (`GenVs`, `RunLit`): a literal field by field in layout
-  order at the destination's top (`CodeGen::GenFieldInits`): a fixed
-  field evaluated, then stored; a `T[]` or nested struct built there; an
-  explicit `pad n` zeroed. A call returning one is handed the
-  destination; anything else (`copy(x)`, a variable, a field, a
-  pointee) is copied whole, `ImgSize` bytes.
+  its size (`FieldAddr`, `ImgSize`, `CodeGen::SizeX`). `ImgSize` of a
+  `T[]` counts its prefix and elements, and of a struct it walks the
+  fields. A field is read, written (a fixed one), passed on, iterated or
+  rendered where it lies.
+* **building** (`GenVs`, `RunLit`): `BuildInto` reaches `GenVs` for the
+  image mode. `RunLit` builds a literal field by field in layout order at
+  the destination's top (`CodeGen::GenFieldInits`). A fixed field is
+  evaluated, then stored. A `T[]` or nested struct is built there. An
+  explicit `pad n` is zeroed. `CallAt` hands a call that returns one the
+  destination. `CopyFrom` copies anything else (`copy(x)`, a variable, a
+  field, a pointee) whole, `ImgSize` bytes.
 * **text**: `print` and `str` render one as `Name { a, b }`, a `u8[]`
-  field quoted (`RenderInto`).
+  field quoted (`RenderRun`, from `RenderInto`).
 
 Not yet: assigning a whole value to a variable or field of a variable-
-size type (the C moves the bytes behind it, as for a `u8[]`), equality,
-omitted variable-size fields, globals of these types. Debug info names
+size type (the C moves the bytes behind it, as for a `u8[]`) and omitted
+variable-size fields other than optionals. Debug info names
 the type by its Goose name, a record of its fields up to and including
 the first variable-size one, whose offsets after it are no constants:
 
@@ -931,16 +968,19 @@ of 3811 (`bde460a` measured 2343, where the table's previous row says
 whole, self-compiling byte for byte, plain and `--debug`. Of the 149
 functions the class held (44 programs, 15 alone), frame objects are 80
 (22 programs, 5 alone), and bytes structs with a field of a type not
-held 42 (`varint` 15, optionals 11, ADTs 5, limited arrays 5). Next:
-frame objects, then slices and resizable arrays of variable-size
-elements (`Txt[:]`, `u8[][]`), walked sequentially as the C walks them.
+held 42 (`varint` 15, optionals 11, ADTs 5, limited arrays 5). Frame
+objects came next (`TgModule::FoOk`). `GenFo` builds one, and `FoSize`
+gives its struct's size: the fixed fields, then the tail's header. Slices
+and resizable arrays of variable-size elements (`Txt[:]`, `u8[][]`)
+follow, walked sequentially as the C walks them.
 
 A return inside a value another return is building at a destination
 stack (`return str("x", if c { return "y"; } else { n })`) left what
 was built in front of its own value, which the C moves down
-(`ExitStart`); such a function now stays in C
-(`codegen/exit_value_destination`'s `early_str`, which compiled once
-unreachable code got values, and printed garbage).
+(`ExitStart`). `DoReturn` resets the stack's top to its saved `top0`
+before it builds a result, and `BreakValue` moves a break's value down.
+`codegen/exit_value_destination`'s `early_str` compiled once unreachable
+code got values, and printed garbage.
 
 `test/tinygen/tinygen_varsize.goose` covers these whole (a whole
 program), and `test/tinygen_backend.py` builds it again with `main`,
@@ -974,18 +1014,20 @@ passes, returns and reads the other's values (the ADT section of
   whole ADTs assigned anew, another variant overwriting the old in
   place.
 * **`match`** over a fixed-mode value or through a reference to one
-  (`GenAdtMatch`): the value copied once and its tag read once, then a
-  compare per listed variant in arm order, several per arm and `_`; a
-  binder is a local of the variant's type the payload is copied into
-  (fixed mode binds by value only, §8.1), described to the debugger in
-  the arm's scope, and the arm's line is a line entry after the copy.
+  (`GenAdtMatch`, called by `GenMatch`, which owns the `Ctl`).
+  `AdtScrutinee` reads the value once and its tag once into a `Scrut`. A
+  compare per listed variant follows in arm order (`TagIs`), several per
+  arm and `_`. A binder is a local of the variant's type that the payload
+  is copied into (`BindAdtArm`; fixed mode binds by value only, §8.1). It
+  is described to the debugger in the arm's scope. The arm's line is a
+  line entry after the copy.
 * **Case functions** (§8.2, `GenDispatch`, as `CodeGen::EmitDispatch`):
-  every argument evaluated once in order, the scrutinee's in any
-  position, the others kept in locals; the variant's case then called
-  with its payload by value and the shared arguments, each case
-  through its own signature, a single fixed result delivered from
-  every arm. Cases with results through out-pointers, by-value arrays
-  or a variable-mode scrutinee go to C.
+  every argument is evaluated once in order. The scrutinee may be in any
+  position (`ScrutAt`), and the others are kept in locals. The variant's
+  case is then called with its payload by value and the shared
+  arguments, each case through its own signature. The result channels
+  are those of `RetChans`. A dispatch whose cases differ in result or
+  argument types, or one over a resizable ADT, goes to C.
 * **No variant matches**: as `GS_UNREACHABLE`, under `--debug` an abort
   with `GS_E_TAG` and the Goose line, else `tyg_unreachable`.
 * **Debug info**: `Shape` a struct of `tag`, an enum named `Shape.tag`
@@ -1004,13 +1046,14 @@ passes, returns and reads the other's values (the ADT section of
       (Shape.Rect) r = (w = 3, h = 4)
       (Dir) d = (tag = West)
 
-Not held yet: **variable-mode ADTs** (`Shape..`, each value its own
-variant's size: by value an image on a data stack like a `u8[]`,
-results built at a destination, `&`-binders into the payload), which
-now block 22 programs, 5 alone, the largest ADT remainder; ADTs whose
-payloads hold what is not held (an optional, a limited array: `ADT
-with optional` and so on in `-v`); `print` and `str` of ADTs; `==` on
-them; and dispatch with out-pointer results.
+**Variable-mode ADTs** (`Shape..`, each value its own variant's size) are
+held too. By value, a value is an image on a data stack, as a `u8[]` is.
+`GenVm` builds one at a destination: a variant literal as its tag and
+fields, a call handed the destination, else a copy. `VmFrom` adapts a
+variant or a fixed-mode value. A binder can take the payload by reference
+(`BindAdtArm`). `print`, `str` and `==` handle ADTs (`RenderInto`,
+`EqJump`). Not held: ADTs whose payloads hold what is not held
+(`ADT with ...` in `-v`).
 
 **tinygen gaps met.** tinygen has no multiway branch: a match or a
 dispatch is a chain of compares, linear in the variants, where the C
@@ -1039,7 +1082,7 @@ whose variable-mode array stays in C, runs with its case functions and
 `T?` (§3.8) as the C backend has it, so that either half calls the other
 with optionals in any position: the address a `T&` would be, `NULL`
 for null, and for a resizable array the fat reference `gs_rref` with a
-null `hdr` (`NullLit::CgX`, `GenTruth`). An optional of anything the
+null `hdr` (`NullLit::CgX`; here `TgFn::Null`, `OptCond`, `OptTest`). An optional of anything the
 backend holds behind a plain reference is held too
 (`TgModule::OptRef`), as a parameter, a result (the C return value or
 an out-pointer, as any address), a local, a struct field, an element, a
@@ -1063,12 +1106,11 @@ type checks treat a struct met again on the way as held if the rest is.
   that, so the backend does not ask.
 * **rebound**: `.=` stores the new address, or null, in the slot.
 * **printed**: `null`, or the pointee rendered as `CodeGen::RenderLoc`
-  does. A pointee whose type reaches itself (a list) is rendered by the
-  C half's recursive render functions; such a `print` or `str` keeps
-  its function in C (`text of type Link? [recursive]`).
+  does (`RenderInto`). A pointee whose type reaches itself (a list) is
+  rendered by a render procedure that tinygen emits (`EmitRender`).
 
-Relative optionals (`T&<u32 in pool>?`) stay in C with the relative
-references. The debug info gives a `T?` as a typedef under its Goose
+Relative optionals (`T&<u32 in pool>?`) follow the relative references
+(`RelOk`). The debug info gives a `T?` as a typedef under its Goose
 name over the C half's pointer (`(Link?) n = 0x...`, `p *n` shows the
 `Link`), a fat one as the record `i64[>..]?` of `hdr` and `stk`. No
 tinygen gap was met.
