@@ -1474,7 +1474,7 @@ struct TgFn {
         if (d.mode == 1) { GenImg(nullptr, d.stk, t, l, &v); return; }
         SameElem(v.elem, t->arr->sub, l);
         StartHdr(d.stk, d.hdr);
-        CopyView(d.stk, HdrLen(d.hdr), t, v);
+        CopyView(d.stk, CountAt(d.hdr), t, v);
     }
     // The one entry to every builder: n's value built at d.
     tyg_val BuildInto(Node *n, const InPlace &d, Line l) {
@@ -1597,7 +1597,6 @@ struct TgFn {
     }
 
     // Shared by the builders: a resizable's header is (base, count); a build dispatches on the node.
-    static tyg_addr HdrLen(tyg_addr hdr) { hdr.offset += 8; return hdr; }
     tyg_addr NewHdr() { return AtL(tyg_local_new(p, 16, 8)); }
     static Node *StripCopy(Node *n) {
         auto c = Is<Call>(n);
@@ -1632,7 +1631,7 @@ struct TgFn {
     tyg_val StartHdr(tyg_val stk, tyg_addr hdr) {
         auto top = Top(stk);
         St(hdr, top);
-        St(HdrLen(hdr), I64(0));
+        St(CountAt(hdr), I64(0));
         return top;
     }
     // k zero bytes pushed.
@@ -1643,7 +1642,7 @@ struct TgFn {
     void BuildTail(Node *init, tyg_val stk, TypeExpr *ft, tyg_addr len, Line l) {
         auto th = NewHdr();
         TailHdr(init, stk, th, ft, l);
-        if (!Ended()) St(len, Ld(HdrLen(th)));
+        if (!Ended()) St(len, Ld(CountAt(th)));
     }
     void PushVal(tyg_val stk, TypeExpr *ft, const V &v) {
         auto top = Top(stk);
@@ -1749,7 +1748,7 @@ struct TgFn {
         auto et = t->arr->sub;
         auto fix = cg.IsFix(et);
         n = StripCopy(n);
-        auto len = HdrLen(hdr);
+        auto len = CountAt(hdr);
         if (BuildCtl(n, InPlace { 2, stk, t, hdr }, l)) return;
         if (auto al = Is<ArrayLit>(n)) {
             if (al->capexpr) No(l, "array literal of this kind");
@@ -1850,7 +1849,7 @@ struct TgFn {
     // elements counted into the header. A literal, a variant constant, a call returning one handed
     // stk, or a fixed variant of the ADT (payload copied behind the tag); the C copies no other.
     void GenRb(Node *n, tyg_val stk, tyg_addr hdr, TypeExpr *t, Line l) {
-        auto len = HdrLen(hdr);
+        auto len = CountAt(hdr);
         auto adt = t->kind == TY_ENUM;
         auto isst = t->kind == TY_STRUCT;
         auto ei = isst ? nullptr : M.EI(t);
@@ -1926,7 +1925,7 @@ struct TgFn {
     // A value x, a result held elsewhere (a forwarded call's), as the ADT or variant t at the top
     // of stk, its header at hdr: its bytes copied, an ADT's tag put in front of a variant's payload.
     void RbFrom(tyg_val stk, tyg_addr hdr, const V &x, TypeExpr *t, Line l) {
-        auto len = HdrLen(hdr);
+        auto len = CountAt(hdr);
         if (!x.mem || !x.t) No(l, cat("value of type ", M.NameWhy(t)));
         auto ts = t->kind == TY_ENUM ? M.TagSize(t) : 0;
         auto top = Top(stk);
@@ -1940,7 +1939,7 @@ struct TgFn {
         auto at = same ? top : Add(top, I64(ts));   // An ADT's bytes hold their tag; a variant's lie behind it.
         if (M.IsRb(x.t)) {
             auto xb = Ld(x.a);
-            auto cnt = Ld(HdrLen(x.a));
+            auto cnt = Ld(CountAt(x.a));
             auto n = RbBytes(same ? t : x.t, xb, cnt);
             tyg_move_dyn(p, at, xb, n);
             SetTop(stk, Add(at, n));
@@ -1967,7 +1966,7 @@ struct TgFn {
         if (fi != sh.tailfi) return P { AtV(at), ft };
         auto th = tyg_local_new(p, 16, 8);
         StL(th, at);
-        StL(th, Ld(HdrLen(base.a)), 8);
+        StL(th, Ld(CountAt(base.a)), 8);
         P r { AtL(th), ft, base.stk };
         r.tmphdr = true;
         r.ohdr = base.tmphdr ? base.ohdr : base.a;   // The struct's own header, whose count it is.
@@ -2082,7 +2081,7 @@ struct TgFn {
         if (rc && n && !from && RcPrelude(n, stk, t, l, at())) return at();
         SetTop(stk, Add(at(), I64(rc ? 8 : TgModule::PrefixBytes(t))));
         auto hdr = NewHdr();
-        auto len = HdrLen(hdr);
+        auto len = CountAt(hdr);
         if (n) {
             GenRz(n, stk, hdr, t, l);
         } else {
@@ -2175,10 +2174,6 @@ struct TgFn {
 
     // ---- Conversions -------------------------------------------------------
 
-    static tyg_addr AddrOff(tyg_addr a, int64_t off) {
-        a.offset += off;
-        return a;
-    }
     tyg_val I8(int v) { return tyg_iconst(p, TYG_I8, v); }
     static string TyStr(TypeExpr *t) {
         string s;
@@ -2204,17 +2199,7 @@ struct TgFn {
     }
     // arm(vi), in a block entered when the tag in `tag` is variant vi, for each of n variants.
     template <class F> void TagSwitch(tyg_local tag, size_t n, F arm) {
-        auto done = NewBlock();
-        for (size_t vi = 0; vi < n; vi++) {
-            auto hit = NewBlock(), miss = NewBlock();
-            Branch(Cmp(TYG_EQ, LdL(tag), I64((int64_t)vi)), hit, miss);
-            SetBlock(hit);
-            arm(vi);
-            tyg_jump(p, done);
-            SetBlock(miss);
-        }
-        tyg_jump(p, done);
-        SetBlock(done);
+        for (size_t vi = 0; vi < n; vi++) If(Cmp(TYG_EQ, LdL(tag), I64((int64_t)vi)), [&] { arm(vi); });
     }
 
     // C's conversion of a scalar between the scalar types: what an
@@ -2265,7 +2250,7 @@ struct TgFn {
             tyg_store(p, M.TagScal(want), r.a, tyg_convert(p, TYG_TRUNC, M.TagScal(want), LdL(tag)), 0);
             TagSwitch(tag, ei->en->variants.size(), [&](size_t vi) {
                 auto psz = cg.VariantLayout(ei, (int)vi).size;
-                if (psz) tyg_copy(p, AddrOff(r.a, M.TagSize(want)), AddrOff(x.a, M.TagSize(x.t)), psz);
+                if (psz) tyg_copy(p, AddrPlus(r.a, M.TagSize(want)), AddrPlus(x.a, M.TagSize(x.t)), psz);
             });
             return r;
         }
@@ -2325,7 +2310,7 @@ struct TgFn {
         if (TgModule::IsRel(pl.t)) return P { AtV(RelLoad(pl, Line {})), pl.t->ref->sub };
         P r { AtV(Ld(pl.a)), pl.t->ref->sub };
         r.enc = TgModule::IsVarint(r.t);   // A varint in a bytes value, read-only.
-        if (cg.IsFatRef(pl.t)) r.stk = Ld(AddrOff(pl.a, 8));
+        if (cg.IsFatRef(pl.t)) r.stk = Ld(AddrPlus(pl.a, 8));
         return r;
     }
     // Through references to what they refer to (§3.8; an optional one only where the checker narrowed it).
@@ -2426,7 +2411,7 @@ struct TgFn {
             if (base.t->kind == TY_VARIANT && M.TypeOk(base.t)) return VariantField(base, d->fieldidx);
             if (base.t->kind != TY_STRUCT || !M.TypeOk(base.t)) No(n->line, "field of this type");
             auto si = cg.SI(base.t);
-            return P { AddrOff(base.a, cg.StructLayout(si).offs[d->fieldidx]), si->ftypes[d->fieldidx] };
+            return P { AddrPlus(base.a, cg.StructLayout(si).offs[d->fieldidx]), si->ftypes[d->fieldidx] };
         }
         if (auto ix = Is<Index>(n)) return IndexPlace(ix);
         if (auto se = Is<SliceExpr>(n)) {
@@ -2547,7 +2532,7 @@ struct TgFn {
                 return;
             }
             for (size_t i = 0; i < al->elems.size() && !Ended(); i++)
-                Into(P { AddrOff(pl.a, (int64_t)i * esz), et }, al->elems[i]);
+                Into(P { AddrPlus(pl.a, (int64_t)i * esz), et }, al->elems[i]);
             return;
         }
         auto sl = Is<StructLit>(lit);
@@ -2561,7 +2546,7 @@ struct TgFn {
         if (t->kind == TY_ENUM) StoreTag(pl.a, t, M.EI(t)->en->VariantIndex(sl->variant));
         for (size_t i = 0; i < sh.fields->size() && !Ended(); i++) {
             auto init = (*sh.fields)[i].ispad ? nullptr : sl->InitFor((int)i);
-            if (init) Into(P { AddrOff(pl.a, sh.offs[i]), (*sh.ftypes)[i] }, init);
+            if (init) Into(P { AddrPlus(pl.a, sh.offs[i]), (*sh.ftypes)[i] }, init);
         }
     }
     // A fill [v; k] of a value linking to itself (CodeGen::FreezeFill): v's leaves evaluated once,
@@ -2661,7 +2646,7 @@ struct TgFn {
             if (cnt > cg.ArrSize(pl.t->arr)) No(n->line, "array literal length");
             tyg_zero(p, pl.a, M.Size(pl.t));
             for (int64_t i = 0; i < cnt && !Ended(); i++)
-                Into(P { AddrOff(pl.a, (lim ? M.LimWidth(pl.t) : 0) + i * esz), et }, al->elems[(size_t)i]);
+                Into(P { AddrPlus(pl.a, (lim ? M.LimWidth(pl.t) : 0) + i * esz), et }, al->elems[(size_t)i]);
             if (lim && !Ended()) LimSetLen(pl, I64(cnt));
             return;
         }
@@ -2932,7 +2917,7 @@ struct TgFn {
     void EqJump(const P &a, const P &b, tyg_block fail, Line l) {
         auto t = a.t;
         auto cmpw = [&](int64_t off, tyg_scalar s, tyg_cond c) {
-            EqNext(Cmp(c, tyg_load(p, s, AddrOff(a.a, off), 0), tyg_load(p, s, AddrOff(b.a, off), 0)), fail);
+            EqNext(Cmp(c, tyg_load(p, s, AddrPlus(a.a, off), 0), tyg_load(p, s, AddrPlus(b.a, off), 0)), fail);
         };
         if (!cg.IsFix(t)) {
             if (!EqBitwise(t)) {
@@ -2958,7 +2943,7 @@ struct TgFn {
         if (!M.TypeOk(t)) No(l, cat("comparison of type ", M.NameWhy(t)));
         if (t->kind == TY_STRUCT || t->kind == TY_VARIANT) {
             for (auto &f : M.Fields(t))
-                EqJump(P { AddrOff(a.a, f.off), f.t }, P { AddrOff(b.a, f.off), f.t }, fail, l);
+                EqJump(P { AddrPlus(a.a, f.off), f.t }, P { AddrPlus(b.a, f.off), f.t }, fail, l);
             return;
         }
         if (t->kind == TY_ENUM) {
@@ -2967,7 +2952,7 @@ struct TgFn {
             TagSwitch(tag, cg.EIOf(t)->en->variants.size(), [&](size_t vi) {
                 auto vt = cg.VariantType(t, (int)vi);
                 if (!cg.FixedSize(vt)) return;
-                EqJump(P { AddrOff(a.a, M.TagSize(t)), vt }, P { AddrOff(b.a, M.TagSize(t)), vt }, fail, l);
+                EqJump(P { AddrPlus(a.a, M.TagSize(t)), vt }, P { AddrPlus(b.a, M.TagSize(t)), vt }, fail, l);
             });
             return;
         }
@@ -3105,7 +3090,7 @@ struct TgFn {
         tyg_local loc;
     };
     tyg_addr ElemAt(tyg_addr a, int64_t off, const ElemDyn &dy) {
-        return dy.on ? AtV(Add(tyg_addr_of(p, a), LdL(dy.loc)), off) : AddrOff(a, off);
+        return dy.on ? AtV(Add(tyg_addr_of(p, a), LdL(dy.loc)), off) : AddrPlus(a, off);
     }
     // F(leaf type, offset, ElemDyn) for each scalar leaf: an array's elements unrolled up to 256,
     // beyond that in a counted loop (as CodeGen).
@@ -4709,19 +4694,6 @@ struct TgFn {
         }
         TextLit(stk, len, " }");
     }
-    // body(vi) in a block of its own for the variant index vi the tag in local `tag` holds; on after.
-    template <class F> void ForTag(tyg_local tag, size_t nvariants, F body) {
-        auto done = NewBlock();
-        for (size_t vi = 0; vi < nvariants; vi++) {
-            auto next = NewBlock();
-            ContinueIf(Cmp(TYG_EQ, LdL(tag), I64((int64_t)vi)), next);
-            body(vi);
-            tyg_jump(p, done);
-            SetBlock(next);
-        }
-        tyg_jump(p, done);
-        SetBlock(done);
-    }
 
     // The value at pl rendered structurally, as CodeGen::RenderLoc renders it: references through to
     // what they refer to, a scalar by gs_fmt_*, u8 elements as their bytes (quoted when nested),
@@ -4771,7 +4743,7 @@ struct TgFn {
                 auto ei = cg.EIOf(t);
                 auto varmode = M.IsVm(t);
                 auto tag = Local(LoadTag(pl.a, t));
-                ForTag(tag, ei->en->variants.size(), [&](size_t vi) {
+                TagSwitch(tag, ei->en->variants.size(), [&](size_t vi) {
                     auto vt = cg.VariantType(t, (int)vi);
                     auto pa = AddrPlus(pl.a, M.TagSize(t));
                     P vp { pa, vt };
@@ -4873,7 +4845,7 @@ struct TgFn {
             return;
         }
         auto tag = Local(LoadTag(AtV(Ld(pl.a)), t));
-        ForTag(tag, ei->en->variants.size(), [&](size_t vi) { variant((int)vi, M.TagSize(t)); });
+        TagSwitch(tag, ei->en->variants.size(), [&](size_t vi) { variant((int)vi, M.TagSize(t)); });
     }
 
     // A variant's positional literal (CodeGen::RenderVariant): `E.V` for one without fields, else
@@ -5267,9 +5239,9 @@ struct TgFn {
                 // Built straight into the packet, prefix and tail as they lie, the count from its header.
                 sized([&] {
                     auto cntp = AtV(StackReserve(stk, I64(8)));
-                    auto hdr = AtL(tyg_local_new(p, 16, 8));
+                    auto hdr = NewHdr();
                     GenRs(arg, stk, hdr, pt, c->line);
-                    if (!Ended()) St(cntp, Ld(AddrPlus(hdr, 8)));
+                    if (!Ended()) St(cntp, Ld(CountAt(hdr)));
                 });
             } else if (M.Resz(pt)) {
                 // The worker's thunk rebuilds the header on a stack of its own.
@@ -6251,7 +6223,7 @@ struct TgFn {
         InPlace d { fo ? 3 : img ? 1 : 2, dst, t, hdr, &fp };
         if (!x) BuildInto(val, d, l);
         else CopyFrom(P { x->a, x->t, x->stk }, d, l);
-        if (d.mode == 2 && !Ended()) St(len, Ld(HdrLen(hdr)));
+        if (d.mode == 2 && !Ended()) St(len, Ld(CountAt(hdr)));
     }
 
     // return, return x, return a, b (results the C does not return are written through their channels as
@@ -6895,15 +6867,8 @@ struct TgFn {
         auto len = AddrPlus(dt.a, 8);
         St(dt.a, Top(dst.stk));
         St(len, I64(0));
-        if (!cg.IsFix(v.elem)) {
-            auto top = Top(dst.stk);
-            auto bytes = LdL(el, 16);
-            tyg_move_dyn(p, top, LdL(el), bytes);
-            SetTop(dst.stk, Add(top, bytes));
-            St(len, LdL(el, 8));
-            return;
-        }
-        CopyRun(dst.stk, len, dt.t->arr->sub, LdL(el), LdL(el, 8));
+        CopyBytes(dst.stk, len, LdL(el), cg.IsFix(v.elem) ? Mul(LdL(el, 8), I64(cg.FixedSize(v.elem))) : LdL(el, 16),
+                  LdL(el, 8));
     }
 
     // ---- Frame objects as bytes ---------------------------------------------------
@@ -7032,7 +6997,7 @@ struct TgFn {
     void GenRs(Node *n, tyg_val stk, tyg_addr hdr, TypeExpr *t, Line l) {
         n = StripCopy(n);
         if (BuildCtl(n, InPlace { 2, stk, t, hdr }, l)) return;
-        auto len = AddrPlus(hdr, 8);
+        auto len = CountAt(hdr);
         if (auto sl = Is<StructLit>(n); sl && sl->sinst && !sl->variant && cg.TEq(sl->exprtype, t)) {
             auto start = Local(Top(stk));
             LitWithTail(sl, stk, t, LastRealField(cg.SI(t)->st->fields), len, l);
@@ -7058,7 +7023,7 @@ struct TgFn {
         tyg_move_dyn(p, top, from, bytes);
         SetTop(stk, Add(top, bytes));
         St(hdr, top);
-        St(AddrPlus(hdr, 8), n);
+        St(CountAt(hdr), n);
     }
 
     // ---- Variable-size structs -------------------------------------------------
@@ -7076,19 +7041,14 @@ struct TgFn {
             // The tag, and its variant's payload: a variable one walked, only on its own tag's path.
             auto ei = cg.EIOf(t);
             auto ts = M.TagSize(t);
-            auto res = tyg_local_new(p, 8, 8);
+            auto res = Local(I64(ts));
             auto tag = Local(LoadTag(AtV(at), t));
-            auto done = NewBlock();
             for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
                 If(Cmp(TYG_EQ, LdL(tag), I64((int64_t)vi)), [&] {
                     auto vt = cg.VariantType(t, (int)vi);
                     auto ps = cg.IsFix(vt) ? I64(cg.FixedSize(vt)) : ImgSize(vt, Add(at, I64(ts)));
                     StL(res, Add(ps, I64(ts)));
-                    tyg_jump(p, done);
                 });
-            StL(res, I64(ts));
-            tyg_jump(p, done);
-            SetBlock(done);
             return LdL(res);
         }
         if (M.IsRc(t)) return Add(Mul(LimCapOf(P { AtV(at), t }), I64(cg.FixedSize(t->arr->sub))), I64(8));
@@ -7164,14 +7124,9 @@ struct TgFn {
         }
         auto tag = Local(LoadTag(src, srct));
         tyg_store(p, M.TagScal(t), AtV(base), tyg_convert(p, TYG_TRUNC, M.TagScal(t), LdL(tag)), 0);
-        auto done = NewBlock();
         for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
-            If(Cmp(TYG_EQ, LdL(tag), I64((int64_t)vi)), [&] {
-                copyfix(cg.VariantLayout(ei, (int)vi).size, AddrPlus(src, ts));
-                tyg_jump(p, done);
-            });
-        tyg_jump(p, done);
-        SetBlock(done);
+            If(Cmp(TYG_EQ, LdL(tag), I64((int64_t)vi)),
+               [&] { copyfix(cg.VariantLayout(ei, (int)vi).size, AddrPlus(src, ts)); });
         return LdL(start);
     }
 
@@ -7191,40 +7146,36 @@ struct TgFn {
         auto sl = Is<StructLit>(n);
         auto d = Is<Dot>(n);
         auto var = sl && sl->variant ? sl->variant : d && d->variantconst ? d->variantconst : nullptr;
-        if (var) {
-            auto ei = cg.EIOf(t);
-            auto vi = ei->en->VariantIndex(var);
-            auto vt = cg.VariantType(t, vi);
-            auto base = at();
-            auto ts = M.TagSize(t);
-            if (!cg.IsFix(vt)) {
-                // A variable payload: the tag, then its fields built in turn.
-                if (!sl) No(l, cat("variant constant of type ", M.NameWhy(t)));
-                SetTop(stk, Add(base, I64(ts)));
-                StoreTag(AtV(base), t, vi);
-                SelfScope scope(selfbase, base);
-                RunLit(sl, stk, ei->en->variants[(size_t)vi].fields, ei->vftypes[(size_t)vi]);
-                return at();
-            }
-            // A fixed payload: the tag, the rest zero bytes, a literal's fields stored in place.
-            auto size = ts + cg.FixedSize(vt);
-            SetTop(stk, Add(base, I64(size)));
-            tyg_zero(p, AtV(base), size);
-            StoreTag(AtV(base), t, vi);
-            if (!sl) return at();
-            SelfScope scope(selfbase, base);
-            auto &lay = cg.VariantLayout(ei, vi);
-            for (size_t i = 0; i < ei->en->variants[(size_t)vi].fields.size(); i++) {
-                if (ei->en->variants[(size_t)vi].fields[i].ispad) continue;
-                auto init = sl->InitFor((int)i);
-                if (!init) continue;
-                Into(P { AtV(at(), ts + lay.offs[i]), ei->vftypes[(size_t)vi][i] }, init);
-                if (Ended()) break;
-            }
+        if (!var) {
+            auto pl = Deref(Place(n));
+            if (!Ended()) CopyFrom(pl, InPlace { 1, stk, t }, l);
             return at();
         }
-        auto pl = Deref(Place(n));
-        if (!Ended()) CopyFrom(pl, InPlace { 1, stk, t }, l);
+        auto ei = cg.EIOf(t);
+        auto vi = (size_t)ei->en->VariantIndex(var);
+        auto vt = cg.VariantType(t, (int)vi);
+        auto &fs = ei->en->variants[vi].fields;
+        auto base = at();
+        auto ts = M.TagSize(t);
+        if (!cg.IsFix(vt)) {   // A variable payload: the tag, then its fields built in turn.
+            if (!sl) No(l, cat("variant constant of type ", M.NameWhy(t)));
+            SetTop(stk, Add(base, I64(ts)));
+            StoreTag(AtV(base), t, (int)vi);
+            SelfScope scope(selfbase, base);
+            RunLit(sl, stk, fs, ei->vftypes[vi]);
+            return at();
+        }
+        // A fixed payload: the tag, the rest zero bytes, a literal's fields stored in place.
+        auto size = ts + cg.FixedSize(vt);
+        SetTop(stk, Add(base, I64(size)));
+        tyg_zero(p, AtV(base), size);
+        StoreTag(AtV(base), t, (int)vi);
+        if (!sl) return at();
+        SelfScope scope(selfbase, base);
+        auto &lay = cg.VariantLayout(ei, (int)vi);
+        for (size_t i = 0; i < fs.size() && !Ended(); i++)
+            if (auto init = fs[i].ispad ? nullptr : sl->InitFor((int)i))
+                Into(P { AtV(at(), ts + lay.offs[i]), ei->vftypes[vi][i] }, init);
         return at();
     }
 
@@ -7283,8 +7234,7 @@ struct TgFn {
         auto sym = M.Sym(si.cname, TYG_SYM_FUNC | TYG_SYM_GLOBAL);
         auto sig = M.Sig(sp);
         if (!sig) No(sp->sf->line, cat("signature: ", tyg_error(m) ? tyg_error(m) : "?"));
-        p = tyg_proc_begin(m, sym, sig);
-        if (!p) No(sp->sf->line, cat("tyg_proc_begin: ", tyg_error(m) ? tyg_error(m) : "?"));
+        NewProcBegin(sym, sig, sp->sf->line);
         auto file = M.File(sp->sf->line.fileidx);
         auto ptrto = [&](const tyg_dtype *dt) { return tyg_dt_pointer(m, dt); };
         vector<const tyg_dtype *> pdt;
@@ -7384,10 +7334,7 @@ struct TgFn {
             if (!NonFixedRet(sp->rets[i])) continue;
             chans[i].top0 = Local(Top(LdL(chans[i].a)));
         }
-        gblk = NewBlock();
-        gstart = NewBlock();
-        tyg_jump(p, gblk);
-        SetBlock(gstart);
+        NewProcBody();
         if (cg.fromids.count(sp)) {
             // A `return from` target: values in flight to it are built on its destinations (EmitSpec).
             for (size_t i = 0; i < sp->rets.size(); i++) {
@@ -7417,13 +7364,8 @@ struct TgFn {
     void EmitRender(const string &name, TypeExpr *t) {
         auto ptr = tyg_type_ptr(m);
         const tyg_type *pts[3] = { ptr, ptr, ptr };
-        p = tyg_proc_begin(m, M.Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL), tyg_sig_new(m, nullptr, pts, 3, 0));
-        if (!p) No(Line {}, cat("tyg_proc_begin: ", tyg_error(m) ? tyg_error(m) : "?"));
-        // The entry block as a function's, for the globals a link reads (a pool's base).
-        gblk = NewBlock();
-        gstart = NewBlock();
-        tyg_jump(p, gblk);
-        SetBlock(gstart);
+        NewProcBegin(M.Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL), tyg_sig_new(m, nullptr, pts, 3, 0), {});
+        NewProcBody();   // The entry block as a function's, for the globals a link reads (a pool's base).
         inlinet = t;
         RenderInto(tyg_param(p, 0), AtV(tyg_param(p, 1)), P { AtV(tyg_param(p, 2)), t }, true, Line {});
         if (!Ended()) tyg_ret(p, 0);
