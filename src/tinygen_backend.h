@@ -6741,7 +6741,6 @@ struct TgFn {
     // ---- Threads and queues (§11.2) ------------------------------------------
 
     static tyg_addr AddrPlus(tyg_addr a, int64_t off) { return a.offset += off, a; }
-    // The address of the queue for elements of type t.
     tyg_val QueueAddr(TypeExpr *t) {
         cg.usesthreads = true;
         return CallC(M.QueueAccessor(t), {}, {}, tyg_type_ptr(m));
@@ -6768,7 +6767,6 @@ struct TgFn {
     // A node's value bytes follow its gs_qnode header (next, size).
     static constexpr int64_t QNODE = 16;
 
-    // The resizable (or frame object) n of type t built in a temporary of its own.
     P RzValue(Node *n, TypeExpr *t, Line l) {
         if (M.FoOk(t)) {
             P x { AtL(tyg_local_new(p, M.Size(t), 8)), t, Stk(AllocStk(false, l), l) };
@@ -6898,7 +6896,6 @@ struct TgFn {
                                 { thunk, base, Sub(Top(stk), base) }, IT(TYG_I64)));
     }
 
-    // qput(v): the value's bytes copied into a node of the queue.
     V GenQput(Call *c) {
         auto an = c->ArgNodes();
         auto t = an[0]->exprtype;
@@ -7123,7 +7120,6 @@ struct TgFn {
         if (!t || t->kind != TY_REF || (t->ref->lenstorage >= 0 && !M.RelOk(t, 1))) No(l, "null of this type");
         return ValV(t, I64(0));
     }
-    // A reference value's address: a fat reference's hdr.
     tyg_val Addr(const V &x, Line l) {
         if (!x.t || x.t->kind != TY_REF || (x.t->ref->lenstorage >= 0 && !M.RelOk(x.t, 1))) No(l, "address of this value");
         return x.mem ? Ld(x.a) : x.v;
@@ -7193,7 +7189,6 @@ struct TgFn {
 
     // ---- Varints in bytes values (§3.6: ULEB128, values zigzag) --------------
 
-    // body() once, then again while it returns true.
     template <class F> void DoWhile(F body) {
         auto head = NewBlock(), again = NewBlock(), done = NewBlock();
         tyg_jump(p, head);
@@ -7206,7 +7201,6 @@ struct TgFn {
     tyg_val ViLoad8(tyg_val at) { return tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, TYG_I8, AtV(at), 0)); }
     void ViStore8(tyg_val at, tyg_val v) { tyg_store(p, TYG_I8, AtV(at), tyg_convert(p, TYG_TRUNC, TYG_I8, v), 0); }
     tyg_val ViAnd(tyg_val v, int64_t k) { return tyg_bin(p, TYG_AND, v, I64(k)); }
-    // The ULEB128 at `at`, unsigned.
     tyg_val UlebRead(tyg_val at) {
         auto v = Local(I64(0)), sh = Local(I64(0)), q = Local(at);
         DoWhile([&] {
@@ -7285,7 +7279,6 @@ struct TgFn {
             if (!Ended()) BuildArm(c->fvbody, l, build);
         });
     }
-    // An if with an else whose arms each build a value in place.
     template <class F> void BuildIf(IfExpr *ie, Line l, F build) {
         IfElse(Truth(ie->cond), [&] { BuildArm(ie->thenb, l, build); }, [&] { BuildArm(ie->elseb, l, build); });
     }
@@ -7345,18 +7338,18 @@ struct TgFn {
         tyg_local res = 0;
         bool pr = false, valued = false;
         TypeExpr *et = nullptr;
+        V w;   // The value, where n was built in place.
     };
-    // Starts construct n. True when n was built in place (value in w); otherwise k is set up. `gate`
+    // Starts construct n. True when n was built in place (value in k.w); otherwise k is set up. `gate`
     // false: n gives no value (an if without else, a loop without a break value).
-    bool CtlBegin(Ctl &k, Node *n, bool discard, const InPlace *ip, bool gate, V &w) {
+    bool CtlBegin(Ctl &k, Node *n, bool discard, const InPlace *ip, bool gate) {
         k.pr = TakePref(k.res);
-        if (gate && !ip && !k.pr && WantInPlace(n, discard, w)) return true;
+        if (gate && !ip && !k.pr && WantInPlace(n, discard, k.w)) return true;
         k.valued = gate && !ip && Valued(n, discard);
         k.et = Carry(n->exprtype);
         if (k.valued && !k.pr) k.res = Temp(k.et);
         return false;
     }
-    // One arm's value into k's result, or built in place.
     void CtlArm(const Ctl &k, const InPlace *ip, Node *body, Line l) {
         if (ip) BuildArm(body, l, [&](Node *v) { BuildTo(v, *ip, l); });
         else ArmVal(body, k.valued, k.pr, k.et, k.res);
@@ -7375,8 +7368,7 @@ struct TgFn {
 
     V GenIf(IfExpr *i, bool discard) {
         Ctl k;
-        V w;
-        if (CtlBegin(k, i, discard, nullptr, i->elseb != nullptr, w)) return w;
+        if (CtlBegin(k, i, discard, nullptr, i->elseb != nullptr)) return k.w;
         auto arm = [&](Node *n) { CtlArm(k, nullptr, n, i->line); };
         auto c = Truth(i->cond);
         if (i->elseb) IfElse(c, [&] { arm(i->thenb); }, [&] { arm(i->elseb); });
@@ -7395,8 +7387,7 @@ struct TgFn {
     // `block { ... }` (EarlyBlock::CgAny): its tail's value, or a break's.
     V GenEarly(EarlyBlock *e, bool discard, const InPlace *ip = nullptr) {
         Ctl k;
-        V w;
-        if (CtlBegin(k, e, discard, ip, true, w)) return w;
+        if (CtlBegin(k, e, discard, ip, true)) return k.w;
         auto done = NewBlock();
         loops.push_back(CtlTarget(k, done, done, true, ip));
         CtlArm(k, ip, e->body, e->line);
@@ -7409,9 +7400,8 @@ struct TgFn {
     // `loop { ... }`, its value a break's.
     V GenLoopX(LoopExpr *lp, bool discard, const InPlace *ip = nullptr) {
         Ctl k;
-        V w;
         auto brkval = std::any_of(lp->breaks.begin(), lp->breaks.end(), [](Break *b) { return b->val; });
-        if (CtlBegin(k, lp, discard, ip, brkval, w)) return w;
+        if (CtlBegin(k, lp, discard, ip, brkval)) return k.w;
         auto body = NewBlock(), done = NewBlock();
         tyg_jump(p, body);
         SetBlock(body);
@@ -7433,8 +7423,7 @@ struct TgFn {
     // order, each value or range at the scrutinee's type (unsigned for an unsigned one).
     V GenMatch(MatchExpr *me, bool discard, const InPlace *ip = nullptr) {
         Ctl k;
-        V w;
-        if (CtlBegin(k, me, discard, ip, true, w)) return w;
+        if (CtlBegin(k, me, discard, ip, true)) return k.w;
         if (auto adt = AdtOf(me->scrutinee->exprtype)) return GenAdtMatch(me, adt, k, ip);
         auto ot = cg.OperandT(me->scrutinee->exprtype);
         if (!ot || ot->kind != TY_INT || ot->intstorage == IS_VARINT)
@@ -7485,7 +7474,6 @@ struct TgFn {
     void StoreTag(tyg_addr a, TypeExpr *adt, int vi) {
         tyg_store(p, M.TagScal(adt), a, tyg_iconst(p, M.TagScal(adt), vi), 0);
     }
-    // The tag at a, widened.
     tyg_val LoadTag(tyg_addr a, TypeExpr *adt) {
         return tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, M.TagScal(adt), a, 0));
     }
@@ -7531,7 +7519,6 @@ struct TgFn {
         if (t->kind == TY_ENUM) StoreTag(x.a, t, d->einst->en->VariantIndex(d->variantconst));
         return x;
     }
-    // A payload field of a variant at base.
     P VariantField(const P &base, int fieldidx) {
         auto ei = cg.EIVar(base.t);
         auto vi = M.VariantIdx(base.t);
@@ -7567,9 +7554,7 @@ struct TgFn {
         auto x = GenAs(n, adt);
         return ScrutAt(adt, x.a);
     }
-    // Branches to `hit` if the scrutinee's tag is variant vi, else on.
     void TagIs(const Scrut &s, int vi, tyg_block hit) { HitElse(Cmp(TYG_EQ, LdL(s.tag), I64(vi)), hit); }
-    // Variant vi's payload, copied out of the scrutinee into `to`.
     void CopyPayload(const Scrut &s, int vi, tyg_addr to) {
         auto sz = cg.FixedSize(cg.VariantType(s.adt, vi));
         if (sz) tyg_copy(p, to, AddrPlus(s.v.a, M.TagSize(s.adt)), sz);
@@ -7707,7 +7692,6 @@ struct TgFn {
             for (auto r : sp0->rets) lastrets.push_back(Dummy(r));
             return lastrets.empty() ? V {} : lastrets[0];
         }
-        // The results' channels, the same for every case.
         vector<tyg_arg> chanargs;
         auto rets = RetChans(sp0, cg.sinfo[sp0], idst, dst, chanargs, c->line);
         auto done = NewBlock();
