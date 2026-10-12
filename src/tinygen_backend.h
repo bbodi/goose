@@ -1641,11 +1641,16 @@ struct TgFn {
         return Add(SpVal(l), I64(live));
     }
 
-    // Moves `bytes` bytes of n elements from elems (maybe on stk itself) to its top, counting them at len.
-    void CopyBytes(tyg_val stk, tyg_addr len, tyg_val elems, tyg_val bytes, tyg_val n) {
+    // Moves n bytes from src (maybe on stk itself) to the top of stk, which grows by them; where they land.
+    tyg_val PushBytes(tyg_val stk, tyg_val src, tyg_val n) {
         auto top = Top(stk);
-        tyg_move_dyn(p, top, elems, bytes);
-        SetTop(stk, Add(top, bytes));
+        tyg_move_dyn(p, top, src, n);
+        SetTop(stk, Add(top, n));
+        return top;
+    }
+    // Moves `bytes` bytes of n elements from elems to the top of stk, counting them at len.
+    void CopyBytes(tyg_val stk, tyg_addr len, tyg_val elems, tyg_val bytes, tyg_val n) {
+        PushBytes(stk, elems, bytes);
         St(len, Add(Ld(len), n));
     }
     void CopyRun(tyg_val stk, tyg_addr len, TypeExpr *et, tyg_val elems, tyg_val n) {
@@ -1848,9 +1853,8 @@ struct TgFn {
         if (M.IsRb(x.t)) {
             auto xb = Ld(x.a);
             auto cnt = Ld(CountAt(x.a));
-            auto n = RbBytes(same ? t : x.t, xb, cnt);
-            tyg_move_dyn(p, at, xb, n);
-            SetTop(stk, Add(at, n));
+            SetTop(stk, at);
+            PushBytes(stk, xb, RbBytes(same ? t : x.t, xb, cnt));
             St(len, cnt);
             return;
         }
@@ -4799,11 +4803,7 @@ struct TgFn {
                 StL(okl, tyg_convert(p, TYG_ZEXT, TYG_I64, Cmp(TYG_SGE, n, I64(0))));
             });
         }
-        auto moveIn = [&] {
-            auto top = Top(r.stk);
-            tyg_move_dyn(p, top, LdL(pay), LdL(pn));
-            SetTop(r.stk, Add(top, LdL(pn)));
-        };
+        auto moveIn = [&] { PushBytes(r.stk, LdL(pay), LdL(pn)); };
         auto accepted = Cmp(TYG_NE, LdL(okl), I64(0));
         if (isimg) {
             // The prefix reserved, the payload behind it, the count patched in
@@ -5050,15 +5050,14 @@ struct TgFn {
                 St(AddrPlus(obj, pre + 8), Ld(AtV(node, QNODE)));
                 if (pre) tyg_copy(p, obj, AtV(image), pre);
                 auto n = Sub(Ld(AtV(node, 8)), I64(8 + pre));
-                tyg_move_dyn(p, StackReserve(stk, n), Add(image, I64(pre)), n);
+                PushBytes(stk, Add(image, I64(pre)), n);
             });
             return result(MemV(t, obj, stk));
         }
         if (!cg.IsFix(t)) {
             auto stk = idst ? idst : Stk(AllocStk(false, c->line), c->line);
             auto size = Ld(AtV(node, 8));
-            auto top = StackReserve(stk, size);
-            tyg_move_dyn(p, top, Add(node, I64(QNODE)), size);
+            auto top = PushBytes(stk, Add(node, I64(QNODE)), size);
             CallC("free", { tyg_type_ptr(m) }, { node }, nullptr);
             return result(MemV(t, AtV(top)));
         }
@@ -6597,10 +6596,7 @@ struct TgFn {
         if (M.FoOk(tail)) estart = Add(estart, I64(cg.FoBytesPrefix(tail)));
         auto elem = IsGrow(tail) ? tail->arr->sub : cg.FoTailArr(tail)->arr->sub;
         auto bytes = Add(Sub(estart, from), Mul(n, I64(cg.FixedSize(elem))));
-        auto top = Top(stk);
-        tyg_move_dyn(p, top, from, bytes);
-        SetTop(stk, Add(top, bytes));
-        St(hdr, top);
+        St(hdr, PushBytes(stk, from, bytes));
         St(CountAt(hdr), n);
     }
 
@@ -6708,11 +6704,7 @@ struct TgFn {
 
     // Copies the image of type t at src (maybe on stk, below its top) to the top of stk; its address.
     tyg_val ImgCopy(tyg_val stk, tyg_val src, TypeExpr *t) {
-        auto top = Top(stk);
-        auto size = ImgSize(t, src);
-        tyg_move_dyn(p, top, src, size);
-        SetTop(stk, Add(top, size));
-        return top;
+        return PushBytes(stk, src, ImgSize(t, src));
     }
     // A variant or fixed-mode ADT at `src` adapted to the variable-mode ADT t at the top of stk
     // (CodeGen::GenVarEnumFromLoc): the tag, then the payload; its address.
