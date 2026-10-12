@@ -129,7 +129,10 @@ function that takes `gs_sp` owns `GS(gs_sp + k)` for the indices it counts
 up and down as its locals and temporaries take them, and hands a callee in
 either half `gs_sp` plus the indices in use. Its stack block is the C half's
 thread-local `gs_stks`, which an exported shim (`gs_tg_stks`) returns once
-per invocation (gap 6). The stack accounting (`codegen_stacks.h`) counts a
+per invocation (gap 6). A program without threads has one block, so a
+procedure reads it through an exported pointer to `gs_stks` (`gs_tg_stkpp`)
+and makes no call. A scan for thread and queue builtins before the bodies
+are compiled tells the two cases apart (`TgModule::fixedaddrs`). The stack accounting (`codegen_stacks.h`) counts a
 tinygen function as it counts a C one: the backend gives `CodeGen::stackown`
 the most indices the body holds at once and `CodeGen::stackcalls` every
 call it hands an index to, so `BoundStacks`, `--stacks` and the thread cap
@@ -144,7 +147,9 @@ through the trampolines.
 tinygen function calls it from there). tinygen code reaches one through an
 accessor the C half exports (`void *gs_tg_g0(void) { return &GS_GL->x_g; }`),
 so a worker thread reads its own instance through the thread-local `gs_gl`
-without tinygen touching thread-local storage (gap 6). See the second stage.
+without tinygen touching thread-local storage (gap 6). In a program without
+threads the address is fixed at load, so the accessor is a data pointer
+(`void *gs_tg_g0 = (void *)&GS_GL->x_g;`) that a procedure loads. See the second stage.
 
 ## Building tinygen into goose
 

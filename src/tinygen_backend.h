@@ -43,6 +43,7 @@ inline string TgFixedShim(const string &name) {
     // object has its own (TgSupportBody).
     static const map<string, const char *> fixed = {
         { "gs_tg_stks", "void *gs_tg_stks(void) { return gs_stks; }\n" },
+        { "gs_tg_stkpp", "void *gs_tg_stkpp = (void *)&gs_stks;\n" },
         { "gs_tg_thread_spawn",
           "int64_t gs_tg_thread_spawn(void (*e)(uint8_t *), const void *a, int64_t n) "
           "{ return gs_thread_spawn(e, a, n); }\n" },
@@ -153,6 +154,8 @@ inline string TgSupportBody(string_view runtimeh) {
     // its end frees it (the runtime's gs_stack_block and gs_thread_run).
     s += "static GS_TG_TLS gs_stack *gs_tg_tstks;\n"
          "void *gs_tg_stks(void) { return gs_tg_tstks; }\n"
+         // A program without threads has one block, the main thread's: gs_stks, set by gs_rt_init.
+         "void *gs_tg_stkpp = (void *)&gs_stks;\n"
          "void gs_tg_stack_block(int64_t n) {\n"
          "    gs_tg_tstks = (gs_stack *)calloc((size_t)(n > 0 ? n : 1), sizeof(gs_stack));\n"
          "    if (!gs_tg_tstks) gs_panic(\"out of memory allocating stack block\");\n"
@@ -183,6 +186,10 @@ struct TgModule {
     Ast &ast;
     CodeGen &cg;
     bool checks;           // GS_DEBUG: the overflow and `as` checks of §6.2/§6.3.
+    // A program without threads has one instance of the globals and one stack block, at addresses
+    // fixed at load: a procedure reads them from data pointers (gs_tg_stkpp, the gs_tg_g accessors)
+    // instead of calling an accessor on entry. TinyGenBackend::Choose sets it.
+    bool fixedaddrs = false;
     tyg_module *m = nullptr;
     map<int, tyg_file> files;
     map<int, tyg_sym> filenames;
@@ -1203,14 +1210,21 @@ struct TgModule {
         return it != names.end() ? it->second : (names[d] = cat(prefix, names.size()));
     }
     map<const VarDef *, string> accessors, stkaccessors;
+    // Whether the accessor `name` of a global is a data pointer (direct) rather than a function.
+    bool DirectAcc(const string &name) { return fixedaddrs && name.rfind("gs_tg_g", 0) == 0; }
+    // The C half's accessor returning the address `addr`: a pointer initialized to it when direct.
+    void NeedAccessor(const string &name, const string &addr) {
+        NeedShim(name, DirectAcc(name) ? cat("void *", name, " = (void *)", addr, ";\n") :
+                 cat("void *", name, "(void) { return (void *)", addr, "; }\n"));
+    }
     string Accessor(VarDef *d) {
         auto name = AccessorName(accessors, d, "gs_tg_g");
-        NeedShim(name, cat("void *", name, "(void) { return (void *)&(", cg.gnames[d], "); }\n"));
+        NeedAccessor(name, cat("&(", cg.gnames[d], ")"));
         return name;
     }
     string StackAccessor(VarDef *d) {
         auto name = AccessorName(stkaccessors, d, "gs_tg_gs");
-        NeedShim(name, cat("void *", name, "(void) { return (void *)", cg.gstks[d], "; }\n"));
+        NeedAccessor(name, cg.gstks[d]);
         return name;
     }
     // A global pool's freelist accessors: its header's, its stack's.
@@ -1219,10 +1233,8 @@ struct TgModule {
         auto n = flaccessors.size();
         auto r = flaccessors.count(d) ? flaccessors[d] :
             (flaccessors[d] = { cat("gs_tg_gf", n), cat("gs_tg_gfs", n) });
-        NeedShim(r.first, cat("void *", r.first, "(void) { return (void *)&(", cg.gpools[d].first,
-                              "); }\n"));
-        NeedShim(r.second, cat("void *", r.second, "(void) { return (void *)", cg.gpools[d].second,
-                               "; }\n"));
+        NeedAccessor(r.first, cat("&(", cg.gpools[d].first, ")"));
+        NeedAccessor(r.second, cg.gpools[d].second);
         return r;
     }
     // The `return from` channels' accessors (gs_tg_lret_<tid>_<i>, gs_tg_fdst_, gs_tg_fval_), with
@@ -1717,7 +1729,7 @@ struct TgFn {
         auto sp0 = SpVal(l);
         if (!stksl) {
             stksl = Slot();
-            M.NeedShim("gs_tg_stks");
+            M.NeedShim(M.fixedaddrs ? "gs_tg_stkpp" : "gs_tg_stks");
         }
         return Add(LdL(stksl), Mul(Add(sp0, I64(k)), I64(8)));
     }
@@ -7537,8 +7549,12 @@ struct TgFn {
     void Finish(Line line) {
         SetBlock(gblk);
         Loc(line);
-        if (stksl) StL(stksl, CallC("gs_tg_stks", {}, {}, tyg_type_ptr(m)));
-        for (auto &[acc, loc] : gaddrs) StL(loc, CallC(acc, {}, {}, tyg_type_ptr(m)));
+        auto data = [&](const string &name) { return Ld(tyg_at_sym(M.Sym(name, TYG_SYM_GLOBAL), 0)); };
+        if (stksl)
+            StL(stksl, M.fixedaddrs ? Ld(AtV(data("gs_tg_stkpp"))) :
+                CallC("gs_tg_stks", {}, {}, tyg_type_ptr(m)));
+        for (auto &[acc, loc] : gaddrs)
+            StL(loc, M.DirectAcc(acc) ? data(acc) : CallC(acc, {}, {}, tyg_type_ptr(m)));
         tyg_jump(p, gstart);
         auto bad = tyg_proc_end(p) != 0;
         p = nullptr;
@@ -7679,8 +7695,16 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                  std::max<int64_t>(size, 1), align);
         return sym;
     }
-    // An accessor `name`: a procedure returning the address of `target`.
+    // An accessor `name`: a procedure returning the address of `target`, or a pointer to it when
+    // direct.
     void DefAccessor(const string &name, tyg_sym target) {
+        if (mod->DirectAcc(name)) {
+            static const uint8_t zero[8] = {};
+            auto sym = mod->Sym(name, TYG_SYM_GLOBAL);
+            tyg_data(mod->m, sym, TYG_SECTION_DATA, zero, 8, 8);
+            tyg_data_reloc(mod->m, sym, 0, 8, target, 0);
+            return;
+        }
         auto p = tyg_proc_begin(mod->m, FSym(name), SigOf(tyg_type_ptr(mod->m), {}));
         tyg_ret(p, tyg_addr_of(p, tyg_at_sym(target, 0)));
         EndProc(p, name);
@@ -7740,6 +7764,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         set<FnSpec *> ours;
         mod = make_unique<TgModule>(ast, cg, checks, source);
         mod->rtdecls = runtime_decls;
+        mod->fixedaddrs = !UsesThreads(cg);
         if (!mod->m) {
             for (auto sp : specs) left.emplace_back(sp, "tinygen has no module for this target");
             mod.reset();
@@ -7757,6 +7782,37 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         }
         BuildRenders();
         return ours;
+    }
+
+    // Whether the program may run threads, which makes the C backend set CodeGen::usesthreads as it
+    // meets them: a thread_fn, or a call of a thread or queue builtin, anywhere live. Known before any
+    // body is compiled, for TgModule::fixedaddrs.
+    static bool ThreadsIn(Node *n) {
+        if (!n) return false;
+        if (auto c = Is<Call>(n)) {
+            switch (c->builtin) {
+                case B_THREAD_SPAWN:
+                case B_THREAD_WAIT:
+                case B_QPUT:
+                case B_QGET:
+                case B_QPOLL:
+                    return true;
+                default:
+                    break;
+            }
+        }
+        auto found = false;
+        RunChildren(n, [&](Node *ch) { found = found || ThreadsIn(ch); });
+        return found;
+    }
+    bool UsesThreads(CodeGen &cg) {
+        if (cg.usesthreads || !cg.queues.empty()) return true;
+        for (auto sp : ast.fnspecs)
+            if (sp->live && (sp->sf->isthread || ThreadsIn(sp->body))) return true;
+        for (auto g : ast.globals)
+            for (auto i : g->inits)
+                if (ThreadsIn(i)) return true;
+        return false;
     }
 
     // The render procedures the functions asked for (TgModule::RenderFn), each possibly asking for
@@ -7791,6 +7847,8 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     // The C the object calls into (appended to the C half): the shims, and a trampoline per extern fn.
     string Shims(CodeGen &cg) {
         if (!mod) return "";
+        if (mod->fixedaddrs && (cg.usesthreads || !cg.queues.empty()))
+            throw CompileError { "tinygen: the program uses threads, which UsesThreads missed" };
         string s = "\n/* ---- for the tinygen object (docs/design/tinygen_backend.md) ---- */\n";
         for (auto &sh : mod->shims) s += sh.second;
         for (auto sp : mod->externs) {
