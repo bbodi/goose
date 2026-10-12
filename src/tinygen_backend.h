@@ -5451,10 +5451,9 @@ struct TgFn {
         return lastrets.empty() ? V {} : lastrets[0];
     }
 
-    // A channel per result after the declared arguments (C.3), appended to args: an image's
-    // stack (a temporary's, or idst for the first result); a resizable's destination stack (a
-    // temporary's, or dst) and its count's address; a frame object's tail stack and struct; a
-    // temporary's address for a fixed result the C does not return. Where each result will be.
+    // A channel per result after the declared arguments (C.3), appended to args: an image's stack
+    // (idst for the first), a resizable's stack (dst for the first) and count, a frame object's
+    // stack and struct, an out-pointer for a fixed result the C does not return. Where each is.
     vector<V> RetChans(FnSpec *callee, CodeGen::SpecInfo &ci, tyg_val idst, const RzDst *dst,
                        vector<tyg_arg> &args, Line l) {
         vector<V> rets(callee->rets.size());
@@ -5493,8 +5492,7 @@ struct TgFn {
         for (int k = 0; k < 4; k++)
             args.push_back(ArgOfVal(Ended() ? I64(0) : Ld(AddrPlus(at, 8 * k))));
     }
-    // The members of the gs_pref a pool variable gives: its header's address, its stack, its free
-    // list's address and that list's stack.
+    // gs_pref's members for a pool variable: header, its stack, free list, its stack.
     vector<tyg_val> PoolRefParts(const VarDef *vd, Line l) {
         P pl;
         tyg_addr fl;
@@ -5506,9 +5504,9 @@ struct TgFn {
 
     // Whether a variable holds a gs_pref: a pool reference variable, or a parameter handed a pool.
     bool IsPrefStore(const VarDef *vd) { return cg.PrefVar(vd) || (prefs.count(vd) && !vd->reusable); }
-    // The pool reference a node gives (CodeGen::GenPrefVal), the address of its 32 bytes: a pool's
-    // (&pool), another pool reference variable's, or what a construct choosing among pools builds,
-    // each arm into one temporary (prefctl and prefloc hand the construct that temporary).
+    // The pool reference a node gives (CodeGen::GenPrefVal), the address of its 32 bytes: a pool's,
+    // another pool reference variable's, or what a construct choosing among pools builds, each
+    // arm into one temporary (prefctl and prefloc hand it to the construct).
     bool prefctl = false;
     tyg_local prefloc = 0;
     bool TakePref(tyg_local &res) {
@@ -5551,8 +5549,7 @@ struct TgFn {
         auto src = GenPref(n);
         if (!Ended()) tyg_copy(p, dst, src, 32);
     }
-    // An arm of a control construct, its value stored in the construct's temporary: as the
-    // type, or as a pool reference where `pr`.
+    // An arm of a control construct, its value stored in the construct's temporary.
     void ArmVal(Node *n, bool valued, bool pr, TypeExpr *et, tyg_local res) {
         if (valued && pr) {
             BuildArm(n, n->line, [&](Node *v) { PrefInto(AtL(res), v); });
@@ -5599,10 +5596,9 @@ struct TgFn {
         }
     }
 
-    // A call of a function value (§7.6; CodeGen::EmitFvCall): the checked body instance spliced
-    // in here, its parameters ordinary locals bound to the arguments in order, in a scope of its
-    // own. Its value is a copy (§4.1), so that a slice of it never points into a variable the
-    // body names.
+    // A call of a function value (§7.6; CodeGen::EmitFvCall): its body spliced in here in a scope
+    // of its own, the parameters locals bound to the arguments. Its value is a copy (§4.1), so a
+    // slice of it never points into a variable the body names.
     V GenFvCall(Call *c) {
         auto et = c->fvbody->exprtype;
         auto wantsval = !cg.IsVoidT(et);
@@ -5631,13 +5627,11 @@ struct TgFn {
         return Ended() ? Dummy(et) : x;
     }
 
-    // The element the last push added, where it lies: what print renders of a push's value (a
-    // reference, §3.3), read there.
+    // The element the last push added: what print renders of a push's value (a reference, §3.3).
     std::optional<P> pushed;
     bool discardpush = false;   // A push in statement position: its value unwanted.
-    // v.push(x) for a fixed element (EmitPush): the receiver, then the element, which may grow the
-    // array itself, then its slot claimed at the stack's top, where the elements end, and the
-    // count raised. Its value is the element's address.
+    // v.push(x) (EmitPush): the receiver, then the element, which may grow the array itself, then
+    // its slot claimed at the stack's top and the count raised. Its value is the element's address.
     V GenPush(Call *c) {
         auto dp = discardpush;
         discardpush = false;
@@ -5648,8 +5642,7 @@ struct TgFn {
             return LimPush(c, pl);
         }
         auto la = CountAt(pl.a);
-        // The value of a push whose element lies at `at` (counted already): its reference, or a
-        // varint element decoded.
+        // The value of a push whose element lies at `at`: its reference, or a varint decoded.
         auto counted = [&](tyg_val at) -> V {
             auto et = c->exprtype;
             if (et && et->kind != TY_REF && !cg.IsVoidT(et) && M.IsScalar(et))
@@ -5660,8 +5653,7 @@ struct TgFn {
             return r;
         };
         if (IsGrow(pl.t) && M.VeOk(pl.t) && pl.stk) {
-            // An image element: built straight at the top of the array's own stack, behind the
-            // elements before it, then counted.
+            // An image element: built at the top of the array's own stack, then counted.
             auto at = GenImg(an[1], pl.stk, pl.t->arr->sub, c->line);
             if (Ended()) return Dummy(c->exprtype);
             St(la, Add(Ld(la), I64(1)));
@@ -5695,16 +5687,14 @@ struct TgFn {
         return wanted ? Load(*pushed, c->line) : r;
     }
 
-    // v.append(x) (EmitAppend): a call's resizable result built straight at v's top, its count
-    // added; anything else holding elements (an array, a slice, a string literal, copy(x)) copied
-    // there.
+    // v.append(x) (EmitAppend): a call's resizable result built at v's top, its count added;
+    // anything else holding elements (an array, a slice, a string literal, copy(x)) copied there.
     V GenAppend(Call *c) {
         auto an = c->ArgNodes();
         auto pl = Deref(Place(an[0]));
         if (TgModule::IsLim(pl.t)) return LimAppend(c, pl);
         if (IsGrow(pl.t) && M.VeOk(pl.t) && pl.stk) {
-            // Elements of variable size: the source's run of bytes copied whole behind the last,
-            // its count added.
+            // Elements of variable size: the source's run of bytes copied whole.
             auto src = an[1];
             if (auto cc = Is<Call>(src); cc && cc->builtin == B_COPY && cc->ArgNodes().size() == 1)
                 src = cc->ArgNodes()[0];
@@ -5748,8 +5738,7 @@ struct TgFn {
         auto al = Is<ArrayLit>(src);
         auto same = al && al->exprtype && al->exprtype->kind == TY_ARRAY && cg.TEq(al->exprtype->arr->sub, et);
         if (same && !al->capexpr && cg.HasRelRef(et) && (!al->fillval || Is<IntLit>(al->fillcount))) {
-            // A literal of elements holding relative references builds its run where the
-            // elements stay, at the receiver's top (§4.3).
+            // A literal of relative-reference elements builds its run at the receiver's top (§4.3).
             auto k = LitCount(al);
             auto base = tyg_local_new(p, 8, 8);
             auto leaves = FillCapture(al);
@@ -5770,16 +5759,14 @@ struct TgFn {
     }
     static bool IsGrow(TypeExpr *t) { return TgModule::IsGrow(t); }
 
-    // Text of print, str and format (EmitStr, EmitFormatInto): each argument evaluated and
-    // written in turn at the top of a u8 resizable's stack, its count at len: a scalar formatted
-    // by the runtime's gs_fmt_* straight at the top, a u8 array or slice copied, anything else
-    // rendered structurally (RenderInto).
-    // The call whose user format overloads the value being rendered uses (CodeGen::FmtContext).
+    // Text of print, str and format (EmitStr, EmitFormatInto): each argument written in turn at the
+    // top of a u8 resizable's stack, its count at len: a scalar by the runtime's gs_fmt_*, a u8
+    // array or slice copied, anything else rendered structurally (RenderInto).
+    // The call whose user format overloads the value being rendered use (CodeGen::FmtContext).
     Call *fmtc = nullptr;
     TypeExpr *inlinet = nullptr;   // The type a render procedure's body renders inline.
 
-    // A type's name as text renders it: the checked type the C renders is the value's, which a
-    // `const` variable's place does not drop.
+    // A type's name as text renders it: the value's own, without a `const` of its place.
     static string TextName(TypeExpr *t) {
         auto s = TgModule::Name(t);
         if (t->cq && s.rfind("const ", 0) == 0) s = s.substr(6);
@@ -5793,8 +5780,7 @@ struct TgFn {
     void TextLit(tyg_val stk, tyg_addr len, const string &s) { CopyLit(stk, len, M.ast.inttypes[IS_U8], s); }
 
     // A user `format` overload rendering the value at pl (EmitUserFormat): handed the builder as a
-    // gs_rref -- its header, the { base, len } that len is in, and its stack -- and the value as
-    // the overload takes it.
+    // gs_rref (its header and stack) and the value as the overload takes it.
     void UserFormat(tyg_val stk, tyg_addr len, P pl, FnSpec *sp, Line l) {
         string why;
         if (!M.SigOk(sp, false, why)) No(l, cat("format overload: ", why));
@@ -5804,8 +5790,7 @@ struct TgFn {
         auto r = PairLocal(tyg_addr_of(p, AddrPlus(len, -8)), stk);
         vector<tyg_arg> args { ArgOfMem(AtL(r)) };
         if (pl.enc || TgModule::IsVarint(pl.t)) {
-            // An i64 read out of varint storage, which holds no i64: the overload is handed a
-            // temporary holding its value (RefArg).
+            // A varint holds no i64: the overload is handed a temporary holding its value (RefArg).
             auto i64t = M.ast.inttypes[IS_I64];
             auto tmp = Temp(i64t);
             StL(tmp, Load(pl, l).v);
@@ -5836,8 +5821,7 @@ struct TgFn {
     }
 
     // Where an argument of print, str or format is rendered from: a call's reference result where
-    // it points, as a reference variable is, not as the value the checker decayed it to;
-    // anything else its place.
+    // it points, not as the value the checker decayed it to; anything else its place.
     P RenderPlace(Node *a) {
         auto fc = Is<Call>(a);
         if (fc && fc->builtin == B_PUSH) {
@@ -5874,8 +5858,7 @@ struct TgFn {
             auto bt = a->exprtype;
             while (bt && IsPlainRef(bt)) bt = bt->ref->sub;
             if (fmtc && TgModule::IsVarint(bt)) {
-                // A varint read out of its storage is an i64 (§3.6): an i64 overload is handed a
-                // temporary holding its value.
+                // A varint read out of storage is an i64 (§3.6): an i64 overload gets a temporary.
                 if (auto sp = cg.FmtSpecFor(fmtc, i64t)) {
                     auto x = GenAs(a, i64t);
                     if (Ended()) return;
@@ -5886,8 +5869,8 @@ struct TgFn {
                 }
             }
             if (fmtc && bt && cg.FmtSpecFor(fmtc, bt)) {
-                // The overload renders it, whatever its type. A function value's reference result
-                // is spliced in as a value, where the overload must get the storage it names.
+                // A function value's reference result is spliced in as a value, but the overload
+                // must get the storage it names.
                 if (auto fc = Is<Call>(a); fc && fc->fvbody && a->exprtype && a->exprtype->kind == TY_REF)
                     No(a->line, "format overload of a function value's reference result");
                 auto pl = RenderPlace(a);
@@ -5977,12 +5960,9 @@ struct TgFn {
         SetBlock(done);
     }
 
-    // The value at pl rendered structurally, as CodeGen::RenderLoc renders it: through references
-    // to what they refer to, a scalar by gs_fmt_*, u8 elements as their bytes (gs_fmt_quoted's
-    // quoted form when nested in a larger value), other arrays and slices as `[a, b]` with their
-    // elements and count read once, a struct as `Name { a, b }`. The types held are fixed or
-    // arrays of fixed elements, none reaching itself through references, so no render functions
-    // are needed.
+    // The value at pl rendered structurally, as CodeGen::RenderLoc renders it: references through to
+    // what they refer to, a scalar by gs_fmt_*, u8 elements as their bytes (quoted when nested),
+    // other arrays and slices as `[a, b]`, a struct as `Name { a, b }`.
     void RenderInto(tyg_val stk, tyg_addr len, P pl, bool nested, Line l, int depth = 0) {
         if (depth > 32) No(l, "text of a type this deep");
         // A reference renders what it refers to, a relative one decoded (CodeGen::RenderInto).
@@ -5998,10 +5978,9 @@ struct TgFn {
             RenderOpt(stk, len, pl, nested, l, depth);
             return;
         }
-        // A struct that reaches itself is rendered by a procedure of its own, which calls itself
-        // for the next level (CodeGen::EmitRenderCall). It runs no overloads: the checker leaves
-        // none in such a type (CheckPrintable's OverloadedPart). The procedure's own body renders
-        // the first level here (inlinet).
+        // A struct that reaches itself is rendered by a procedure of its own (CodeGen::EmitRenderCall),
+        // which runs no overloads (the checker leaves none in such a type) and renders its first
+        // level inline (inlinet).
         if ((t->kind == TY_STRUCT || t->kind == TY_ENUM) && M.Recursive(t)) {
             if (inlinet && cg.TEq(inlinet, t)) {
                 inlinet = nullptr;
@@ -6094,8 +6073,7 @@ struct TgFn {
     }
 
     // A resizable ADT, or one of its variants, at the header pl: the variant the tag says, read
-    // once, as its literal; each field where the walk finds it, the header's base and count read
-    // as its rendering begins (CodeGen::RenderLoc).
+    // once, as its literal; each field where the walk finds it (CodeGen::RenderLoc).
     void RenderRb(tyg_val stk, tyg_addr len, const P &pl, Line l, int depth) {
         auto t = pl.t;
         if (t->kind == TY_STRUCT) {
@@ -6157,8 +6135,7 @@ struct TgFn {
         }, l, depth);
     }
 
-    // gs_abort(GS_E_<what>) with the Goose file and line, through a shim (the codes are the C
-    // half's enum); the block ends there.
+    // gs_abort(GS_E_<what>) with the Goose file and line, through a shim; the block ends there.
     void Abort(const string &what, Line l) {
         auto name = cat("gs_tg_abort_", what);
         M.NeedShim(name);
@@ -6174,8 +6151,8 @@ struct TgFn {
         SetBlock(ok);
     }
 
-    // pop, pop_n, resize and clear of a resizable (codegen_builtins.h): the receiver, then the
-    // arguments, then the checks; the elements end at the stack's top, which moves with the count.
+    // pop, pop_n, resize and clear of a resizable (codegen_builtins.h): the elements end at the
+    // stack's top, which moves with the count.
     V GenShrink(Call *c) {
         auto an = c->ArgNodes();
         auto pl = Deref(Place(an[0]));
@@ -6215,8 +6192,7 @@ struct TgFn {
                 return V {};
             default: break;
         }
-        // resize(n) / resize(n, fill): shrink to n, or grow by copies of fill, which is evaluated
-        // before the length is read.
+        // resize(n[, fill]): shrink to n, or grow by copies of fill (evaluated before the length).
         auto nn = Index64(an[1]);
         V fv;
         if (an.size() > 2) {
@@ -6257,8 +6233,7 @@ struct TgFn {
         auto slice = t && t->kind == TY_SLICE && IsU8(t->sub);
         if (t && M.RcOk(t) && IsU8(t->arr->sub)) return ImgTemp(c, t, c->line);   // u8[..] (GenRc).
         if (t && TgModule::IsLim(t) && M.TypeOk(t) && IsU8(t->arr->sub)) {
-            // A static-capacity u8[..k]: the text rendered as a resizable's, then copied under
-            // the capacity check.
+            // A static-capacity u8[..k]: rendered as a resizable's, then copied under the check.
             auto r = RzTemp(cg.GrowU8(), c->line);
             GenRz(c, r.stk, r.a, r.t, c->line);
             if (Ended()) return Dummy(t);
@@ -6276,8 +6251,8 @@ struct TgFn {
         auto an = c->ArgNodes();
         auto pl = Deref(Place(an[0]));
         if (TgModule::IsLim(pl.t) && M.LimHeld(pl.t) && IsU8(pl.t->arr->sub)) {
-            // Into a static-capacity u8[..k] (CodeGen::AppendBytes): the text rendered into a
-            // builder of the statement's, then its bytes appended under the capacity check.
+            // Into a static-capacity u8[..k] (CodeGen::AppendBytes): rendered into a builder of
+            // the statement's, then appended under the capacity check.
             auto b = RzTemp(cg.GrowU8(), c->line);
             auto blen = CountAt(b.a);
             St(b.a, Top(b.stk));
@@ -6297,8 +6272,8 @@ struct TgFn {
         return V {};
     }
 
-    // gs_uleb_check: the ULEB128 at `at`, bounded by `end`, shortest and within 64 bits. Its byte
-    // count into k, 0 where it is none, and its value into v.
+    // gs_uleb_check: the ULEB128 at `at` bounded by `end`, shortest and within 64 bits: its byte
+    // count into k (0 where it is none), its value into v.
     struct Uleb {
         tyg_local k, v;
     };
@@ -6332,10 +6307,8 @@ struct TgFn {
         return r;
     }
     // from_bytes<T[>..]>(bytes) (CodeGen::EmitFromBytes): the framing prefix has to count exactly
-    // the rest of the slice; then the payload is verified as an image of elements (plain fixed
-    // ones by their size alone, the others by the element's verifier procedure,
-    // TgModule::VerifyFn) and copied as the array's elements. The array result, and whether the
-    // bytes were one.
+    // the rest of the slice; the payload is verified as an image of elements (plain fixed ones by
+    // size alone, others by TgModule::VerifyFn) and copied. The array, and whether it was one.
     vector<V> GenFromBytes(Call *c) {
         auto t = c->rettypes.empty() ? nullptr : c->rettypes[0];
         // A T[] image result (a statement's own stack) as well as a resizable.
@@ -6383,9 +6356,8 @@ struct TgFn {
         tyg_jump(p, framed);
         SetBlock(framed);
         if (!plain) {
-            // The verifier. An image with relative links to variable elements gets a bitmap of
-            // element starts, on a stack of its own; one needing more of that stack than is
-            // reserved (GS_BM_MAX) cannot be verified and is rejected.
+            // Relative links to variable elements need a bitmap of element starts on a stack of
+            // its own; one beyond what is reserved (GS_BM_MAX) is rejected.
             tyg_val bm = I64(0);
             if (!cg.IsFix(et) && cg.HasRelRefAny(et)) {
                 auto bstk = Stk(AllocStk(false, c->line), c->line);
