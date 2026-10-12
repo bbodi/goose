@@ -313,6 +313,7 @@ struct TgModule {
         vector<int64_t> off, coff;
         int64_t pre = 0;
         int var = -1, last = -1;
+        bool bare = false;   // A bare pad (aligns in a C layout, inserts nothing in bytes) among `off`.
         FieldSet(const vector<Field> &_f, const vector<TypeExpr *> &_t) : f(_f), t(_t) {}
         // Whether ok(type) holds for each real field among the first n.
         template <class P> bool All(P ok, size_t n = SIZE_MAX) const {
@@ -340,14 +341,15 @@ struct TgModule {
         if (fix) {
             auto lo = cg.LayoutFields(f, t);
             fs.off = lo.offs, fs.pre = lo.size;
-            return fs;
+        } else {
+            for (size_t i = 0; fs.var < 0; i++) {
+                fs.off.push_back(fs.pre);
+                if (f[i].ispad) fs.pre += PadSize(f[i]);
+                else if (!cg.IsFix(t[i])) fs.var = (int)i;
+                else fs.pre += cg.FixedSize(t[i]);
+            }
         }
-        for (size_t i = 0; fs.var < 0; i++) {
-            fs.off.push_back(fs.pre);
-            if (f[i].ispad) fs.pre += PadSize(f[i]);
-            else if (!cg.IsFix(t[i])) fs.var = (int)i;
-            else fs.pre += cg.FixedSize(t[i]);
-        }
+        for (size_t i = 0; i < fs.off.size(); i++) fs.bare = fs.bare || (f[i].ispad && f[i].padsize < 0);
         if (fo && fs.var >= 0) {
             auto n = (long)fs.var;
             auto lo = cg.LayoutFields({ f.begin(), f.begin() + n }, { t.begin(), t.begin() + n });
@@ -997,10 +999,9 @@ struct TgModule {
         }
         return t->kind == TY_VARIANT && cg.IsResz(t);
     }
-    // Where the fields of a resizable struct (st) or of a variant lie, and its tail: offsets per field from
-    // the payload's start, the bytes before the tail's elements, and what the tail is.
+    // What a variant's payload is in a resizable ADT's bytes, past its tag: the bytes before the tail's
+    // elements, and what the tail is.
     struct RbShape {
-        vector<int64_t> offs;
         int64_t pre = 0;
         TypeExpr *elem = nullptr;    // The tail's element type, null without one.
         int tailfi = -1;
@@ -1008,17 +1009,13 @@ struct TgModule {
         bool fo = false;             // The tail is a frame object, its fields bytes ahead of its elements.
         bool ok = true;
     };
-    RbShape RbShapeIn(const FieldSet &fs, bool st) {
+    RbShape RbShapeOf(EnumInst *ei, int vi) {
+        auto &fs = VarFields(ei, vi);
         RbShape sh;
-        sh.offs = fs.off, sh.pre = fs.pre;
-        for (size_t i = 0; i < fs.off.size(); i++)
-            if (fs.f[i].ispad && fs.f[i].padsize < 0) sh.ok = false;   // A bare pad aligns here, inserts nothing.
+        sh.pre = fs.pre, sh.ok = !fs.bare;
         if (fs.var < 0) return sh;
         auto ft = fs.t[(size_t)fs.var];
-        if (st) {
-            if (fs.var == fs.last) sh.tailfi = fs.var;
-            else sh.ok = false;
-        } else if (cg.IsResz(ft)) {
+        if (cg.IsResz(ft)) {
             sh.tailfi = fs.var;
             if (fs.var != fs.last) sh.ok = false;
             else if (IsGrow(ft)) sh.elem = ft->arr->sub;
@@ -1033,13 +1030,11 @@ struct TgModule {
         }
         return sh;
     }
-    RbShape RbStShape(TypeExpr *t) { return RbShapeIn(StFields(t), true); }
-    RbShape RbShapeOf(EnumInst *ei, int vi) { return RbShapeIn(VarFields(ei, vi), false); }
     // Variant vi of the ADT or variant type t, which a resizable ADT holds: a fixed one, a variable-size
     // one (an image, no tail), or one ending in a T[>..].
     bool RbVarOk(TypeExpr *t, int vi, int depth) {
         auto &fs = VarFields(EI(t), vi);
-        auto sh = RbShapeIn(fs, false);
+        auto sh = RbShapeOf(EI(t), vi);
         if (!sh.ok) return false;
         if (sh.img) return VvOk(t->kind == TY_VARIANT ? t : cg.VariantType(t, vi), depth + 1);
         auto d = depth + 1;
@@ -1052,11 +1047,11 @@ struct TgModule {
         if (!IsRb(t) || depth > 32) return false;
         return Within(t, true, [&] {
             if (t->kind == TY_STRUCT) {   // Its fixed fields held, its tail a resizable ADT.
-                auto sh = RbStShape(t);
                 auto &fs = StFields(t);
-                return sh.ok && sh.tailfi >= 0 && fs.t[(size_t)sh.tailfi]->kind != TY_ARRAY &&
-                       fs.All([&](TypeExpr *ft) { return TypeOk(ft, depth + 1); }, (size_t)sh.tailfi) &&
-                       IsRb(fs.t[(size_t)sh.tailfi]) && RbOk(fs.t[(size_t)sh.tailfi], depth + 1);
+                if (fs.bare || fs.var < 0 || fs.var != fs.last) return false;
+                auto tail = fs.t[(size_t)fs.var];
+                return fs.All([&](TypeExpr *ft) { return TypeOk(ft, depth + 1); }, (size_t)fs.var) &&
+                       tail->kind != TY_ARRAY && IsRb(tail) && RbOk(tail, depth + 1);
             }
             return AllVariants(t, [&](int vi, const FieldSet &) { return RbVarOk(t, vi, depth); });
         });
@@ -1749,9 +1744,8 @@ struct TgFn {
     // The bytes of the value of type t at base, its tail cnt elements: tag, fixed fields, tail.
     tyg_val RbBytes(TypeExpr *t, tyg_val base, tyg_val cnt) {
         if (t->kind == TY_STRUCT) {
-            auto sh = M.RbStShape(t);
-            auto tt = cg.SI(t)->ftypes[(size_t)sh.tailfi];
-            return Add(I64(sh.pre), RbBytes(tt, Add(base, I64(sh.pre)), cnt));
+            auto &fs = M.StFields(t);
+            return Add(I64(fs.pre), RbBytes(fs.t[(size_t)fs.var], Add(base, I64(fs.pre)), cnt));
         }
         auto ei = M.EI(t);
         auto one = [&](int vi, bool tag) {
@@ -1777,11 +1771,12 @@ struct TgFn {
         auto isst = t->kind == TY_STRUCT;
         auto ei = isst ? nullptr : M.EI(t);
         auto ts = adt ? M.TagSize(t) : 0;
-        auto begin = [&](int vi) {
-            auto top = StartHdr(stk, hdr);
-            if (!adt) return;
-            StoreTag(AtV(top), t, vi);
-            SetTop(stk, Add(top, I64(ts)));
+        auto begin = [&](int vi) {   // The header at the value's start, its tag stored; its start.
+            auto top = Local(StartHdr(stk, hdr));
+            if (!adt) return top;
+            StoreTag(AtV(LdL(top)), t, vi);
+            SetTop(stk, Add(LdL(top), I64(ts)));
+            return top;
         };
         // A literal's fields in turn, then its tail.
         auto fields = [&](StructLit *sl, const TgModule::FieldSet &fs, int tailfi) {
@@ -1800,7 +1795,7 @@ struct TgFn {
         if (isst) {   // Its fixed fields in turn, then its tail, a resizable ADT of its own.
             if (!lit || !sl->sinst || sl->variant) No(l, "resizable struct built from this value");
             begin(0);
-            fields(sl, M.StFields(t), M.RbStShape(t).tailfi);
+            fields(sl, M.StFields(t), M.StFields(t).var);
             return;
         }
         if (lit && (!adt || sl->variant)) {
@@ -1812,15 +1807,14 @@ struct TgFn {
             fields(sl, fs, sh.tailfi);
             return;
         }
-        if (auto d = Is<Dot>(n); d && d->variantconst && adt && d->exprtype && cg.TEq(d->exprtype, t))
-            return begin(ei->en->VariantIndex(d->variantconst));
+        if (auto d = Is<Dot>(n); d && d->variantconst && adt && d->exprtype && cg.TEq(d->exprtype, t)) {
+            begin(ei->en->VariantIndex(d->variantconst));
+            return;
+        }
         auto rt = DestSpec(c) ? DestSpec(c)->rets[0] : nullptr;
         auto ofadt = adt && rt && rt->kind == TY_VARIANT && M.EI(rt) == ei;   // A call of one of its variants.
         if (ofadt && M.IsRb(rt)) {
-            // The variant behind the ADT's tag, built where the call puts it; the header starts at the tag.
-            auto start = Local(Top(stk));
-            StoreTag(AtV(LdL(start)), t, M.VariantIdx(rt));
-            SetTop(stk, Add(LdL(start), I64(ts)));
+            auto start = begin(M.VariantIdx(rt));   // Built behind the tag where the call puts it.
             CallRz(c, stk, hdr);
             if (!Ended()) St(hdr, LdL(start));
             return;
