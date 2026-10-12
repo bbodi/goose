@@ -290,6 +290,8 @@ with threads.
   runs under Rosetta and passes `-arch x86_64` to cc. The Command Line Tools'
   `cc`, `git` and `lldb` are arm64 only. So `GOOSE_CC` must name a wrapper
   that runs cc natively (`arch -arm64 /usr/bin/cc "$@"`).
+* On Linux x86-64 (GCC 15, lldb 21), the full suite passes, lldb checks
+  included.
 
 ## Status
 
@@ -352,7 +354,7 @@ times slower than `cc -O2`, most of all in tight loops such as blur's.
 ## Next steps
 
 * Faster loop code, which is where the gap to `cc -O2` is.
-* Linux and Windows: run tinygen's ABI test and this suite there.
+* Windows: run tinygen's ABI test and this suite there.
 * An in-memory `goose run --backend=tinygen`, once tinygen can load code
   in memory, if its faster start is worth losing the debugger.
 * Direct globals for programs with threads, through a context pointer passed
