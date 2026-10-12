@@ -1023,9 +1023,9 @@ int Main(int argc, char **argv) {
                                 cg.sinfo[sp].cname.c_str(),
                                 ast.sources[sp->sf->line.fileidx].first.c_str(),
                                 sp->sf->line.line, why.c_str());
-                // A build whose every function went through tinygen needs
-                // nothing of the C half the support object does not hold:
-                // its main goes into the object, and no C is compiled.
+                // A build whose every function went through tinygen, and
+                // that needs nothing of the C half beyond the support object,
+                // puts its main into the object and compiles no C.
                 string whynot;
                 if (verb != "build") whynot = "not goose build";
                 else if (standalone) whynot = "--standalone";
@@ -1036,8 +1036,8 @@ int Main(int argc, char **argv) {
                 tgwhole = whynot.empty() && tgb->WholeProgram(cg, whynot);
                 tgchecks = tgb->checks;
                 if (tgwhole) tgb->EmitMain(cg);
-                // After WholeProgram, which may have built gs_init_globals
-                // into the object and asked the C half for more.
+                // Compile after WholeProgram: it may add gs_init_globals to
+                // the object and ask the C half for more.
                 tgb->Compile(cg);
                 cg.result += tgb->Shims(cg);
                 if (verbose)

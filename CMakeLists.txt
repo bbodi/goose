@@ -129,8 +129,8 @@ target_compile_definitions(goose PRIVATE GOOSE_TCC_LIB_PATH="${TCC_STAGE}")
 
 # The tinygen backend (docs/design/tinygen_backend.md): tinygen is one C99
 # translation unit in a repository of its own, by default checked out beside
-# this one. Without it the compiler builds as before, and
-# `--backend=tinygen` says it was left out.
+# this one. Without it the compiler has the C backend only, and
+# `--backend=tinygen` reports that tinygen was left out.
 set(TINYGEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../tinygen" CACHE PATH
     "A tinygen checkout, for the tinygen backend; empty or missing builds without it")
 if(TINYGEN_DIR AND EXISTS "${TINYGEN_DIR}/src/tinygen.c" AND

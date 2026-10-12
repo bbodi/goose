@@ -1,24 +1,19 @@
-"""The tinygen backend (docs/design/tinygen_backend.md): `goose build
---backend=tinygen` against the expected output of the C backends.
+"""The tinygen backend: `goose build --backend=tinygen` against the
+expected output of the C backend.
 
-Each program is built with the specializations tinygen supports in an object
-of its own and the rest in the C, and run; its output must be the blessed
-one the C backends are held to. The test/tinygen/ fixtures must go through
-tinygen whole (every function compiled by it), and some are also built
-with chosen functions left to C, so that calls cross between the two
-halves in both directions (structs, arrays and slices, multiple results,
-strings and resizable arrays handed in, and built at a destination,
-u8[] values, arrays shrunk and resized, free variables of nested
-functions, function values, globals on dedicated stacks, `return from`
-through frames of both halves, values rendered by print and str, block, loop and match values and
-references rebound);
-the other programs are ones the backend covers in part. A program
-tinygen covers whole that needs nothing of a C half (WHOLE_PROGRAM) must
-build without the C compiler compiling any C of its own, and again on the
-mixed path (--tinygen-mixed) to the same output. The gfx, ui, audio and
-physics fixtures run whole and headless; the windowed samples are only built. Where lldb is installed, one program is run under it to see
-that the debugger finds a Goose function by name and shows its Goose source
-line, its parameters and its locals with their Goose types.
+Each program in PROGRAMS is built and run; its output must be the blessed
+one the C backend is held to. Tinygen must compile at least one function of
+each program, and every function of those marked whole (the test/tinygen/
+fixtures among them). Some fixtures are also built with --tinygen-skip,
+which leaves the named functions to C, so that calls cross between the two
+halves in both directions. The WHOLE_PROGRAM programs must take the whole
+program path, which compiles no C of the program's own; with
+--tinygen-mixed or --tinygen-skip they must take the mixed path. The gfx,
+ui, audio and physics fixtures run headless; the windowed samples
+(BUILD_ONLY) are only built. Where lldb is installed, several fixtures run
+under it to check that the debugger finds Goose functions by name and shows
+their Goose source lines, and their parameters, locals and globals by their
+Goose types.
 
 Called by run_tests.py; `python test/tinygen_backend.py <goose>` runs it on
 its own."""
@@ -155,8 +150,8 @@ PROGRAMS += [
      ["--tinygen-skip=scaled,by_ref,grow,first_tok,turn,circle"]),
     ("samples/05_shapes.goose", False, []),
 ]
-WHOLE_PROGRAM |= {"tinygen_adts", "cnames"}   # cnames: its enum now held
-WHOLE_PROGRAM |= {"wider_slot_operations", "05_shapes"}   # varint references, ADT rendering now held
+WHOLE_PROGRAM |= {"tinygen_adts", "cnames"}
+WHOLE_PROGRAM |= {"wider_slot_operations", "05_shapes"}
 
 
 # Limited arrays T[..k]: the fixture whole, plain and --debug, then with

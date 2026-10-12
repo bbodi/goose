@@ -224,7 +224,7 @@ inline int BuildExecutable(const string &rootfile, const string &cfile, const st
                            const vector<string> &extraobjects = {},
                            const pair<string, std::function<string()>> &tgsupport = {}) {
     Builder b { tc, opts, msgs };
-    // Objects made beside the C (the tinygen backend's), then the runtime.
+    // The tinygen object and its support object, then the runtime.
     vector<string> objects = extraobjects;
     if (tgsupport.second) {
         auto obj = CachedObject(b, tgsupport.first, tgsupport.second,

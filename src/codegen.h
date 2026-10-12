@@ -1319,9 +1319,6 @@ struct CodeGen {
     string result;   // Includes, prototypes and code.
     string ExportHeader();
 
-    // Extern-support C and user headers are inputs to this emission, not
-    // process state that the driver must install before constructing us.
-    // A function the extern support declares gets no prototype here.
     // Another backend that compiles some specializations itself, to an
     // object of its own linked beside this C (tinygen_backend.h). It chooses
     // among the live specializations once their call interfaces are known;
@@ -1333,6 +1330,9 @@ struct CodeGen {
     SpecBackend *backend = nullptr;
     set<FnSpec *> foreign;   // The specializations the other backend defines.
 
+    // Extern-support C and user headers are inputs to this emission, not
+    // process state that the driver must install before constructing us.
+    // A function the extern support declares gets no prototype here.
     CodeGen(Ast &_ast, string_view runtime_ext_text, const vector<string> &headers,
             bool _norfcheck = false, bool _library = false, int64_t _maxstacks = 0,
             SpecBackend *_backend = nullptr)
