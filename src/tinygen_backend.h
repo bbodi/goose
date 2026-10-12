@@ -1864,16 +1864,12 @@ struct TgFn {
             StoreTag(AtV(top), t, vi);
             SetTop(stk, Add(top, I64(ts)));
         };
-        // A literal's fields in turn: pads and absent fields zeroed, the tail built by `tail`.
+        // A literal's fields before the tail in turn, then the tail built by `tail` from its init.
         auto fields = [&](StructLit *sl, auto &fs, auto &fts, int tailfi, auto tail) {
-            for (size_t i = 0; i < fs.size() && !Ended(); i++) {
-                if (fs[i].ispad) { PushZero(stk, fs[i].padsize); continue; }
-                auto init = sl->InitFor((int)i);
-                if (init && Is<SelfRef>(init)) No(l, "self reference in a resizable ADT");
-                if ((int)i == tailfi) tail(init, fts[i]);
-                else if (!init) PushZero(stk, cg.FixedSize(fts[i]));
-                else if (!BuildField(stk, fts[i], init)) return;
-            }
+            for (size_t i = 0; i < fs.size(); i++)
+                if (auto init = sl->InitFor((int)i); init && Is<SelfRef>(init)) No(l, "self reference in a resizable ADT");
+            RunLit(sl, stk, fs, fts, tailfi < 0 ? (size_t)-1 : (size_t)tailfi);
+            if (tailfi >= 0 && !Ended()) tail(sl->InitFor(tailfi), fts[(size_t)tailfi]);
         };
         if (StripCopy(n) != n) No(l, "copy of a resizable ADT");
         if (BuildCtl(n, InPlace { 2, stk, t, hdr }, l)) return;
@@ -6179,9 +6175,7 @@ struct TgFn {
                 if (t.inplace == 2) St(t.hdr, top0);
             });
         } else if (t.rt) {
-            auto x = GenAs(b->val, t.rt);
-            if (!M.IsScalar(t.rt) && !x.mem && !Ended()) No(b->line, "aggregate value");
-            Store(P { AtL(t.res), t.rt }, x);
+            Into(P { AtL(t.res), t.rt }, b->val);
         } else {
             Stmt1(b->val);
         }
@@ -6568,49 +6562,36 @@ struct TgFn {
     void AssignWhole(Assign *a, P pl) {
         auto l = a->line;
         auto t = pl.t;
+        // The stack's top goes back to `top`, where the old value began; a->rhs is built there.
+        auto rebuild = [&](tyg_val top, const InPlace &d) {
+            SetTop(pl.stk, top);
+            BuildInto(a->rhs, d, l);
+        };
         if (IsGrow(t)) {
             if (!(M.RzOk(t) || M.VeOk(t)) || !pl.stk) No(l, "assignment to an array of this kind");
-            SetTop(pl.stk, BaseOf(pl));
-            if (pl.rbase) {
-                // A resizable struct's tail: built behind a header of its own, only the count the owner's.
-                auto th = AtL(tyg_local_new(p, 16, 8));
-                GenRz(a->rhs, pl.stk, th, t, l);
-                if (!Ended()) St(AddrPlus(pl.a, 8), Ld(AddrPlus(th, 8)));
-            } else {
-                GenRz(a->rhs, pl.stk, pl.a, t, l);
-            }
+            auto th = pl.rbase ? NewHdr() : pl.a;   // A resizable struct's tail: a header of its own, only the count the owner's.
+            rebuild(BaseOf(pl), InPlace { 2, pl.stk, t, th });
+            if (pl.rbase && !Ended()) St(AddrPlus(pl.a, 8), Ld(AddrPlus(th, 8)));
             return;
         }
-        if (pl.bfo && pl.stk) {
-            // A frame object tail of a resizable struct, rebuilt as bytes (GenFoAsBytes).
-            SetTop(pl.stk, tyg_addr_of(p, pl.a));
-            GenFoBytes(a->rhs, pl.stk, t, AddrPlus(pl.ohdr, 8), l);
+        if (pl.bfo && pl.stk) {   // A frame object tail of a resizable struct, rebuilt as bytes (GenFoAsBytes).
+            rebuild(tyg_addr_of(p, pl.a), InPlace { 4, pl.stk, t, AddrPlus(pl.ohdr, 8) });
             return;
         }
-        if (M.FoOk(t) && pl.stk) {
-            // Its innermost tail's elements given back.
-            SetTop(pl.stk, Ld(AddrPlus(pl.a, M.FoHdrOff(t))));
-            GenFo(a->rhs, pl, l);
+        if (M.FoOk(t) && pl.stk) {   // Its innermost tail's elements given back.
+            rebuild(Ld(AddrPlus(pl.a, M.FoHdrOff(t))), InPlace { 3, pl.stk, t, pl.a, &pl });
             return;
         }
-        if (pl.tmphdr && pl.stk && M.RbOk(t)) {
-            // The tail of a resizable struct, a resizable ADT: its count the struct's.
-            SetTop(pl.stk, Ld(pl.a));
-            GenRb(a->rhs, pl.stk, pl.a, t, l);
+        if (pl.tmphdr && pl.stk && M.RbOk(t)) {   // The tail of a resizable struct, a resizable ADT: its count the struct's.
+            rebuild(Ld(pl.a), InPlace { 2, pl.stk, t, pl.a });
             if (!Ended()) St(AddrPlus(pl.ohdr, 8), Ld(AddrPlus(pl.a, 8)));
             return;
         }
         if (pl.tmphdr) No(l, "assignment to the tail of a resizable struct");
-        if (M.RsOk(t)) {
-            if (!pl.stk) No(l, "assignment to a resizable struct without its stack");
-            SetTop(pl.stk, Ld(pl.a));
-            GenRs(a->rhs, pl.stk, pl.a, t, l);
-            return;
-        }
-        if (M.IsRb(t)) {
-            if (!M.RbOk(t) || !pl.stk) No(l, "assignment to a resizable ADT of this kind");
-            SetTop(pl.stk, Ld(pl.a));
-            GenRb(a->rhs, pl.stk, pl.a, t, l);
+        if (M.RsOk(t) || M.IsRb(t)) {
+            if (M.RsOk(t) ? !pl.stk : !M.RbOk(t) || !pl.stk)
+                No(l, M.RsOk(t) ? "assignment to a resizable struct without its stack" : "assignment to a resizable ADT of this kind");
+            rebuild(Ld(pl.a), InPlace { 2, pl.stk, t, pl.a });
             return;
         }
         if (IsAddrRef(t)) {
@@ -6643,9 +6624,7 @@ struct TgFn {
             SelfRelInto(pl, a->rhs);   // A literal linking to itself is built where it lies.
             return;
         }
-        auto x = GenAs(a->rhs, t);
-        if (!M.IsScalar(t) && !x.mem && !Ended()) No(l, "aggregate value");
-        Store(pl, x);
+        Into(pl, a->rhs);
     }
 
     void StmtAssign(Assign *a) {
@@ -6660,9 +6639,7 @@ struct TgFn {
             auto rel = TgModule::IsRel(pl.t) && M.RelOk(pl.t, 1);
             if (!rel && (!(IsPlainRef(pl.t) || M.OptRef(pl.t)) || !M.TypeOk(pl.t)))
                 No(a->line, cat("rebind of type ", M.NameWhy(pl.t)));
-            auto x = GenAs(a->rhs, pl.t);
-            if (!M.IsScalar(pl.t) && !x.mem && !Ended()) No(a->line, "aggregate value");
-            Store(pl, x);
+            Into(pl, a->rhs);
             return;
         }
         if (a->op == T_ASSIGN) return AssignWhole(a, pl);
@@ -6881,40 +6858,30 @@ struct TgFn {
     void GenFo(Node *n, P pl, Line l) {
         if (BuildCtl(n, InPlace { 3, pl.stk, pl.t, pl.a, &pl }, l)) return;
         auto sl = Is<StructLit>(n);
-        if (!sl && n->exprtype && cg.TEq(n->exprtype, pl.t)) {
-            // Any other one copied: a call's result, a variable.
+        if (!sl && n->exprtype && cg.TEq(n->exprtype, pl.t)) {   // Any other one copied: a call's result, a variable.
             P src;
-            if (Is<Call>(n)) {
-                auto x = Gen1(n);
-                src = P { x.a, x.t, x.stk };
-            } else {
-                src = Deref(Place(n));
-            }
-            if (!Ended()) FoCopy(pl, src, l);
+            if (Is<Call>(n)) { auto x = Gen1(n); src = P { x.a, x.t, x.stk }; }
+            else src = Deref(Place(n));
+            if (!Ended()) CopyFrom(src, InPlace { 3, pl.stk, pl.t, pl.a, &pl }, l);
             return;
         }
         if (!sl || !sl->sinst || sl->variant) No(l, cat("value of type ", M.NameWhy(pl.t)));
         auto si = cg.SI(pl.t);
         auto fl = M.FoLayout(pl.t);
-        for (size_t i = 0; i < si->st->fields.size(); i++) {
+        for (size_t i = 0; i < si->st->fields.size() && !Ended(); i++) {
             if (si->st->fields[i].ispad) continue;
             auto init = sl->InitFor((int)i);
             auto fp = FoFieldPlace(pl, (int)i, l);
-            if ((int)i == fl.tailfi && M.FoOk(fp.t)) {
-                // A nested frame object, its tail on the same stack.
-                if (init) {
-                    GenFo(init, fp, l);
-                } else {
-                    tyg_zero(p, fp.a, M.Size(fp.t));
-                    St(AddrPlus(fp.a, M.FoHdrOff(fp.t)), Top(pl.stk));
-                }
-                if (Ended()) return;
-            } else if ((int)i == fl.tailfi) {
-                TailHdr(init, pl.stk, fp.a, fp.t, l);
-            } else {
+            if ((int)i != fl.tailfi) {
                 if (init) Into(fp, init);
                 else tyg_zero(p, fp.a, M.Size(fp.t));
-                if (Ended()) return;
+            } else if (!M.FoOk(fp.t)) {
+                TailHdr(init, pl.stk, fp.a, fp.t, l);
+            } else if (init) {   // A nested frame object, its tail on the same stack.
+                GenFo(init, fp, l);
+            } else {
+                tyg_zero(p, fp.a, M.Size(fp.t));
+                St(AddrPlus(fp.a, M.FoHdrOff(fp.t)), Top(pl.stk));
             }
         }
     }
@@ -7193,18 +7160,15 @@ struct TgFn {
     // A variant or fixed-mode ADT at `src` adapted to the variable-mode ADT t at the top of stk
     // (CodeGen::GenVarEnumFromLoc): the tag, then the payload; its address.
     tyg_val VmFrom(tyg_val stk, tyg_addr src, TypeExpr *srct, TypeExpr *t, Line l) {
-        auto start = Local(Top(stk));
         if (M.EI(srct) != M.EI(t) || (srct->kind != TY_VARIANT && !(srct->kind == TY_ENUM && !srct->enu->varmode)))
             No(l, cat("value of type ", M.NameWhy(t)));
+        auto start = Local(Top(stk));
         auto base = LdL(start);
         auto ts = M.TagSize(t);
         SetTop(stk, Add(base, I64(ts)));
         auto ei = M.EI(t);
         auto copyfix = [&](int64_t sz, tyg_addr from) {
-            if (!sz) return;
-            auto top = Top(stk);
-            tyg_copy(p, AtV(top), from, sz);
-            SetTop(stk, Add(top, I64(sz)));
+            if (sz) tyg_copy(p, AtV(StackReserve(stk, I64(sz))), from, sz);
         };
         if (srct->kind == TY_VARIANT) {
             StoreTag(AtV(base), t, M.VariantIdx(srct));
