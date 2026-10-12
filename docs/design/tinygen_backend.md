@@ -215,6 +215,10 @@ in the debugger. `-O1` and `-O2` still work.
   and parameters, locals and globals with Goose types.
 * goose_in_goose built through tinygen compiles itself to C that is byte for
   byte the C backend's.
+* On an arm64 Mac, an x86-64 compiler (`-DCMAKE_OSX_ARCHITECTURES=x86_64`)
+  runs under Rosetta and passes `-arch x86_64` to cc. The Command Line Tools'
+  `cc`, `git` and `lldb` are arm64 only. So `GOOSE_CC` must name a wrapper
+  that runs cc natively (`arch -arm64 /usr/bin/cc "$@"`).
 
 ## Status
 
@@ -258,8 +262,10 @@ catch.
 3. **lldb shows `i8` and `u8` as characters.** lldb reads every language
    through clang's types. Goose would need lldb formatters shipped with the
    compiler.
-4. **Packed records on x86-64.** On arm64 tinygen passes packed records as
-   clang does. On SysV and Windows x64 this is unchecked.
+4. **Packed records on Windows x64.** On arm64 and on SysV x86-64 (checked on
+   macOS under Rosetta), tinygen passes packed records as clang does: a
+   misaligned field sends the record to memory. tinygen's `test/abi.c` and
+   the `tinygen_abi` fixture check this. Windows x64 is unchecked.
 5. **Direct thread-local access on Mach-O.** Programs with threads read
    their stack block and globals through accessor calls.
 6. **Debug info for a member of a symbol.** In a mixed build, the C half
@@ -271,7 +277,7 @@ catch.
 ## Next steps
 
 * Faster loop code, which is where the gap to `cc -O2` is.
-* Linux and Windows, with the x86-64 ABI check above.
+* Linux and Windows: run tinygen's ABI test and this suite there.
 * `goose run --backend=tinygen`, once tinygen can load code in memory.
 * Let `--stack-reserve` take the whole-program path.
 * Direct globals for programs with threads, through a context pointer passed
