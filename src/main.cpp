@@ -840,7 +840,7 @@ int Main(int argc, char **argv) {
         }
         if (tinygen) {
             tgrun = true;
-            buildopts = BuildOptions { ccrequest, true, verbose, dryrun, false, "" };
+            buildopts = BuildOptions { true, verbose, dryrun, false, "" };
         } else {
             forcejit = true;
         }
