@@ -1366,6 +1366,41 @@ struct TgModule {
         return Held(fv->type);
     }
 
+    // Whether parameter i of sp is a slice or a fat reference, which the C passes as its two members
+    // (CodeGen::ParamFields). Passed as one 16-byte record, it would travel in two registers under
+    // SysV but by reference to a copy under Windows x64, where the C half would not find it.
+    bool SplitParam(FnSpec *sp, size_t i) {
+        auto t = sp->argtypes[i];
+        return !cg.IsPoolParam(sp, i) && !RzParam(t) && !cg.IsLargeFixed(t) &&
+               !cg.ParamFields(t, false).empty();
+    }
+    // args for a call through Sig(sp), built with a split parameter's record by its address
+    // (tyg_arg.mem): that argument replaced by the record's two members, loaded from it. `ended`
+    // where the code is unreachable, which loads nothing. An extern fn takes its C types as they are.
+    void SplitArgs(tyg_proc *p, FnSpec *sp, vector<tyg_arg> &args, bool ended) {
+        if (sp->sf->isextern) return;
+        size_t k = 0;
+        for (size_t i = 0; i < sp->argtypes.size() && k < args.size(); i++) {
+            auto t = sp->argtypes[i];
+            if (cg.IsPoolParam(sp, i)) {
+                k += 4;
+                continue;
+            }
+            if (!SplitParam(sp, i)) {
+                k += RzParam(t) && Resz(t) ? 2 : 1;
+                continue;
+            }
+            auto at = args[k].mem;
+            tyg_arg lo {}, hi {};
+            lo.val = ended ? tyg_iconst(p, TYG_I64, 0) : tyg_load(p, TYG_I64, at, 0);
+            at.offset += 8;
+            hi.val = ended ? tyg_iconst(p, TYG_I64, 0) : tyg_load(p, TYG_I64, at, 0);
+            args[k] = lo;
+            args.insert(args.begin() + (ptrdiff_t)k + 1, hi);
+            k += 2;
+        }
+    }
+
     tyg_sig *Sig(FnSpec *sp) {
         if (auto it = sigs.find(sp); it != sigs.end()) return it->second;
         auto &si = cg.sinfo[sp];
@@ -1376,6 +1411,11 @@ struct TgModule {
             // A pool reference, gs_pref, as its four members (ParamFields).
             if (cg.IsPoolParam(sp, i)) ptrs(4);
             else if (RzParam(t) && !Resz(t)) ptrs(1);   // A by-value T[]: its image's address.
+            // A slice: its data and length; a fat reference: its header and stack (SplitParam).
+            else if (SplitParam(sp, i)) {
+                ptrs(1);
+                ps.push_back(t->kind == TY_SLICE ? tyg_type_int(m, TYG_I64, 1) : tyg_type_ptr(m));
+            }
             // A by-value T[>..]: its header, then its stack; a large fixed value: its copy's address.
             else {
                 ps.push_back(cg.IsLargeFixed(t) ? tyg_type_ptr(m) : AT(t));
@@ -4124,6 +4164,7 @@ struct TgFn {
 
     // The call, and its C return value: rets[cret], none where cret < 0.
     V Result(FnSpec *callee, int cret, tyg_sig *sig, tyg_callee ce, vector<tyg_arg> &args) {
+        M.SplitArgs(p, callee, args, Ended());
         auto n = (int)args.size();
         auto rt = cret < 0 ? nullptr : callee->rets[cret];
         if (rt && !M.IsScalar(rt)) {
@@ -7237,6 +7278,12 @@ struct TgFn {
                 for (int k = 0; k < 4; k++) pdt.push_back(ptrto(M.DT(M.ast.inttypes[IS_U8])));
                 continue;
             }
+            if (M.SplitParam(sp, i)) {
+                pdt.push_back(ptrto(M.DT(M.ast.inttypes[IS_U8])));
+                pdt.push_back(t->kind == TY_SLICE ? M.DT(M.ast.inttypes[IS_I64]) :
+                                                    ptrto(M.DT(M.ast.inttypes[IS_U8])));
+                continue;
+            }
             pdt.push_back((M.RzParam(t) && !M.Resz(t)) || cg.IsLargeFixed(t) ? ptrto(M.DT(t)) :
                           M.DT(t));
             if (M.RzParam(t) && M.Resz(t)) pdt.push_back(ptrto(M.StackDT()));
@@ -7257,7 +7304,8 @@ struct TgFn {
         int pi = 0;
         for (size_t i = 0; i < sp->argtypes.size(); i++) {
             auto t = sp->argtypes[i];
-            pi += cg.IsPoolParam(sp, i) ? 4 : M.RzParam(t) && M.Resz(t) ? 2 : 1;
+            auto two = (M.RzParam(t) && M.Resz(t)) || M.SplitParam(sp, i);
+            pi += cg.IsPoolParam(sp, i) ? 4 : two ? 2 : 1;
         }
         auto param = [&] { return Local(tyg_param(p, pi++)); };
         // Free variables (§7.5): the address of the variable in its frame, read through as a by-value
@@ -7289,6 +7337,15 @@ struct TgFn {
                 auto loc = Slot32();
                 for (int k = 0; k < 4; k++) StL(loc, tyg_param(p, pi++), 8 * k);
                 locals[vd] = prefs[vd] = loc;
+                DebugVar(tyg_debug_param, vd, M.DT(t), loc);
+                continue;
+            }
+            if (M.SplitParam(sp, i)) {
+                // A slice or a fat reference, reassembled from its two members (SplitParam).
+                auto loc = tyg_local_new(p, 16, 8);
+                locals[vd] = loc;
+                StL(loc, tyg_param(p, pi++));
+                StL(loc, tyg_param(p, pi++), 8);
                 DebugVar(tyg_debug_param, vd, M.DT(t), loc);
                 continue;
             }
@@ -7782,6 +7839,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
             else a.mem = tyg_at_val(tyg_param(p, (int)i), 0);
             args.push_back(a);
         }
+        mod->SplitArgs(p, sp, args, false);
         if (zerosp) args.push_back(TgFn::ArgOfVal(tyg_iconst(p, TYG_I64, 0)));
         auto call = [&](tyg_addr *ret) { return CallArgs(p, sig, callee, args, ret); };
         auto rt = sp->rets.empty() ? nullptr : sp->rets[0];
@@ -8115,6 +8173,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                 fn.StL(cur, fn.Add(img, sz));
             }
             if (ki.needssp) args.push_back(TgFn::ArgOfVal(fn.I64(0)));
+            mod->SplitArgs(p, sp, args, false);
             CallArgs(p, mod->Sig(sp), mod->FnSym(ki.cname), args);
             tyg_ret(p, 0);
             EndProc(p, cg.thunks[sp]);
