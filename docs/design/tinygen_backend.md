@@ -103,6 +103,13 @@ halves. An abort passes the Goose file and line.
 because the C function may be `static` or a macro. A function the runtime
 object exports needs no trampoline (`TgModule::RuntimeApi`).
 
+**Parameters** follow `SigParams`. A slice is two parameters, its data and
+length; a fat reference is its header and stack; a pool reference is its four
+members (`CodeGen::ParamFields`, `TgModule::SplitParam`). Passing a slice as
+one 16-byte record instead works under SysV and on arm64, which put it in the
+same two registers, but not on Windows x64, which passes it by reference to a
+copy.
+
 **Results** follow `SigParams`. The first fixed result is the C return value.
 Later fixed results are out-pointers. A resizable or `u8[]` result is built at
 a destination stack the caller passes.
@@ -292,6 +299,10 @@ with threads.
   that runs cc natively (`arch -arm64 /usr/bin/cc "$@"`).
 * On Linux x86-64 (GCC 15, lldb 21), the full suite passes, lldb checks
   included.
+* On Windows x64 (MSVC 19.44, clang-cl and lldb 23), the full suite passes
+  but for three lldb checks (see "What tinygen lacks"). That compiler was
+  built without the audio, gfx, physics and ui packages, so their fixtures
+  were skipped. lldb needs Python's `python3.dll` on `PATH` to start.
 
 ## Status
 
@@ -324,6 +335,45 @@ Run time of `bench/goose` programs at medium size, in milliseconds:
 tinygen beats `cc -O0` on every benchmark, by 2 to 29 times. It is 1.05 to 7
 times slower than `cc -O2`, most of all in tight loops such as blur's.
 
+### Windows x64
+
+These come from an Intel Core i7-8700, MSVC 19.44 and clang-cl 23, and a
+Release build of the compiler made by MSVC. Builds are the median of five
+runs, run times the best of three. Every build printed the same output, and
+tinygen compiled every program whole.
+
+| `goose build` of goose_in_goose | ms |
+|---|---|
+| C backend, default, MSVC (`/O2`) | 4360 |
+| C backend, default, clang-cl (`-O2`) | 4219 |
+| C backend, `--debug`, MSVC | 778 |
+| C backend, `--debug`, clang-cl | 1267 |
+| `--backend=tinygen`, linked by MSVC | 492 |
+| `--backend=tinygen`, linked by clang-cl | 569 |
+
+The compiler takes about 400 ms of tinygen's build (`--dry-run`), the same
+with either backend: on this machine the front end, not tinygen, is most of
+it.
+
+| Program | tinygen | MSVC `--debug` | clang-cl `--debug` | MSVC `/O2` | clang-cl `-O2` |
+|---|---|---|---|---|---|
+| sum | 434 | 923 | 912 | 72 | 85 |
+| push | 475 | 630 | 523 | 124 | 77 |
+| calc | 553 | 1091 | 1149 | 208 | 188 |
+| sexp | 1606 | 3261 | 3282 | 702 | 599 |
+| lru | 1306 | 1914 | 1892 | 888 | 851 |
+| graph | 1269 | 1459 | 1476 | 766 | 905 |
+| scene | 425 | 2923 | 2956 | 128 | 121 |
+| blur | 408 | 4205 | 5808 | 212 | 35 |
+| particles | 712 | 1675 | 1607 | 519 | 458 |
+
+tinygen beats both compilers' debug builds on every benchmark, by 1.1 to 14
+times. It is 1.4 to 12 times slower than their optimized builds. The gap is
+wider than in the macOS figures, which come from another machine. Nothing
+in it is particular to Windows: sum's inner loop calls nothing and touches
+no thread-local, but reloads the array's base and length from the stack
+on every iteration.
+
 ## What tinygen lacks
 
 1. **In-memory loading.** tinygen cannot map and relocate its own code in
@@ -339,10 +389,14 @@ times slower than `cc -O2`, most of all in tight loops such as blur's.
    language through clang's types, so without the formatters `i8` and `u8`
    show as characters and an ADT as all its payloads. lldb does not load
    the formatters by itself (see "Loading").
-4. **Packed records on Windows x64.** On arm64 and on SysV x86-64 (checked on
-   macOS under Rosetta), tinygen passes packed records as clang does: a
-   misaligned field sends the record to memory. tinygen's `test/abi.c` and
-   the `tinygen_abi` fixture check this. Windows x64 is unchecked.
+4. **Register variables lldb can read in CodeView.** On Windows, lldb cannot
+   show an `f64` local that tinygen keeps in an XMM register ("unable to
+   convert register kind=4 reg_num=110"). A one-byte value in a register
+   shows wrong: a `Dir` parameter holding `West` in `rbx` shows as `North`.
+   An optional shows under its pointer type (`Link *`), not its Goose name
+   (`Link?`). The values are right; three of the lldb checks fail on
+   Windows for this. (Packed records are fine there: the `tinygen_abi`
+   fixture passes whole and mixed, as on arm64 and SysV x86-64.)
 5. **Direct thread-local access on Mach-O.** Programs with threads read
    their stack block and globals through accessor calls.
 6. **Debug info for a member of a symbol.** In a mixed build, the C half
@@ -354,7 +408,10 @@ times slower than `cc -O2`, most of all in tight loops such as blur's.
 ## Next steps
 
 * Faster loop code, which is where the gap to `cc -O2` is.
-* Windows: run tinygen's ABI test and this suite there.
+* Windows: CodeView register numbers lldb understands (see "What tinygen
+  lacks").
+* Linux and macOS: check the split slice and fat reference parameters
+  (`docs/todo.md`).
 * An in-memory `goose run --backend=tinygen`, once tinygen can load code
   in memory, if its faster start is worth losing the debugger.
 * Direct globals for programs with threads, through a context pointer passed
