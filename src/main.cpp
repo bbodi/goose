@@ -39,6 +39,7 @@
 #include "runtime_inline.h"
 #include "jit.h"
 #include "progress.h"
+#include "tinygen_backend.h"
 #include "process.h"
 #include "buildfile.h"
 #include "toolchain.h"
@@ -447,6 +448,29 @@ string RuntimeObjectSource() {
                                           "runtime_ext.h", "runtime_os.h" }));
 }
 
+// The C of the tinygen backend's support object (TgSupportBody): what the C
+// half of a program gives the tinygen object and does not depend on the
+// program, for a build with no C half. Compiled once per runtime and
+// configuration, `checks` (GS_DEBUG) included, as the runtime object is.
+string TinygenSupportSource(bool checks) {
+#if !GOOSE_HAVE_TINYGEN
+    (void)checks;
+    return "";
+#else
+    auto rh = RuntimeSections({ "runtime.h" });
+    return cat("/* The tinygen backend's support object (docs/design/tinygen_backend.md),\n"
+               "   written by the Goose compiler. Do not edit. */\n\n"
+               "#define GS_SEPARATE_RUNTIME 1\n#define GS_RUNTIME_VERSION ", RuntimeVersion(), "\n",
+               checks ? "#define GS_DEBUG 1\n" : "", rh,
+               "#pragma pack(push, 1)\n"
+               "typedef struct { uint8_t *base; int64_t len; } gs_rhdr;\n"
+               "typedef struct { gs_rhdr *hdr; gs_stack *stk; } gs_rref;\n"
+               "typedef struct { uint8_t *data; int64_t len; } sl_u8;\n"
+               "#pragma pack(pop)\n",
+               RuntimeSections({ "runtime_ext.h" }), TgSupportBody(rh));
+#endif
+}
+
 // Locates the src/runtime/ directory (only needed by --gen-runtime-header):
 // an explicit env override, next to the executable, or relative to it in the
 // source tree layout.
@@ -464,6 +488,22 @@ string FindRuntimeDir(const char *exe) {
     }
     throw CompileError { "cannot locate the runtime sources (src/runtime); "
                          "set GOOSE_RUNTIME" };
+}
+
+// The lldb formatters for tinygen builds (src/lldb/goose_lldb.py), as an
+// absolute path: in lldb/ beside an installed compiler, else in the source
+// tree the compiler was built in. Empty where there is none.
+string FindLldbFormatters(const string &exe) {
+    auto exedir = DirOf(exe);
+    for (auto rel : { "lldb/", "../src/lldb/", "../../src/lldb/", "../../../src/lldb/" }) {
+        auto path = cat(exedir, rel, "goose_lldb.py");
+        if (!FileExists(path)) continue;
+        auto parts = PathParts(path);
+        string norm;
+        for (size_t i = 0; i < parts.size(); i++) Append(norm, i ? "/" : "", parts[i]);
+        return norm;
+    }
+    return "";
 }
 
 // Regenerates src/runtime_inline.h from src/runtime/, so the compiler binary
@@ -598,15 +638,15 @@ CodeGen::StackConfig StackConfigOf(const vector<string> &cdefines) {
 
 int Main(int argc, char **argv) {
     auto exe = ExePath(argv[0]);
-    // The verb forms, `goose run|build|check|fetch|toolchain|version ...`. A
+    // The verb forms, `goose run|debug|build|check|fetch|toolchain|version ...`. A
     // first argument that is none of them is read as an option or a file, as
     // it always was, so `goose foo.goose` is `goose run foo.goose`.
     string verb;
     auto firstarg = 1;
     if (argc > 1) {
         string v = argv[1];
-        if (v == "run" || v == "build" || v == "check" || v == "fetch" || v == "toolchain" ||
-            v == "version") {
+        if (v == "run" || v == "debug" || v == "build" || v == "check" || v == "fetch" ||
+            v == "toolchain" || v == "version") {
             verb = v;
             firstarg = 2;
         }
@@ -626,6 +666,13 @@ int Main(int argc, char **argv) {
     // A build is for a deliverable: the inlining and the C compiler's
     // optimization both at their highest.
     auto optlevel = verb == "build" ? 2 : 1;
+    auto optgiven = false;
+    // --backend=tinygen: the specializations tinygen supports go to a
+    // native object of its own, with debug information that names the
+    // Goose source (docs/design/tinygen_backend.md).
+    string backendname = "c";
+    vector<string> tinygenskip;
+    auto tinygenmixed = false;
     vector<string> cdefines, progargs, includenames, files;
     for (int i = firstarg; i < argc; i++) {
         string arg = argv[i];
@@ -691,9 +738,25 @@ int Main(int argc, char **argv) {
             }
             return 0;
         }
-        else if (arg == "-O0") optlevel = 0;
-        else if (arg == "-O1") optlevel = 1;
-        else if (arg == "-O2") optlevel = 2;
+        else if (arg == "-O0") optlevel = 0, optgiven = true;
+        else if (arg == "-O1") optlevel = 1, optgiven = true;
+        else if (arg == "-O2") optlevel = 2, optgiven = true;
+        else if (arg.rfind("--backend=", 0) == 0) backendname = arg.substr(10);
+        else if (arg == "--backend" && i + 1 < argc) backendname = argv[++i];
+        // Hidden: the mixed path for a program tinygen could build whole,
+        // for comparing the two.
+        else if (arg == "--tinygen-mixed") tinygenmixed = true;
+        // Hidden: functions the tinygen backend leaves to C, by name, for
+        // testing calls between the two halves.
+        else if (arg.rfind("--tinygen-skip=", 0) == 0) {
+            auto names = arg.substr(15);
+            for (size_t b = 0; b <= names.size();) {
+                auto e = names.find(',', b);
+                if (e == string::npos) e = names.size();
+                if (e > b) tinygenskip.push_back(names.substr(b, e - b));
+                b = e + 1;
+            }
+        }
         else if (arg == "-o" && i + 1 < argc) outname = argv[++i];
         else if (arg == "--header" && i + 1 < argc) headername = argv[++i];
         else if (arg == "--include" && i + 1 < argc) includenames.push_back(argv[++i]);
@@ -719,6 +782,33 @@ int Main(int argc, char **argv) {
         else files.push_back(arg);
     }
     if (verbose || dryrun) ProgressPlain();
+    // goose debug: goose run --backend=tinygen, with lldb starting the program.
+    auto debugverb = verb == "debug";
+    if (debugverb) {
+        verb = "run";
+        backendname = "tinygen";
+    }
+    if (backendname != "c" && backendname != "tinygen") {
+        fprintf(stderr, "unknown backend: %s (c or tinygen)\n", backendname.c_str());
+        return 1;
+    }
+    auto tinygen = backendname == "tinygen";
+    if (tinygen) {
+        #if !GOOSE_HAVE_TINYGEN
+            fprintf(stderr, "--backend=tinygen: this compiler was built without tinygen "
+                            "(TINYGEN_DIR, CMakeLists.txt)\n");
+            return 1;
+        #endif
+        if (verb != "build" && verb != "run") {
+            fprintf(stderr, "--backend=tinygen works with goose build and goose run\n");
+            return 1;
+        }
+        // A debug build: no inlining unless asked for, so that every Goose
+        // function is a function in the debugger, and the C half compiled
+        // with debug information and no optimization (--debug adds the
+        // checks of GS_DEBUG on both halves).
+        if (!optgiven) optlevel = 0;
+    }
     if (verb == "toolchain") {
         try {
             auto tools = FindTools(ccrequest, refresh);
@@ -738,13 +828,22 @@ int Main(int argc, char **argv) {
     // C goes to the program's build directory (build.h).
     BuildOptions buildopts;
     string builddir;
+    // goose run --backend=tinygen: tinygen writes an object, which only a link makes runnable, so
+    // the program is built into its build directory as goose build would build it, then started
+    // as a child that shares this process's streams.
+    auto tgrun = false;
     if (verb == "run") {
         if (!outname.empty()) {
             fprintf(stderr, "goose run takes no -o: it compiles and runs the program in this "
                             "process\n");
             return 1;
         }
-        forcejit = true;
+        if (tinygen) {
+            tgrun = true;
+            buildopts = BuildOptions { true, verbose, dryrun, false, "" };
+        } else {
+            forcejit = true;
+        }
     } else if (verb == "check") {
         nocgen = true;
     } else if (verb == "fetch") {
@@ -757,7 +856,7 @@ int Main(int argc, char **argv) {
                             "(-o out.c) writes the C for a C host\n");
             return 1;
         }
-        buildopts = BuildOptions { debug, verbose, dryrun, standalone, outname };
+        buildopts = BuildOptions { debug || tinygen, verbose, dryrun, standalone, outname };
         outname.clear();
     }
     if (files.size() > 1 && !multitest) {
@@ -775,6 +874,7 @@ int Main(int argc, char **argv) {
     }
     if (files.empty()) {
         fprintf(stderr, "usage: goose run file.goose [options] [-- program args...] | "
+                        "goose debug file.goose [options] [-- program args...] | "
                         "goose check file.goose [options] | goose fetch [--update] file.goose | "
                         "goose version |\n"
                         "       goose build file.goose [options] [-o exe] [--debug] [--standalone] "
@@ -790,7 +890,8 @@ int Main(int argc, char **argv) {
                         "--multi-test [options] file.goose... | --emit-runtime runtime.c | "
                         "--gen-runtime-header | "
                         "--<package>-link msvc|cc\n");
-        fprintf(stderr, "without -o the program is compiled and run in this process by TinyCC.\n");
+        fprintf(stderr, "without -o the program is compiled and run in this process by TinyCC;\n"
+                        "goose run --backend=tinygen builds it and runs the executable.\n");
         fprintf(stderr, "the .c that -o writes links with the runtime that --emit-runtime "
                         "writes, compiled once;\n--standalone writes one that holds the "
                         "runtime itself.\n");
@@ -806,7 +907,8 @@ int Main(int argc, char **argv) {
     // With no output file the program is compiled into this process and run,
     // which is what --jit asks for explicitly; a build writes the C to its
     // build directory instead.
-    auto jit = verb != "build" && (forcejit || outname.empty());
+    auto building = verb == "build" || tgrun;
+    auto jit = !building && (forcejit || outname.empty());
     if (!headername.empty() && (jit || multitest)) {
         fprintf(stderr, "--header requires C output for a single input file\n");
         return 1;
@@ -822,14 +924,18 @@ int Main(int argc, char **argv) {
                         "--dump-file, --jit or program arguments\n");
         return 1;
     }
-    // The program shares stdout in JIT mode; progress goes to stderr.
-    auto msgs = jit ? stderr : stdout;
+    // The program shares stdout in a run; progress goes to stderr.
+    auto msgs = jit || tgrun ? stderr : stdout;
     // The file being compiled, the C file it goes to, if any, and the
     // --include headers as that C file names them.
     string filename, outfile;
     vector<string> includes;
     // What a JIT run compiles and starts, once the compile produced it.
     string program;
+    // The tinygen backend's object, when it compiled anything, and whether
+    // it is the whole program (no C half to compile), with GS_DEBUG's checks.
+    string tgobject;
+    bool tgwhole = false, tgchecks = false;
     // The program's Ast outlives the compile: a build and a JIT run read
     // its packages, for the native parts the program needs (native.h).
     unique_ptr<Ast> astp;
@@ -926,8 +1032,72 @@ int Main(int argc, char **argv) {
         for (auto &rf : runtime_files)
             if (string_view(rf.name) == "runtime_ext.h") runtime_ext_text = rf.text;
         auto stackcfg = StackConfigOf(cdefines);
-        CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, stackcfg.maxstacks);
+        #if GOOSE_HAVE_TINYGEN
+            unique_ptr<TinyGenBackend> tgb;
+            if (tinygen && !nocgen) {
+                auto checks = std::find(cdefines.begin(), cdefines.end(), "GS_DEBUG=1") !=
+                              cdefines.end();
+                tgb = make_unique<TinyGenBackend>(ast, checks, filename, runtime_ext_text,
+                                                  RuntimeSections({ "runtime.h", "runtime_ext.h" }));
+                tgb->skip = tinygenskip;
+            }
+            CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, stackcfg, tgb.get());
+        #else
+            CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, stackcfg);
+        #endif
         if (stacks) cg.StackReport(msgs, stackcfg);
+        #if GOOSE_HAVE_TINYGEN
+            if (tgb) {
+                fprintf(msgs, "tinygen: %d of %d function(s) compiled, %d left to C\n",
+                        (int)tgb->taken.size(), (int)cg.livespecs.size(), (int)tgb->left.size());
+                if (verbose)
+                    for (auto &[sp, why] : tgb->left)
+                        fprintf(msgs, "tinygen: %s (%s:%d) left to C: %s\n",
+                                cg.sinfo[sp].cname.c_str(),
+                                ast.sources[sp->sf->line.fileidx].first.c_str(),
+                                sp->sf->line.line, why.c_str());
+                // A build whose every function went through tinygen, and
+                // that needs nothing of the C half beyond the support object,
+                // puts its main into the object and compiles no C.
+                string whynot;
+                if (!building) whynot = "not goose build";
+                else if (standalone) whynot = "--standalone";
+                else if (!includenames.empty()) whynot = "--include";
+                else if (tinygenmixed) whynot = "--tinygen-mixed";
+                // The support object is shared, so only the defines that main passes to it
+                // at run time (EmitMain) or that the compiler reads itself keep a whole build.
+                for (auto &d : cdefines) {
+                    auto name = d.substr(0, d.find('='));
+                    if (whynot.empty() && d != "GS_DEBUG=1" && name != "GS_STACK_RESERVE" &&
+                        name != "GS_STACK_GAP" && name != "GS_STACK_BUDGET" &&
+                        name != "GS_MAX_STACKS")
+                        whynot = cat("-D", d);
+                }
+                tgwhole = whynot.empty() && tgb->WholeProgram(cg, whynot);
+                tgchecks = tgb->checks;
+                if (tgwhole) tgb->EmitMain(cg);
+                // Compile after WholeProgram: it may add gs_init_globals to
+                // the object and ask the C half for more.
+                tgb->Compile(cg);
+                cg.result += tgb->Shims(cg);
+                if (verbose)
+                    fprintf(msgs, tgwhole ? "tinygen: whole program: no C compiled for it\n"
+                                          : "tinygen: mixed: the C half compiled by the C compiler (%s)\n",
+                            whynot.c_str());
+                // lldb loads no script on its own (load-script-from-symbol-file
+                // defaults to trusted, signed dSYMs only), so say how to.
+                if (verbose)
+                    if (auto py = FindLldbFormatters(exe); !py.empty())
+                        fprintf(msgs, "tinygen: lldb formatters: command script import \"%s\"\n",
+                                py.c_str());
+                if (!tgb->taken.empty() && !outfile.empty()) {
+                    tgobject = cat(DirOf(outfile), PathStem(outfile), ".tg.o");
+                    string err;
+                    if (!dryrun && !tgb->Write(tgobject, err))
+                        throw CompileError { cat("tinygen: cannot write ", tgobject, ": ", err) };
+                }
+            }
+        #endif
         // The packages whose native parts the program needs, which a JIT
         // run takes functions from and a build links: its own, when it has
         // one, and every package an extern fn it calls was declared in,
@@ -965,7 +1135,7 @@ int Main(int argc, char **argv) {
                        cg.head, RuntimeSections({ "runtime_ext.h", "runtime_os.h" }), cg.result);
             return out;
         };
-        if (!outfile.empty() && !nocgen) {
+        if (!outfile.empty() && !nocgen && !tgwhole) {
             auto out = assemble(!standalone);
             auto f = fopen(outfile.c_str(), "wb");
             if (!f) throw CompileError { cat("cannot write output file: ", outfile) };
@@ -1015,7 +1185,7 @@ int Main(int argc, char **argv) {
                 outfile.replace(pos, 1, stem);
         }
         includes = includenames;
-        if (verb == "build") {
+        if (building) {
             builddir = ProgramBuildDir(file);
             std::error_code ec;
             filesystem::create_directories(filesystem::path(builddir), ec);
@@ -1031,6 +1201,8 @@ int Main(int argc, char **argv) {
                 if (FileExists(inc)) inc = AbsolutePath(inc);
         }
         program.clear();
+        tgobject.clear();
+        tgwhole = false;
         astp.reset();
         nativepkgs.clear();
         try {
@@ -1041,7 +1213,7 @@ int Main(int argc, char **argv) {
             // (CMakeLists.txt).
             auto code = RunOnCompilerStack(compile);
             if (code) return code;
-            if (verb == "build") {
+            if (building) {
                 if (nocgen) return 0;
                 // The native parts first, so that the link can take their
                 // response files: a builtin package's from the compiler's
@@ -1060,8 +1232,49 @@ int Main(int argc, char **argv) {
                     if (!BuildNativePart(*astp, pkg, filename, b, false, nb)) return 1;
                     rsps.push_back(nb.rsp);
                 }
-                return BuildExecutable(filename, outfile, builddir, tc, buildopts, DirOf(exe),
-                                       msgs, rsps, astp->packages[0].output);
+                pair<string, std::function<string()>> tgsupport;
+                if (tgwhole) {
+                    auto src = TinygenSupportSource(tgchecks);
+                    tgsupport = { cat("goose_tgsupport", tgchecks ? "_checks-" : "-", Hex8(src)),
+                                  [src] { return src; } };
+                }
+                // A run's executable stays in the build directory, out of the source's.
+                if (tgrun) {
+                    buildopts.exe = cat(builddir, "/", PathStem(filename));
+                    #ifdef _WIN32
+                        buildopts.exe += ".exe";
+                    #endif
+                }
+                auto built = BuildExecutable(filename, tgwhole ? string() : outfile, builddir, tc,
+                                             buildopts, DirOf(exe), msgs, rsps,
+                                             astp->packages[0].output,
+                                             tgobject.empty() ? vector<string> {}
+                                                              : vector<string> { tgobject },
+                                             tgsupport);
+                if (built || !tgrun || buildopts.dryrun) return built;
+                fflush(msgs);
+                fflush(stdout);
+                // Its resources are the entry source's, as in a run through TinyCC, not the
+                // build cache's (gs_os_resource_dir).
+                SetEnvVar("GOOSE_RESOURCE_DIR", DirOf(AbsolutePath(filename)));
+                vector<string> progargv { buildopts.exe };
+                progargv.insert(progargv.end(), progargs.begin(), progargs.end());
+                if (debugverb) {
+                    auto lldb = FindOnPath("lldb");
+                    if (lldb.empty()) {
+                        fprintf(stderr, "goose debug needs lldb on PATH\n");
+                        return 1;
+                    }
+                    vector<string> dbg { lldb };
+                    if (auto py = FindLldbFormatters(exe); !py.empty())
+                        dbg.insert(dbg.end(), { "-o", cat("command script import \"", py, "\"") });
+                    dbg.push_back("--");
+                    progargv.insert(progargv.begin(), dbg.begin(), dbg.end());
+                }
+                string err;
+                auto ran = RunInherited(progargv, err);
+                if (ran < 0) fprintf(stderr, "%s\n", err.c_str());
+                return ran < 0 ? 1 : ran;
             }
             if (program.empty()) return code;
             // The native parts the program reaches hand the run their

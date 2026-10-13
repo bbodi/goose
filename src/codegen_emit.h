@@ -484,7 +484,7 @@ inline void CodeGen::EmitSimdVersions(FnSpec *sp, const string &name, const stri
         Append(code, "#if GS_SIMD >= ", lv, "\nGS_SIMD_TARGET", lv, " static ", ret, " ",
                versions[lv], "(", params, ") {\n", fnbody, "}\n#endif\n");
     }
-    Append(code, "static ", ret, " ", name, "(", params, ") {\n",
+    Append(code, backend ? "" : "static ", ret, " ", name, "(", params, ") {\n",
            "#if GS_SIMD >= 1\n    switch (gs_simd_level()) {\n");
     for (int lv = SIMD_LEVELS; lv >= 1; lv--) {
         if (lv > 1) Append(code, "#if GS_SIMD >= ", lv, "\n");
@@ -583,8 +583,8 @@ inline void CodeGen::EmitSpec(FnSpec *sp, bool er) {
     fnbody += bodyout;
     auto name = er ? ernames[sp] : curinfo->cname;
     if (sp->sf->issimd) EmitSimdVersions(sp, name, params, fnbody);
-    else Append(code, "static ", FnAttrs(sp), SigRet(sp), " ", name, "(", params, ") {\n", fnbody,
-                "}\n\n");
+    else Append(code, er ? cat("static ", FnAttrs(sp)) : FnLinkage(sp), SigRet(sp), " ", name, "(",
+                params, ") {\n", fnbody, "}\n\n");
     curspec = nullptr;
     curinfo = nullptr;
     emiter = false;
@@ -791,6 +791,7 @@ inline void CodeGen::EmitGlobalInit() {
     cscopes.clear();
     stackown[nullptr] = std::max(stackown[nullptr], stkmax);
     auto decls = HoistAggregateDecls(body);
+    noglobalinit = decls.empty() && body.empty();
     Append(code, "static void gs_init_globals(void) {\n");
     code += decls;
     code += body;
@@ -840,10 +841,12 @@ inline void CodeGen::EmitProgramInit() {
         EmitThreadThunk(sp, stacks);
         workerregions = std::max(workerregions, stacks + thunkregions[sp]);
     }
+    rtinit[0] = mainstacks;
+    rtinit[1] = mainstacks + globalregions;
+    rtinit[2] = workerregions;
     Append(code, "static void gs_program_init(int argc, char **argv) {\n"
                  "    if (gs_program_initialized) return;\n"
-                 "    gs_rt_init(argc, argv, ", mainstacks, ", ", mainstacks + globalregions,
-           ", ", workerregions, ");\n");
+                 "    gs_rt_init(argc, argv, ", rtinit[0], ", ", rtinit[1], ", ", rtinit[2], ");\n");
     // The queues, before anything that could use one runs.
     vector<string> qnames;
     for (auto &[m, q] : queues) qnames.push_back(q);

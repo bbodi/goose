@@ -460,6 +460,19 @@ program and each of its workers can take and the cap that puts on
 `hardware_threads()`, and `-DGS_STACK_STATS=1` makes a program report its
 actual use as it ends.
 
+`goose build --backend=tinygen` (experimental) makes a debug build through
+[tinygen](docs/design/tinygen_backend.md), a code generator that writes
+machine code with debug info directly. The compiler must be built with a
+tinygen checkout beside this one (`TINYGEN_DIR`). The debugger then shows
+Goose functions, `.goose` lines, and locals with their Goose names and types.
+A program that tinygen compiles whole needs no C compiler except to link. A
+function tinygen does not support goes through C, and `-v` says why.
+`goose run --backend=tinygen` builds the program the same way and runs it.
+`goose debug prog.goose -- args` builds it the same way and starts lldb on it,
+with Goose's formatters loaded: arrays show as their elements, text as
+strings, and optionals and ADTs as Goose values. In an lldb started some
+other way, `command script import src/lldb/goose_lldb.py` loads them.
+
 A program with C of its own names it in a sidecar beside the source,
 `foo.build` beside `foo.goose`: `c_sources = ["impl.c"];`, with `c_include`,
 `c_defines`, `c_libs` and `_windows`, `_linux` or `_macos` variants of each

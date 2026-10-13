@@ -401,6 +401,11 @@ struct CodeGen {
     // thunk reserves for its arguments and its copy of the globals.
     int globalregions = 0;
     unordered_map<FnSpec *, int> thunkregions;
+    // What gs_program_init hands gs_rt_init (the main program's stacks,
+    // its regions, a worker's), and whether gs_init_globals does nothing:
+    // what a program without a C half starts with (TinyGenBackend::EmitMain).
+    int64_t rtinit[3] = { 0, 0, 0 };
+    bool noglobalinit = false;
     // GS_MAX_STACKS as the program is configured (main.cpp): the most data
     // stacks one thread program may use at once, zero for no limit.
     int64_t maxstacks = 0;
@@ -417,6 +422,9 @@ struct CodeGen {
         uint64_t reserve, gap, budget;
         int64_t maxstacks;
     };
+    // The configuration the program is built with (main.cpp, StackConfigOf), which a backend
+    // without the C preprocessor reads instead of GS_STACK_RESERVE and the others.
+    StackConfig stackcfg { 0, 0, 0, 0 };
     void StackReport(FILE *out, const StackConfig &cfg);
 
     // Long-distance return targets (§7.9): id, per-ret TLS channels.
@@ -1262,6 +1270,12 @@ struct CodeGen {
     static const char *FnAttrs(FnSpec *sp) {
         return sp->outofline ? "GS_NOINLINE " : sp->cinline ? "GS_INLINE " : "";
     }
+    // A specialization's storage class and attributes. With another backend
+    // beside this one (SpecBackend) every specialization has external
+    // linkage, since the other object calls the C ones and the C calls its
+    // own, and none is inline: an inline definition with external linkage
+    // defines no symbol in C.
+    string FnLinkage(FnSpec *sp) { return backend ? string() : cat("static ", FnAttrs(sp)); }
     const VarDef *NamedResult(Block *fnbody, SFunction *target, size_t nrets, size_t resultidx);
     const VarDef *OpenIbNrvo(InlineBlock *ib, const Dst &d);
     void PlanTopClasses(FnSpec *sp);
@@ -1308,12 +1322,27 @@ struct CodeGen {
     string result;   // Includes, prototypes and code.
     string ExportHeader();
 
+    // Another backend that compiles some specializations itself, to an
+    // object of its own linked beside this C (tinygen_backend.h). It chooses
+    // among the live specializations once their call interfaces are known;
+    // the ones it takes get a prototype here and no body.
+    struct SpecBackend {
+        virtual ~SpecBackend() {}
+        virtual set<FnSpec *> Choose(CodeGen &cg, const vector<FnSpec *> &specs) = 0;
+        // The extern fns the specializations it took call, after Choose.
+        virtual vector<FnSpec *> Externs() { return {}; }
+    };
+    SpecBackend *backend = nullptr;
+    set<FnSpec *> foreign;   // The specializations the other backend defines.
+
     // Extern-support C and user headers are inputs to this emission, not
     // process state that the driver must install before constructing us.
     // A function the extern support declares gets no prototype here.
     CodeGen(Ast &_ast, string_view runtime_ext_text, const vector<string> &headers,
-            bool _norfcheck = false, bool _library = false, int64_t _maxstacks = 0)
-        : ast(_ast), library(_library), norfcheck(_norfcheck), maxstacks(_maxstacks) {
+            bool _norfcheck = false, bool _library = false, StackConfig _stackcfg = {},
+            SpecBackend *_backend = nullptr)
+        : ast(_ast), library(_library), norfcheck(_norfcheck), maxstacks(_stackcfg.maxstacks),
+          stackcfg(_stackcfg), backend(_backend) {
         for (auto t : ast.alltypes)
             if (t->kind == TY_REF && t->ref->pool) poolglobals.insert(t->ref->pool);
         ComputeRelRootMax();
@@ -1324,11 +1353,13 @@ struct CodeGen {
         // state every propagating function's ordinary exit leaves behind.
         if (!fromids.empty()) data += "static GS_TLS int32_t gs_rf;\n";
         EmitGlobalDecls();
+        if (backend) foreign = backend->Choose(*this, livespecs);
         // Prototypes for every live specialization, then their bodies.
         for (auto sp : livespecs)
-            Append(protos, "static ", FnAttrs(sp), SigRet(sp), " ", sinfo[sp].cname, "(",
+            Append(protos, FnLinkage(sp), SigRet(sp), " ", sinfo[sp].cname, "(",
                    SigParams(sp, false), ");\n");
-        for (auto sp : livespecs) EmitSpec(sp);
+        for (auto sp : livespecs)
+            if (!foreign.count(sp)) EmitSpec(sp);
         EmitGlobalInit();
         // Element-run twins requested by call sites, the globals'
         // initializers included (may request more).
@@ -1368,6 +1399,19 @@ struct CodeGen {
         for (auto sp : usedexterns) {
             if (runtime_ext_text.find(cat(" ", sp->sf->cname, "(")) != string_view::npos) continue;
             externs += ExternProto(sp);
+        }
+        // An --include header is C written against the program's types, and
+        // reads a struct an extern takes by reference. Nothing else may need
+        // that struct's body when the other backend makes the extern's callers.
+        if (!headers.empty()) {
+            auto all = usedexterns;
+            if (backend)
+                for (auto sp : backend->Externs()) all.push_back(sp);
+            for (auto sp : all)
+                for (auto t : sp->argtypes)
+                    if (t->kind == TY_REF && StructLike(t->ref->sub) && !IsResz(t->ref->sub) &&
+                        !IsBytesT(t->ref->sub))
+                        CT(t->ref->sub);
         }
         string includes;
         for (auto inc : headers) {

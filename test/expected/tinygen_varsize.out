@@ -1,0 +1,14 @@
+1 Ada math 100
+Bob eng 90 3
+Employee { 7, "Ada", "math", 105 }
+108 3
+Bob/eng #2 $90
+105 106
+Bob 42 ship it 90
+Bs
+Team { Employee { 2, "Bob", "eng", 90 }, 42, "ship it" }
+Bob Ada
+Bob 3
+Employee { 0, "tmp", "eng", 0 }
+Employee { 1, "tmp", "eng", 10 }
+Employee { 2, "tmp", "eng", 20 }

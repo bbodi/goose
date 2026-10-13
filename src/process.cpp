@@ -23,6 +23,9 @@
 #else
     #include <unistd.h>
     #include <dlfcn.h>
+    #include <spawn.h>
+    #include <sys/wait.h>
+    extern char **environ;
     #include <fcntl.h>
     #include <sys/file.h>
 #endif
@@ -70,6 +73,72 @@ static bool IsFile(const string &path) {
         return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
     #else
         return access(path.c_str(), X_OK) == 0;
+    #endif
+}
+
+int RunInherited(const vector<string> &argv, string &err) {
+    if (argv.empty()) {
+        err = "nothing to run";
+        return -1;
+    }
+    #ifdef _WIN32
+        // One command line, quoted as the C runtime's argv parser reads it back: a backslash
+        // run is literal unless a quote follows, which it then escapes.
+        string line;
+        for (auto &a : argv) {
+            if (!line.empty()) line += ' ';
+            if (!a.empty() && a.find_first_of(" \t\n\v\"") == string::npos) {
+                line += a;
+                continue;
+            }
+            line += '"';
+            for (size_t i = 0;; i++) {
+                size_t slashes = 0;
+                while (i < a.size() && a[i] == '\\') i++, slashes++;
+                if (i == a.size()) {
+                    line.append(slashes * 2, '\\');
+                    break;
+                }
+                if (a[i] == '"') line.append(slashes * 2 + 1, '\\');
+                else line.append(slashes, '\\');
+                line += a[i];
+            }
+            line += '"';
+        }
+        auto n = MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, nullptr, 0);
+        std::wstring wline((size_t)n, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, wline.data(), n);
+        STARTUPINFOW si {};
+        si.cb = sizeof si;
+        PROCESS_INFORMATION pi {};
+        if (!CreateProcessW(nullptr, wline.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr,
+                            &si, &pi)) {
+            err = cat("cannot start ", argv[0], ": error ", (int)GetLastError());
+            return -1;
+        }
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD code = 1;
+        GetExitCodeProcess(pi.hProcess, &code);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return (int)code;
+    #else
+        vector<char *> args;
+        for (auto &a : argv) args.push_back(const_cast<char *>(a.c_str()));
+        args.push_back(nullptr);
+        pid_t pid;
+        if (auto e = posix_spawn(&pid, args[0], nullptr, nullptr, args.data(), environ)) {
+            err = cat("cannot start ", argv[0], ": ", strerror(e));
+            return -1;
+        }
+        int status = 0;
+        while (waitpid(pid, &status, 0) < 0)
+            if (errno != EINTR) {
+                err = cat("cannot wait for ", argv[0], ": ", strerror(errno));
+                return -1;
+            }
+        if (WIFEXITED(status)) return WEXITSTATUS(status);
+        return WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1;
     #endif
 }
 

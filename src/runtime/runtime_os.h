@@ -426,7 +426,9 @@ GS_API void gs_os_read_stdin(gs_rref out) {
 GS_API int64_t gs_os_arg_count(void) { return gs_argc; }
 
 /* Application resources, independent of cwd and argv[0]. JIT supplies its
-   entry source directory; AOT discovers the running executable at runtime.
+   entry source directory; AOT discovers the running executable at runtime,
+   unless GOOSE_RESOURCE_DIR names the directory: `goose run` sets it to the
+   entry source's when it runs an executable built in its build cache.
    Append only on success, including a final path separator. */
 GS_API uint8_t gs_os_resource_dir(gs_rref out) {
 #ifdef GS_JIT_RESOURCE_DIR
@@ -434,12 +436,26 @@ GS_API uint8_t gs_os_resource_dir(gs_rref out) {
     gs_bld_append(out, dir, (int64_t)strlen(dir));
     return 1;
 #elif defined(_WIN32)
+    const wchar_t *env = _wgetenv(L"GOOSE_RESOURCE_DIR");
+    if (env && *env) {
+        size_t len = wcslen(env);
+        if (!gs_os_append_wide(out, env, (int)len)) return 0;
+        if (env[len - 1] != L'\\' && env[len - 1] != L'/') gs_bld_append(out, "\\", 1);
+        return 1;
+    }
     wchar_t path[GS_OS_PATH_MAX];
     DWORD n = GetModuleFileNameW(NULL, path, GS_OS_PATH_MAX);
     if (!n || n >= GS_OS_PATH_MAX) return 0;
     while (n && path[n - 1] != L'\\' && path[n - 1] != L'/') --n;
     return n && gs_os_append_wide(out, path, (int)n);
 #else
+    const char *env = getenv("GOOSE_RESOURCE_DIR");
+    if (env && *env) {
+        size_t len = strlen(env);
+        gs_bld_append(out, env, (int64_t)len);
+        if (env[len - 1] != '/') gs_bld_append(out, "/", 1);
+        return 1;
+    }
     char path[GS_OS_PATH_MAX];
     size_t n;
     #ifdef __APPLE__

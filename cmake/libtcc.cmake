@@ -14,12 +14,23 @@ set(TCC_SRC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tinycc")
 set(TCC_BUILD "${CMAKE_BINARY_DIR}/tcc")
 set(TCC_STAGE "${CMAKE_BINARY_DIR}/tcclib")
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+# On macOS, CMAKE_OSX_ARCHITECTURES picks the target (an x86-64 build on an
+# arm64 host keeps CMAKE_SYSTEM_PROCESSOR at arm64).
+set(tcc_cpu "${CMAKE_SYSTEM_PROCESSOR}")
+if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+    list(LENGTH CMAKE_OSX_ARCHITECTURES tcc_narch)
+    if(NOT tcc_narch EQUAL 1)
+        message(FATAL_ERROR "libtcc: build for one architecture at a time "
+                            "(CMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES})")
+    endif()
+    set(tcc_cpu "${CMAKE_OSX_ARCHITECTURES}")
+endif()
+if(tcc_cpu MATCHES "^(x86_64|AMD64|amd64)$" AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(tcc_arch x86_64)
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+elseif(tcc_cpu MATCHES "^(aarch64|arm64|ARM64)$")
     set(tcc_arch arm64)
 else()
-    message(FATAL_ERROR "libtcc: no TinyCC backend for CPU '${CMAKE_SYSTEM_PROCESSOR}'; "
+    message(FATAL_ERROR "libtcc: no TinyCC backend for CPU '${tcc_cpu}'; "
                         "the compiler builds on x86-64 and arm64")
 endif()
 

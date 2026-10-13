@@ -21,6 +21,14 @@ Local changes:
   spilled three-float struct. Variadic arguments retain eight-byte slots.
   `test/packages/pkg_float_abi.goose` checks calls into native C through the
   in-process backend as well as native builds.
+- `x86_64-gen.c`: on SysV, a struct with a field off its natural alignment
+  (a packed struct, such as every Goose fixed struct) is passed and returned
+  in memory, as the psABI and clang do. TinyCC passed `{int32_t; double}`
+  packed in two integer registers, so a JIT call into native C read garbage.
+  `test/tinygen/tinygen_extern.goose`, run through the in-process backend,
+  checks it. TinyCC still classifies a struct as one class, not per
+  eightbyte: `{double; int64_t}` goes in two integer registers where clang
+  uses an SSE and an integer register.
 
 To update, copy the same files from a newer TinyCC commit and record that
 commit here. Preserve the local changes until they are included upstream.
