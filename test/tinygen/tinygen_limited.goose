@@ -2,9 +2,9 @@
 // fields, elements, parameters (by value and by reference), results and
 // globals; built from literals, strings, fills, slices and other arrays
 // (copied in under the capacity check); indexed, sliced, iterated,
-// compared and printed; grown with push and append and shrunk with pop,
-// pop_n, resize and clear; and ending in a push past the capacity, which
-// must abort with its Goose line as the C backend's does.
+// compared and printed; grown with push, append and format (into a field
+// with no builder) and shrunk with pop, pop_n, resize and clear; and ending
+// in a push past the capacity, which must abort with its Goose line.
 
 struct Name { tag: i32, text: u8[..8] }
 
@@ -100,6 +100,8 @@ fn main() {
     history.push(3);
     history.append([4, 5]);
     print(history, " ", history.len);
+    let c = card(3, true, "new");
+    print(c.cost, "|", c.tag, " ", c.tag.len, " ", card(-12, false, "").cost);
     var small: u8[..4] = "abcd";
     print(small.len);
     small.pop();
@@ -107,4 +109,15 @@ fn main() {
     print(small);
     small.push('!');
     print("not reached");
+}
+
+struct Card { cost: u8[..48], tag: u8[..8] }
+
+fn card(r: i64, rare: bool, name: u8[:]) -> Card {
+    var c = Card { cost: [], tag: [] };
+    format(c.cost, "R", r, " ", rare, " ", 2.5, " ", 0.5 as f32, " ", 18446744073709551615 as u64,
+           " ", if rare { "rare" } else { "always" });
+    format(c.tag, name);
+    format(c.tag, "!", -7 as i8);
+    return c;
 }

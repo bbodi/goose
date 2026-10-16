@@ -5019,6 +5019,13 @@ struct TgFn {
         auto an = c->ArgNodes();
         auto pl = Deref(Place(an[0]));
         if (TgModule::IsLim(pl.t) && M.LimHeld(pl.t) && IsU8(pl.t->arr->sub)) {
+            auto simple = true;
+            for (size_t i = 1; i < an.size(); i++)
+                simple = simple && cg.SimpleText(cg.FmtContext(c, an[i]), an[i]->exprtype);
+            if (simple) {
+                FormatIntoLim(pl, an);
+                return V {};
+            }
             // Into a static-capacity u8[..k] (CodeGen::AppendBytes): rendered into a builder of the
             // statement's, then appended under the capacity check.
             auto b = RzTemp(cg.GrowU8(), c->line);
@@ -5037,6 +5044,46 @@ struct TgFn {
             No(c->line, "format into an array of this kind");
         TextInto(pl.stk, CountAt(pl.a), c, an, 1);
         return V {};
+    }
+    // Arguments that are all simple text into a static-capacity u8[..k] (CodeGen::EmitFormatInto):
+    // each appended in turn under the capacity check, a scalar formatted into a frame buffer first.
+    // No builder, so no data stack: the C backend gives such a function no gs_sp.
+    void FormatIntoLim(const P &pl, const vector<Node *> &an) {
+        tyg_local buf = 0, top = 0, cnt = 0;
+        for (size_t i = 1; i < an.size(); i++) {
+            auto a = an[i];
+            auto t = a->exprtype;
+            tyg_val src, n;
+            if (t->kind == TY_ARRAY || t->kind == TY_SLICE) {
+                if (auto s = Is<StrLit>(a)) {
+                    src = BytesAddr(s->val);
+                    n = I64((int64_t)s->val.size());
+                } else {
+                    auto v = ViewOf(Place(a), a->line);
+                    if (Ended()) return;
+                    src = v.elems;
+                    n = v.len;
+                }
+            } else {
+                auto ot = cg.OperandT(t);
+                auto x = GenAs(a, ot).v;
+                if (Ended()) return;
+                if (!buf) {
+                    buf = tyg_local_new(p, 32, 8);   // GS_FMT_MAX, the most a gs_fmt_* writes.
+                    top = Slot();
+                    cnt = Slot();
+                }
+                St(AtL(top), AddrOf(AtL(buf)));
+                StL(cnt, I64(0));
+                FmtScalar(AddrOf(AtL(top)), AtL(cnt), ot, x);
+                src = AddrOf(AtL(buf));
+                n = LdL(cnt);
+            }
+            auto at = Local(LimLen(pl));
+            AbortUnless(Cmp(TYG_SLE, Add(LdL(at), n), LimCapOf(pl)), "CAPACITY", a->line);
+            tyg_copy_dyn(p, Add(LimView(pl).elems, LdL(at)), src, n);
+            LimSetLen(pl, Add(LdL(at), n));
+        }
     }
 
     // gs_uleb_check: the ULEB128 at `at` bounded by `end`, shortest and within 64 bits: its byte count

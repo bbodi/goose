@@ -14,5 +14,6 @@ Name { 7, "tiny" } 4 tiny
 [[1, 2], [3, 4]] 2 4
 Hey!! ey true
 [1, 2, 3, 4, 5] 5
+R3 true 2.5 0.5 18446744073709551615 rare|new!-7 6 R-12 false 2.5 0.5 18446744073709551615 always
 4
 abcz

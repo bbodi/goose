@@ -184,7 +184,7 @@ PROGRAMS += [
     ("test/tinygen/tinygen_limited.goose", False, ["--tinygen-skip=main"]),
     ("test/tinygen/tinygen_limited.goose", False, ["--tinygen-skip=grow,halves,bag"]),
     ("test/tinygen/tinygen_limited.goose", False,
-     ["--tinygen-skip=digits,sum,shrink,named"]),
+     ["--tinygen-skip=digits,sum,shrink,named,card"]),
     # A return nested in another return's T[] value as it is built.
     ("test/codegen/exit_value_destination.goose", True, []),
 ]
