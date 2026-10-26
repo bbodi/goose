@@ -8,7 +8,7 @@
 struct Pair { a: i32, b: f64 }
 
 extern fn hypot(x: f64, y: f64) -> f64;
-extern "abs" fn c_abs(x: i32) -> i32;
+extern fn c_abs(x: i32) -> i32 = "abs";
 extern fn tg_checksum(s: const u8[:]) -> u32;
 extern fn tg_pair_scale(p: Pair, k: i32) -> Pair;
 extern fn tg_pair_fill(out: Pair&, n: i64);

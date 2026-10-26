@@ -769,8 +769,8 @@ R"(  --cc name|path        The C compiler for packages' native parts: msvc,
                         clang-cl, clang, gcc, cc or a path (or GOOSE_CC).
   -v                    Print each command that builds a native part, and
                         what it prints.
-  --backend=tinygen     Build the executable through tinygen in the build
-                        directory and run it there instead.
+  --backend name        tinygen builds the executable through tinygen in the
+                        build directory and runs it there instead.
 )");
     if (topic == "debug") return cat(
 R"(usage: goose debug file.goose [options] [-- program args...]
@@ -800,9 +800,10 @@ R"(  --cc name|path        The C compiler: msvc, clang-cl, clang, gcc, cc or a
                         the runtime object built once per C compiler.
   -v                    Print each command the build runs and what it prints.
   --dry-run             Print the commands the build would run, and run none.
-  --backend=c|tinygen   tinygen writes the machine code itself, with debug
-                        info naming the Goose source (default -O0); what it
-                        does not support goes through C.
+  --backend name        c (the default) or tinygen, which writes the machine
+                        code itself, with debug info naming the Goose source
+                        (default -O0); what it does not support goes through
+                        C.
 )");
     if (topic == "check") return cat(
 R"(usage: goose check file.goose [options]
@@ -940,6 +941,9 @@ Options:
   --unsafe-no-rf-check  Leave out the checks after calls that a `return ...
                         from` can pass through: unsound, for pricing them only.
   --gen-runtime-header  Regenerate src/runtime_inline.h from src/runtime/.
+  --tinygen-mixed       With --backend tinygen, compile the C half even when
+                        tinygen took every function.
+  --tinygen-skip=f,g    With --backend tinygen, leave these functions to C.
 
 goose format --verify file.goose|dir... formats each file in memory and
 writes nothing: it checks the result as a format does, and that formatting
