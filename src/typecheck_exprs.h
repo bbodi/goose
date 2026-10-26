@@ -11,6 +11,7 @@ namespace goose {
 // Lvalue paths: names, fields, elements, optionally through references.
 
 inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n) {
+    DestScope ds(*this, Dest {});
     NodeScope ns(*this, n);
     // The value the path denotes, recorded as its Check would (Ident::Check,
     // ContainerRead): what the operands evaluated before a later point of
@@ -22,6 +23,7 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n) {
         RecordVal(n, v);
     };
     if (auto id = Is<Ident>(n)) {
+        if (!id->expansionerror.empty()) Error(id, string(id->expansionerror));
         auto vd = LookupVar(id->name, id->ns, n);
         if (!vd) {
             if (auto kind = ScopeNameKind(id->name))
@@ -58,9 +60,11 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n) {
         return lv;
     }
     if (auto d = Is<Dot>(n)) {
+        if (d->incomplete) IncompleteDot(d);
         auto lv = LValueBase(d->obj);
         auto base = lv.type;
         DerefLValue(lv, d->obj);
+        CheckAccessorOwner(d, d->accessorowner, lv.type);
         ResolveMemberLValue(lv, d);
         if (lv.intemp) NoRelRefTempRead(d->obj, base, lv.type);
         n->exprtype = lv.type;
@@ -106,6 +110,7 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n) {
 // `cmpview`: the path is the slice `==` compares an operand as (§4.5),
 // which ends with the comparison, so it may view any temporary.
 inline TypeCheck::LVal TypeCheck::LValueBase(Node *n, bool cmpview) {
+    DestScope ds(*this, Dest {});
     if (Is<Ident>(n) || Is<Dot>(n) || Is<Index>(n)) return CheckLValue(n);
     auto v = CheckV(n, nullptr);
     NoUntypedEmptyArray(v, n, "an index, slice or field of it");
@@ -168,6 +173,9 @@ inline void TypeCheck::DerefLValue(LVal &lv, Node *at) {
 // is when its initializer runs (§11.1).
 inline void TypeCheck::RequireAssigned(VarDef *vd, Node *at) {
     if (vd->assigned) return;
+    // Its initializer's check failed and reported why: a use is no error
+    // of its own.
+    if (failedglobals.count(vd)) throw Abandoned {};
     auto order = vd->isglobal
                      ? cat(": globals initialize in declaration order, imported files first "
                            "(§11.1), so ", vd->name, " has no value until its initializer at ",
@@ -207,6 +215,7 @@ inline void TypeCheck::ReadBackLVal(LVal &lv) {
     // a slot read, byte view or not (§5.2).
     lv.byteview = lv.byteview || lv.Any([&](const RootAlt &a) {
         return a.root && (a.root->contentbyteview ||
+                          (a.root->heldholder && a.root->heldholder->contentbyteview) ||
                           (a.root->isglobal && lv.type->cq && IsU8(PointeeOf(lv.type))));
     });
     // What was stored into a slot passed the store rule (§5.2) with its own
@@ -230,7 +239,7 @@ inline void TypeCheck::ReadBackLVal(LVal &lv) {
 // points within the value or array its slot lies in (§3.9), which is no more
 // writable through it than along the path.
 inline bool TypeCheck::SlotLoadWritable(TypeExpr *t, bool path) {
-    auto selfrel = t->kind == TY_REF && t->ref->lenstorage >= 0 && !t->ref->pool;
+    auto selfrel = IsSelfRelRef(t);
     return !t->cq && (path || !selfrel);
 }
 
@@ -599,7 +608,23 @@ template<typename F> void TypeCheck::AfterHead(Node *n, Node *next, F f) {
 // derived for it, else the value's own root (a temporary's outlives nothing).
 inline VarDef *TypeCheck::HolderRootOf(const Val &v) { return ContentsOf(v).Root(); }
 
-// Field / builtin-property resolution on an lvalue path.
+// A `const for` field accessor over fields<T> (`owner`) names a field of a
+// value of type T, a struct or a variant type, alone; one in a literal of a
+// variant (`lit`) belongs to that variant whichever mode the literal
+// settles to (const_for.md).
+inline void TypeCheck::CheckAccessorOwner(Node *at, TypeExpr *owner, TypeExpr *t,
+                                          StructLit *lit) {
+    if (!owner) return;
+    auto owned = lit && owner->kind == TY_VARIANT
+                     ? lit->variant && owner->var->variant == lit->variant &&
+                           TypeArgsEq(owner->var->adt->enu->args, lit->einst->args)
+                     : TypeEq(ast.PlainOf(t), owner);
+    if (!owned)
+        Error(at, cat("const for accessor belongs to ", TypeStr(owner), ", not ", TypeStr(t)));
+}
+
+// Field / builtin-property resolution on an lvalue path, whose accessor the
+// caller has checked (CheckAccessorOwner).
 inline void TypeCheck::ResolveMemberLValue(LVal &lv, Dot *d) {
     auto t = lv.type;
     // Steps the path into the named field of a field run; a frame
@@ -626,6 +651,7 @@ inline void TypeCheck::ResolveMemberLValue(LVal &lv, Dot *d) {
     if (t->kind == TY_STRUCT) {
         auto inst = GetStructInst(t);
         if (step(inst->st->fields, inst->ftypes, FieldsInFrame(d))) return;
+        if (inst->st->broken) throw Abandoned {};
         Error(d, cat("struct ", inst->st->name, " has no field ", d->name));
     }
     if (t->kind == TY_VARIANT) {
@@ -634,6 +660,17 @@ inline void TypeCheck::ResolveMemberLValue(LVal &lv, Dot *d) {
         if (step(t->var->variant->fields, inst->vftypes[vi], false)) return;
         Error(d, cat("variant ", inst->en->name, ".", t->var->variant->name,
                      " has no field ", d->name));
+    }
+    // A member of an exemplar's opaque value (CheckExemplars) is one more,
+    // of a type that all of them share: what it is, only a call could say.
+    if (IsOpaque(t)) {
+        if (t->cq) lv.writable = false;
+        lv.letbound = lv.fotail = lv.isvarint = false;
+        lv.type = OpaqueMember();
+        lv.var = nullptr;
+        lv.fromstorage = true;
+        lv.isslot = true;
+        return;
     }
     Error(d, cat("no field access on a value of type ", TypeStr(t)));
 }
@@ -952,12 +989,18 @@ inline Val TypeCheck::CheckValueAt(Node *&n, TypeExpr *expected, Dest d, bool ca
 
 // An operand of an operator: always the pointee.
 inline Val TypeCheck::Operand(Node *n) {
+    DestScope ds(*this, Dest {});
     auto v = DecayRef(CheckV(n, nullptr));
     n->exprtype = v.type;
+    // An operator computes with the number an index type holds (§3.11), so
+    // nothing it computes is one. The operand keeps its type for the
+    // bounds-check pass, which an index operand's is for.
+    if (IsIndexT(v.type)) v.type = ast.NoIndex(v.type);
     return v;
 }
 
 inline void TypeCheck::MustFit(Val &v, Node *n, TypeExpr *dt) {
+    FlagScope recording(recordingrelative, true);
     auto vt = DecayedType(v);
     if (vt->kind == TY_ARRAY && vt->arr->akind == A_FIXED)
         CheckArrayCount(n, dt, ArraySize(vt->arr));
@@ -973,6 +1016,10 @@ inline void TypeCheck::MustFit(Val &v, Node *n, TypeExpr *dt) {
             RelyOnNamed(v, n);
         }
     } else {
+        // A type naming nothing fits nothing, which is the consequence of
+        // the error reported at the name.
+        if (!ast.unknowntypes.empty() && (MentionsUnknown(dt) || MentionsUnknown(v.type)))
+            throw Abandoned {};
         if (!fitfail.empty()) Error(n, fitfail);
         auto got = dt->kind == TY_REF ? StorageType(v) : v.type;
         string hint;
@@ -1144,6 +1191,22 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
     switch (dt->kind) {
         case TY_INT:
             if (t->kind != TY_INT) return false;
+            // An index or bound type takes only a value of one of the same
+            // array (an index where a bound is wanted), at most as wide: no
+            // constant, and no computed value, says anything about the
+            // array's length (§3.11).
+            if (dt->ix) {
+                if (t->ix && t->ix->arr == dt->ix->arr && (dt->ix->upto || !t->ix->upto) &&
+                    ImplicitInt(t->intstorage, dt->intstorage)) {
+                    v.type = dt;
+                    return true;
+                }
+                fitfail = cat("expected a value of type ", TypeStr(dt), ", got ", TypeStr(t),
+                              v.ck == CK_INT || v.litint ? " constant" : "",
+                              " (only `x as ", TypeStr(dt), "` makes one, checking x against ",
+                              dt->ix->arr->name, ".len, §3.11)");
+                return false;
+            }
             // A literal parameter adapts to any integer type; whether the
             // literal fits is each call site's question (§7.7).
             if (v.unsized) {
@@ -1262,8 +1325,9 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
                 // bounds the pointee's lifetime will not do (§9.5).
                 auto want = dt->ref->pool ? dt->ref->pool : curdst.roots.Root();
                 auto have = dt->ref->pool ? PoolOf(links.Root()) : links.Root();
-                if (!want || (!dt->ref->pool && !curdst.roots.Exact()) || !links.Exact() ||
-                    have != want) {
+                auto fits = dt->ref->pool ? want && links.Exact() && have == want
+                    : RelativeDestination(links, curdst, fitnode, recordingrelative);
+                if (!fits) {
                     auto why = links.Exact() ? string() : ReadBackWhy(links);
                     auto vroot = links.Root() ? links.Root()->name : string_view("static data");
                     fitfail = cat(dt->ref->pool
@@ -1290,16 +1354,8 @@ inline bool TypeCheck::FitsAt(Val &v, TypeExpr *dt) {
         case TY_ENUM: {
             // Mode adaptation copies at construction (fixed <-> variable);
             // a variant value constructs its enum (the tag is static).
-            if (t->kind == TY_VARIANT) {
-                auto adt = t->var->adt;
-                if (adt->enu->en != dt->enu->en) return false;
-                if (!TypeArgsEq(adt->enu->args, dt->enu->args)) return false;
-            } else if (t->kind == TY_ENUM) {
-                if (t->enu->en != dt->enu->en) return false;
-                if (!TypeArgsEq(t->enu->args, dt->enu->args)) return false;
-            } else {
-                return false;
-            }
+            auto adt = AdtOf(t);
+            if (!adt || !SameAdt(adt, dt)) return false;
             if (!dt->enu->varmode && !GetEnumInst(dt)->allfixed) return false;
             v.type = dt;
             return true;
@@ -1316,6 +1372,7 @@ inline string TypeCheck::ConstStr(const Val &v) {
 // references decay (a bool& condition reads its pointee); an already
 // narrowed optional stays a valid (trivially true) test.
 inline Val TypeCheck::CheckCond(Node *n) {
+    DestScope ds(*this, Dest {});
     FlagScope rs(inreturn, false);
     auto v = CheckV(n, nullptr);
     auto id = Is<Ident>(n);
@@ -1335,6 +1392,19 @@ inline TypeExpr *TypeCheck::UnifyBranch(TypeExpr *a, TypeExpr *b, Node *at, bool
     if (!b) return a;
     if (TypeEq(a, b)) return a;
     if (TopConstEq(a, b)) return a->cq ? a : b;   // Read-only in one branch: in both.
+    if (a->kind == TY_INT && b->kind == TY_INT && (a->ix || b->ix)) {
+        // Index or bound types of one array join at the wider width, as a
+        // bound if either is one; anything else joins as the plain
+        // integers they are (§3.11).
+        if (a->ix && b->ix && a->ix->arr == b->ix->arr) {
+            auto upto = a->ix->upto || b->ix->upto;
+            if (ImplicitInt(a->intstorage, b->intstorage))
+                return ast.IndexTypeOf(b->intstorage, b->ix->arr, upto, at->line);
+            if (ImplicitInt(b->intstorage, a->intstorage))
+                return ast.IndexTypeOf(a->intstorage, a->ix->arr, upto, at->line);
+        }
+        return UnifyBranch(ast.NoIndex(a), ast.NoIndex(b), at, wantvalue);
+    }
     if (a->kind == TY_INT && b->kind == TY_INT) {
         if (ImplicitInt(a->intstorage, b->intstorage)) return b;
         if (ImplicitInt(b->intstorage, a->intstorage)) return a;
@@ -1357,6 +1427,7 @@ inline Val TypeCheck::VoidVal() {
 // that itself holds a reference (a reference variable or field), yields
 // the stored reference — there are no references to references.
 inline Val TypeCheck::CheckRefOf(Unary *x) {
+    DestScope ds(*this, Dest {});
     auto lv = CheckLValue(x->child);
     if (lv.var) RequireAssigned(lv.var, x);
     // A resizable value has a header of its own only as a whole variable or
@@ -1695,6 +1766,7 @@ inline void TypeCheck::RetypeVal(Val &v, TypeExpr *ct) {
 }
 
 inline Val TypeCheck::CheckRefIdentity(Binary *b) {
+    DestScope ds(*this, Dest {});
     // Reference identity (§4.5): the addresses, never the pointees. Each
     // side is a reference (plain or optional) or null, or storage taken
     // by reference as a `.=` binding takes it; the pointee types agree.
@@ -1740,7 +1812,14 @@ inline Val TypeCheck::CheckLogical(Binary *b) {
     }
     for (auto [gv, gn] : mid.globals)
         if (gn && !gv->narrowed) b->rightkills.push_back(gv);
+    // What it leaves emptied may not be, but what it ended stays ended.
+    auto rightkills = cur.kills;
     RestoreFlow(snap);
+    erase_if(cur.kills, [&](const Kill &k) {
+        return none_of(rightkills.begin(), rightkills.end(), [&](const Kill &l) {
+            return l.container == k.container && l.base == k.base && l.path == k.path;
+        });
+    });
     for (auto kv : b->rightkills) kv->narrowed = nullptr;
     for (auto v : mayassign) v->maybeassigned = true;
     Val v;
@@ -1752,6 +1831,15 @@ inline Val TypeCheck::CheckBinaryResult(Binary *b, Val &lv, Val &rv) {
     NoUntypedEmptyArray(lv, b->left, TName(b->op));
     NoUntypedEmptyArray(rv, b->right, TName(b->op));
     auto lt = LoadType(lv.type), rt = LoadType(rv.type);
+    // An exemplar's opaque operand (CheckExemplars) supports any operator:
+    // a comparison is a bool, anything else is of the opaque type.
+    if (IsOpaque(lt) || IsOpaque(rt)) {
+        Val v;
+        auto compare = b->op == T_EQ || b->op == T_NEQ || b->op == T_LT || b->op == T_GT ||
+                       b->op == T_LTEQ || b->op == T_GTEQ;
+        v.type = compare ? ast.booltype : IsOpaque(lt) ? lt : rt;
+        return v;
+    }
     auto numeric = [](TypeExpr *t) { return IsIntT(t) || t->kind == TY_FLT; };
     if (b->op == T_EQ || b->op == T_NEQ) {
         Val v;
@@ -2142,12 +2230,7 @@ inline void TypeCheck::RetypeFlexInt(Node *n, TypeExpr *t) {
 // or default declared in one -- so that the types around a cast may differ
 // from one specialization to the next (§7.7).
 inline bool TypeCheck::InGenericCode() {
-    auto generic = [](const SFunction *sf) {
-        if (!sf) return false;
-        if (!sf->generics.empty()) return true;
-        for (auto &p : sf->params) if (!p.type) return true;
-        return false;
-    };
+    auto generic = [](const SFunction *sf) { return sf && sf->IsGeneric(); };
     for (auto i = (int)frames.size() - 1; i >= 0;) {
         auto &fr = frames[i];
         if (fr.isfunval && !fr.isdefault) return true;
@@ -2169,6 +2252,9 @@ inline bool TypeCheck::Converts(const Val &v, TypeExpr *t) {
     auto vt = LoadType(v.type);
     if (t->kind == TY_INT) {
         if (vt->kind != TY_INT) return false;
+        if (t->ix)
+            return vt->ix && vt->ix->arr == t->ix->arr && (t->ix->upto || !vt->ix->upto) &&
+                   ImplicitInt(vt->intstorage, t->intstorage);
         if (vt->intstorage == t->intstorage) return true;
         if (v.ck == CK_INT || (v.litint && t->intstorage != IS_VARINT))
             return v.litint ? ConstsFit(v, t->intstorage)
@@ -2391,8 +2477,9 @@ inline void TypeCheck::CastVerdict(const CastAlt &a, const string &reason,
     w.cast = a.cast->Origin();
     w.redundant = !reason.empty();
     if (w.redundant) {
-        w.text = cat("redundant `as", a.cast->unchecked ? "! " : " ", TypeStr(a.cast->totype),
-                     "`: ", reason);
+        w.diag.where = LocOf(a.cast);
+        w.diag.message = cat("redundant `as", a.cast->unchecked ? "! " : " ",
+                             TypeStr(a.cast->totype), "`: ", reason);
         w.dependson = dependson;
     }
     if (WarningsHeld()) cur.pendingwarnings.push_back(std::move(w));
@@ -2436,10 +2523,7 @@ inline void TypeCheck::ReportRedundantCasts() {
         return tuple(l.fileidx, l.line, i);
     };
     sort(out.begin(), out.end(), [&](size_t i, size_t j) { return key(i) < key(j); });
-    for (auto i : out)
-        fputs(cat(Where(castverdicts[i].cast->line), ": warning: ", castverdicts[i].text, "\n")
-                  .c_str(),
-              stderr);
+    for (auto i : out) ast.Warn(castverdicts[i].diag);
 }
 
 // A name in a compile-time size, capacity or fill count, or in an integer
@@ -2452,6 +2536,7 @@ inline void TypeCheck::ReportRedundantCasts() {
 // parameter default, which names what a top-level declaration would, a name
 // its scope makes something else is an error as well (DefaultScopeName).
 inline void TypeCheck::ConstName(Ident *id, const char *what) {
+    if (!id->expansionerror.empty()) Error(id, string(id->expansionerror));
     if (auto vd = LookupVar(id->name, id->ns); vd && !vd->isglobal)
         Error(id, cat(what, " ", id->name, " names a local variable, not a constant"));
     if (auto kind = ScopeNameKind(id->name))
@@ -2518,11 +2603,11 @@ inline int64_t TypeCheck::FillCount(Node *n) {
 inline bool TypeCheck::ConstIntValue(Node *n, Val &v, bool &literal,
                                      set<VarDecl *> &visiting, ConstUse *use) {
     if (auto i = Is<IntLit>(n)) {
-        v.type = ast.inttypes[i->uns ? IS_U64 : IS_I64];
+        v.type = i->fixedtype ? i->fixedtype : ast.inttypes[i->uns ? IS_U64 : IS_I64];
         v.ck = CK_INT;
         v.ival = i->val;
         v.uns = i->uns;
-        literal = true;
+        literal = !i->fixedtype;
         return true;
     }
     if (auto id = Is<Ident>(n)) {
@@ -2541,6 +2626,13 @@ inline bool TypeCheck::ConstIntValue(Node *n, Val &v, bool &literal,
         if (g->type) {
             auto t = g->type;
             if (!IsIntT(t)) return false;
+            if (v.notconst) {
+                // The initializer's `~c` at the width the annotation gives.
+                if (!FitsIntStorage(v.litlo, false, t->intstorage)) Error(n, ConstsNoFit(v, t));
+                v.ival = WrapStorage(v.ival, t->intstorage);
+                v.uns = t->intstorage == IS_U64 && v.ival < 0;
+                v.notconst = false;
+            }
             if (!FitsIntStorage(v.ival, v.uns, t->intstorage))
                 Error(n, cat("constant ", ConstStr(v), " does not fit ", TypeStr(t)));
             v.type = ast.PlainOf(t);
@@ -2552,6 +2644,13 @@ inline bool TypeCheck::ConstIntValue(Node *n, Val &v, bool &literal,
     if (auto u = Is<Unary>(n)) {
         if (u->op != T_MINUS && u->op != T_BITNOT) return false;
         if (!ConstIntValue(u->child, v, literal, visiting, use)) return false;
+        // A constant a check gives no type of its own: a literal, or a named
+        // constant, which only its annotation would give one.
+        auto adapts = literal;
+        if (auto id = Is<Ident>(u->child)) {
+            auto g = ast.LookupGlobal(id->name, id->ns);
+            adapts = g && !g->type;
+        }
         auto s = v.type->intstorage;
         if (u->op == T_MINUS) {
             if (v.uns && (!literal || v.ival != INT64_MIN))
@@ -2563,12 +2662,20 @@ inline bool TypeCheck::ConstIntValue(Node *n, Val &v, bool &literal,
             v.ival = (int64_t)(0u - (uint64_t)v.ival);
             if (literal) v.type = ast.inttypes[IS_I64];
             v.uns = false;
+            v.notconst = false;
+        } else if (adapts && s == IS_I64 && !v.notconst && v.ival >= 0) {
+            // `~c` of such a constant c >= 0 is ~c at the width it is used
+            // at (Val::notconst, NumericUnary), i64's here.
+            v.notconst = true;
+            v.litlo = v.lithi = v.ival;
+            v.ival = ~v.ival;
         } else {
             v.ival = ~v.ival;
             auto bits = IntBits(s);
             if (IsUnsigned(s) && bits < 64)
                 v.ival = (int64_t)((uint64_t)v.ival & ((1ull << bits) - 1));
             v.uns = s == IS_U64 && v.ival < 0;
+            v.notconst = false;
         }
         if (!FitsIntStorage(v.ival, v.uns, v.type->intstorage))
             Error(n, "signed overflow in constant expression");
@@ -2669,13 +2776,15 @@ inline bool TypeCheck::ConstExtent(Ident *id, bool cap, int64_t &extent,
 }
 
 // All scalar leaves integers, or all floats; only structs and fixed
-// arrays compose; the value must be fixed-size (a constructed result).
+// arrays compose; the value must be fixed-size (a constructed result). No
+// leaf is of an index or bound type: arithmetic on one computes a plain
+// integer (§3.11), which the result's leaf of that type could not hold.
 inline bool TypeCheck::ElementwiseOK(TypeExpr *t) {
     int isint = -1;
     function<bool(TypeExpr *)> rec = [&](TypeExpr *t2) -> bool {
         switch (t2->kind) {
             case TY_INT:
-                if (t2->intstorage == IS_VARINT) return false;
+                if (t2->intstorage == IS_VARINT || t2->ix) return false;
                 if (isint == 0) return false;
                 isint = 1;
                 return true;
@@ -2736,6 +2845,7 @@ inline Val TypeCheck::CheckVariantConst(Dot *d, SEnum *en) {
     auto t = ast.EnumOf(en, {}, false, d->line);
     auto inst = GetEnumInst(t);
     auto found = en->FindVariant(d->name);
+    if (!found && en->broken) throw Abandoned {};
     if (!found) Error(d, cat("enum ", en->name, " has no variant named ", d->name));
     if (found->has_payload)
         Error(d, cat("variant ", en->name, ".", d->name,
@@ -2814,12 +2924,15 @@ inline bool TypeCheck::InitOrderSafe(Node *n, set<FnSpec *> &visiting, FnSpec *c
     }
     if (auto c = Is<AsCast>(n)) {
         auto from = LoadType(c->child->exprtype), to = c->totype;
-        bool lossless = from && to && IsIntT(from) && IsIntT(to) &&
+        // Into an index or bound type the conversion is a bounds check, in
+        // every build, whatever the widths (§3.11).
+        if (to->ix) return false;
+        bool lossless = IsIntT(from) && IsIntT(to) &&
             ((IsUnsigned(from->intstorage) == IsUnsigned(to->intstorage) &&
               IntBits(to->intstorage) >= IntBits(from->intstorage)) ||
              (IsUnsigned(from->intstorage) && !IsUnsigned(to->intstorage) &&
               IntBits(to->intstorage) > IntBits(from->intstorage)));
-        return (c->unchecked || c->implicit || (to && to->kind == TY_FLT) || lossless) &&
+        return (c->unchecked || c->implicit || to->kind == TY_FLT || lossless) &&
                safe(c->child);
     }
     if (auto c = Is<Call>(n)) {
@@ -2884,13 +2997,16 @@ inline TypeCheck::LitDeep TypeCheck::CheckInits(StructLit *sl, vector<Field> &fi
     auto pos = 0;
     for (auto &fi : sl->inits) {
         auto idx = -1;
+        CheckAccessorOwner(fi.val, fi.accessorowner, selft, sl);
         if (named) {
             for (auto i = 0; i < (int)fields.size(); i++)
                 if (!fields[i].ispad && fields[i].name == fi.name) { idx = i; break; }
+            if (idx < 0 && LacksByError(selft)) throw Abandoned {};
             if (idx < 0) Error(fi.val, cat(what, " has no field ", fi.name));
             if (got[idx]) Error(fi.val, cat("duplicate initializer for field ", fi.name));
         } else {
             while (pos < (int)fields.size() && fields[pos].ispad) pos++;
+            if (pos >= (int)fields.size() && LacksByError(selft)) throw Abandoned {};
             if (pos >= (int)fields.size())
                 Error(fi.val, cat("too many initializers for ", what));
             idx = pos++;
@@ -2920,6 +3036,8 @@ inline TypeCheck::LitDeep TypeCheck::CheckInits(StructLit *sl, vector<Field> &fi
                                   " (it has no declared default, and ", why, ")"));
                 fi.val = DefaultValue(ftypes[i], sl->line);
             }
+            // No value could be written for a field of a type naming nothing.
+            else if (!ast.unknowntypes.empty() && MentionsUnknown(ftypes[i])) throw Abandoned {};
             else Error(sl, cat("missing initializer for field ", fields[i].name, " of ", what,
                                " (it has no default)"));
         }
@@ -2996,10 +3114,16 @@ inline void TypeCheck::CheckSelfInit(Node *n, TypeExpr *ft, TypeExpr *selft) {
     // An `in pool` self is the value's own offset in the pool, so unlike a
     // self-relative one it only means anything where the literal is being
     // built: inside that pool.
-    if (ft->ref->pool && (!curdst.roots.Exact() || PoolOf(curdst.roots.Root()) != ft->ref->pool))
+    Roots poolroot;
+    if (ft->ref->pool) poolroot.Set(ft->ref->pool, true);
+    if (ft->ref->pool && !RelativeDestination(poolroot, curdst, n, true))
         Error(n, cat("self initializes ", TypeStr(ft), " only in a literal being built "
                      "inside ", ft->ref->pool->name, " (a push, an append, an alloc, or an "
                      "element store), since it stores the value's own offset in it (§3.9)"));
+    if (ft->ref->pool && curdst.fill)
+        Error(n, cat("self cannot initialize ", TypeStr(ft), " in a .resize fill value, which "
+                     "is built once and copied into every slot the resize adds, while self "
+                     "stores the value's own offset in ", ft->ref->pool->name, " (§3.9)"));
     // A resizable pointee needs a header the offset cannot carry; the root
     // rule keeps every other relative reference away from one, but a
     // self-reference satisfies that rule by construction.
@@ -3013,14 +3137,21 @@ inline void TypeCheck::CheckSelfInit(Node *n, TypeExpr *ft, TypeExpr *selft) {
 // Statements.
 
 inline void TypeCheck::CheckStmts(Block *b) {
+    // The parser lost a statement here (Block::brokenat), which it reported:
+    // what the block holds from there on was not what the program meant,
+    // and the body ends silently.
+    auto lost = [&](size_t i) { return (int)i == b->brokenat; };
     for (size_t i = 0; i < b->stmts.size(); i++) {
         if (!reachable) {
             b->stmts.resize(i);
             break;
         }
+        if (lost(i)) throw Abandoned {};
         blockpos.back().idx = i;
+        if (auto cf = Is<ConstFor>(b->stmts[i])) b->stmts[i] = ExpandStatements(cf);
         CheckStmt(b->stmts[i]);
     }
+    if (lost(b->stmts.size())) throw Abandoned {};
     // Drop the unreachable suffix (including the tail), so later passes never
     // see unchecked nodes. Function bodies are specialization clones; unknown
     // recursive calls may return, so only proven exits can prune them.
@@ -3197,6 +3328,8 @@ inline bool TypeCheck::UsedAfter(VarDef *v) {
 }
 
 inline void TypeCheck::CheckStmt(Node *n) {
+    DestScope ds(*this, Dest {});
+    ast.CheckCancel();
     // A statement inside a returned value's block is no part of that value:
     // the function's locals outlive it.
     FlagScope rs(inreturn, false);

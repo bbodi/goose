@@ -203,6 +203,15 @@ PROGRAMS += [
 WHOLE_PROGRAM |= {"tinygen_varsize"}
 
 
+
+# On macOS a data stack commits its pages from the fault handler; lldb must
+# hand those faults to the program instead of stopping on them (as goose
+# debug does).
+LLDB_PASS_FAULTS = ["-o", "settings set platform.plugin.darwin.ignored-exceptions EXC_BAD_ACCESS",
+                    "-o", "process handle SIGBUS -s false -n false -p true",
+                    "-o", "process handle SIGSEGV -s false -n false -p true"] \
+    if sys.platform == "darwin" else []
+
 def check_lldb_varsize(exe, base, lldb, ok, fail):
     """A variable-size struct parameter as the image it points at, its
     fields up to the first variable-size one by their Goose types."""
@@ -212,7 +221,7 @@ def check_lldb_varsize(exe, base, lldb, ok, fail):
     if not good:
         fail("tinygen lldb varsize build", log)
         return
-    code, o, e = tc.run_capture([lldb, "-b", "-o", "b pay", "-o", "run", "-o", "frame variable",
+    code, o, e = tc.run_capture([lldb, "-b", *LLDB_PASS_FAULTS, "-o", "b pay", "-o", "run", "-o", "frame variable",
                                  "-o", "p *e", "-o", "kill", out])
     text = o + e
     wants = [r"pay_g.* at tinygen_varsize\.goose:19", r"\(Employee \*\) e = 0x",
@@ -425,7 +434,7 @@ def check_lldb_limited(exe, base, ok, fail):
     if not good:
         fail("tinygen lldb limited build", log)
         return
-    code, o, e = tc.run_capture([lldb, "-b", "-o", "b tinygen_limited.goose:84",
+    code, o, e = tc.run_capture([lldb, "-b", *LLDB_PASS_FAULTS, "-o", "b tinygen_limited.goose:84",
                                  "-o", "b tinygen_limited.goose:89", "-o", "run",
                                  "-o", "frame variable a", "-o", "continue",
                                  "-o", "frame variable n", "-o", "kill", out])
@@ -453,7 +462,7 @@ def check_lldb_adts(exe, base, ok, fail):
     if not good:
         fail("tinygen lldb ADT build", log)
         return
-    code, o, e = tc.run_capture([lldb, "-b", "-o", "b scaled", "-o", "run",
+    code, o, e = tc.run_capture([lldb, "-b", *LLDB_PASS_FAULTS, "-o", "b scaled", "-o", "run",
                                  "-o", "frame variable s",
                                  "-o", "b tinygen_adts.goose:49", "-o", "continue",
                                  "-o", "frame variable r", "-o", "b turn", "-o", "continue",
@@ -485,7 +494,7 @@ def check_lldb(exe, base, ok, fail, say):
     if not good:
         fail("tinygen lldb build", log)
         return
-    code, o, e = tc.run_capture([lldb, "-b", "-o", "b mixed_sum", "-o", "run",
+    code, o, e = tc.run_capture([lldb, "-b", *LLDB_PASS_FAULTS, "-o", "b mixed_sum", "-o", "run",
                                  "-o", "frame variable", "-o", "bt",
                                  "-o", "b tinygen_structs.goose:30", "-o", "continue",
                                  "-o", "frame variable", "-o", "kill", out])
@@ -515,7 +524,7 @@ def check_lldb_arrays(exe, base, lldb, ok, fail):
     if not good:
         fail("tinygen lldb arrays build", log)
         return
-    code, o, e = tc.run_capture([lldb, "-b", "-o", "b weighted", "-o", "run",
+    code, o, e = tc.run_capture([lldb, "-b", *LLDB_PASS_FAULTS, "-o", "b weighted", "-o", "run",
                                  "-o", "frame variable", "-o", "up", "-o", "frame variable a",
                                  "-o", "kill", out])
     text = o + e
@@ -541,7 +550,7 @@ def check_lldb_globals(exe, base, lldb, ok, fail):
     if not good:
         fail("tinygen lldb globals build", log)
         return
-    code, o, e = tc.run_capture([lldb, "-b", "-o", "b sum_primes", "-o", "run",
+    code, o, e = tc.run_capture([lldb, "-b", *LLDB_PASS_FAULTS, "-o", "b sum_primes", "-o", "run",
                                  "-o", "target variable PRIMES counter seed hist last",
                                  "-o", "kill", out])
     text = o + e
@@ -566,7 +575,7 @@ def check_lldb_strings(exe, base, lldb, ok, fail):
     if not good:
         fail("tinygen lldb strings build", log)
         return
-    code, o, e = tc.run_capture([lldb, "-b", "-o", "b first_last", "-o", "b total", "-o", "run",
+    code, o, e = tc.run_capture([lldb, "-b", *LLDB_PASS_FAULTS, "-o", "b first_last", "-o", "b total", "-o", "run",
                                  "-o", "p *s", "-o", "continue", "-o", "frame variable v",
                                  "-o", "p *v.hdr", "-o", "parray 3 v.hdr->base", "-o", "kill",
                                  out])
@@ -607,7 +616,7 @@ def check_lldb_built(exe, base, lldb, ok, fail):
         if not good:
             fail(f"tinygen lldb {name} build", log)
             return
-        args = [lldb, "-b"]
+        args = [lldb, "-b", *LLDB_PASS_FAULTS]
         for c in cmds + ["kill"]:
             args += ["-o", c]
         code, o, e = tc.run_capture([*args, out])
@@ -630,7 +639,7 @@ def check_lldb_freevars(exe, base, lldb, ok, fail):
     if not good:
         fail("tinygen lldb nested build", log)
         return
-    code, o, e = tc.run_capture([lldb, "-b", "-o", "b bump", "-o", "run", "-o", "frame variable",
+    code, o, e = tc.run_capture([lldb, "-b", *LLDB_PASS_FAULTS, "-o", "b bump", "-o", "run", "-o", "frame variable",
                                  "-o", "br del 1", "-o", "b tinygen_nested.goose:28",
                                  "-o", "continue", "-o", "frame variable", "-o", "kill", out])
     text = o + e
@@ -656,7 +665,7 @@ def check_lldb_whole(exe, base, lldb, ok, fail):
     if not good or "tinygen: whole program" not in log:
         fail("tinygen lldb whole program build", log)
         return
-    code, o, e = tc.run_capture([lldb, "-b", "-o", "b tinygen_structs.goose:41", "-o", "run",
+    code, o, e = tc.run_capture([lldb, "-b", *LLDB_PASS_FAULTS, "-o", "b tinygen_structs.goose:41", "-o", "run",
                                  "-o", "frame variable", "-o", "bt", "-o", "kill", out])
     text = o + e
     wants = [
@@ -711,7 +720,7 @@ def check_lldb_formatters(exe, base, lldb, ok, fail):
         if f'command script import "{FORMATTERS}"' not in log:
             fail("tinygen -v names the lldb formatters", log)
             return
-        args = [lldb, "-b", "-o", f'command script import "{FORMATTERS}"']
+        args = [lldb, "-b", *LLDB_PASS_FAULTS, "-o", f'command script import "{FORMATTERS}"']
         for c in cmds + ["kill"]:
             args += ["-o", c]
         code, o, e = tc.run_capture([*args, out])
@@ -736,7 +745,7 @@ def check_lldb_optionals(exe, base, ok, fail):
         fail("tinygen lldb optionals build", log)
         return
     # or_zero(big), then or_zero(none); then sum's loop.
-    code, o, e = tc.run_capture([lldb, "-b", "-o", "b or_zero", "-o", "run", "-o", "continue",
+    code, o, e = tc.run_capture([lldb, "-b", *LLDB_PASS_FAULTS, "-o", "b or_zero", "-o", "run", "-o", "continue",
                                  "-o", "frame variable", "-o", "br del 1",
                                  "-o", "b tinygen_optionals.goose:41", "-o", "continue",
                                  "-o", "frame variable", "-o", "p *n", "-o", "kill", out])

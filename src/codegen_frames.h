@@ -28,13 +28,7 @@ inline bool CodeGen::IsPoolParam(FnSpec *sp, size_t i) {
 inline string CodeGen::HandedStacks(Node *n) {
     auto c = n;
     if (auto un = Is<Unary>(n); un && un->op == T_BITAND) c = un->child;
-    while (auto d = Is<Dot>(c)) {
-        if (!d->IsField()) return "";
-        c = d->obj;
-        // A reference field on the way leads to another stack.
-        if (!Is<Ident>(c) && c->exprtype && c->exprtype->kind == TY_REF) return "";
-    }
-    auto id = Is<Ident>(c);
+    auto id = Is<Ident>(FieldChainRoot(c, false));
     auto v = id ? id->vdef : nullptr;
     while (v && refalias.count(v)) v = const_cast<VarDef *>(refalias[v]);
     if (!v || !v->type || (!IsResz(v->type) && (!IsFatRef(v->type) || v->isvar)))
@@ -51,7 +45,7 @@ inline string CodeGen::HandedStacks(Node *n) {
 // arguments carry, and the callee's globals.
 inline string CodeGen::SyncReach(FnSpec *callee, const vector<string> &args,
                                  const vector<Node *> &an) {
-    if (!cachetops) return "*";
+    if (!cachetops || sinfo[callee].readsalltops) return "*";
     for (auto fv : sinfo[callee].freevars)
         if (fv->reusable || (fv->type && HoldsFatRef(fv->type))) return "*";
     string handed;
@@ -107,7 +101,8 @@ inline void CodeGen::CollectSpecs() {
         si.cname = Unique(base);
         si.hasrf = !sp->needs.empty();
         for (size_t i = 0; i < sp->rets.size(); i++)
-            if (si.cret < 0 && IsFix(sp->rets[i]) && !IsLargeFixed(sp->rets[i]))
+            if (si.cret < 0 && IsFix(sp->rets[i]) && !IsLargeFixed(sp->rets[i]) &&
+                !NeedsResultLocation(sp->rets[i]))
                 si.cret = (int)i;
         for (auto t : sp->needs)
             if (!fromids.count(t)) fromids[t] = (int)fromids.size() + 1;
@@ -150,8 +145,7 @@ inline void CodeGen::CollectSpecs() {
             // A slice literal still constructs a fixed array to point at.
             if (auto al = Is<ArrayLit>(n); al && al->exprtype->kind == TY_SLICE &&
                 IsFix(al->exprtype->sub)) {
-                auto count = al->fillval ? ((IntLit *)al->fillcount)->val
-                                         : (int64_t)al->elems.size();
+                auto count = LitCount(al);
                 si.needssp |= count > NATIVE_VALUE_LIMIT /
                     std::max<int64_t>(FixedSize(al->exprtype->sub), 1);
             }
@@ -163,6 +157,8 @@ inline void CodeGen::CollectSpecs() {
             // (GenAdtAdapted).
             if (auto from = AdtFrom(n)) si.needssp |= NeedsStack(from);
             if (auto c = Is<Call>(n)) {
+                if (c->spec && c->spec->sf->isextern && c->spec->sf->readsalltops)
+                    si.readsalltops = true;
                 auto add = [&](FnSpec *k) {
                     pair<FnSpec *, const Call *> e { k, c->fvremap.empty() ? nullptr : c };
                     if (k && k != sp && sinfo.count(k) && seencalls.insert(e).second)
@@ -173,7 +169,9 @@ inline void CodeGen::CollectSpecs() {
                 // Formatting a user type calls its format overload, and print
                 // and thread_spawn assemble their text or packet on a stack.
                 for (auto &fs : c->fmtspecs) add(fs.second);
-                if (c->builtin == B_PRINT || c->builtin == B_THREAD_SPAWN) si.needssp = true;
+                if (c->builtin == B_PRINT || c->builtin == B_THREAD_SPAWN ||
+                    c->builtin == B_THREAD_SPAWN_CONTAINED)
+                    si.needssp = true;
                 // A result is built as the call's own type (str() passed as
                 // a slice or returned as a u8[..16], say) before it is fitted.
                 for (auto rt : c->rettypes) si.needssp |= NeedsStack(rt);
@@ -202,7 +200,7 @@ inline void CodeGen::CollectSpecs() {
         };
         walk(sp->body);
     }
-    // All three summaries follow the same call edges. Iterate together to
+    // These summaries follow the same call edges. Iterate together to
     // handle recursion without repeatedly traversing the AST or retaining a
     // separate global-touch table that must track the specialization table.
     for (auto changed = true; changed;) {
@@ -225,6 +223,10 @@ inline void CodeGen::CollectSpecs() {
                     if (si.globals.insert(v).second) changed = true;
                 if (ki.needssp && !si.needssp) {
                     si.needssp = true;
+                    changed = true;
+                }
+                if (ki.readsalltops && !si.readsalltops) {
+                    si.readsalltops = true;
                     changed = true;
                 }
             }
@@ -262,7 +264,7 @@ inline void CodeGen::PushArg(vector<string> &args, TypeExpr *t, bool pool, const
         return;
     }
     auto x = v;
-    if (!all_of(x.begin(), x.end(), [](char c) { return isalnum((unsigned char)c) || c == '_'; })) {
+    if (!IsCName(x)) {
         x = T();
         L(pool ? string("gs_pref") : CT(t), " ", x, " = ", v, ";");
     }
@@ -288,13 +290,15 @@ inline string CodeGen::SigParams(FnSpec *sp, bool decls, bool er) {
             add(cat(ct, " ", pn));
             return;
         }
-        string init;
+        // The members are assigned one by one: TinyCC compiles a brace
+        // initializer into a memset call that zeroes the struct first.
+        string sets;
         for (auto &f : fs) {
             auto m = decls ? Unique2(cat(pn, "_", f.second)) : cat(pn, "_", f.second);
             add(cat(f.first, m));
-            Append(init, init.empty() ? "" : ", ", m);
+            Append(sets, " ", pn, ".", f.second, " = ", m, ";");
         }
-        if (decls) Append(paramcopies, "    ", ct, " ", pn, " = { ", init, " };\n");
+        if (decls) Append(paramcopies, "    ", ct, " ", pn, ";", sets, "\n");
     };
     for (size_t i = 0; i < sp->params.size(); i++) {
         auto vd = sp->params[i];
@@ -307,7 +311,7 @@ inline string CodeGen::SigParams(FnSpec *sp, bool decls, bool er) {
             // By-value resizable: the header (or frame object) by value
             // plus its stack (C.3).
             EmitCoreTypes();
-            add(cat(IsFrameObj(pt) ? CT(pt) : string("gs_rhdr"), " ", pn));
+            add(cat(RzCT(pt), " ", pn));
             add(cat("gs_stack *", pn, "_stk"));
             if (decls) vstk[vd] = cat(pn, "_stk");
         } else if (IsBytesT(pt)) {
@@ -330,7 +334,7 @@ inline string CodeGen::SigParams(FnSpec *sp, bool decls, bool er) {
             addval(ft, true, "gs_pref", fn);
         } else if (IsResz(ft)) {
             EmitCoreTypes();
-            add(cat(IsFrameObj(ft) ? CT(ft) : string("gs_rhdr"), " *", fn));
+            add(cat(RzCT(ft), " *", fn));
             add(cat("gs_stack *", fn, "_stk"));
             if (decls) {
                 vstk[fv] = cat(fn, "_stk");
@@ -371,8 +375,9 @@ inline string CodeGen::SigRet(FnSpec *sp) {
 }
 
 // The stacks of the classes PlanTopClasses admitted: each has a single
-// spelling then (see the note above). A caller's stack arriving as a plain
-// `gs_stack *` parameter otherwise never does, and keeps the memory form.
+// spelling then (see the note above toporder in codegen.h). A caller's stack
+// arriving as a plain `gs_stack *` parameter otherwise never does, and keeps
+// the memory form.
 inline bool CodeGen::CacheableStk(const string &stk) {
     if (!cachetops) return false;
     if (stk.compare(0, 3, "GS(") == 0) return topown;
@@ -436,27 +441,22 @@ inline string CodeGen::TopW(const string &stk) {
     return Top(stk);
 }
 
-// A loop's edges, where the tops it grows are loaded and stored back.
-inline int CodeGen::MarkLoopBegin() {
-    if (!markers) return -1;
+// Opens a region of the kind `cons` names (loopcons) inside the innermost
+// open one.
+inline int CodeGen::OpenRegion(const string &cons) {
     auto id = (int)loopparent.size();
     loopparent.push_back(loopstack.empty() ? -1 : loopstack.back());
-    loopcons.push_back("");
+    loopcons.push_back(cons);
     loopstack.push_back(id);
     L(LOOPMARK, "b", id);
     return id;
 }
 
+// A loop's edges, where the tops it grows are loaded and stored back.
+inline int CodeGen::MarkLoopBegin() { return markers ? OpenRegion("") : -1; }
+
 // A block's edges, likewise (GenBlockInner).
-inline int CodeGen::MarkBlockBegin() {
-    if (!markers) return -1;
-    auto id = (int)loopparent.size();
-    loopparent.push_back(loopstack.empty() ? -1 : loopstack.back());
-    loopcons.push_back(BLOCKREGION);
-    loopstack.push_back(id);
-    L(LOOPMARK, "b", id);
-    return id;
-}
+inline int CodeGen::MarkBlockBegin() { return markers ? OpenRegion(BLOCKREGION) : -1; }
 
 inline void CodeGen::MarkLoopEnd(int id) {
     if (id < 0) return;
@@ -474,12 +474,7 @@ inline void CodeGen::MarkLoopEnd(int id) {
 // the call reaches.
 inline int CodeGen::MarkConsBegin(const string &stk) {
     if (!markers || CacheableStk(stk) || InConsOf(stk)) return -1;
-    auto id = (int)loopparent.size();
-    loopparent.push_back(loopstack.empty() ? -1 : loopstack.back());
-    loopcons.push_back(stk);
-    loopstack.push_back(id);
-    L(LOOPMARK, "b", id);
-    return id;
+    return OpenRegion(stk);
 }
 
 // Where each stack is cached: the region TopW counted every growth of it

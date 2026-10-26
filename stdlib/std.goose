@@ -19,6 +19,25 @@ fn abs<T>(x: T) -> T { if x < 0 { return -x; } return x; }
 fn abs(x: f32) -> f32 { if x < 0.0 { return -x; } return x; }
 fn abs(x: f64) -> f64 { if x < 0.0 { return -x; } return x; }
 
+// Truncating remainder pairs with `/`. The product stays between a and
+// zero; divisor -1 has remainder zero even when its quotient cannot fit.
+fn rem<T>(a: T, b: T) -> T {
+    // A negative all-ones divisor is -1; this also accepts unsigned types.
+    if b < 0 && ~b == 0 { return 0; }
+    return a - (a / b) * b;
+}
+
+// Euclidean division pairs with `%`. Adjust the truncating quotient from
+// its remainder, without forming a - (a % b), which can underflow.
+fn div_euclid<T>(a: T, b: T) -> T {
+    let q = a / b;
+    if rem(a, b) < 0 {
+        if b > 0 { return q - 1; }
+        return q + 1;
+    }
+    return q;
+}
+
 fn sign<T>(x: T) -> T {
     if x < 0 { return -1; }
     if 0 < x { return 1; }
@@ -45,37 +64,11 @@ fn next_pow2(x: i64) -> i64 {
     return p;
 }
 
-fn popcount(x: u64) -> i64 {
-    var v = x;
-    var n = 0;
-    while v != 0 {
-        v = v & (v - 1);
-        n += 1;
-    }
-    return n;
-}
-
-// Leading / trailing zero bits; 64 for zero.
-fn clz(x: u64) -> i64 {
-    if x == 0 { return 64; }
-    var v = x;
-    var n = 0;
-    while (v >> 63) == 0 {
-        v = v << 1;
-        n += 1;
-    }
-    return n;
-}
-fn ctz(x: u64) -> i64 {
-    if x == 0 { return 64; }
-    var v = x;
-    var n = 0;
-    while (v & 1) == 0 {
-        v = v >> 1;
-        n += 1;
-    }
-    return n;
-}
+// The bits set, and the leading / trailing zero bits, 64 for zero: the
+// runtime's (src/runtime/runtime_ext.h), one instruction where it can.
+extern fn popcount(x: u64) -> i64 = "gs_popcount";
+extern fn clz(x: u64) -> i64 = "gs_clz";
+extern fn ctz(x: u64) -> i64 = "gs_ctz";
 
 // The values a and b refer to. `T&` of a reference type is that reference
 // (spec §3.8), so for two elements of an array of references this swaps
@@ -364,16 +357,17 @@ fn find<T>(xs: T[:], sub: T[:]) -> i64 {
     if sub.len == 0 { return 0; }
     var i = 0;
     while i + sub.len <= xs.len {
-        if xs[i..i + sub.len] == sub { return i; }
+        if xs[i] == sub[0] && xs[i..i + sub.len] == sub { return i; }
         i += 1;
     }
     return -1;
 }
 fn rfind<T>(xs: T[:], sub: T[:]) -> i64 {
+    if sub.len == 0 { return xs.len; }
     if sub.len > xs.len { return -1; }
     var i = xs.len - sub.len;
     while i >= 0 {
-        if xs[i..i + sub.len] == sub { return i; }
+        if xs[i] == sub[0] && xs[i..i + sub.len] == sub { return i; }
         i -= 1;
     }
     return -1;
@@ -448,11 +442,11 @@ fn byte_set(bytes: u8[:]) -> ByteSet {
 }
 
 // The first i with s[i] in the set, -1 if none.
-extern "gs_find_any" fn find_any(s: const u8[:], set: const ByteSet&) -> i64;
+extern fn find_any(s: const u8[:], set: const ByteSet&) -> i64 = "gs_find_any";
 
 // find_pair, but for its check of d.
-extern "gs_find_pair" fn byte_set_pair(s: const u8[:], a: const ByteSet&, d: i64,
-                                       b: const ByteSet&) -> i64;
+extern fn byte_set_pair(s: const u8[:], a: const ByteSet&, d: i64,
+                          b: const ByteSet&) -> i64 = "gs_find_pair";
 
 // The first i with s[i] in a and s[i + d] in b, of those with i + d < s.len;
 // -1 if none. d >= 0.
@@ -970,11 +964,12 @@ fn make_heap<A, F>(xs: A&) {
 // ---- strings ---------------------------------------------------------------------
 // Plain rendering is the builtin `format`; these add control and parsing.
 
-// Digits of v in the base (2..36), right-aligned in `width` with `pad`.
+// Digits of v in the base (2..36), right-aligned in `width` with `pad`,
+// appended to `out`, any u8 array that grows (u8[>..], or a limited u8[..k]).
 // Base ten is the builtin text of the integer, the runtime's digit loop
 // writing straight into `out`; other bases divide by the `base` parameter,
 // a real division per digit.
-fn format_uint(out: u8[>..]&, v: u64, base: i64, width: i64, padc: u8) {
+fn format_uint<B>(out: B&, v: u64, base: i64, width: i64, padc: u8) {
     if base == 10 {
         if width > 1 {
             var n = 1;
@@ -1013,7 +1008,7 @@ fn format_uint(out: u8[>..]&, v: u64, base: i64, width: i64, padc: u8) {
 
 // The sign goes in front of any padding: -0042. The magnitude is taken in
 // unsigned arithmetic, which holds i64.min's.
-fn format_int(out: u8[>..]&, v: i64, base: i64, width: i64, padc: u8) {
+fn format_int<B>(out: B&, v: i64, base: i64, width: i64, padc: u8) {
     if v < 0 {
         out.push('-');
         format_uint(out, 0 - v as! u64, base, width - 1, padc);

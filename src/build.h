@@ -71,7 +71,14 @@ struct Builder {
             return {};
         #else
             if (tc.style == "msvc") return {};
-            return { "-lm", "-pthread" };
+            vector<string> libs = { "-lm", "-pthread" };
+            #ifdef __linux__
+                // dlopen, for the runtime's dynamic externs: in libdl before
+                // glibc 2.34, and in libc since, where the archive left
+                // behind is empty.
+                libs.push_back("-ldl");
+            #endif
+            return libs;
         #endif
     }
 
@@ -221,15 +228,16 @@ inline string RuntimeObject(const Builder &b) {
 // What `goose build` does once the compiler has written the program's C to
 // `cfile` in `builddir`: finds the runtime object for the toolchain `tc`,
 // which built the native parts whose response files are `nativersps`
-// (native.h and builtin.h, found by the caller), and links the executable,
-// named by -o, the program's sidecar (`output`) or the root file. A whole
-// program the tinygen backend wrote (`cfile` "") links its object with the
-// support object `tgsupport` names (TinygenSupportSource), cached as the
-// runtime object is, so that no C of the program's is compiled. The exit
-// code.
+// (native.h and builtin.h, found by the caller) in link order, a package's
+// before the packages it requires and the program's own C first of all, and
+// links the executable, named by -o, the program's sidecar (`output`) or the
+// root file. A whole program the tinygen backend wrote (`cfile` "") links its
+// object with the support object `tgsupport` names (TinygenSupportSource),
+// cached as the runtime object is, so that no C of the program's is compiled.
+// The exit code.
 inline int BuildExecutable(const string &rootfile, const string &cfile, const string &builddir,
-                           const Toolchain &tc, const BuildOptions &opts, const string &exedir,
-                           FILE *msgs, const vector<string> &nativersps, const string &output,
+                           const Toolchain &tc, const BuildOptions &opts, FILE *msgs,
+                           const vector<string> &nativersps, const string &output,
                            const vector<string> &extraobjects = {},
                            const pair<string, std::function<string()>> &tgsupport = {}) {
     Builder b { tc, opts, msgs };
@@ -246,10 +254,6 @@ inline int BuildExecutable(const string &rootfile, const string &cfile, const st
         if (obj.empty()) return 1;
         objects.push_back(obj);
     }
-    // The response files in link order: a package's before the packages it
-    // requires, the program's own C first of all.
-    auto rsps = nativersps;
-    (void)exedir;
     auto exe = opts.exe;
     if (exe.empty()) {
         exe = cat(DirOf(rootfile), output.empty() ? PathStem(rootfile) : output);
@@ -257,7 +261,12 @@ inline int BuildExecutable(const string &rootfile, const string &cfile, const st
             if (exe.size() < 4 || exe.compare(exe.size() - 4, 4, ".exe") != 0) exe += ".exe";
         #endif
     }
-    if (!b.Link(cfile, objects, rsps, exe, builddir, cat(builddir, "/cc.log"))) return 1;
+    if (!opts.dryrun) {
+        std::error_code ec;
+        auto exedirpath = filesystem::path(exe).parent_path();
+        if (!exedirpath.empty()) filesystem::create_directories(exedirpath, ec);
+    }
+    if (!b.Link(cfile, objects, nativersps, exe, builddir, cat(builddir, "/cc.log"))) return 1;
     if (!opts.dryrun) fprintf(msgs, "built %s\n", exe.c_str());
     return 0;
 }

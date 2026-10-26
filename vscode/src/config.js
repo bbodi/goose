@@ -41,14 +41,17 @@ function settings(vscode, uri, definition = {}, taskFolder) {
     };
 }
 
-function argumentsFor(action, config) {
-    // `goose build` is a verb, which comes first; the rest are flags.
-    const args = action === 'build' ? ['build'] : [];
+// The command line of a compiler action; a check with `diagnostics: 'json'`
+// asks for its errors and warnings as JSON on stdout (docs/implementation.md
+// §1), which a compiler without the flag rejects.
+function argumentsFor(action, config, options = {}) {
+    // `goose check` and `goose build` are verbs, which come first; the rest are flags.
+    const args = action === 'build' || action === 'check' ? [action] : [];
+    if (options.diagnostics) args.push('--diagnostics', options.diagnostics);
     if (config.stdlib) args.push('--stdlib', config.stdlib);
-    if (action === 'check') args.push('--check');
-    else if (action === 'run') args.push('--jit');
+    if (action === 'run') args.push('--jit');
     else if (action === 'generateC') args.push('-o', config.output);
-    else if (action !== 'build') throw new Error(`Unknown Goose task action: ${action}`);
+    else if (action !== 'build' && action !== 'check') throw new Error(`Unknown Goose task action: ${action}`);
     args.push(config.file);
     if (action === 'run' && config.runArguments.length) args.push('--', ...config.runArguments);
     return args;

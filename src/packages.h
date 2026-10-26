@@ -28,10 +28,14 @@ inline string PackageDir(const string &dir) {
     return abs + "/";
 }
 
-inline bool IsPathSource(const string &text) {
-    return text.rfind("./", 0) == 0 || text.rfind("../", 0) == 0 || text.rfind(".\\", 0) == 0 ||
-           text.rfind("..\\", 0) == 0 || text[0] == '/' || text[0] == '\\' ||
+inline bool IsAbsoluteSource(const string &text) {
+    return (!text.empty() && (text[0] == '/' || text[0] == '\\')) ||
            (text.size() > 1 && text[1] == ':');
+}
+
+inline bool IsPathSource(const string &text) {
+    return text == "." || text == ".." || text.rfind("./", 0) == 0 || text.rfind("../", 0) == 0 ||
+           text.rfind(".\\", 0) == 0 || text.rfind("..\\", 0) == 0 || IsAbsoluteSource(text);
 }
 
 // Reads a source as written in a file in `fromdir`. A path is resolved from
@@ -44,8 +48,7 @@ inline PackageSource ParsePackageSource(const string &text, const string &fromdi
     if (text.empty()) throw CompileError { "a package source is a path or a git repository" };
     if (IsPathSource(text)) {
         s.ispath = true;
-        auto absolute = text[0] == '/' || text[0] == '\\' || (text.size() > 1 && text[1] == ':');
-        s.dir = PackageDir(absolute ? text : cat(fromdir, text));
+        s.dir = PackageDir(IsAbsoluteSource(text) ? text : cat(fromdir, text));
         return s;
     }
     auto at = text.rfind('@');
@@ -80,6 +83,9 @@ inline bool SameSource(const PackageSource &a, const PackageSource &b) {
 
 // `goose fetch --update`: refs that are not commits are fetched again.
 inline bool package_update = false;
+// `--offline`: nothing is fetched; a package whose checkout is not in the
+// cache is an error at its import, which `goose fetch` resolves.
+inline bool package_nofetch = false;
 
 inline bool IsCommitHash(const string &ref) {
     if (ref.size() < 7 || ref.size() > 40) return false;
@@ -116,16 +122,17 @@ inline string GitCacheDir(const PackageSource &s) {
 
 // Reads the package's sidecar, `<name>.build` beside its entry, if there is
 // one (§4.7): the C it compiles, where to find headers, what to define and
-// link, or the CMake target to build; and for the program its executable's
-// name. Lists take a _windows, _linux or _macos suffix for a platform's own
-// part. Paths are relative to the package root.
+// link, or the CMake target to build; the directories that are none of its
+// own; and for the program its executable's name. Lists take a _windows,
+// _linux or _macos suffix for a platform's own part. Paths are relative to
+// the package root.
 inline void LoadSidecar(Package &pkg, bool isprogram) {
     pkg.sidecar = cat(pkg.root, pkg.name, ".build");
     auto bf = LoadBuildFile(pkg.sidecar, pkg.hassidecar);
     if (!pkg.hassidecar) return;
     const char *lists[] = { "c_sources", "c_include", "c_defines", "c_flags_cc", "c_flags_msvc",
-                            "c_libs" };
-    vector<string> known = { "cmake_target", "cmake_options", "main_thread_only" };
+                            "c_libs", "dylibs" };
+    vector<string> known = { "cmake_target", "cmake_options", "main_thread_only", "exclude" };
     for (auto key : lists)
         for (auto suffix : { "", "_windows", "_linux", "_macos" }) known.push_back(cat(key, suffix));
     if (isprogram) known.push_back("output");
@@ -142,8 +149,7 @@ inline void LoadSidecar(Package &pkg, bool isprogram) {
         for (auto &e : bf.Strings(cat(key, platform))) v.push_back(e);
         if (paths)
             for (auto &e : v)
-                if (!IsPathSource(e) || e.rfind("./", 0) == 0 || e.rfind("../", 0) == 0)
-                    e = ForwardSlashes(AbsolutePath(cat(pkg.root, e)));
+                if (!IsAbsoluteSource(e)) e = ForwardSlashes(AbsolutePath(cat(pkg.root, e)));
         return v;
     };
     pkg.csources = list("c_sources", true);
@@ -155,7 +161,29 @@ inline void LoadSidecar(Package &pkg, bool isprogram) {
     pkg.cmake_target = bf.Str("cmake_target");
     pkg.cmake_options = bf.Strings("cmake_options");
     pkg.main_thread_only = bf.Bool("main_thread_only");
+    for (auto &e : bf.Strings("exclude")) pkg.exclude.push_back(PackageDir(cat(pkg.root, e)));
     if (isprogram) pkg.output = bf.Str("output");
+    // dylibs maps a name the source's extern blocks use to the spelling
+    // to open on every platform, and the suffixed lists on one; the
+    // generated C carries all of them, the runtime picking its own. A name
+    // no block declares is refused once every block is known (ParseProgram).
+    for (auto suffix : { "", "_windows", "_linux", "_macos" }) {
+        auto key = cat("dylibs", suffix);
+        for (auto &e : bf.Strings(key)) {
+            auto eq = e.find('=');
+            if (eq == string::npos || eq == 0 || eq + 1 == e.size())
+                throw CompileError { cat(pkg.sidecar, ": ", key, " entry \"", e,
+                                         "\" is written name=spelling") };
+            auto name = e.substr(0, eq), spelling = e.substr(eq + 1);
+            auto it = std::find_if(pkg.dylibs.begin(), pkg.dylibs.end(),
+                                   [&](auto &d) { return d.name == name; });
+            if (it == pkg.dylibs.end()) it = pkg.dylibs.insert(it, DylibSpelling { name });
+            auto &slot = *suffix ? it->On(suffix) : it->any;
+            if (!slot.empty())
+                throw CompileError { cat(pkg.sidecar, ": ", key, " maps ", name, " twice") };
+            slot = spelling;
+        }
+    }
     if (!pkg.csources.empty() && !pkg.cmake_target.empty())
         throw CompileError { cat(pkg.sidecar, ": a package has either c_sources or a cmake_target") };
 }
@@ -167,9 +195,12 @@ inline void RemoveTree(const string &path) {
     filesystem::path p(path);
     if (!filesystem::exists(p, ec)) return;
     #ifdef _WIN32
-        for (auto &e : filesystem::recursive_directory_iterator(p, ec))
-            filesystem::permissions(e.path(), filesystem::perms::owner_write,
-                                    filesystem::perm_options::add, ec);
+        for (filesystem::recursive_directory_iterator it(p, ec), end; !ec && it != end;
+             it.increment(ec)) {
+            std::error_code pec;
+            filesystem::permissions(it->path(), filesystem::perms::owner_write,
+                                    filesystem::perm_options::add, pec);
+        }
     #endif
     filesystem::remove_all(p, ec);
 }
@@ -211,7 +242,10 @@ inline string FetchPackage(const PackageSource &s, const string &name) {
     auto dir = GitCacheDir(s);
     std::error_code ec;
     auto have = filesystem::is_directory(filesystem::path(dir), ec);
-    auto update = have && package_update && !IsCommitHash(s.ref);
+    if (!have && package_nofetch)
+        throw CompileError { cat("the package ", name, " from ", s.text, " is not fetched, and "
+                                 "--offline fetches nothing: `goose fetch` fetches it") };
+    auto update = have && package_update && !IsCommitHash(s.ref) && !package_nofetch;
     if (!have || update) {
         auto parent = filesystem::path(dir).parent_path();
         filesystem::create_directories(parent, ec);

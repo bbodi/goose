@@ -36,9 +36,12 @@ inline string TgFixedShim(const string &name) {
             if (name != cat("gs_tg_", op, "_", sfx)) continue;
             auto ct = string(CodeGen::IntCT(is));
             auto neg = string(op) == "neg";
+            // A signed modulo takes a temporary of the caller's for the C remainder.
+            auto smod = string(op) == "mod" && !IsUnsigned(is);
             return cat(ct, " ", name, "(", ct, " a, ", neg ? "" : cat(ct, " b, "),
-                       "const char *f, int l) { return gs_",
-                       op, "_", sfx, neg ? "(a, f, l); }\n" : "(a, b, f, l); }\n");
+                       "const char *f, int l) { ", smod ? "int64_t t; " : "", "return gs_",
+                       op, "_", sfx, neg ? "(a, f, l); }\n" : smod ? "(t, a, b, f, l); }\n"
+                                                             : "(a, b, f, l); }\n");
         }
     // gs_thread_spawn is the runtime.h helper of a program with threads (GS_NEED_THREADS); the support
     // object has its own (TgSupportBody).
@@ -46,8 +49,8 @@ inline string TgFixedShim(const string &name) {
         { "gs_tg_stks", "void *gs_tg_stks(void) { return gs_stks; }\n" },
         { "gs_tg_stkpp", "void *gs_tg_stkpp = (void *)&gs_stks;\n" },
         { "gs_tg_thread_spawn",
-          "int64_t gs_tg_thread_spawn(void (*e)(uint8_t *), const void *a, int64_t n) "
-          "{ return gs_thread_spawn(e, a, n); }\n" },
+          "int64_t gs_tg_thread_spawn(void (*e)(uint8_t *), const void *a, int64_t n, int c) "
+          "{ return gs_thread_spawn(e, a, n, c); }\n" },
         { "gs_tg_stack_init", "void gs_tg_stack_init(void *s) { gs_stack_init((gs_stack *)s); }\n" },
         { "gs_tg_rf", "void *gs_tg_rf(void) { return &gs_rf; }\n" },
         { "gs_tg_rfpanic",
@@ -162,11 +165,16 @@ inline string TgSupportBody(string_view runtimeh) {
          "}\n"
          "static void gs_tg_thread_run(void (*entry)(uint8_t *), uint8_t *args) {\n"
          "    entry(args);\n"
+         "    gs_rt_stats();\n"
+         "}\n"
+         "static void gs_tg_thread_release(void) {\n"
          "    free(gs_tg_tstks);\n"
          "    gs_tg_tstks = NULL;\n"
          "}\n"
-         "int64_t gs_tg_thread_spawn(void (*entry)(uint8_t *), const void *args, int64_t size) {\n"
-         "    return gs_thread_start(gs_tg_thread_run, entry, args, size);\n"
+         "int64_t gs_tg_thread_spawn(void (*entry)(uint8_t *), const void *args, int64_t size,\n"
+         "                           int contained) {\n"
+         "    return gs_thread_start(gs_tg_thread_run, gs_tg_thread_release, entry, args, size,\n"
+         "                           contained);\n"
          "}\n"
          "static uint8_t gs_tg_noglobals;\n"
          "void gs_tg_start(int argc, char **argv, int64_t mainstacks, int64_t mainregions,\n"
@@ -4313,7 +4321,7 @@ struct TgFn {
             return MemV(c->rettypes[0], AtL(t));
         }
         if (b == B_THREAD_WAIT) return GenThreadWait(c);
-        if (b == B_THREAD_SPAWN) return GenThreadSpawn(c);
+        if (b == B_THREAD_SPAWN || b == B_THREAD_SPAWN_CONTAINED) return GenThreadSpawn(c);
         if (b == B_QPUT) return GenQput(c);
         if (b == B_QGET || b == B_QPOLL) return GenQget(c, idst);
         if (b >= 0) No(line, cat("builtin ", BuiltinByKind(b).name));
@@ -5284,12 +5292,19 @@ struct TgFn {
         return start;
     }
 
+    // thread_wait(id): whether the worker returned rather than aborted. The form that takes the
+    // abort's message goes through C.
     V GenThreadWait(Call *c) {
         cg.usesthreads = true;
-        auto id = GenAs(c->ArgNodes()[0], M.ast.inttypes[IS_I64]).v;
-        if (!Ended()) CallC("gs_thread_wait", { IT(TYG_I64), tyg_type_ptr(m), IT(TYG_I32) },
-                            { id, FileArg(c->line), LineArg(c->line) }, nullptr);
-        return V {};
+        auto an = c->ArgNodes();
+        if (an.size() != 1) No(c->line, "thread_wait with a message");
+        auto id = GenAs(an[0], M.ast.inttypes[IS_I64]).v;
+        if (Ended()) return Dummy(c->exprtype);
+        auto ptr = tyg_type_ptr(m);
+        auto null = I64(0);
+        return ValV(c->exprtype,
+                    CallC("gs_thread_wait", { IT(TYG_I64), ptr, ptr, ptr, IT(TYG_I32) },
+                          { id, null, null, FileArg(c->line), LineArg(c->line) }, IT(TYG_I8, false)));
     }
 
     // thread_spawn(worker, args...) (CodeGen::EmitThreadSpawn): arguments and the worker's globals
@@ -5377,8 +5392,11 @@ struct TgFn {
             });
         }
         M.NeedShim("gs_tg_thread_spawn");
-        return ValV(i64t, CallC("gs_tg_thread_spawn", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64) },
-                                { thunk, base, Sub(Top(stk), base) }, IT(TYG_I64)));
+        return ValV(i64t, CallC("gs_tg_thread_spawn",
+                                { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64), IT(TYG_I32) },
+                                { thunk, base, Sub(Top(stk), base),
+                                  I32(c->builtin == B_THREAD_SPAWN_CONTAINED) },
+                                IT(TYG_I64)));
     }
 
     V GenQput(Call *c) {
@@ -5521,64 +5539,17 @@ struct TgFn {
         return bt && ((bt->kind == TY_ARRAY && IsU8(bt->arr->sub)) ||
                       (bt->kind == TY_SLICE && IsU8(bt->sub)));
     }
-    // print(...) (§3.7): every argument is evaluated before any text is written (B_PRINT).
+    // print(...) (§3.7): the whole line, newline included, rendered into a builder on a stack of the
+    // statement's before any of it is written, then one gs_out_bytes (B_PRINT).
     V GenPrint(Call *c) {
         auto an = c->ArgNodes();
-        // A value rendered structurally sends the whole line through a builder on a stack of the
-        // statement's.
-        auto simple = [&](Node *a) {
-            if (Is<StrLit>(a)) return true;
-            auto bt = PlainPointee(a->exprtype);
-            auto fc = cg.FmtContext(c, a);
-            if (bt && cg.FmtSpecFor(fc, bt)) return false;
-            if (TgModule::IsVarint(bt) && cg.FmtSpecFor(fc, M.ast.inttypes[IS_I64])) return false;
-            if (PrintsAsBytes(bt)) return true;
-            auto ot = cg.OperandT(a->exprtype);
-            return ot && M.IsScalar(ot) && ot->kind != TY_REF;
-        };
-        if (!std::all_of(an.begin(), an.end(), simple)) {
-            auto b = RzTemp(cg.GrowU8(), c->line);
-            auto len = CountAt(b.a);
-            StartHdr(b.stk, b.a);
-            TextInto(b.stk, len, c, an, 0);
-            if (Ended()) return V {};
-            CallC("gs_out_bytes", { tyg_type_ptr(m), IT(TYG_I64) }, { Ld(b.a), Ld(len) }, nullptr);
-            CallC("gs_out_nl", {}, {}, nullptr);
-            return V {};
-        }
-        vector<std::function<void()>> outs;   // The calls, made once every argument is evaluated.
-        auto bytes = [&](tyg_val ptr, tyg_val len) {
-            outs.push_back([=] {
-                CallC("gs_out_bytes", { tyg_type_ptr(m), IT(TYG_I64) }, { ptr, len }, nullptr);
-            });
-        };
-        auto scalar = [&](const char *fn, tyg_val v, const tyg_type *ty) {
-            outs.push_back([=] { CallC(fn, { ty }, { v }, nullptr); });
-        };
-        for (auto a : an) {
-            if (auto s = Is<StrLit>(a)) {
-                bytes(BytesAddr(s->val), I64((int64_t)s->val.size()));
-            } else if (PrintsAsBytes(PlainPointee(a->exprtype))) {
-                auto v = ViewOf(Place(a), a->line);
-                bytes(v.elems, v.len);
-            } else {
-                auto ot = cg.OperandT(a->exprtype);
-                if (ot->kind == TY_INT && ot->intstorage == IS_U64)
-                    scalar("gs_out_uint", GenAs(a, ot).v, IT(TYG_I64, false));
-                else if (ot->kind == TY_INT)
-                    scalar("gs_out_int", GenAs(a, M.ast.inttypes[IS_I64]).v, IT(TYG_I64));
-                else if (ot->kind == TY_FLT && M.Scal(ot) == TYG_F32)
-                    scalar("gs_out_f32", GenAs(a, ot).v, tyg_type_scalar(m, TYG_F32));
-                else if (ot->kind == TY_FLT)
-                    scalar("gs_out_flt", GenAs(a, ot).v, tyg_type_scalar(m, TYG_F64));
-                else
-                    scalar("gs_out_bool", tyg_convert(p, TYG_ZEXT, TYG_I64, GenAs(a, ot).v),
-                           IT(TYG_I64));
-            }
-        }
+        auto b = RzTemp(cg.GrowU8(), c->line);
+        auto len = CountAt(b.a);
+        StartHdr(b.stk, b.a);
+        TextInto(b.stk, len, c, an, 0);
         if (Ended()) return V {};
-        for (auto &o : outs) o();
-        CallC("gs_out_nl", {}, {}, nullptr);
+        CopyLit(b.stk, len, M.ast.inttypes[IS_U8], "\n");
+        CallC("gs_out_bytes", { tyg_type_ptr(m), IT(TYG_I64) }, { Ld(b.a), Ld(len) }, nullptr);
         return V {};
     }
 
@@ -7961,6 +7932,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         if (auto c = Is<Call>(n)) {
             switch (c->builtin) {
                 case B_THREAD_SPAWN:
+                case B_THREAD_SPAWN_CONTAINED:
                 case B_THREAD_WAIT:
                 case B_QPUT:
                 case B_QGET:
