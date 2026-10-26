@@ -4,6 +4,8 @@
 // requires every function to go through tinygen; the suite also runs it
 // through the C backends, against the same expected output.
 
+import std;
+
 recursive fn fib(n: i64) -> i64 {
     if n < 2 { return n; }
     return fib(n - 1) + fib(n - 2);
@@ -106,4 +108,6 @@ fn main() {
     print(sum_to(100), " ", sign(-8), " ", sign(0), " ", sign(12), " ", bump(17));
     let big: u64 = 18446744073709551615;
     print(big, " ", big / 3, " ", big % 1000, " ", big >> 60);
+    // The runtime's static externs, through the support object's trampolines.
+    print(popcount(big >> 4), " ", clz(255), " ", ctz(96));
 }

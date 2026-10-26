@@ -90,6 +90,13 @@ inline const vector<TgSupportExtern> &TgSupportExterns() {
             { "gs_find_any", "int64_t", "sl_u8 a0, const void *a1", "a0, a1" },
             { "gs_find_pair", "int64_t", "sl_u8 a0, const void *a1, int64_t a2, const void *a3",
               "a0, a1, a2, a3" },
+            { "gs_ffi_cstr", "uint8_t", "uint64_t a0, gs_rref a1", "a0, a1" },
+            { "gs_ffi_bytes", "uint8_t", "uint64_t a0, int64_t a1, gs_rref a2", "a0, a1, a2" },
+            { "gs_popcount", "int64_t", "uint64_t a0", "a0" },
+            { "gs_clz", "int64_t", "uint64_t a0", "a0" },
+            { "gs_ctz", "int64_t", "uint64_t a0", "a0" },
+            { "gs_mul_add", "double", "double a0, double a1, double a2", "a0, a1, a2" },
+            { "gs_mul_addf", "float", "float a0, float a1, float a2", "a0, a1, a2" },
         };
         static const char *unary[] = { "sqrt", "sin", "cos", "tan", "asin", "acos", "atan",
                                        "exp", "log", "log2", "log10" };
