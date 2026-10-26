@@ -1,3 +1,6 @@
 // The sidecar of pkg_own_c.goose: its C, compiled with a define.
 c_sources = ["pkg_own_c_impl.c"];
 c_defines = ["OWN_C_SCALE=2"];
+// A link flag as written, beside libraries by name.
+c_libs_macos = ["-framework CoreFoundation"];
+c_libs_linux = ["-lm"];

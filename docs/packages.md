@@ -136,6 +136,7 @@ c_sources = ["impl.c", "vendor/stb_impl.c"];   // compiled with the program's bu
 c_include = ["vendor"];
 c_defines = ["IMPL_FAST=1"];
 c_libs = ["m"];                                // system libraries, by name
+c_libs_macos = ["-framework OpenGL"];          // or flags for the link, as written
 c_libs_windows = ["user32"];                   // one platform's part
 dylibs_linux = ["SDL2=libSDL2-2.0.so.0"];      // what an extern "SDL2" block opens here
 output = "foo";                                // the executable's name, if not the file's

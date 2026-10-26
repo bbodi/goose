@@ -544,7 +544,19 @@ inline bool BuildNativePart(const Ast &ast, int pkg, const string &rootfile,
         objects.push_back(obj);
     }
     vector<string> libs;
-    for (auto &l : p.clibs) libs.push_back(b.LibFlag(l));
+    // A library by name, or flags for the link as written, a word each
+    // (`-framework OpenGL`, `-L/opt/homebrew/lib`).
+    for (auto &l : p.clibs) {
+        if (l[0] != '-') {
+            libs.push_back(b.LibFlag(l));
+            continue;
+        }
+        for (size_t i = 0; (i = l.find_first_not_of(" \t", i)) != string::npos;) {
+            auto e = std::min(l.find_first_of(" \t", i), l.size());
+            libs.push_back(l.substr(i, e - i));
+            i = e;
+        }
+    }
     string rsp;
     for (auto &o : objects) Append(rsp, "\"", o, "\"\n");
     for (auto &l : libs) Append(rsp, l, "\n");
