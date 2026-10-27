@@ -31,6 +31,13 @@ Local changes:
   checks it. TinyCC still classifies a struct as one class, not per
   eightbyte: `{double; int64_t}` goes in two integer registers where clang
   uses an SSE and an integer register.
+- `lib/libtcc1.c`, `tccgen.c`: round an unsigned 64-bit integer of 2^63 or
+  more to float or double once, at run time (`__floatundisf`,
+  `__floatundidf`), and a 64-bit integer constant to float once when folding
+  it. Both went through `long double`, which is no wider than `double` on
+  Windows (and, for the folding, on Apple ARM64), so they rounded twice and
+  could be an ulp off.
+  `test/runtime/float_conversions_unchecked.goose` checks values past 2^63.
 
 To update, copy the same files from a newer TinyCC commit and record that
 commit here. Preserve the local changes until they are included upstream.

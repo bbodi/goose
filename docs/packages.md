@@ -20,57 +20,26 @@ described in [design/packages.md](design/packages.md).
 
 `goose foo.goose` (or `goose run foo.goose`) compiles the program into the
 compiler's own process and runs it there, with no C compiler and no build
-step. The arguments after `--` go to the program. `goose build foo.goose`
-makes an executable, `foo` or `foo.exe`, beside the source:
+step. `goose build foo.goose` makes an executable, `foo` or `foo.exe`,
+beside the source, with a C compiler found on the machine:
 
 ```bash
 goose build foo.goose && ./foo
-goose build -o out/foo foo.goose        # the executable elsewhere
-goose build --debug foo.goose           # GS_DEBUG checks, debug information, no C optimization
-goose build --standalone foo.goose      # the runtime inside the one C file
 goose build --dry-run foo.goose         # print the commands instead of running them
-goose build -v foo.goose                # print them as they run
 ```
 
-`build` finds an installed C compiler: MSVC or clang on Windows, and cc, gcc, or
-clang elsewhere. `goose toolchain` shows which one it found. To select a
-compiler, use `--cc clang`, `GOOSE_CC`, or `cc = "clang";` in `~/.goose/config`.
-The runtime is compiled once per compiler into `~/.goose`, and the program is
-linked with the native parts of its packages. `goose check foo.goose` only
-typechecks. Both build and run default to `-O2`.
+`goose toolchain` shows which C compiler a build uses, and `--cc clang`,
+`GOOSE_CC` or `cc = "clang";` in `~/.goose/config` selects another. The
+runtime and the C of each package are compiled once per C compiler, and an
+executable is linked with the native parts of the packages it uses. A run
+builds the same native parts into a library that it loads, unless the
+package is compiled into the compiler. Everything the compiler produces
+along the way goes under `~/.goose` (`GOOSE_HOME` moves it,
+[§5](#5-the-cache)).
 
-Everything the compiler produces along the way goes under `~/.goose`
-(`GOOSE_HOME` moves it): fetched packages, their builds, the runtime
-objects and each program's C. `goose build --dry-run` shows the commands
-with their paths, for a Makefile or CMake project that wants to drive the
-C compiler itself.
-
-Work that takes a while (fetching a package, building a package's C,
-compiling the runtime) prints one line as it starts. On a terminal, a live
-line below it shows what is running, for how long, and the last line the
-tool printed; the live line is erased when the work is done. When the
-output goes anywhere else (a file, a pipe, a CI log, an agent running the
-command), there is no live line, only those one-line notes.
-`GOOSE_PROGRESS=plain` or `GOOSE_PROGRESS=live` overrides the choice; `-v`
-and `--dry-run` always use plain output.
-
-`goose version` (or `goose --version`) prints the compiler's version and
-the runtime's hash.
-
-Errors and warnings are in color on a terminal. `--color never` or a set
-`NO_COLOR` turns that off, and `--color always` or `CLICOLOR_FORCE=1` turns
-it on wherever the output goes.
-
-A run, build or check that succeeds prints a line or two about what it did
-(`parsed ok`, `typechecked ok`, `wrote`). `-q` leaves them out, so that only
-what the program prints is printed.
-
-`goose completion bash` (or `zsh`, `fish`, `powershell`) prints a script
-that completes the commands, their options and `.goose` files. `goose help
-completion` says where to put it.
-
-`goose help --man` prints the whole help as a man page, which a release
-has as `man/goose.1`.
+[The command line](command_line.md) describes the rest: every option of
+run, build and check, what the compiler prints, and how to write the C
+for a build system of your own.
 
 ## 2. Using a package
 
@@ -120,7 +89,8 @@ are flat, pinned and in one place, and a program contains only one version
 of each package.
 
 `goose fetch program.goose` fetches everything the root declares, for a
-later offline session. When a tool that is needed is missing, the error
+later offline session, and `--offline` makes any command fetch nothing.
+When a tool that is needed is missing, the error
 names it: `git` to fetch, `cmake` for a package built with CMake, and a C
 compiler for any C code. A program with no C and no such packages needs
 none of them.
@@ -135,6 +105,7 @@ C that belongs to the program goes in a sidecar beside the root file,
 c_sources = ["impl.c", "vendor/stb_impl.c"];   // compiled with the program's build
 c_include = ["vendor"];
 c_defines = ["IMPL_FAST=1"];
+c_flags_cc = ["-mavx2"];                       // compile flags for gcc and clang; c_flags_msvc for MSVC
 c_libs = ["m"];                                // system libraries, by name
 c_libs_macos = ["-framework OpenGL"];          // or flags for the link, as written
 c_libs_windows = ["user32"];                   // one platform's part
@@ -158,7 +129,7 @@ A single-header library needs only one `impl.c` that defines its
 implementation macro and includes the header. Alternatively,
 `--include shim.h` on the command line splices a header into the generated
 C; this still works for small shims written against the generated types
-(spec §7.10).
+(spec §7.10, [command_line.md](command_line.md#8-writing-the-c-yourself)).
 
 ## 4. Making a package
 

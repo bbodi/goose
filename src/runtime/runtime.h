@@ -238,6 +238,38 @@ GS_API GS_NORETURN void gs_asfail_f(const char *why, double d, int f32, const ch
    results the baseline's, though both have FMA: only math's mul_add uses
    it (GS_MUL_ADD_MODE, below). Elsewhere the versions are left out, and so
    is the choice. -DGS_SIMD=0 or 1 lowers the level; nothing raises it. */
+/* Whole-vector elementwise arithmetic (spec §6.1). Where the C compiler has
+   GCC's vector extensions, an elementwise operation on a struct or fixed
+   array of 2 to 16 floats of one width, 16, 32 or 64 bytes with no padding,
+   is one operation on a vector type of the same layout. Lane by lane it
+   computes what the members do. Elsewhere (MSVC, TinyCC, or -DGS_VEC=0) the
+   operation stays member by member.
+
+   The vector types are aligned(1), since such a value may sit at any
+   address (structs are packed), and may_alias, since the generated code
+   reads and writes the value's memory through them. It uses them only
+   inside expressions: GS_VLD, GS_VST and vector literals, never as a local
+   (the generated code gathers declarations at the top of a function,
+   outside the GS_VEC test) and never as a parameter or result, so code
+   built for one instruction set never hands a vector to code built for
+   another, which the x86-64 ABI forbids for wide vectors. */
+#if !defined(GS_VEC) && (defined(__clang__) || defined(__GNUC__)) && !defined(__TINYC__)
+#define GS_VEC 1
+#endif
+#if GS_VEC
+typedef double gs_vf64_2 __attribute__((vector_size(16), aligned(1), may_alias));
+typedef double gs_vf64_4 __attribute__((vector_size(32), aligned(1), may_alias));
+typedef double gs_vf64_8 __attribute__((vector_size(64), aligned(1), may_alias));
+typedef float gs_vf32_4 __attribute__((vector_size(16), aligned(1), may_alias));
+typedef float gs_vf32_8 __attribute__((vector_size(32), aligned(1), may_alias));
+typedef float gs_vf32_16 __attribute__((vector_size(64), aligned(1), may_alias));
+#define GS_VLD(V, p) (*(const V *)(const void *)(p))
+#define GS_VST(V, p, x) ((void)(*(V *)(void *)(p) = (x)))
+#else
+#undef GS_VEC
+#define GS_VEC 0
+#endif
+
 #if defined(__clang__) && (defined(__x86_64__) || defined(_M_X64)) && !defined(__TINYC__)
 #ifndef GS_SIMD
 #define GS_SIMD 2
@@ -302,12 +334,15 @@ static inline int gs_simd_level(void) {
    is built for FMA and twice where it is not, so its results are the
    implementation's (§7.12). GS_MUL_ADD_BASE says which for code built for
    the target as a whole: fused on arm64 and on x86-64 built for AVX2 or
-   past it (-march=x86-64-v3, /arch:AVX2), separate everywhere else and
-   under TinyCC. A simd function's AVX2 and AVX-512 versions have FMA
-   whatever the target, so the compiler sets GS_MUL_ADD_MODE to fused around
-   them, and back to the base after (EmitSimdVersions). */
-#if !defined(__TINYC__) && (defined(__FMA__) || defined(__aarch64__) || defined(_M_ARM64) || \
-                            (defined(_MSC_VER) && defined(__AVX2__)))
+   past it (-march=x86-64-v3, clang-cl's /arch:AVX2), separate everywhere
+   else, under TinyCC and under MSVC. MSVC compiles fma() to a call into the
+   C library, even with /arch:AVX2, which also keeps a loop around it from
+   vectorizing: a matrix multiply ran 2.7x slower fused than separate. A
+   simd function's AVX2 and AVX-512 versions have FMA whatever the target,
+   so the compiler sets GS_MUL_ADD_MODE to fused around them, and back to
+   the base after (EmitSimdVersions). */
+#if !defined(__TINYC__) && !(defined(_MSC_VER) && !defined(__clang__)) && \
+    (defined(__FMA__) || defined(__aarch64__) || defined(_M_ARM64))
 #define GS_MUL_ADD_BASE fused
 #else
 #define GS_MUL_ADD_BASE separate

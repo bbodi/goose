@@ -184,6 +184,9 @@ inline bool EndsInBlock(const Node *n) {
         Is<LoopExpr>(n) || Is<ForLoop>(n) || Is<FnDecl>(n) || Is<Block>(n) ||
         Is<InlineBlock>(n) || Is<ConstFor>(n)) return true;
     if (auto c = Is<Call>(n)) return c->trailing != nullptr;
+    // As Defer::Dump writes it: the block form, or its one statement.
+    if (auto d = Is<Defer>(n))
+        return d->body->stmts.size() != 1 || d->body->tail || EndsInBlock(d->body->stmts[0]);
     return false;
 }
 
@@ -558,6 +561,18 @@ inline void Break::Dump(string &s, int ind) const {
 }
 
 inline void Continue::Dump(string &s, int) const { s += "continue"; }
+
+// The statement form where the body is one statement (a block of its own
+// stays the block form), the block form otherwise; both parse back to the
+// same body.
+inline void Defer::Dump(string &s, int ind) const {
+    s += "defer ";
+    if (body->stmts.size() == 1 && !body->tail && !Is<Block>(body->stmts[0])) {
+        body->stmts[0]->Dump(s, ind);
+        return;
+    }
+    body->Dump(s, ind);
+}
 
 // Optimizer output only (--specs); this form does not reparse.
 inline void InlineBlock::Dump(string &s, int ind) const {

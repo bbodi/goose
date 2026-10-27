@@ -1,10 +1,10 @@
-"""Prints POW10_128, the table at the end of stdlib/json.goose that its
-Eisel-Lemire number parser multiplies by: for each q from -348 to 347, the
+"""Prints float_text::POW10_128, the table at the end of stdlib/std.goose that
+its Eisel-Lemire reading multiplies by: for each q from -348 to 347, the
 leading 128 bits of 10^q, rounded down, as two u64s, the high half first.
 These are the values of Go's strconv detailedPowersOfTen (its comment gives
 1e43 as 0xE596B7B0_C643C719_6D9CCD05_D0000000), which the asserts check.
 
-    python scripts/json_pow10_table.py
+    python scripts/pow10_table.py
 """
 
 LO, HI = -348, 347
@@ -29,7 +29,7 @@ def main():
     assert leading_128(43) == 0xE596B7B0C643C7196D9CCD05D0000000
     assert leading_128(-348) == 0xFA8FD5A0081C02881732C869CD60E453
     assert leading_128(-1) == 0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
-    print(f"let POW10_128: u64[{2 * (HI - LO + 1)}] = [")
+    print(f"const float_text::POW10_128: u64[{2 * (HI - LO + 1)}] = [")
     mask = (1 << 64) - 1
     for q in range(LO, HI + 1, 2):
         cells = " ".join(f"0x{leading_128(r) >> 64:016X}, 0x{leading_128(r) & mask:016X}," for r in (q, q + 1))

@@ -60,7 +60,7 @@ goose example.goose
 which compiles the program into the compiler's own process and runs it
 there, with no C compiler and no build step. `goose check` typechecks
 without running, and `goose build` makes an executable
-([packages.md](packages.md) has the rest of the command line).
+([command_line.md](command_line.md) has the rest of the command line).
 
 ---
 
@@ -2619,6 +2619,72 @@ even 4
 
 Spec §6.4.
 
+### `defer`
+
+`defer s;` and `defer { … }` run their body when the block they are
+written in ends, however it ends: falling off the end, `break`,
+`continue`, `return`, a block's `return` through a higher-order function,
+or a `return … from` passing through the function. A `defer` in a loop
+body runs at the end of every iteration. An exit runs the defers written
+before it, latest first, so a cleanup sits next to what it cleans up and
+is skipped where that never happened. The body is ordinary code run later:
+it sees variables as they are at the exit, and on a `return` it runs after
+the returned value is built and before the block's storage is released.
+
+```goose
+var depth = 0;
+
+fn describe(items: i64[:]) -> i64 {
+    depth++;
+    defer depth--;                   // every way out of describe restores it
+    print("depth ", depth);
+    var count = 0;
+    for x in items {
+        defer count++;               // once per iteration, continue included
+        if x < 0 { continue; }
+        if x > 100 { return -1; }
+    }
+    return count;
+}
+
+fn main() {
+    print(describe([1, 2, -3]), " ", describe([5, 500, 7]), " ", depth);
+    {
+        defer print("block done");
+        print("in the block");
+    }
+}
+```
+
+```
+depth 1
+depth 1
+3 -1 0
+in the block
+block done
+```
+
+The body is checked where it is written, so it names only what is declared
+before it, and a `var` optional narrowed before it is not narrowed inside
+it, since an assignment before an exit may undo that. Three things it may
+not do, each a compile error:
+
+* **Leave.** No `return`, `break` or `continue` in it may target anything
+  outside it, including a `return` in a block passed to a call in the body.
+* **Use long-distance returns.** It may not call a function that does
+  `return … from`, propagates one, or catches one, since the body may run
+  while such a return is in flight ([section 20](#20-long-distance-return-and-errors));
+  the error names the chain of calls that brings the machinery in.
+* **Name the function's named result.** A local that the function returns
+  by name is built where the caller receives it ([section 17](#results)),
+  and is complete when the body runs.
+
+A `defer` belongs in a function: a global initializer has no scope exit.
+Nothing runs a defer where no exit happens: `abort`, a failed `assert` or
+bounds check, `exit`, and a contained worker's abort end the code without
+running any, and the process or the worker's end reclaims what the body
+would have released. Spec §6.6.
+
 ### Loops
 
 <!-- fragment -->
@@ -3369,7 +3435,8 @@ error: line 1: bad age
 * **It is a hidden discriminant, not an unwinder.** Each frame on the
   path checks a flag after the call and returns at once in the propagate
   case; normal epilogues run, so every data stack restores itself. There
-  are no tables and no destructors, because there is nothing to destroy.
+  are no tables and no destructors; the only code that runs on the way is
+  the `defer` bodies of the blocks being left ([section 16](#defer)).
 * **The value lands where `load`'s caller wanted it.** `str(…)` builds the
   message directly at `load`'s return destination, bypassing the frames
   being unwound.
@@ -3384,8 +3451,8 @@ error: line 1: bad age
 The same machinery lets a block `return` from its enclosing function
 through a higher-order function ([section 18](#function-values)).
 The library's `exception` module packages it as `exception::try<E>(body)
-{ error => … }` and `exception::throw(value)` ([stdlib.md](stdlib.md#exception)).
-Spec §7.9.
+{ error => … }` and `exception::throw(value)`, with a `finally` written
+as a `defer` ([stdlib.md](stdlib.md#exception)). Spec §7.9.
 
 ### Stopping the program
 
@@ -3900,7 +3967,7 @@ Spec §12.
 
 **Keywords**: `import namespace struct enum type fn thread_fn export simd
 recursive let var extern const pad reusable if else while for in loop
-block guard match return break continue as true false null self bool
+block guard defer match return break continue as true false null self bool
 varint i8 i16 i32 i64 u8 u16 u32 u64 f32 f64`.
 
 **Contextual keywords**, which are ordinary names everywhere else: `from`

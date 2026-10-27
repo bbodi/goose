@@ -823,6 +823,7 @@ enum NodeKind : uint8_t {
     NK_Return,
     NK_Break,
     NK_Continue,
+    NK_Defer,
     NK_FunVal,
     NK_VarDecl,
     NK_Assign,
@@ -1367,6 +1368,18 @@ NODE_END
 NODE(Continue)
     BCE_WALK
     Continue(Line l) : Node(l, NKind) {}
+NODE_END
+
+// `defer s;` or `defer { ... }` (§6.6): the body runs when the block the
+// statement is in ends, however it ends. The statement form is a block of
+// one statement. The body cannot leave, and may not run long-distance
+// return machinery or name the function's named result (TypeCheck::
+// CheckDefer, CheckDefers); codegen emits it at each exit of the block
+// (CodeGen::RegisterDefer).
+NODE(Defer)
+    BCE_WALK
+    Block *body;
+    Defer(Line l, Block *_body) : Node(l, NKind), body(_body) {}
 NODE_END
 
 // A function value: trailing block or block with named params. Non-escaping,
@@ -2255,6 +2268,7 @@ struct FnSpec {
     vector<VarDef *> classroots;
     Line joinedat;                 // The call that joined it to its cycle.
     set<FnSpec *> needs;           // Concrete `return from` targets enclosing every call.
+    bool hasdefer = false;         // The body, a function value's run in it included, has a `defer`.
     // Calls that reused this spec, with the call path each was checked on: a
     // target recorded later applies to those paths too. The call that created
     // the spec needs no entry, since its path starts every path a target

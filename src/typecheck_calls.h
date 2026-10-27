@@ -3602,6 +3602,9 @@ inline void TypeCheck::CheckReturn(Return *r) {
         tf = (int)frames.size() - 1;
         if (!frames[tf].sf) Error(r, "return outside of a function");
     }
+    // A return written in a defer body, or in a function value written in
+    // one, would leave the body (§6.6), whichever function it exits.
+    if (deferbodies && InDeferBody()) Error(r, "return cannot leave a defer body (§6.6)");
     auto tspec = frames[tf].spec;
     r->target = frames[tf].sf;
     r->targetspec = tspec;

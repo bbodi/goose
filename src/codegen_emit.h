@@ -712,16 +712,16 @@ inline bool CodeGen::StaticInitX(Node *n, TypeExpr *t, string &out) {
             auto &a = *t->arr;
             if (a.akind != A_FIXED) return false;
             auto k = ArrSize(t->arr);
-            if (k < 1 || k > MAXSTATICELEMS) return false;
+            if (k < 1) return false;
             string s = "{ { ";
             if (auto str = Is<StrLit>(n)) {
-                if (!IsU8(a.sub) || (int64_t)str->val.size() != k) return false;
+                if (k > MAXSTATICELEMS || !IsU8(a.sub) || (int64_t)str->val.size() != k) return false;
                 for (int64_t e = 0; e < k; e++)
                     Append(s, e ? ", " : "", (int)(uint8_t)str->val[(size_t)e]);
             } else if (auto al = Is<ArrayLit>(n)) {
                 string ex;
                 if (al->fillval) {
-                    if (!StaticInitX(al->fillval, a.sub, ex)) return false;
+                    if (k > MAXSTATICELEMS || !StaticInitX(al->fillval, a.sub, ex)) return false;
                     for (int64_t e = 0; e < k; e++) Append(s, e ? ", " : "", ex);
                 } else {
                     if ((int64_t)al->elems.size() != k) return false;
