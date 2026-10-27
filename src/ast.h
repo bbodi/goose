@@ -1631,6 +1631,9 @@ struct VarDef {
     // allowed (§6.5, §8.1).
     bool copybind = false;
     bool isglobal = false;
+    // A global's position in ast.globals' definitions (TypeCheck::
+    // NoteNarrowed); -1 for every other variable.
+    int globalindex = -1;
     bool isparam = false;
     // One of the results of `a, b = f();` (VarDecl::results), which its one
     // assignment takes as the call's value: constructed at the target, as
