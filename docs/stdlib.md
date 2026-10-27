@@ -12,6 +12,7 @@
 - [ffi](#ffi)
 - [binary](#binary)
 - [base64](#base64)
+- [bitflags](#bitflags)
 - [csv](#csv)
 - [json](#json)
 - [regex](#regex)
@@ -22,9 +23,9 @@
 
 </details>
 
-The standard library has sixteen modules under `stdlib/`: `std`,
-`dictionary`, `vec`, `math`, `os`, `ffi`, `binary`, `base64`, `csv`, `json`,
-`regex`, `audio`, `gfx`, `physics`, `ui`, and `exception`. Import each module by name,
+The standard library has seventeen modules under `stdlib/`: `std`,
+`dictionary`, `vec`, `math`, `os`, `ffi`, `binary`, `base64`, `bitflags`,
+`csv`, `json`, `regex`, `audio`, `gfx`, `physics`, `ui`, and `exception`. Import each module by name,
 for example `import std;`. The compiler locates the library in its source
 tree; use `--stdlib <dir>` or `GOOSE_STDLIB` to select another location.
 Everything is written in Goose except the following parts, all reached
@@ -53,8 +54,10 @@ For **text rendering, fonts and game HUDs**, start with
 [`ui`](#text-rendering-and-game-huds), which renders over `gfx`. For external
 binary file formats, use [`binary`](#binary); `from_bytes` reads Goose's own
 serialization format. Text formats have modules of their own:
-[`json`](#json), [`csv`](#csv) and [`base64`](#base64), and
-[`regex`](#regex) searches text with regular expressions.
+[`json`](#json), [`csv`](#csv) and [`base64`](#base64),
+[`regex`](#regex) searches text with regular expressions, and
+[`bitflags`](#bitflags) holds a set of an enum's variants in one integer,
+the flag words of wire formats and C APIs.
 
 The library uses these conventions:
 
@@ -103,8 +106,8 @@ The library uses these conventions:
   but its temporary array cannot hold copies of self-relative links (spec
   §3.9).
 * The `std`, `dictionary`, `vec`, `math`, and `os` names are global;
-  `ffi`, `binary`, `base64`, `csv`, `json`, `regex`, `audio`, `gfx`,
-  `physics`, `ui` and `exception` use their own namespaces, and so do the
+  `ffi`, `binary`, `base64`, `bitflags`, `csv`, `json`, `regex`, `audio`,
+  `gfx`, `physics`, `ui` and `exception` use their own namespaces, and so do the
   helpers `std` and `json` read and write float text with, in `float_text`.
   A local named `fill` or `count` shadows the global function of that name,
   so a call to that function is an error. A global variable of such a name does not
@@ -881,6 +884,66 @@ The codec computes the alphabet rather than looking it up, so the C
 compiler vectorizes both loops. Both are also `simd fn`s (spec §7.12): when
 clang builds for x86-64, they run as AVX2 or AVX-512 code on a CPU that
 supports it, several times faster than with the baseline SSE2.
+
+## bitflags
+
+A set of an enum's variants in one unsigned integer: a flag word with
+names and a type. `import bitflags;` puts it in namespace `bitflags`.
+
+```goose
+struct BitFlags<E, B> { bits: B = 0 }                               // the empty set is BitFlags<E, B> { .. }
+fn has<E, B>(set: BitFlags<E, B>, flag: E) -> bool
+fn with<E, B>(set: BitFlags<E, B>, flag: E) -> BitFlags<E, B>       // the set plus flag
+fn without<E, B>(set: BitFlags<E, B>, flag: E) -> BitFlags<E, B>    // the set minus flag
+fn toggle<E, B>(set: BitFlags<E, B>, flag: E) -> BitFlags<E, B>
+fn with_all<E, B>(set: BitFlags<E, B>, flags: E[:]) -> BitFlags<E, B> // the set plus every flag of the array
+fn is_empty<E, B>(set: BitFlags<E, B>) -> bool
+fn all<E, B>() -> BitFlags<E, B>                                    // every flag of E
+fn union<E, B>(a: BitFlags<E, B>, b: BitFlags<E, B>) -> BitFlags<E, B>
+fn intersection<E, B>(a: BitFlags<E, B>, b: BitFlags<E, B>) -> BitFlags<E, B>
+fn difference<E, B>(a: BitFlags<E, B>, b: BitFlags<E, B>) -> BitFlags<E, B>   // a minus b
+fn has_all<E, B>(set: BitFlags<E, B>, wanted: BitFlags<E, B>) -> bool
+fn has_any<E, B>(set: BitFlags<E, B>, wanted: BitFlags<E, B>) -> bool
+fn of_bits<E, B>(bits: B) -> BitFlags<E, B>, bool                  // the set of the known bits; false when a bit was no flag
+fn each<E, B, F>(set: BitFlags<E, B>)                               // F(flag) for each flag in the set, in declaration order
+fn format_names<E, B>(out: u8[>..]&, set: BitFlags<E, B>)           // {Read, Write}; {} when empty
+fn bit_of<E>(flag: E) -> i64                                        // the flag's bit: its variant's position, 0 first
+fn count<E>() -> i64                                                // the number of flags
+```
+
+Variant *i* is bit *i*. `B` is the storage: `u8` holds up to eight flags,
+`u16`, `u32` and `u64` up to sixty-four. A `BitFlags<E, u32>` is four
+bytes, `==` compares sets, and sets pass by value. Two enums give two
+types, so `mode.has(Weekday.Monday)` on a `Permissions` does not compile.
+There is no `|` or `&`, since Goose has no operator overloading.
+
+```goose
+enum Permission { Read, Write, Execute }
+type Permissions = bitflags::BitFlags<Permission, u8>;
+fn format(out: u8[>..]&, mode: Permissions) { bitflags::format_names(out, mode); }
+
+var mode = Permissions { .. }.with_all([Permission.Read, Permission.Write]);
+mode = mode.with(Permission.Execute).without(Permission.Read);
+if mode.has(Permission.Write) { … }
+print(mode);                                        // {Write, Execute}
+mode.bits                                           // 6: the integer for a wire or a C call
+let read, known = bitflags::of_bits<Permission, u8>(byte);
+if !known { … }                                     // a bit of byte names no Permission
+mode.each() { flag => … };
+```
+
+Every function takes the set first, so it works as a method:
+`mode.has(flag)` is `has(mode, flag)`, found through the type's namespace
+(spec §11.1) with no prefix and no import at the call site.
+`Permissions { .. }` is the empty set. `of_bits` has no set to call it on,
+so it keeps the prefix and the type arguments; its bool is false when a bit
+was set that is no flag, which a strict decoder rejects and a lenient one
+ignores.
+
+`print` and `str` do not find a `format` overload on a generic type, so a
+program declares one per flag type, as above. `bit_of` is inlined and the
+C compiler folds it: `mode.has(Permission.Write)` ends up as one and-test,
+`all` and the mask of `of_bits` as constants.
 
 ## csv
 

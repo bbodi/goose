@@ -1,0 +1,20 @@
+empty set: {} bits 0
+bit_of: Read 0 Write 1 Execute 2 Sunday 6 December 11
+count: Permission 3 Weekday 7 Month 12
+with: {Read} 1 then {Read, Execute} 5
+with_all: {Read, Write} from [Read, Write]; {January, December}
+method form: {Write} has Write true
+has: {Read, Write} Read true Write true Execute false
+without: {Read, Write} minus Write is {Read}, minus Read is {}
+toggle: {Read, Write} Execute on {Read, Write, Execute}, Read off {Write}
+all: {Read, Write, Execute} 7, {January, February, March, April, May, June, July, August, September, October, November, December} 4095
+==: {Saturday, Sunday} == {Saturday, Sunday} true, bits 96
+union: {Friday} + {Saturday, Sunday} = {Friday, Saturday, Sunday}
+intersection: {Saturday, Sunday} & {Monday, Sunday} = {Sunday}, & {Friday} = {}
+difference: {Saturday, Sunday} - {Monday, Sunday} = {Saturday}
+has_all: {Read, Write} has all of {Read} true; {Read} has all of {Read, Write} false
+has_any: {Read, Write} has any of {Write, Execute} true, of {Execute} false
+of_bits: 3 -> {Read, Write} known true; 9 -> {Read} known false; 128 -> {} known false; 0xFFFF -> 4095 known false
+each: Weekday.Friday Weekday.Saturday Weekday.Sunday
+format_names: {Read, Write} {} {Saturday, Sunday}
+bitflags: seventeen functions on Permission, Weekday and Month passed

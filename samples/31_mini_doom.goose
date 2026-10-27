@@ -31,6 +31,7 @@ import math;
 import vec;
 import os;
 import binary;
+import bitflags;
 import gfx;
 import audio;
 
@@ -263,9 +264,25 @@ fn load_pictures() {
 
 // --- map records ------------------------------------------------------------
 
+// The LINEDEFS and THINGS flag words, named as the Doom source names them;
+// variant i is bit i. Bits that later ports added are dropped at the read.
+enum LineFlag { Blocking, BlockMonsters, TwoSided, DontPegTop, DontPegBottom, Secret, SoundBlock, DontDraw, Mapped }
+type LineFlags = bitflags::BitFlags<LineFlag, u16>;
+enum ThingFlag { Easy, Medium, Hard, Ambush, MultiplayerOnly }
+type ThingFlags = bitflags::BitFlags<ThingFlag, u16>;
+
+fn line_flags(word: i64) -> LineFlags {
+    let flags, known = bitflags::of_bits<LineFlag, u16>(word as u16);
+    return flags;
+}
+fn thing_flags(word: i64) -> ThingFlags {
+    let flags, known = bitflags::of_bits<ThingFlag, u16>(word as u16);
+    return flags;
+}
+
 struct Side { offset: float2, upper: i64, lower: i64, middle: i64, sector: i64 }
 struct Line {
-    a: float2, b: float2, flags: i64, special: i64, tag: i64, front: i64, back: i64,
+    a: float2, b: float2, flags: LineFlags, special: i64, tag: i64, front: i64, back: i64,
     activated: bool = false,
 }
 struct Sector {
@@ -401,7 +418,7 @@ fn load_map() {
         let back = i16le(ld, at + 12);
         require(a < vertices.len && b < vertices.len, "bad linedef vertex");
         require(front < sides.len && back >= -1 && back < sides.len, "bad linedef side");
-        lines.push(Line { vertices[a], vertices[b], u16le(ld, at + 4),
+        lines.push(Line { vertices[a], vertices[b], line_flags(u16le(ld, at + 4)),
             u16le(ld, at + 6), u16le(ld, at + 8), front, back });
     }
     let sg = records("SEGS", 12);
@@ -561,7 +578,7 @@ fn reset_game() {
         let at = i * 10;
         let pos = float2 { i16le(things, at), i16le(things, at + 2) };
         let kind = u16le(things, at + 6);
-        let flags = u16le(things, at + 8);
+        let flags = thing_flags(u16le(things, at + 8));
         let z = sectors[sector_at(pos)].floor;
         if kind == 1 {
             player.pos = pos;
@@ -569,8 +586,8 @@ fn reset_game() {
             player.yaw = i16le(things, at + 4) * PI / 180.0;
             have_start = true;
         }
-        // Skill bit 2 is medium; bit 16 marks multiplayer-only things.
-        if (flags & 2) == 0 || (flags & 16) != 0 { continue; }
+        // Medium skill only, and nothing that exists only in multiplayer.
+        if !flags.has(ThingFlag.Medium) || flags.has(ThingFlag.MultiplayerOnly) { continue; }
         let name = thing_picture(kind);
         if name.len == 0 { continue; }
         let picture = find_picture(name, 0);
@@ -633,7 +650,7 @@ fn can_stand(pos: float2, z: f32, radius: f32, height: f32, ignore: i64, enemy: 
         // wall without floating-point drift turning contact into overlap.
         if distance2(pos, nearest_on_line(pos, line.a, line.b)) >= radius - 0.01 { continue; }
         let back = back_sector(line);
-        if back < 0 || (line.flags & 1) != 0 || (enemy && (line.flags & 2) != 0) { return false; }
+        if back < 0 || line.flags.has(LineFlag.Blocking) || (enemy && line.flags.has(LineFlag.BlockMonsters)) { return false; }
         let a = sectors[front_sector(line)];
         let b = sectors[back];
         let bottom = max(a.floor, b.floor);
@@ -1130,19 +1147,19 @@ fn world_mesh(out: Vertex[>..]&) {
             let shade = lighting(side.sector) * (if abs(a.x - b.x) < 0.1 { 0.88 } else { 1.0 });
             if other_id < 0 {
                 if side.middle < 0 { continue; }
-                let anchor = if (line.flags & 16) != 0 { s.floor + pictures[side.middle].h } else { s.ceiling };
+                let anchor = if line.flags.has(LineFlag.DontPegBottom) { s.floor + pictures[side.middle].h } else { s.ceiling };
                 add_wall(out, a, b, s.floor, s.ceiling, side.middle, side.offset, anchor, shade);
                 continue;
             }
             let other = sectors[sides[other_id].sector];
             if side.upper >= 0 && !(s.ceiling_pic < 0 && other.ceiling_pic < 0) {
-                let anchor = if (line.flags & 8) != 0 { s.ceiling }
+                let anchor = if line.flags.has(LineFlag.DontPegTop) { s.ceiling }
                              else { other.ceiling + pictures[side.upper].h };
                 add_wall(out, a, b, max(s.floor, other.ceiling), s.ceiling,
                          side.upper, side.offset, anchor, shade);
             }
             if side.lower >= 0 {
-                let anchor = if (line.flags & 16) != 0 { s.ceiling } else { other.floor };
+                let anchor = if line.flags.has(LineFlag.DontPegBottom) { s.ceiling } else { other.floor };
                 add_wall(out, a, b, s.floor, min(s.ceiling, other.floor),
                          side.lower, side.offset, anchor, shade);
             }
@@ -1150,7 +1167,7 @@ fn world_mesh(out: Vertex[>..]&) {
                 let bottom = max(s.floor, other.floor);
                 let top = min(s.ceiling, other.ceiling);
                 let height: f32 = pictures[side.middle].h;
-                let anchor = if (line.flags & 16) != 0 { bottom + height } else { top };
+                let anchor = if line.flags.has(LineFlag.DontPegBottom) { bottom + height } else { top };
                 add_wall(out, a, b, max(bottom, anchor + side.offset.y - height),
                          min(top, anchor + side.offset.y), side.middle, side.offset, anchor, shade);
             }

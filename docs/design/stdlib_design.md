@@ -274,6 +274,7 @@ constant (§2): `format(out, 'x')` appends `120`, and a byte is appended with
 | `stdlib/dictionary.goose` | `std` | `dictionary<K, V>` and its functions | `default<T>()` |
 | `stdlib/vec.goose` | `std`, `math` | `vec2/3/4<T>`, `float*`, `double*`, `int*`, vector functions | — |
 | `stdlib/os.goose` | `std` | files, stdio, arguments, environment, time, sleep, entropy | `extern fn`, runtime C in `src/runtime/runtime_os.h` |
+| `stdlib/bitflags.goose` | `std` | namespace `bitflags`: `BitFlags<E, B>`, a set of enum `E`'s variants in a `B`-wide integer; `has`/`with`/`without`, set algebra, `of_bits`, `each`, `format_names` | `const for` over `variants<E>` |
 
 `import std;` must be written explicitly; nothing is imported
 automatically. The compiler resolves `import std;` by looking in three
