@@ -16,9 +16,9 @@ specification. The other documents cover the library, tools, and compiler.
 
 ## Library and tools
 
-* [Standard library](stdlib.md): the sixteen modules, `std`, `dictionary`,
-  `vec`, `math`, `os`, `ffi`, `binary`, `base64`, `csv`, `json`, `regex`,
-  `exception`, and `gfx`, `audio`, `physics` and `ui` for graphics, sound,
+* [Standard library](stdlib.md): the seventeen modules, `std`, `dictionary`,
+  `vec`, `math`, `os`, `ffi`, `binary`, `base64`, `bitflags`, `csv`, `json`,
+  `regex`, `exception`, and `gfx`, `audio`, `physics` and `ui` for graphics, sound,
   rigid bodies and widgets. All are written in readable Goose under
   `stdlib/`.
 * [The command line](command_line.md): every command and option of
