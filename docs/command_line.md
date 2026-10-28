@@ -157,7 +157,7 @@ beyond those in [§5](#5-options-for-run-build-and-check):
 | `--debug` | Turn on the overflow, range and tag checks (`GS_DEBUG=1`), and build the C without optimization and with debug information (`/Od /Zi`, or `-O0 -g`), for a debugger. |
 | `--cc name\|path` | The C compiler, as above. |
 | `--standalone` | Compile the runtime into the program, rather than linking the runtime object built once per C compiler. |
-| `--backend name` | Without it, a compiler with tinygen builds through tinygen's C (`tinygen-c`), or with `--debug` through tinygen's machine code (`tinygen`); a program tinygen cannot take whole (`--include`, `--standalone`, `-D` other than the GS_* ones, a library or an `export fn`) builds through the C generator's C (`c`), and `-v` says why. `-o x.c` writes that C and builds nothing. |
+| `--backend name` | Without it, a compiler with tinygen builds through tinygen's C (`tinygen-c`), or with `--debug` through tinygen's machine code (`tinygen`); a program tinygen cannot take whole (`--include`, `--standalone`, a library or an `export fn`) builds through the C generator's C (`c`), and `-v` says why. `-o x.c` writes that C and builds nothing. |
 | `-v` | Print each command the build runs, and what it prints. |
 | `--dry-run` | Print the commands the build would run, with their paths, and run none of them. A Makefile or CMake project can take them from here. |
 
@@ -191,7 +191,7 @@ These options have the same meaning for `goose run`, `goose build`,
 |---|---|
 | `-O0`, `-O1`, `-O2` | How much the Goose compiler inlines: nothing, a little, or the most (the default). Constant folding and propagation run at every level, and a build's C compiler optimizes at every level. |
 | `--debug` | Turn on the overflow checks, the range checks of `as` casts and the tag checks (`GS_DEBUG=1`). Each failure names its source line, and an overflow or a cast names the values involved. A build also gets debug information ([§3](#3-building-an-executable)). |
-| `-D NAME[=VALUE]` | Define a C macro in the generated program, as `-DNAME[=VALUE]` does too. The define is written into the C itself, so a run and a build see the same source. The value is 1 when none is given. |
+| `-D NAME[=VALUE]` | Define a C macro in the generated program, as `-DNAME[=VALUE]` does too. The define is written into the C itself, so a run and a build see the same source. The value is 1 when none is given. With tinygen it goes into the support unit, the C that includes the runtime's headers (and any `--include` header); tinygen's C reads no macro. |
 | `--stack-reserve size` | The address space reserved for each data stack, from 64K up to 256T with a `K`, `M`, `G` or `T` suffix. The default is 2G. The address space is committed as it is used, so a large reservation costs nothing until it is used. |
 | `--stacks` | Report how many data stacks the program and each of its workers use, what that adds up to, and the cap it puts on `hardware_threads()`. |
 | `--bce-lines` | Report, for each source line, how many bounds checks the compiler removed and how many it kept. |

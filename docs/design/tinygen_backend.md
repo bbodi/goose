@@ -292,8 +292,8 @@ generator's program does. Exit status, arguments, resource root and abort
 statuses come from the same hosted runtime (`test/jit_runtime.py`).
 
 The run takes this path only if tinygen takes the program whole, by the
-`goose build` rules: every function compiled, no `--include`, only the
-`-D`s the support object takes, and a plain `main`. Two more classes take
+`goose build` rules: every function compiled, no `--include`, and a plain
+`main`. Every `-D` goes into the support unit. Two more classes take
 the old path for now. The first is a program calling an extern of a shared
 library: the C generator binds it through the runtime's loader, whereas
 tinygen's C calls it by name, which only a link resolves. The second is a
@@ -348,8 +348,11 @@ With a compiler built with tinygen, `goose build` without `--backend` means
 `--backend=tinygen` (the fast debug build, GS_DEBUG checks as before). `-o x.c`
 selects tinygen-c, also with `--debug`. A program that tinygen cannot take
 whole builds through the C generator's C, all of it, as the JIT of `goose run`
-does: `--include`, `--standalone`, a `-D` other than GS_DEBUG and the GS_STACK_*
-ones, a library or `export fn` (`WholeProgram`), or any function left to C.
+does: `--include`, `--standalone`, a library or `export fn` (`WholeProgram`), or any
+function left to C. A `-D` keeps the program on tinygen: it goes into the support
+object's source (`DefinesSource`), which a define other than GS_DEBUG and the ones
+main hands the runtime as it starts (GS_STACK_*, GS_MAX_STACKS) makes an object of
+its own in the cache.
 `-v` prints `build: backend tinygen-c (the default)` and, for a fallback,
 `build: the C generator's C, compiled by the C compiler, for the whole program
 (tinygen cannot take it whole: why)`. There is no mixed build unless

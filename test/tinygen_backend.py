@@ -444,6 +444,7 @@ def check_tinygen_backend(exe, base, ok, fail, say):
     check_jit(exe, base, ok, fail)
     check_default_inlining(exe, base, ok, fail)
     check_build_defaults(exe, base, ok, fail)
+    check_c_path_flags(exe, base, ok, fail)
     check_debug(exe, base, ok, fail)
     check_lldb(exe, base, ok, fail, say)
     check_lldb_limited(exe, base, ok, fail)
@@ -690,6 +691,45 @@ def check_build_defaults(exe, base, ok, fail):
             return
     ok(f"goose build: tinygen-c by default and tinygen with --debug on {len(DEFAULT_BUILD_PROGRAMS)} "
        "programs, the C generator's C for --include and --standalone, -o out.c")
+
+
+def check_c_path_flags(exe, base, ok, fail):
+    """The flags that took a program to the C generator's C (G3.3) keep it on tinygen: plain goose
+    build, --debug and goose run, -v saying so, the program's output and stderr markers right."""
+    exe = Path(exe).resolve()
+    work = base / "cflags"
+    work.mkdir(parents=True, exist_ok=True)
+
+    def each(source, flags, label, want=None):
+        """Builds and runs source each way; False after a failure."""
+        exp, aborts, markers = expected(source) if want is None else (want, False, [])
+        out = work / f"{source.stem}{tc.EXE_SUFFIX}"
+        for verb, extra, says in [("build", [], "tinygen: whole program"),
+                                  ("build", ["--debug"], "tinygen: whole program"),
+                                  ("run", [], TINYGEN_JIT)]:
+            name = f"goose {verb} {' '.join(map(str, extra + flags))} {source.name} ({label})"
+            out.unlink(missing_ok=True)
+            code, o, e = tc.run_capture([exe, verb, "-v", *extra, *flags,
+                                         *(["-o", out] if verb == "build" else []), source],
+                                        cwd=work)
+            if verb == "build":
+                if code != 0 or says not in o + e or DEFAULT_C_PATH in o + e:
+                    fail(f"{name}: -v should say {says}", o + e)
+                    return False
+                code, o, e = tc.run_capture([out], cwd=work)
+            elif says not in e:
+                fail(f"{name}: -v should say {says}", o + e)
+                return False
+            if (code != 0) != aborts or any(mk not in e for mk in markers) or \
+                    o.rstrip("\n") != exp.rstrip("\n"):
+                fail(f"{name} (exit {code})", f"{e}\n--- got:\n{o}\n--- want:\n{exp}")
+                return False
+        return True
+
+    # -D: every define reaches the support unit, GS_STACK_STATS's report among them.
+    if not each(ROOT / "test/runtime/stack_stats.goose", ["-DGS_STACK_STATS=1"], "-D"):
+        return
+    ok("the C path's flags on tinygen: -D")
 
 
 def check_default_inlining(exe, base, ok, fail):
