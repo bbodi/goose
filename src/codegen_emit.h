@@ -943,7 +943,7 @@ inline void CodeGen::EmitExports() {
         }
         for (auto &a : argv) Append(args, args.empty() ? "" : ", ", a);
         auto outlen = Unique("gs_export_len");
-        if (returnslice) Append(params, params.empty() ? "" : ", ", "int64_t *", outlen);
+        if (returnslice) Append(params, params.empty() ? "" : ", ", "gs_i64 *", outlen);
         if (params.empty()) params = "void";
         if (!args.empty() && si.needssp) args += ", ";
         if (si.needssp) args += "0";

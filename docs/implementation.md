@@ -4900,6 +4900,10 @@ count exactly; truncating it would change where subsequent fields start.
 Known counts are checked statically; dynamic counts are checked before
 storing or patching the length field.
 
+Generated scalar and pointer typedefs carry one-byte alignment on GCC and
+Clang. References and slices retain that alignment when a packed field's
+address escapes its containing struct; aggregate types use `#pragma pack(1)`.
+
 Layout details needed for byte/C compatibility (`FixedSize`, `LayoutFields`,
 `LenStore`, `TagStore`):
 
