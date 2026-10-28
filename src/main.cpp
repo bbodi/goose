@@ -843,9 +843,9 @@ the packages the program uses. Intermediates go under GOOSE_HOME.
 
 tinygen compiles the program: its C, optimized by the C compiler, or with
 --debug its machine code with debug info naming the Goose source. A program
-tinygen cannot take whole (--standalone, a library or an export fn, or
---include with -o x.c) builds through the C generator's C instead; -v says
-why. --backend picks a path.
+tinygen cannot take whole (a library or an export fn, or --include or
+--standalone with -o x.c) builds through the C generator's C instead; -v
+says why. --backend picks a path.
 
 Options:
   -o exe                Where the executable goes.
@@ -1968,7 +1968,10 @@ int Main(int argc, char **argv) {
                 // puts its main into the object and compiles no C.
                 string whynot;
                 if (!building && !tgjit) whynot = "not goose build";
-                else if (standalone) whynot = "--standalone";
+                // tinygen's C cannot hold the runtime in one file (it declares the runtime's
+                // functions with tinygen's signatures), so -o x.c --standalone stays the C
+                // generator's; a standalone build compiles the runtime into the build directory.
+                else if (standalone && !tgcout.empty()) whynot = "--standalone with -o x.c";
                 // tinygen's C alone does not hold the --include headers' functions.
                 else if (!includenames.empty() && !tgcout.empty()) whynot = "--include with -o x.c";
                 else if (tinygenmixed) whynot = "--tinygen-mixed";
@@ -2217,6 +2220,22 @@ int Main(int argc, char **argv) {
                     }
                     if (!b.CompileObject(src, obj, "compiling the extern unit",
                                          cat(builddir, "/tgx.log")))
+                        return 1;
+                    tgobjects.push_back(obj);
+                }
+                // --standalone: the runtime compiled for this program, with the -D given, in
+                // place of the runtime object built once per C compiler (buildopts.standalone).
+                if (tgwhole && standalone) {
+                    auto src = cat(builddir, "/goose_runtime.c");
+                    auto obj = cat(builddir, "/goose_runtime.o");
+                    if (!buildopts.dryrun &&
+                        !WriteFileMakingDirs(src, DefinesSource(cdefines, false) +
+                                                  RuntimeObjectSource())) {
+                        fprintf(stderr, "cannot write %s\n", src.c_str());
+                        return 1;
+                    }
+                    if (!b.CompileObject(src, obj, "compiling the runtime",
+                                         cat(builddir, "/runtime.log")))
                         return 1;
                     tgobjects.push_back(obj);
                 }

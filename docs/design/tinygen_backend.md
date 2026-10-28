@@ -84,14 +84,22 @@ static or inline function is callable. The `-D` given go into the unit as
 into the support object. `goose build -o x.c` with `--include` still writes
 the C generator's C, since tinygen's C alone lacks the header's functions.
 
+**`--standalone`.** A whole program built with `--standalone` links a runtime
+object compiled from `RuntimeObjectSource` in its build directory, with the
+`-D` given, instead of the one cached per C compiler. `goose build -o x.c
+--standalone` still writes the C generator's single file: tinygen's C
+declares the runtime's functions with tinygen's signatures (`void *` for the
+runtime's typed pointers), which conflict with the runtime's own in one
+translation unit, the reason `goose run` uses two TinyCC units.
+
 **Mixed.** The C backend writes its C as usual, and the C compiler compiles it
 at `-O0 -g`. That C holds `main`, the globals, any function tinygen did not
 take, and the shims the object calls. `CodeGen` gives every function external
 linkage, so the two objects resolve each other's calls.
 
 A build takes the mixed path when a function or a global initializer falls
-back to C. It also takes it for `--standalone`, a library, or an `export fn`
-that `ExportOk` rejects. A `-D` goes into the support object's source, and
+back to C. It also takes it for a library or an `export fn` that `ExportOk`
+rejects, and for `--include` or `--standalone` with `-o x.c`. A `-D` goes into the support object's source, and
 `GS_DEBUG` picks its variant. The stack
 settings (`GS_STACK_RESERVE`, `GS_STACK_GAP`, `GS_STACK_BUDGET` and
 `GS_MAX_STACKS`, so `--stack-reserve` too) keep a whole build: `main` passes
@@ -100,7 +108,7 @@ them to `gs_tg_start`, and the backend reads them from `CodeGen::stackcfg`.
 the path and the reason:
 
     tinygen: whole program: no C compiled for it
-    tinygen: mixed: the C half compiled by the C compiler (--standalone)
+    tinygen: mixed: the C half compiled by the C compiler (export fns)
 
 ## Conventions shared with the C backend
 
@@ -360,8 +368,8 @@ With a compiler built with tinygen, `goose build` without `--backend` means
 `--backend=tinygen` (the fast debug build, GS_DEBUG checks as before). `-o x.c`
 selects tinygen-c, also with `--debug`. A program that tinygen cannot take
 whole builds through the C generator's C, all of it, as the JIT of `goose run`
-does: `--standalone`, a library or `export fn` (`WholeProgram`), `--include` with
-`-o x.c`, or any
+does: a library or `export fn` (`WholeProgram`), `--include` or `--standalone`
+with `-o x.c`, or any
 function left to C. A `-D` keeps the program on tinygen: it goes into the support
 object's source (`DefinesSource`), which a define other than GS_DEBUG and the ones
 main hands the runtime as it starts (GS_STACK_*, GS_MAX_STACKS) makes an object of

@@ -639,8 +639,7 @@ DEFAULT_C_PATH = "build: the C generator's C, compiled by the C compiler"
 
 def check_build_defaults(exe, base, ok, fail):
     """Plain goose build runs tinygen-c, --debug the native tinygen backend (both -v named, the
-    program's output right); --standalone builds through the C generator's C,
-    -v naming why; -o x.c writes tinygen's C or, for the fallback, the generator's."""
+    program's output right); -o x.c writes tinygen's C or, for --standalone, the generator's."""
     exe = Path(exe).resolve()
     work = base / "defaults"
     work.mkdir(parents=True, exist_ok=True)
@@ -673,13 +672,8 @@ def check_build_defaults(exe, base, ok, fail):
             if built(source, flags, says, " ".join(flags)) is None:
                 return
     source = ROOT / DEFAULT_BUILD_PROGRAMS[0]
-    for flags, why in [(["--standalone"], "--standalone"),
-                       (["--debug", "--standalone"], "--standalone")]:
-        log = built(source, flags, ["build: backend", f"{DEFAULT_C_PATH}, for the whole program "
-                                    f"(tinygen cannot take it whole: {why})"], " ".join(map(str, flags)))
-        if log is None:
-            return
-    # -o x.c: tinygen's C for a program it takes, the generator's C else.
+    # -o x.c: tinygen's C for a program it takes, the generator's C else (--standalone: one file
+    # with the runtime, which tinygen's C cannot be).
     for flags, fallback in [([], False), (["--standalone"], True)]:
         out = work / "out.c"
         out.unlink(missing_ok=True)
@@ -689,7 +683,7 @@ def check_build_defaults(exe, base, ok, fail):
             fail(f"goose build {' '.join(flags)} -o out.c (fallback: {fallback})", o + e)
             return
     ok(f"goose build: tinygen-c by default and tinygen with --debug on {len(DEFAULT_BUILD_PROGRAMS)} "
-       "programs, the C generator's C for --standalone, -o out.c")
+       "programs, -o out.c (the C generator's with --standalone)")
 
 
 def check_c_path_flags(exe, base, ok, fail):
@@ -699,8 +693,9 @@ def check_c_path_flags(exe, base, ok, fail):
     work = base / "cflags"
     work.mkdir(parents=True, exist_ok=True)
 
-    def each(source, flags, label, want=None):
-        """Builds and runs source each way; False after a failure."""
+    def each(source, flags, label, want=None, built=""):
+        """Builds and runs source each way, a build's -v log holding `built`; False after a
+        failure."""
         exp, aborts, markers = expected(source) if want is None else (want, False, [])
         out = work / f"{source.stem}{tc.EXE_SUFFIX}"
         for verb, extra, says in [("build", [], "tinygen: whole program"),
@@ -712,8 +707,8 @@ def check_c_path_flags(exe, base, ok, fail):
                                          *(["-o", out] if verb == "build" else []), source],
                                         cwd=work)
             if verb == "build":
-                if code != 0 or says not in o + e or DEFAULT_C_PATH in o + e:
-                    fail(f"{name}: -v should say {says}", o + e)
+                if code != 0 or says not in o + e or DEFAULT_C_PATH in o + e or built not in o + e:
+                    fail(f"{name}: -v should say {says} {built}", o + e)
                     return False
                 code, o, e = tc.run_capture([out], cwd=work)
             elif says not in e:
@@ -741,7 +736,12 @@ def check_c_path_flags(exe, base, ok, fail):
     tc.write_text(source, "extern fn scaled(x: i64) -> i64;\n\nfn main() { print(scaled(14)); }\n")
     if not each(source, ["--include", header, "-DSCALE=3"], "static inline, -D", want="42\n"):
         return
-    ok("the C path's flags on tinygen: -D, --include (a static inline extern, a -D in the header)")
+    # --standalone: the runtime compiled into the build directory instead of the cached object.
+    if not each(ROOT / "samples/01_tour.goose", ["--standalone"], "--standalone",
+                built="/goose_runtime.c -o "):
+        return
+    ok("the C path's flags on tinygen: -D, --include (a static inline extern, a -D in the header), "
+       "--standalone")
 
 
 def check_default_inlining(exe, base, ok, fail):
