@@ -1886,9 +1886,7 @@ int Main(int argc, char **argv) {
                     string err;
                     if (!dryrun && !tgb->Write(written, err))
                         throw CompileError { cat("tinygen: cannot write ", written, ": ", err) };
-                    if (!tgcout.empty() && !quiet && !dryrun)
-                        fprintf(msgs, "wrote %s (tinygen's C; it links with the tinygen support "
-                                      "object and the runtime object)\n", tgcout.c_str());
+                    // nothing is printed on success; the help says what the C links with
                 }
             }
         #endif
