@@ -8354,18 +8354,30 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     // The body of a wrapper p of sp passing its parameters on to `callee` (gs_sp 0 after them if
     // zerosp) and returning the result; a slice as the C wrapper gives it: the base, its length stored
     // through an extra out-pointer parameter.
-    void ForwardCall(tyg_proc *p, FnSpec *sp, tyg_sig *sig, tyg_sym callee, bool zerosp, bool slice) {
+    // `goose`: the callee is the Goose function (an export's), which takes a large fixed value by the
+    // address of a copy of its own, here the C caller's copy, and returns one through gs_r0 (Sig).
+    void ForwardCall(tyg_proc *p, FnSpec *sp, tyg_sig *sig, tyg_sym callee, bool zerosp, bool slice,
+                     bool goose = false) {
         vector<tyg_arg> args;
         for (size_t i = 0; i < sp->argtypes.size(); i++) {
             tyg_arg a {};
-            if (mod->IsScalar(sp->argtypes[i])) a.val = tyg_param(p, (int)i);
+            if (mod->IsScalar(sp->argtypes[i]) || (goose && mod->cg.IsLargeFixed(sp->argtypes[i])))
+                a.val = tyg_param(p, (int)i);
             else a.mem = tyg_at_val(tyg_param(p, (int)i), 0);
             args.push_back(a);
         }
         mod->SplitArgs(p, sp, args, false);
+        auto rt = sp->rets.empty() ? nullptr : sp->rets[0];
+        if (goose && rt && mod->cg.IsLargeFixed(rt)) {
+            auto ra = tyg_at_local(tyg_local_new(p, mod->Size(rt), 8), 0);
+            args.push_back(TgFn::ArgOfVal(tyg_addr_of(p, ra)));
+            if (zerosp) args.push_back(TgFn::ArgOfVal(tyg_iconst(p, TYG_I64, 0)));
+            CallArgs(p, sig, callee, args);
+            tyg_ret_mem(p, ra);
+            return;
+        }
         if (zerosp) args.push_back(TgFn::ArgOfVal(tyg_iconst(p, TYG_I64, 0)));
         auto call = [&](tyg_addr *ret) { return CallArgs(p, sig, callee, args, ret); };
-        auto rt = sp->rets.empty() ? nullptr : sp->rets[0];
         if (!rt) {
             call(nullptr);
             tyg_ret(p, 0);
@@ -8735,19 +8747,21 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     }
 
     // Whether the object writes an `export fn`'s wrapper (CodeGen::EmitExports): a plain specialization
-    // whose parameters and result cross by value. Else why not.
+    // whose parameters and result cross by value, large fixed values among them (ForwardCall). Else
+    // why not.
     bool ExportOk(CodeGen &cg, SFunction *sf, string &why) {
-        auto fail = [&] { return Refuse(why, "export fns"); };
+        auto fail = [&] { return Refuse(why, cat("export fn ", sf->name)); };
         if (sf->specs.size() != 1 || !cg.sinfo.count(sf->specs[0])) return fail();
         auto sp = sf->specs[0];
         auto &si = cg.sinfo[sp];
         if (!si.freevars.empty() || sp->rets.size() > 1 || !mod->SigOk(sp, false, why)) return fail();
         for (size_t i = 0; i < sp->argtypes.size(); i++) {
             auto t = sp->argtypes[i];
-            if (cg.IsPoolParam(sp, i) || mod->RzParam(t) || cg.IsLargeFixed(t) || !mod->TypeOk(t))
-                return fail();
+            if (cg.IsPoolParam(sp, i) || mod->RzParam(t) || !mod->TypeOk(t)) return fail();
         }
-        if (!sp->rets.empty() && (si.cret != 0 || !mod->TypeOk(sp->rets[0]))) return fail();
+        if (!sp->rets.empty() && ((si.cret != 0 && !cg.IsLargeFixed(sp->rets[0])) ||
+                                  !mod->TypeOk(sp->rets[0])))
+            return fail();
         return true;
     }
 
@@ -8765,7 +8779,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
             auto sig = SigOf(!rt ? nullptr : slice ? ptr : mod->AT(rt), ps);
             auto p = tyg_proc_begin(mod->m, mod->FnSym(sf->cname), sig);
             ForwardCall(p, sp, mod->Sig(sp), mod->FnSym(cg.sinfo[sp].cname), cg.sinfo[sp].needssp,
-                        slice);
+                        slice, true);
             EndProc(p, sf->cname);
         }
     }

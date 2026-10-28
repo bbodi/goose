@@ -740,8 +740,22 @@ def check_c_path_flags(exe, base, ok, fail):
     if not each(ROOT / "samples/01_tour.goose", ["--standalone"], "--standalone",
                 built="/goose_runtime.c -o "):
         return
+    # export fn: the C symbols, large fixed values by value among them (which the C generator's
+    # wrapper does not compile), called back through externs.
+    if not each(ROOT / "test/codegen/export.goose", [], "export fn"):
+        return
+    source = work / "export_large.goose"
+    tc.write_text(source, "struct Big { a: i64[1000], seed: i64 }\n"
+                          "export \"e_take\" fn take(b: Big) -> i64 { return b.a[3] + b.seed; }\n"
+                          "export \"e_make\" fn make(seed: i64) -> Big { return Big { seed: seed, .. }; }\n"
+                          "extern fn c_take(b: Big) -> i64 = \"e_take\";\n"
+                          "extern fn c_make(seed: i64) -> Big = \"e_make\";\n"
+                          "fn main() {\n    var b = Big { seed: 5, .. };\n    b.a[3] = 37;\n"
+                          "    print(take(b), \" \", c_take(b), \" \", make(4).seed, \" \", c_make(6).seed);\n}\n")
+    if not each(source, [], "large fixed export fn", want="42 42 4 6\n"):
+        return
     ok("the C path's flags on tinygen: -D, --include (a static inline extern, a -D in the header), "
-       "--standalone")
+       "--standalone, export fn (large fixed values too)")
 
 
 def check_default_inlining(exe, base, ok, fail):

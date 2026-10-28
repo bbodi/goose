@@ -157,7 +157,7 @@ beyond those in [§5](#5-options-for-run-build-and-check):
 | `--debug` | Turn on the overflow, range and tag checks (`GS_DEBUG=1`), and build the C without optimization and with debug information (`/Od /Zi`, or `-O0 -g`), for a debugger. |
 | `--cc name\|path` | The C compiler, as above. |
 | `--standalone` | Compile the runtime into the program, rather than linking the runtime object built once per C compiler. With tinygen the runtime is compiled from its source in the program's build directory and linked; with `-o x.c` the C generator writes one file holding the runtime and the program. |
-| `--backend name` | Without it, a compiler with tinygen builds through tinygen's C (`tinygen-c`), or with `--debug` through tinygen's machine code (`tinygen`); a program tinygen cannot take whole (a library or an `export fn`; `--include` or `--standalone` with `-o x.c`) builds through the C generator's C (`c`), and `-v` says why. `-o x.c` writes that C and builds nothing. |
+| `--backend name` | Without it, a compiler with tinygen builds through tinygen's C (`tinygen-c`), or with `--debug` through tinygen's machine code (`tinygen`); a program tinygen cannot take whole (`--include` or `--standalone` with `-o x.c`) builds through the C generator's C (`c`), and `-v` says why. `-o x.c` writes that C and builds nothing. |
 | `-v` | Print each command the build runs, and what it prints. |
 | `--dry-run` | Print the commands the build would run, with their paths, and run none of them. A Makefile or CMake project can take them from here. |
 

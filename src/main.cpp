@@ -843,9 +843,8 @@ the packages the program uses. Intermediates go under GOOSE_HOME.
 
 tinygen compiles the program: its C, optimized by the C compiler, or with
 --debug its machine code with debug info naming the Goose source. A program
-tinygen cannot take whole (a library or an export fn, or --include or
---standalone with -o x.c) builds through the C generator's C instead; -v
-says why. --backend picks a path.
+tinygen cannot take whole (--include or --standalone with -o x.c) builds
+through the C generator's C instead; -v says why. --backend picks a path.
 
 Options:
   -o exe                Where the executable goes.
