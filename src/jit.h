@@ -38,12 +38,12 @@ inline void JitDiag(void *opaque, const char *msg) {
     Append(*(string *)opaque, msg, "\n");
 }
 
-// Compiles `csrc` in memory and calls its main, returning what the program
+// Compiles `units`, each a translation unit of C, in memory and calls their main, returning what the program
 // returned or exited with. `progargs` become the program's argv after argv[0].
 // `symbols` holds the C functions of the packages' native parts the program
 // reaches, by name (native.h, builtin.h): from the tables compiled in with
 // builtin packages, or loaded from the libraries built for the others.
-inline int RunJit(const string &csrc, const string &libpath, const string &progname,
+inline int RunJit(const vector<string> &units, const string &libpath, const string &progname,
                   const vector<string> &progargs,
                   const vector<pair<string, const void *>> &symbols) {
     string diags;
@@ -71,7 +71,8 @@ inline int RunJit(const string &csrc, const string &libpath, const string &progn
     for (auto p = goose_jit_symbols(); p->name; ++p)
         tcc_add_symbol(s, p->name, p->address);
     for (auto &[name, addr] : symbols) tcc_add_symbol(s, name.c_str(), addr);
-    if (tcc_compile_string(s, csrc.c_str()) < 0) fail("compiling the generated C failed");
+    for (auto &csrc : units)
+        if (tcc_compile_string(s, csrc.c_str()) < 0) fail("compiling the generated C failed");
     if (tcc_add_file(s, support.c_str()) < 0) fail("loading compiler support failed");
     if (tcc_relocate(s) < 0) fail("relocating the generated C failed");
     auto entry = (int (*)(int, char **))tcc_get_symbol(s, "main");

@@ -40,6 +40,7 @@ static const GooseJitSymbol gs_jit_symbols[] = {
     GS_JIT_SYMBOL(realloc)
     GS_JIT_SYMBOL(free)
     GS_JIT_SYMBOL(abs)
+    GS_JIT_SYMBOL(abort)
 #define GS_JIT_MATH(fn) GS_JIT_SYMBOL(fn) GS_JIT_SYMBOL(fn##f)
     GS_JIT_MATH(sqrt)
     GS_JIT_MATH(sin)

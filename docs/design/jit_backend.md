@@ -38,6 +38,12 @@ into Goose. `--standalone` still writes the whole runtime into an AOT unit.
 `-D` writes a define into the generated C source. `--` passes the remaining
 arguments to the program.
 
+Where the compiler is built with tinygen, the C that a plain `goose run`
+compiles is tinygen's C, written by the tinygen backend with
+`TYG_OUTPUT_C`. It is compiled beside a support unit, and the C generator's
+C is the fallback for a program that tinygen cannot take whole, and for
+`--backend=c`. `docs/design/tinygen_backend.md` (`goose run`) describes it.
+
 The program shares the process: its exit status becomes the compiler's, its
 output goes to the same streams, and the compiler's own progress lines move
 to stderr so that stdout carries only the program's output. It does not

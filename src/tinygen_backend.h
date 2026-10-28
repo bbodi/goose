@@ -128,7 +128,9 @@ inline const vector<TgSupportExtern> &TgSupportExterns() {
 // thread-locals kept here (gs_stks, gs_gl).
 inline string TgSupportBody(string_view runtimeh) {
     string s = "\n/* ---- tinygen support (docs/design/tinygen_backend.md) ---- */\n"
-               "#ifdef _MSC_VER\n#define GS_TG_TLS __declspec(thread)\n#else\n"
+               // The embedded JIT runs no threads (TinyCC places no thread-locals in memory).
+               "#if defined(GS_EMBEDDED_JIT)\n#define GS_TG_TLS\n"
+               "#elif defined(_MSC_VER)\n#define GS_TG_TLS __declspec(thread)\n#else\n"
                "#define GS_TG_TLS __thread\n#endif\n"
                "static GS_TG_TLS int32_t gs_rf;\n";
     for (auto op : TgArithOps)
@@ -8713,6 +8715,10 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         EndProc(p, "main");
     }
 
+    // The C main of C output, which calls the gs_tg_main EmitMain made.
+    static constexpr const char *kCMain =
+        "\nint main(int argc, char **argv) { return gs_tg_main(argc, argv); }\n";
+
     bool Write(const string &path, string &err) {
         if (tyg_module_write(mod->m, path.c_str()) != 0) {
             err = tyg_error(mod->m) ? tyg_error(mod->m) : "?";
@@ -8720,10 +8726,23 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         }
         if (!cmain) return true;
         FILE *f = fopen(path.c_str(), "a");
-        if (f) fputs("\nint main(int argc, char **argv) { return gs_tg_main(argc, argv); }\n", f);
+        if (f) fputs(kCMain, f);
         if (f && fclose(f) == 0) return true;
         err = "cannot append main";
         return false;
+    }
+
+    // C output in memory, with its main, for the JIT (goose run): what Write would write.
+    bool CText(string &out, string &err) {
+        const uint8_t *bytes = nullptr;
+        size_t size = 0;
+        if (tyg_module_emit(mod->m, &bytes, &size) != 0) {
+            err = tyg_error(mod->m) ? tyg_error(mod->m) : "?";
+            return false;
+        }
+        out.assign((const char *)bytes, size);
+        if (cmain) out += kCMain;
+        return true;
     }
 };
 

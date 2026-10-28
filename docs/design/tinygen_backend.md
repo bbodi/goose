@@ -263,6 +263,48 @@ in the debugger. `-O1` and `-O2` still work.
 
 ## `goose run`
 
+Plain `goose run` (and `goose file.goose`) runs tinygen's C in TinyCC
+(`docs/design/jit_backend.md`). The module is created with `TYG_OUTPUT_C`, as
+for tinygen-c, and `CText` returns its text in memory with the appended
+`main`. TinyCC compiles two translation units into one in-memory program:
+
+* the support unit, `TinygenSupportSource(checks, true)`: the `-D` defines,
+  `jit_c.h`, `runtime.h`, the packed prelude, `runtime_ext.h`, `TgSupportBody`
+  (shims, trampolines, `gs_tg_start`) and `gs_jit_cleanup`. It names
+  `gs_rt_start` without the runtime version, since the runtime is the one
+  built into Goose. `GS_TG_TLS` is empty there because the JIT runs no
+  threads;
+* tinygen's C (`TinygenJitUnit`). Its prelude's `#include`s of the C headers
+  give way to `jit_c.h` and TinyCC's `va_list`, because the JIT has no C
+  headers. tinygen's prelude has TinyCC fallbacks of its own for traps, byte
+  swaps, atomics and `asm` labels.
+
+They are two units because tinygen's C declares the runtime's functions with
+its own signatures, which conflict with `runtime.h`'s. Both bind the
+runtime's `gs_*` functions through the `GS_JIT_SYMBOL` table, as the C
+generator's program does. Exit status, arguments, resource root and abort
+statuses come from the same hosted runtime (`test/jit_runtime.py`).
+
+The run takes this path only if tinygen takes the program whole, by the
+`goose build` rules: every function compiled, no `--include`, only the
+`-D`s the support object takes, and a plain `main`. Two more classes take
+the old path for now. The first is a program calling an extern of a shared
+library: the C generator binds it through the runtime's loader, whereas
+tinygen's C calls it by name, which only a link resolves. The second is a
+run with `-DGS_MAX_STACKS`, because tinygen counts more data stacks than the
+C generator for some programs (`append_destination_storage`). Otherwise the whole
+program runs on the C generator's C, built by a second `CodeGen` without
+tinygen; a mixed program never goes into one TinyCC unit. `-v` prints
+`jit: tinygen's C` or `jit: the C generator's C ... (why)`. Inlining defaults
+to `-O0`, because tinygen leaves an inlined body to C. So `-O1` and `-O2`
+take the C generator's path. `--backend=c` asks for that path at the old
+default of `-O2`. With `--jit -o out.c`, the C generator's C still goes to
+`out.c` and tinygen's C runs. Threads are refused on both paths.
+
+tinygen's C is about 5 to 15 times slower than the C generator's under
+TinyCC (samples 07, 09, 10, 21, 22). It reads and writes memory through
+`memcpy`, which a C compiler inlines and TinyCC calls.
+
 `goose run --backend=tinygen` builds the executable in the program's build
 directory, as `goose build` would, and runs it as a child process. The
 program shares Goose's standard streams, gets the arguments after `--`, and

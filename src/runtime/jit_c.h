@@ -28,6 +28,14 @@ typedef __UINTPTR_TYPE__ uintptr_t;
 #define INT64_MIN (-9223372036854775807LL - 1)
 #define INT64_MAX 9223372036854775807LL
 #define UINT64_MAX 18446744073709551615ULL
+#define INT8_C(c) c
+#define INT16_C(c) c
+#define INT32_C(c) c
+#define INT64_C(c) c##LL
+#define UINT8_C(c) c
+#define UINT16_C(c) c
+#define UINT32_C(c) c##U
+#define UINT64_C(c) c##ULL
 #define INFINITY (1.0F / 0.0F)
 #define NAN (0.0F / 0.0F)
 
@@ -42,6 +50,7 @@ void *calloc(size_t, size_t);
 void *realloc(void *, size_t);
 void free(void *);
 int abs(int);
+void abort(void);
 
 #define GS_JIT_MATH1(fn) double fn(double); float fn##f(float);
 #define GS_JIT_MATH2(fn) double fn(double, double); float fn##f(float, float);

@@ -421,6 +421,7 @@ def check_tinygen_backend(exe, base, ok, fail, say):
         ok(f"{label} ({done} of {total} functions, whole program)")
     check_tinygen_c(exe, base, ok, fail, say, builtin)
     check_run(exe, base, ok, fail)
+    check_jit(exe, base, ok, fail)
     check_debug(exe, base, ok, fail)
     check_lldb(exe, base, ok, fail, say)
     check_lldb_limited(exe, base, ok, fail)
@@ -558,6 +559,52 @@ def check_run(exe, base, ok, fail):
              f"{err}\n--- got:\n{got}\n--- want:\n{want}")
         return
     ok("goose run --backend=tinygen: output, arguments, exit code, resources, threads")
+
+
+# goose run with no --backend runs tinygen's C in TinyCC (G3.1); --backend=c the C generator's.
+JIT_PROGRAMS = ["samples/01_tour.goose", "test/tinygen/tinygen_text.goose",
+                "test/codegen/defer_results.goose", "test/codegen/index_type_abort.goose",
+                "test/codegen/relative_results.goose"]
+TINYGEN_JIT = "jit: tinygen's C"
+C_JIT = "jit: the C generator's C"
+
+
+def check_jit(exe, base, ok, fail):
+    """Plain goose run (tinygen's C in TinyCC) and goose run --backend=c (the
+    C generator's): the blessed output, exit status and stderr markers on
+    both, -v naming the path, and -O2 (inlined code) falling back whole."""
+    exe = Path(exe).resolve()
+    for rel in JIT_PROGRAMS:
+        source = ROOT / rel
+        want, aborts, markers = expected(source)
+        # Of these only index_type_abort inlines nothing at -O2.
+        o2 = [] if source.stem == "index_type_abort" else [(["-O2"], C_JIT)]
+        for flags, says in [([], TINYGEN_JIT), (["--backend=c"], None)] + o2:
+            label = f"goose run {' '.join(flags + ['-v'])} {source.name}"
+            code, got, err = tc.run_capture([exe, "run", "-v", *flags, source], cwd=source.parent)
+            missing = [mk for mk in markers if mk not in err]
+            if (code != 0) != aborts or missing or got.rstrip("\n") != want.rstrip("\n"):
+                fail(f"{label} (exit {code})", f"{err}\n--- got:\n{got}\n--- want:\n{want}")
+                return
+            if says is None and "jit:" in err or says is not None and says not in err:
+                fail(f"{label}: -v should say {says or 'nothing of tinygen'}", err)
+                return
+    probe = base / "jit_probe.goose"
+    tc.write_text(probe, "import os;\n\nfn main() {\n    let a = args();\n"
+                         "    for i in 1..a.len { print(a[i]); }\n"
+                         "    print(resource_dir());\n    exit(a.len as i32 + 2);\n}\n")
+    code, got, err = tc.run_capture([exe, "run", "-v", probe, "--", "two words", "x"], cwd=ROOT)
+    want = f"two words\nx\n{probe.parent}/\n"
+    if code != 5 or got.replace("\\", "/") != want.replace("\\", "/") or TINYGEN_JIT not in err:
+        fail(f"goose run arguments (exit {code})", f"{err}\n--- got:\n{got}\n--- want:\n{want}")
+        return
+    # A plain run prints nothing of the backend.
+    code, got, err = tc.run_capture([exe, "run", ROOT / JIT_PROGRAMS[0]], cwd=ROOT)
+    if code != 0 or "tinygen" in err or "jit:" in err:
+        fail("goose run without -v: quiet", err)
+        return
+    ok(f"goose run on tinygen's C and with --backend=c: {len(JIT_PROGRAMS)} programs, -O2 "
+       "falling back, arguments, exit code, resources")
 
 
 def check_debug(exe, base, ok, fail):
