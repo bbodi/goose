@@ -770,7 +770,8 @@ R"(  --cc name|path        The C compiler for packages' native parts: msvc,
   -v                    Print each command that builds a native part, and
                         what it prints.
   --backend name        tinygen builds the executable through tinygen in the
-                        build directory and runs it there instead.
+                        build directory and runs it there instead;
+                        tinygen-c builds it through tinygen's C, optimized.
 )");
     if (topic == "debug") return cat(
 R"(usage: goose debug file.goose [options] [-- program args...]
@@ -803,7 +804,11 @@ R"(  --cc name|path        The C compiler: msvc, clang-cl, clang, gcc, cc or a
   --backend name        c (the default) or tinygen, which writes the machine
                         code itself, with debug info naming the Goose source
                         (default -O0); what it does not support goes through
-                        C.
+                        C. tinygen-c has tinygen write C instead (also
+                        -O0), which the C compiler optimizes unless --debug;
+                        with -o out.c it writes that C and builds nothing (a
+                        whole program only; it links with the tinygen
+                        support object and the runtime, as -v shows).
 )");
     if (topic == "check") return cat(
 R"(usage: goose check file.goose [options]
@@ -941,9 +946,10 @@ Options:
   --unsafe-no-rf-check  Leave out the checks after calls that a `return ...
                         from` can pass through: unsound, for pricing them only.
   --gen-runtime-header  Regenerate src/runtime_inline.h from src/runtime/.
-  --tinygen-mixed       With --backend tinygen, compile the C half even when
-                        tinygen took every function.
-  --tinygen-skip=f,g    With --backend tinygen, leave these functions to C.
+  --tinygen-mixed       With --backend tinygen or tinygen-c, compile the C
+                        half even when tinygen took every function.
+  --tinygen-skip=f,g    With --backend tinygen or tinygen-c, leave these
+                        functions to C.
 
 goose format --verify file.goose|dir... formats each file in memory and
 writes nothing: it checks the result as a format does, and that formatting
@@ -1548,25 +1554,30 @@ int Main(int argc, char **argv) {
         verb = "run";
         backendname = "tinygen";
     }
-    if (backendname != "c" && backendname != "tinygen") {
-        fprintf(stderr, "unknown backend: %s (c or tinygen)\n", backendname.c_str());
+    if (backendname != "c" && backendname != "tinygen" && backendname != "tinygen-c") {
+        fprintf(stderr, "unknown backend: %s (c, tinygen or tinygen-c)\n", backendname.c_str());
         return 1;
     }
-    auto tinygen = backendname == "tinygen";
+    // --backend=tinygen-c: the tinygen backend writing C (TYG_OUTPUT_C) instead of an object, which
+    // the C compiler builds as it builds the c backend's: optimized unless --debug.
+    auto tinygenc = backendname == "tinygen-c";
+    auto tinygen = backendname == "tinygen" || tinygenc;
     if (tinygen) {
         #if !GOOSE_HAVE_TINYGEN
-            fprintf(stderr, "--backend=tinygen: this compiler was built without tinygen "
-                            "(TINYGEN_DIR, CMakeLists.txt)\n");
+            fprintf(stderr, "--backend=%s: this compiler was built without tinygen "
+                            "(TINYGEN_DIR, CMakeLists.txt)\n", backendname.c_str());
             return 1;
         #endif
         if (verb != "build" && verb != "run") {
-            fprintf(stderr, "--backend=tinygen works with goose build and goose run\n");
+            fprintf(stderr, "--backend=%s works with goose build and goose run\n",
+                    backendname.c_str());
             return 1;
         }
         // A debug build: no inlining unless asked for, so that every Goose
         // function is a function in the debugger, and the C half compiled
         // with debug information and no optimization (--debug adds the
-        // checks of GS_DEBUG on both halves).
+        // checks of GS_DEBUG on both halves). tinygen-c inlines no more:
+        // tinygen leaves an inlined body to C, and the C compiler inlines.
         if (!optgiven) optlevel = 0;
     }
     if (verb == "toolchain") {
@@ -1592,6 +1603,8 @@ int Main(int argc, char **argv) {
     // the program is built into its build directory as goose build would build it, then started
     // as a child that shares this process's streams.
     auto tgrun = false;
+    // goose build --backend=tinygen-c -o out.c: tinygen's C goes there, and nothing is built.
+    string tgcout;
     if (verb == "run") {
         if (!outname.empty()) {
             fprintf(stderr, "goose run takes no -o: it compiles and runs the program in this "
@@ -1600,7 +1613,7 @@ int Main(int argc, char **argv) {
         }
         if (tinygen) {
             tgrun = true;
-            buildopts = BuildOptions { true, verbose, dryrun, false, "" };
+            buildopts = BuildOptions { debug || !tinygenc, verbose, dryrun, false, "" };
         } else {
             forcejit = true;
         }
@@ -1616,7 +1629,12 @@ int Main(int argc, char **argv) {
                             "(-o out.c) writes the C for a C host\n");
             return 1;
         }
-        buildopts = BuildOptions { debug || tinygen, verbose, dryrun, standalone, outname };
+        buildopts = BuildOptions { debug || (tinygen && !tinygenc), verbose, dryrun, standalone,
+                                   outname };
+        if (tinygenc && outname.size() > 2 && outname.compare(outname.size() - 2, 2, ".c") == 0) {
+            tgcout = outname;
+            buildopts.exe.clear();
+        }
         outname.clear();
     }
     if (files.size() > 1 && !multitest) {
@@ -1672,6 +1690,8 @@ int Main(int argc, char **argv) {
     // it is the whole program (no C half to compile), with GS_DEBUG's checks.
     string tgobject;
     bool tgwhole = false, tgchecks = false;
+    // With --backend=tinygen-c, the C tinygen wrote, which the build compiles to tgobject.
+    string tgcsource;
     // The program's Ast outlives the compile: a build and a JIT run read
     // its packages, for the native parts the program needs (native.h).
     unique_ptr<Ast> astp;
@@ -1800,6 +1820,7 @@ int Main(int argc, char **argv) {
                 tgb = make_unique<TinyGenBackend>(ast, checks, filename, runtime_ext_text,
                                                   RuntimeSections({ "runtime.h", "runtime_ext.h" }));
                 tgb->skip = tinygenskip;
+                tgb->coutput = tinygenc;
             }
             CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, stackcfg, tgb.get());
         #else
@@ -1850,11 +1871,21 @@ int Main(int argc, char **argv) {
                     if (auto py = FindLldbFormatters(exe); !py.empty())
                         fprintf(msgs, "tinygen: lldb formatters: command script import \"%s\"\n",
                                 py.c_str());
+                if (!tgcout.empty() && !tgwhole)
+                    throw CompileError { cat("-o ", tgcout, ": the program needs the C half too "
+                                             "(mixed: ", whynot, "); goose build without -o "
+                                             "builds both") };
                 if (!tgb->taken.empty() && !outfile.empty()) {
                     tgobject = cat(DirOf(outfile), PathStem(outfile), ".tg.o");
+                    if (tinygenc) tgcsource = tgcout.empty() ? cat(DirOf(outfile), PathStem(outfile),
+                                                                   ".tg.c") : tgcout;
+                    auto written = tinygenc ? tgcsource : tgobject;
                     string err;
-                    if (!dryrun && !tgb->Write(tgobject, err))
-                        throw CompileError { cat("tinygen: cannot write ", tgobject, ": ", err) };
+                    if (!dryrun && !tgb->Write(written, err))
+                        throw CompileError { cat("tinygen: cannot write ", written, ": ", err) };
+                    if (!tgcout.empty() && !quiet && !dryrun)
+                        fprintf(msgs, "wrote %s (tinygen's C; it links with the tinygen support "
+                                      "object and the runtime object)\n", tgcout.c_str());
                 }
             }
         #endif
@@ -1958,6 +1989,7 @@ int Main(int argc, char **argv) {
         }
         program.clear();
         tgobject.clear();
+        tgcsource.clear();
         tgwhole = false;
         astp.reset();
         nativepkgs.clear();
@@ -1971,7 +2003,7 @@ int Main(int argc, char **argv) {
             auto code = RunOnCompilerStack(compile);
             if (code) return code;
             if (building) {
-                if (nocgen) return 0;
+                if (nocgen || !tgcout.empty()) return 0;
                 // The native parts first, so that the link can take their
                 // response files: a builtin package's from the compiler's
                 // build, the others' built now.
@@ -1989,6 +2021,11 @@ int Main(int argc, char **argv) {
                     if (!BuildNativePart(*astp, pkg, filename, b, false, nb)) return 1;
                     rsps.push_back(nb.rsp);
                 }
+                // tinygen's C, compiled as the C half is: optimized unless --debug.
+                if (!tgcsource.empty() &&
+                    !b.CompileObject(tgcsource, tgobject, "compiling tinygen's C",
+                                     cat(builddir, "/tgc.log")))
+                    return 1;
                 pair<string, std::function<string()>> tgsupport;
                 if (tgwhole) {
                     auto src = TinygenSupportSource(tgchecks);

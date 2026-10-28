@@ -274,6 +274,27 @@ uses the entry source's directory instead. To match it, Goose sets
 variable when it is set. Unlike a TinyCC run, this path also runs programs
 with threads.
 
+## Optimized builds: `--backend=tinygen-c`
+
+`--backend=tinygen-c` builds as `--backend=tinygen` does, whole or mixed by
+the same rules, but the module is created with `TYG_OUTPUT_C`. `Write` then
+writes `<stem>.tg.c`, tinygen's C for the whole object, and the C compiler
+builds it into `<stem>.tg.o` with the c backend's flags: `-O2`, or `-O0 -g`
+with `--debug`. The link is the tinygen one. A mixed build's C half is
+compiled with the same flags. Goose's own inlining stays at `-O0` unless
+asked for, because tinygen leaves an inlined body (`NK_InlineBlock`) to C;
+the C compiler inlines instead. `goose build --backend=tinygen-c -o out.c`
+writes tinygen's C and builds nothing; a mixed program refuses it.
+
+Two things of tinygen's C output are worked around here:
+
+* C requires `main(int, char **)`, and a tinygen pointer prints as `void *`.
+  So in C output `EmitMain` defines `gs_tg_main`, and `Write` appends a
+  `main` that calls it.
+* tinygen declares a base debug type by its name, so `_Bool` became
+  `typedef _Bool _Bool;`. In C output the `bool` base type is named `bool`,
+  which tinygen leaves to the C type.
+
 ## Testing
 
 * `test/tinygen/` holds fixtures for each area: scalars, structs, arrays,
@@ -287,6 +308,9 @@ with threads.
   the two halves in both directions.
 * It checks that the `WHOLE_PROGRAM` fixtures compile no C, and that
   `--tinygen-mixed` gives the same output.
+* It builds every program again with `--backend=tinygen-c`, the `--debug`
+  ones at `-O0 -g`, and fails a program whose tinygen C does not compile
+  or warns on a line of its own.
 * Where lldb is installed, it checks breakpoints by Goose name, Goose lines,
   and parameters, locals and globals with Goose types. With the formatters
   imported, it checks arrays' elements, text, `i8` and `u8`, optionals,

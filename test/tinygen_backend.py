@@ -10,10 +10,12 @@ halves in both directions. The WHOLE_PROGRAM programs must take the whole
 program path, which compiles no C of the program's own; with
 --tinygen-mixed or --tinygen-skip they must take the mixed path. The gfx,
 ui, audio and physics fixtures run headless; the windowed samples
-(BUILD_ONLY) are only built. Where lldb is installed, several fixtures run
-under it to check that the debugger finds Goose functions by name and shows
-their Goose source lines, and their parameters, locals and globals by their
-Goose types, and, with src/lldb/goose_lldb.py imported, as Goose values.
+(BUILD_ONLY) are only built. All of them are built and run again with
+--backend=tinygen-c, through tinygen's C and the C compiler. Where lldb is
+installed, several fixtures run under it to check that the debugger finds
+Goose functions by name and shows their Goose source lines, and their
+parameters, locals and globals by their Goose types, and, with
+src/lldb/goose_lldb.py imported, as Goose values.
 
 Called by run_tests.py; `python test/tinygen_backend.py <goose>` runs it on
 its own."""
@@ -284,10 +286,10 @@ def expected(source):
     return out, aborts, markers
 
 
-def build(exe, source, out, flags):
-    """Builds source with the tinygen backend; (ok, the compiler's output,
-    functions compiled by tinygen, functions in all)."""
-    code, o, e = tc.run_capture([exe, "build", "--backend=tinygen", "-v", *flags, "-o", out,
+def build(exe, source, out, flags, backend="tinygen"):
+    """Builds source with the tinygen backend (or tinygen-c); (ok, the
+    compiler's output, functions compiled by tinygen, functions in all)."""
+    code, o, e = tc.run_capture([exe, "build", f"--backend={backend}", "-v", *flags, "-o", out,
                                  source])
     m = re.search(r"tinygen: (\d+) of (\d+) function", o + e)
     if code != 0 or not m or not Path(out).exists():
@@ -361,12 +363,115 @@ def check_tinygen_backend(exe, base, ok, fail, say):
             fail(f"{label}: {done} of {total} functions, whole program expected", log)
             continue
         ok(f"{label} ({done} of {total} functions, whole program)")
+    check_tinygen_c(exe, base, ok, fail, say, builtin)
     check_run(exe, base, ok, fail)
     check_debug(exe, base, ok, fail)
     check_lldb(exe, base, ok, fail, say)
     check_lldb_limited(exe, base, ok, fail)
     check_lldb_adts(exe, base, ok, fail)
     check_lldb_optionals(exe, base, ok, fail)
+
+
+def tinygen_c_problem(log, debug):
+    """What is wrong with the compile of tinygen's C in a tinygen-c build's
+    -v log: the first error or warning of the compiler's output (tgc.log,
+    beside the .tg.c), or the wrong flags; "" for nothing."""
+    cmd = next((line for line in log.splitlines() if ".tg.c -o " in line), None)
+    if cmd is None:
+        return "tinygen's C was not compiled"
+    want = ["-O0", "-g"] if debug else ["-O2"]
+    if any(f not in cmd.split() for f in want):
+        return f"compiled without {' '.join(want)}: {cmd}"
+    tgc = next(a for a in cmd.split() if a.endswith(".tg.c"))
+    out = Path(tgc).parent / "tgc.log"
+    text = tc.decode(out.read_bytes()) if out.exists() else ""
+    first = next((line.strip() for line in text.splitlines()
+                  if "error:" in line or "warning:" in line), "")
+    if first or "compiling tinygen's C failed" in log:
+        return first or "does not compile"
+    return ""
+
+
+def check_tinygen_c(exe, base, ok, fail, say, builtin):
+    """--backend=tinygen-c: the same programs, built through tinygen's C
+    output and the C compiler (-O2, or -O0 -g with --debug), with the same
+    output and the same path; a whole program compiles only its .tg.c. A
+    program whose tinygen C does not compile (or warns) fails on a line of
+    its own."""
+    for i, (rel, whole, flags) in enumerate(PROGRAMS):
+        source = ROOT / rel
+        label = f"tinygen-c {source.name}{' ' + ' '.join(flags) if flags else ''}"
+        modules = tc.native_imports(tc.decode(source.read_bytes()))
+        if any(m not in builtin for m in modules):
+            say(f"skip {label} (the compiler was built without {', '.join(modules)})")
+            continue
+        out = base / f"{source.stem}-c{i}{tc.EXE_SUFFIX}"
+        good, log, done, total = build(exe, source, out, flags, "tinygen-c")
+        problem = tinygen_c_problem(log, "--debug" in flags)
+        if problem:
+            fail(f"{label}: tinygen's C: {problem}", log)
+            continue
+        if not good:
+            fail(label, log)
+            continue
+        if done == 0 or (whole and done != total):
+            fail(f"{label}: {done} of {total} functions through tinygen", log)
+            continue
+        alone = (source.stem in WHOLE_PROGRAM and
+                 not any(f.startswith("--tinygen-") for f in flags))
+        cfile = f"{source.stem}.c"
+        compiled = [line for line in log.splitlines() if cfile in line and " -o " in line]
+        if alone != ("tinygen: whole program" in log) or (alone and compiled):
+            fail(f"{label}: expected the {'whole program' if alone else 'mixed'} path", log)
+            continue
+        want, aborts, markers = expected(source)
+        code, got, err = tc.run_capture([out], cwd=ROOT if modules else source.parent)
+        if code != 0 and any(tc.native_unavailable(m, err) for m in modules):
+            say(f"skip {label} (no device for {', '.join(modules)})")
+            continue
+        if (code != 0) != aborts:
+            fail(f"{label} (exit {code})", err)
+            continue
+        missing = [mk for mk in markers if mk not in err]
+        if missing:
+            fail(f"{label}: stderr", err)
+            continue
+        if got.rstrip("\n") != want.rstrip("\n"):
+            fail(label, f"--- got:\n{got}\n--- want:\n{want}")
+            continue
+        ok(f"{label} ({done} of {total} functions{', whole program' if alone else ''})")
+    for rel in BUILD_ONLY:
+        source = ROOT / rel
+        label = f"tinygen-c {source.name} (built, not run)"
+        if any(m not in builtin for m in tc.native_imports(tc.decode(source.read_bytes()))):
+            say(f"skip {label} (the compiler lacks its packages)")
+            continue
+        good, log, done, total = build(exe, source, base / f"{source.stem}-c{tc.EXE_SUFFIX}", [],
+                                       "tinygen-c")
+        problem = tinygen_c_problem(log, False)
+        if problem:
+            fail(f"{label}: tinygen's C: {problem}", log)
+            continue
+        if not good or done != total or "tinygen: whole program" not in log:
+            fail(f"{label}: {done} of {total} functions, whole program expected", log)
+            continue
+        ok(f"{label} ({done} of {total} functions, whole program)")
+    # goose run builds the same way, and -o out.c writes tinygen's C alone.
+    source = ROOT / "test/tinygen/tinygen_text.goose"
+    want, _, _ = expected(source)
+    code, got, err = tc.run_capture([Path(exe).resolve(), "run", "--backend", "tinygen-c", source],
+                                    cwd=source.parent)
+    if code != 0 or got.rstrip("\n") != want.rstrip("\n"):
+        fail(f"goose run --backend tinygen-c {source.name} (exit {code})",
+             f"{err}\n--- got:\n{got}\n--- want:\n{want}")
+        return
+    cout = base / "tinygen_text.tg.c"
+    code, o, e = tc.run_capture([exe, "build", "--backend=tinygen-c", "-o", cout, source])
+    if code != 0 or not cout.exists() or "int main(int argc, char **argv)" not in tc.decode(
+            cout.read_bytes()):
+        fail("goose build --backend=tinygen-c -o out.c", o + e)
+        return
+    ok("goose run --backend tinygen-c, and -o out.c writing tinygen's C")
 
 
 def check_run(exe, base, ok, fail):

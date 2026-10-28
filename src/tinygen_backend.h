@@ -206,6 +206,7 @@ struct TgModule {
     // fixed at load: a procedure reads them from data pointers (gs_tg_stkpp, the gs_tg_g accessors)
     // instead of calling an accessor on entry. TinyGenBackend::Choose sets it.
     bool fixedaddrs = false;
+    bool cout = false;     // C source (TYG_OUTPUT_C) rather than an object.
     tyg_module *m = nullptr;
     map<int, tyg_file> files;
     map<int, tyg_sym> filenames;
@@ -253,10 +254,12 @@ struct TgModule {
         return rtapi[name] = found;
     }
 
-    TgModule(Ast &_ast, CodeGen &_cg, bool _checks, const string &source)
-        : ast(_ast), cg(_cg), checks(_checks) {
+    // cout: the module writes C source (TYG_OUTPUT_C) for the C compiler, not an object.
+    TgModule(Ast &_ast, CodeGen &_cg, bool _checks, const string &source, bool _cout = false)
+        : ast(_ast), cg(_cg), checks(_checks), cout(_cout) {
         auto t = tyg_host_target();
         t.debug_info = 1;
+        if (cout) t.output = TYG_OUTPUT_C;
         m = tyg_module_new(t, source.c_str());
         // C11, the C half's: lldb formats the same under every language code tinygen offers, and the
         // two halves' units then read alike.
@@ -732,7 +735,9 @@ struct TgModule {
                               TYG_DT_SIGNED);
             }
             case TY_FLT: return scalar(Scal(t) == TYG_F32 ? "float" : "double", TYG_DT_FLOAT);
-            case TY_BOOL: return scalar("_Bool", TYG_DT_BOOL);
+            // In C output tinygen declares a base type by its name, and `typedef _Bool _Bool` does
+            // not compile (tinygen's cgen.c, tg_c_name_ok); "bool" it leaves to the C type.
+            case TY_BOOL: return scalar(cout ? "bool" : "_Bool", TYG_DT_BOOL);
             case TY_REF: {
                 if (IsRel(t)) {   // The offset the slot holds, under the reference's name.
                     static const char *un[] = { "unsigned char", "unsigned short", "unsigned int",
@@ -7790,6 +7795,10 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     string runtime_decls;   // runtime.h and runtime_ext.h (TgModule::RuntimeApi).
     // Left to C whatever they hold (--tinygen-skip): what tests calls across the two halves with.
     vector<string> skip;
+    // --backend=tinygen-c: Write writes tinygen's C source, which the C compiler builds into the
+    // object, instead of the object.
+    bool coutput = false;
+    bool cmain = false;   // C output with gs_tg_main (EmitMain).
 
     TinyGenBackend(Ast &_ast, bool _checks, const string &_source, string_view _ext, string _decls)
         : ast(_ast), checks(_checks), source(_source), runtime_ext_text(_ext),
@@ -7912,7 +7921,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     // the other.
     set<FnSpec *> Choose(CodeGen &cg, const vector<FnSpec *> &specs) override {
         set<FnSpec *> ours;
-        mod = make_unique<TgModule>(ast, cg, checks, source);
+        mod = make_unique<TgModule>(ast, cg, checks, source, coutput);
         mod->rtdecls = runtime_decls;
         mod->fixedaddrs = !UsesThreads(cg);
         if (!mod->m) {
@@ -8363,7 +8372,11 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         auto mainsp = ast.MainFunction()->specs[0];
         auto i32 = tyg_type_int(m, TYG_I32, 1), i64 = tyg_type_int(m, TYG_I64, 1);
         auto ptr = tyg_type_ptr(m);
-        auto p = tyg_proc_begin(m, mod->FnSym("main"), SigOf(i32, { i32, ptr }));
+        // C requires main's argv to be a char **, which a tinygen pointer prints as void *: in C
+        // output the procedure is gs_tg_main, and Write adds the main that calls it.
+        auto p = tyg_proc_begin(m, mod->FnSym(coutput ? "gs_tg_main" : "main"),
+                                SigOf(i32, { i32, ptr }));
+        cmain = coutput;
         auto line = mainsp->sf->line;
         auto file = mod->File(line.fileidx);
         auto dint = tyg_dt_base(m, "int", 4, TYG_DT_SIGNED);
@@ -8394,8 +8407,15 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     }
 
     bool Write(const string &path, string &err) {
-        if (tyg_module_write(mod->m, path.c_str()) == 0) return true;
-        err = tyg_error(mod->m) ? tyg_error(mod->m) : "?";
+        if (tyg_module_write(mod->m, path.c_str()) != 0) {
+            err = tyg_error(mod->m) ? tyg_error(mod->m) : "?";
+            return false;
+        }
+        if (!cmain) return true;
+        FILE *f = fopen(path.c_str(), "a");
+        if (f) fputs("\nint main(int argc, char **argv) { return gs_tg_main(argc, argv); }\n", f);
+        if (f && fclose(f) == 0) return true;
+        err = "cannot append main";
         return false;
     }
 };
