@@ -1656,6 +1656,10 @@ struct TgFn {
     TgFn(TgModule &_M, FnSpec *_sp) : M(_M), cg(_M.cg), sp(_sp), m(_M.m) {}
 
     [[noreturn]] static void No(Line l, const string &why) { throw TgUnsupported { l, why }; }
+    // The type checker rules these out, so reaching one is a compiler bug, not a fallback to C.
+    [[noreturn]] static void Unreachable(Line l, const string &what) {
+        throw CompileError { cat("tinygen backend: unreachable: ", what, l.line > 0 ? cat(" (line ", l.line, ")") : string()) };
+    }
 
     // A value: a scalar in a virtual register, or an aggregate in memory.
     struct V {
@@ -1759,7 +1763,7 @@ struct TgFn {
             reldst = nullptr;
             return;
         }
-        if (!BuildCtl(n, InPlace { 5, 0, pl.t, pl.a }, n->line)) No(n->line, "value delivered to a slot");
+        if (!BuildCtl(n, InPlace { 5, 0, pl.t, pl.a }, n->line)) Unreachable(n->line, "value delivered to a slot");
     }
     // A call returning d.t (the same by name, or by TEq if !bymangle) is handed d to build its first
     // result at; false if n is not one.
@@ -1881,7 +1885,7 @@ struct TgFn {
             return s;
         };
         if (live && sp && sp->incycle && callee->incycle && cycle(sp) == cycle(callee))
-            No(l, "data stack held across a call into the recursive cycle");
+            Unreachable(l, "data stack held across a call into the recursive cycle");
         stackcalls.push_back({ callee, live, l });
         return Add(SpVal(l), I64(live));
     }
@@ -1900,11 +1904,11 @@ struct TgFn {
         St(len, Add(Ld(len), n));
     }
     void CopyRun(tyg_val stk, tyg_addr len, TypeExpr *et, tyg_val elems, tyg_val n) {
-        if (!cg.IsFix(et)) No(Line {}, "a copy of elements of variable size");
+        if (!cg.IsFix(et)) Unreachable(Line {}, "a copy of elements of variable size");
         CopyBytes(stk, len, elems, Mul(n, I64(cg.FixedSize(et))), n);
     }
     void SameElem(TypeExpr *a, TypeExpr *b, Line l) {
-        if (cg.Mangle(a) != cg.Mangle(b)) No(l, "array of another element type");
+        if (cg.Mangle(a) != cg.Mangle(b)) Unreachable(l, "array of another element type");
     }
     tyg_val RunBytes(const View &v) {
         return cg.IsFix(v.elem) ? Mul(v.len, I64(cg.FixedSize(v.elem))) : Sub(RunEnd(v), v.elems);
@@ -1926,7 +1930,7 @@ struct TgFn {
         auto len = CountAt(hdr);
         if (BuildCtl(n, InPlace { 2, stk, t, hdr }, l)) return;
         if (auto al = Is<ArrayLit>(n)) {
-            if (al->capexpr) No(l, "array literal of this kind");
+            if (al->capexpr) Unreachable(l, "array literal of this kind");
             if (!al->fillval) {   // Elements (images each built behind the last) counted one by one.
                 StartHdr(stk, hdr);
                 for (auto e : al->elems) {
@@ -1937,7 +1941,7 @@ struct TgFn {
             }
             // [v; k] (CodeGen::GenArrayLit): v built once, then copied k times (k constant, §4.2).
             auto fc = Is<IntLit>(al->fillcount);
-            if (!fc || fc->val < 0) No(l, "fill count");
+            if (!fc || fc->val < 0) Unreachable(l, "fill count");
             // v built once even for none (CodeGen::FreezeFill), then copied behind itself.
             if (!fix) {
                 StartHdr(stk, hdr);
@@ -1977,7 +1981,7 @@ struct TgFn {
         auto s = Is<StrLit>(n);
         auto tobytes = c && c->builtin == B_TO_BYTES && c->ArgNodes().size() == 1;
         if (tobytes || IsStrCall(n) || s) {   // Bytes: a payload's, a text's, a string literal's.
-            if (!IsU8(et)) No(l, "bytes of an array of this type");
+            if (!IsU8(et)) Unreachable(l, "bytes of an array of this type");
             StartHdr(stk, hdr);
             auto an = c ? c->ArgNodes() : vector<Node *> {};
             if (tobytes) ToBytesInto(stk, len, an[0], l);
@@ -2038,11 +2042,11 @@ struct TgFn {
         auto fields = [&](StructLit *sl, const TgModule::FieldSet &fs, int tailfi) {
             for (size_t i = 0; i < fs.f.size(); i++)
                 if (auto e = sl->InitFor((int)i); e && Is<SelfRef>(e))
-                    No(l, "self reference in a resizable ADT");
+                    Unreachable(l, "self reference in a resizable ADT");
             if (tailfi < 0) RunLit(sl, stk, fs);
             else LitWithTail(sl, stk, fs, tailfi, len, l);
         };
-        if (StripCopy(n) != n) No(l, "copy of a resizable ADT");
+        if (StripCopy(n) != n) Unreachable(l, "copy of a resizable ADT");
         if (BuildCtl(n, InPlace { 2, stk, t, hdr }, l)) return;
         auto sl = Is<StructLit>(n);
         auto c = Is<Call>(n);
@@ -2203,7 +2207,7 @@ struct TgFn {
     // patched once counted), or the elements of `from`, or none. Its address.
     tyg_val GenImg(Node *n, tyg_val stk, TypeExpr *t, Line l, const View *from = nullptr) {
         if (TgModule::IsVarint(t)) {   // A varint field: its value zigzag ULEB128 at the top.
-            if (!n || from) No(l, "varint without a value");
+            if (!n || from) Unreachable(l, "varint without a value");
             auto top = Top(stk);
             auto x = GenAs(n, M.ast.inttypes[IS_I64]);
             if (Ended()) return top;
@@ -2215,7 +2219,7 @@ struct TgFn {
         if (n && !from && BuildCtl(n, InPlace { 1, stk, t, {} }, l)) return at();
         if (TgModule::IsVr(t)) {
             // A varint-width relative reference: the offset of the plain reference n is.
-            if (from) No(l, "relative reference without a value");
+            if (from) Unreachable(l, "relative reference without a value");
             if (!n) {   // Declared without one: null, the zero byte.
                 auto top = Top(stk);
                 tyg_store(p, TYG_I8, AtV(top), I8(0), 0);
@@ -2228,11 +2232,11 @@ struct TgFn {
             return top;
         }
         if (M.IsVm(t) || M.IsVv(t) || M.IsVs(t)) {
-            if (!n || from) No(l, cat("value of type ", M.NameWhy(t)));
+            if (!n || from) Unreachable(l, cat("value of type ", M.NameWhy(t)));
             return M.IsVm(t) ? GenVm(n, stk, t, l) : GenVs(n, stk, t, l);
         }
         if (CallAt(n, InPlace { 1, stk, t })) return at();
-        if (!n && !from && M.VarImgOk(t)) No(l, "array of images without a value");
+        if (!n && !from && M.VarImgOk(t)) Unreachable(l, "array of images without a value");
         auto rc = M.IsRc(t);
         if (rc && n && !from && RcPrelude(n, stk, t, l, at())) return at();
         SetTop(stk, Add(at(), I64(rc ? 8 : TgModule::PrefixBytes(t))));
@@ -2365,7 +2369,7 @@ struct TgFn {
                 v = tyg_convert(p, uns ? TYG_ZEXT : TYG_SEXT, TYG_I32, v);
             return tyg_convert(p, uns ? TYG_UITOF : TYG_SITOF, ts, v);
         }
-        if (fflt) No(l, "implicit float to integer conversion");
+        if (fflt) Unreachable(l, "implicit float to integer conversion");
         if (fs == ts) return v;
         if (TgModule::ScalSize(ts) < TgModule::ScalSize(fs)) return tyg_convert(p, TYG_TRUNC, ts, v);
         return tyg_convert(p, TgModule::IsSigned(from) ? TYG_SEXT : TYG_ZEXT, ts, v);
