@@ -288,7 +288,13 @@ REGRESSIONS = ["test/codegen/forward_adaptation.goose", "test/codegen/bytes_valu
                "test/codegen/deep_nested_structs.goose",
                "test/codegen/float_remainder_assign.goose",
                "test/codegen/frame_object_block_value.goose",
-               "test/codegen/diverging_arm_value.goose"]
+               "test/codegen/diverging_arm_value.goose",
+               # G3.1's sweep of goose run: the index type checks of a cast and of an image, and
+               # the line a relative offset overflow names.
+               "test/codegen/index_type_abort.goose", "test/codegen/bound_type_abort.goose",
+               "test/typing/index_types.goose", "test/codegen/relative_results.goose",
+               "test/codegen/relative_declarations.goose",
+               "test/codegen/frame_pool_references.goose"]
 # Programs whose header asks for the debug checks (a runtime-debug or GS_DEBUG=1 line), built with
 # --debug: thread_contained answers only in a debug build, and the others, also listed above, have
 # links the checks verify.

@@ -1709,7 +1709,13 @@ struct TgFn {
     void Open() { if (tyg_block_terminated(p)) SetBlock(NewBlock()); }
     bool Ended() { return tyg_block_terminated(p) != 0; }
     void Jump(tyg_block b) { if (!Ended()) tyg_jump(p, b); }
-    void Loc(Line l) { if (l.line > 0) tyg_loc(p, M.File(l.fileidx), l.line, 0); }
+    // The line of the latest Loc, which a store's range check names (Store).
+    Line here {};
+    void Loc(Line l) {
+        if (l.line <= 0) return;
+        here = l;
+        tyg_loc(p, M.File(l.fileidx), l.line, 0);
+    }
 
     // A local for a value of type t, aligned to the largest power of two up to 8 its size allows.
     tyg_local Temp(TypeExpr *t) {
@@ -2487,8 +2493,8 @@ struct TgFn {
         if (pl.enc) No(Line {}, "a store into a varint in a bytes value");
         // Only a temporary carrying a value across blocks (TgModule::Size) holds a Vr: the language
         // never assigns one.
-        if (TgModule::IsVr(pl.t)) RelOffsetInto(pl, x.v, Line {});
-        else if (TgModule::IsRel(pl.t)) RelStore(pl, x.v, Line {});
+        if (TgModule::IsVr(pl.t)) RelOffsetInto(pl, x.v, here);
+        else if (TgModule::IsRel(pl.t)) RelStore(pl, x.v, here);
         // A scalar without a value comes from code after a return or break (a block never placed).
         else if (M.IsScalar(pl.t) && !x.v) return;
         else if (M.FoOk(pl.t) && x.mem && pl.stk && x.stk) FoCopy(pl, P { x.a, x.t, x.stk }, Line {});
@@ -3481,6 +3487,20 @@ struct TgFn {
         auto tt = c->totype;
         auto x = GenAs(c->child, cg.OperandT(st));
         st = x.t;
+        // Into an index or bound type: checked against the array first, in every build
+        // (CodeGen::IndexTypeCheck, §3.11).
+        if (tt->kind == TY_INT && tt->ix && !c->nobc && st->kind == TY_INT &&
+            st->intstorage != IS_VARINT) {
+            auto i = Conv(x.v, st, M.ast.inttypes[IS_I64], c->line);
+            auto len = ViewOf(Deref(GlobalPlace(tt->ix->arr, c->line)), c->line, true).len;
+            if (!tt->ix->upto) BoundsCheck(i, len, c->line);
+            else
+                If(Cmp(TYG_UGT, i, len), [&] {
+                    CallC("gs_idxfail", { IT(TYG_I64), IT(TYG_I64), tyg_type_ptr(m), IT(TYG_I32) },
+                          { i, len, FileArg(c->line), LineArg(c->line) }, nullptr);
+                    tyg_unreachable(p);
+                });
+        }
         if (!M.IsScalar(st) || !M.IsScalar(tt) || st->kind == TY_REF || tt->kind == TY_REF)
             No(c->line, "cast types");
         if (tt->kind == TY_FLT) {
@@ -7819,8 +7839,18 @@ struct TgFn {
                 VFail(TYG_UGT, LoadN(VAt(), 1, false), I64(1));
                 VAddQ(I64(1));
                 return;
-            case TY_INT:   // A varint: only its length matters.
-                VAddQ(LdL(VUleb().k));
+            case TY_INT:
+                if (t->ix) {
+                    // An index or bound type: one of the array as it is now (CodeGen's walk).
+                    auto sz = CodeGen::IntSize(t->intstorage);
+                    VNeed(sz);
+                    auto v = LoadN(VAt(), sz, !IsUnsigned(t->intstorage));
+                    auto len = ViewOf(Deref(GlobalPlace(t->ix->arr, Line {})), Line {}, true).len;
+                    VFail(t->ix->upto ? TYG_UGT : TYG_UGE, v, len);
+                    VAddQ(I64(sz));
+                    return;
+                }
+                VAddQ(LdL(VUleb().k));   // A varint: only its length matters.
                 return;
             case TY_REF: {
                 auto w = (IntStorage)t->ref->lenstorage;
