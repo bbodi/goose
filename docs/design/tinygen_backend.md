@@ -5,7 +5,7 @@ program's C. tinygen is a C99 library, checked out beside this repository as
 `../tinygen`. It turns a small IR into machine code and writes an object file
 with debug info. The backend lowers each Goose function to that IR.
 
-    goose build --backend=tinygen prog.goose          # debug build, -O0
+    goose build --backend=tinygen prog.goose          # debug build, -O2
     goose build --backend=tinygen --debug prog.goose  # with GS_DEBUG's checks
     goose build --backend=tinygen -v prog.goose       # says what went to C, and why
     goose run --backend=tinygen prog.goose -- args    # builds, then runs it
@@ -258,8 +258,14 @@ When that path holds `src/tinygen.c` and `include/tinygen.h`, CMake compiles
 tinygen as a static library and defines `GOOSE_HAVE_TINYGEN=1`. Without it,
 the compiler has the C backend only, and `--backend=tinygen` says so.
 
-`--backend=tinygen` makes `-O0` the default, so no function is inlined away
-in the debugger. `-O1` and `-O2` still work.
+`--backend=tinygen` inlines as the C backend does, `-O2` by default; `-O0`
+keeps every Goose function a function in the debugger, and `goose debug`
+defaults to it. The optimizer's `NK_InlineBlock` is built by `TgFn::GenInline`:
+the argument bindings in the caller's scope, the body in a scope of its own,
+and a `return` of the inlined function, like a `break` out of a `block`, a
+store of its value and a jump to the block's end. A function whose native
+frame, with the large fixed values of its inlined calls, passes 1 MiB is left
+to C (the C backend keeps those on a data stack).
 
 ## `goose run`
 
@@ -296,9 +302,8 @@ C generator for some programs (`append_destination_storage`). Otherwise the whol
 program runs on the C generator's C, built by a second `CodeGen` without
 tinygen; a mixed program never goes into one TinyCC unit. `-v` prints
 `jit: tinygen's C` or `jit: the C generator's C ... (why)`. Inlining defaults
-to `-O0`, because tinygen leaves an inlined body to C. So `-O1` and `-O2`
-take the C generator's path. `--backend=c` asks for that path at the old
-default of `-O2`. With `--jit -o out.c`, the C generator's C still goes to
+to `-O2`, as for the C backend, and `-O0` is selectable. `--backend=c`
+asks for the C generator's path. With `--jit -o out.c`, the C generator's C still goes to
 `out.c` and tinygen's C runs. Threads are refused on both paths.
 
 tinygen's C is about 5 to 15 times slower than the C generator's under
@@ -323,9 +328,8 @@ the same rules, but the module is created with `TYG_OUTPUT_C`. `Write` then
 writes `<stem>.tg.c`, tinygen's C for the whole object, and the C compiler
 builds it into `<stem>.tg.o` with the c backend's flags: `-O2`, or `-O0 -g`
 with `--debug`. The link is the tinygen one. A mixed build's C half is
-compiled with the same flags. Goose's own inlining stays at `-O0` unless
-asked for, because tinygen leaves an inlined body (`NK_InlineBlock`) to C;
-the C compiler inlines instead. `goose build --backend=tinygen-c -o out.c`
+compiled with the same flags. Goose's own inlining is at `-O2` by default, as
+for the C backend. `goose build --backend=tinygen-c -o out.c`
 writes tinygen's C and builds nothing; a mixed program refuses it.
 
 Two things of tinygen's C output are worked around here:

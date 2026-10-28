@@ -1580,6 +1580,7 @@ struct TgFn {
         InPlace ip;
         tyg_local top0 = 0;
         bool pref = false;        // Its value is a pool reference (GenPref).
+        SFunction *ibsf = nullptr;   // An inlined body: the function whose returns exit here.
     };
     vector<LoopTargets> loops;
     // The value at src copied to d as d.t is: a frame object, an image (a variant or fixed ADT adapted
@@ -1724,7 +1725,22 @@ struct TgFn {
         auto sz = M.Size(t);
         int64_t align = 1;
         while (align < 8 && align * 2 <= sz) align *= 2;
-        return tyg_local_new(p, sz, align);
+        return Frame(sz, align);
+    }
+    // A slot of the native frame. The C generator keeps a large fixed value on a data stack, so that
+    // calls inlined into a function do not add their values to its frame (a thread's native stack
+    // can be 1 MiB, as under MSVC). Here the frame is counted, and a function with inlined calls that
+    // outgrows 1 MiB is left to the C generator.
+    static constexpr int64_t MAX_FRAME = 1 << 20;
+    int64_t framebytes = 0;
+    bool hasinline = false;
+    void CheckFrame() {
+        if (hasinline && framebytes > MAX_FRAME) No(here, "native frame over 1 MiB after inlining");
+    }
+    tyg_local Frame(int64_t size, int64_t align) {
+        framebytes += size;
+        CheckFrame();
+        return tyg_local_new(p, size, align);
     }
 
     // ---- Building values in place ---------------------------------------------------------------
@@ -1735,6 +1751,11 @@ struct TgFn {
         auto c = Is<Call>(n);
         return c && c->builtin == B_COPY && c->ArgNodes().size() == 1 ? c->ArgNodes()[0] : n;
     }
+    // Whether an inlined call is built at d by its arms: it gives the callee's own result type.
+    bool InlineBuildable(InlineBlock *ib, const InPlace &d) {
+        auto rt = InlineAs(ib);
+        return rt && cg.TEq(rt, d.t) && (d.mode <= 3 || d.mode == 5);
+    }
     // If, block, match, early block, loop or function value n built at d, each arm's value by
     // BuildInto. A match, early block or loop only for a destination they deliver to. False for any
     // other n.
@@ -1743,6 +1764,7 @@ struct TgFn {
         if (auto ie = Is<IfExpr>(n); ie && ie->elseb) BuildIf(ie, l, arm);
         else if (auto b = Is<Block>(n); b && b->tail) BuildArm(b, l, arm);
         else if (auto c = Is<Call>(n); c && c->fvbody && c->fvbody->tail) BuildFv(c, l, arm);
+        else if (auto ib = Is<InlineBlock>(n); ib && InlineBuildable(ib, d)) GenInline(ib, false, &d);
         else if ((d.mode > 3 && d.mode != 5) || M.IsRs(d.t)) return false;
         else if (auto me = Is<MatchExpr>(n)) GenMatch(me, false, &d);
         else if (auto e = Is<EarlyBlock>(n)) GenEarly(e, false, &d);
@@ -1763,6 +1785,7 @@ struct TgFn {
         }
         if (auto ie = Is<IfExpr>(n)) return ie->elseb && cg.TEq(n->exprtype, t);
         if (auto b = Is<Block>(n)) return b->tail && cg.TEq(n->exprtype, t);
+        if (auto ib = Is<InlineBlock>(n)) return InlineAs(ib) && cg.TEq(InlineAs(ib), t);   // As a call.
         if (Is<MatchExpr>(n) || Is<EarlyBlock>(n) || Is<LoopExpr>(n)) return cg.TEq(n->exprtype, t);
         return false;
     }
@@ -2333,7 +2356,7 @@ struct TgFn {
     V RzTemp(TypeExpr *t, Line l) { return MemV(t, NewHdr(), Stk(AllocStk(false, l), l)); }
     // A frame object's struct in a temporary, its tail on a stack of the statement's.
     V FoTemp(TypeExpr *t, Line l) {
-        return MemV(t, AtL(tyg_local_new(p, M.Size(t), 8)), Stk(AllocStk(false, l), l));
+        return MemV(t, AtL(Frame(M.Size(t), 8)), Stk(AllocStk(false, l), l));
     }
     // A type BuildTemp builds: an image, a resizable array or a frame object.
     bool TempOk(TypeExpr *t) {
@@ -2839,7 +2862,20 @@ struct TgFn {
 
     // ---- Expressions ----------------------------------------------------------------------------
 
+    InlineBlock *adapting = nullptr;
     V Gen(Node *n) {
+        // An inlined call the checker typed as an image or resizable other than its callee's result
+        // (a return's type): built as that, from the result where it lies (LimCallResult).
+        if (auto ib = Is<InlineBlock>(n);
+            ib && ib != adapting && InlineAs(ib) && ib->exprtype && !M.TypeOk(ib->exprtype) &&
+            !M.VrOk(ib->exprtype) && !cg.TEq(InlineAs(ib), ib->exprtype)) {
+            auto was = adapting;
+            adapting = ib;   // Built as that, not again as that from its own value.
+            V w;
+            auto built = InPlaceValue(ib, ib->exprtype, ib->line, w);
+            adapting = was;
+            if (built) return w;
+        }
         auto x = Gen1(n);
         // After a return or break the code using this value is still built: it needs a value.
         if (Ended() && !x.v && !x.mem && n->exprtype && M.IsScalar(n->exprtype))
@@ -2932,6 +2968,7 @@ struct TgFn {
             }
             case NK_IfExpr: return GenIf(static_cast<IfExpr *>(n), false);
             case NK_EarlyBlock: return GenEarly(static_cast<EarlyBlock *>(n), false);
+            case NK_InlineBlock: return GenInline(static_cast<InlineBlock *>(n), false);
             case NK_LoopExpr: return GenLoopX(static_cast<LoopExpr *>(n), false);
             case NK_MatchExpr: return GenMatch(static_cast<MatchExpr *>(n), false);
             case NK_Return: case NK_Break: case NK_Continue: case NK_VarDecl: case NK_Assign:
@@ -3890,10 +3927,17 @@ struct TgFn {
     // its result where it lies, to copy from.
     bool LimCallResult(Node *n) {
         auto c = Is<Call>(n);
-        if (!c || c->builtin >= 0 || !n->exprtype) return false;
-        auto sp = c->spec ? c->spec : !c->dispatch.empty() ? c->dispatch[0] : nullptr;
-        if (!sp || sp->rets.empty()) return false;
-        auto rt = sp->rets[0];
+        auto ib = Is<InlineBlock>(n);   // An inlined call keeps its callee's type the same way.
+        if (!(c && c->builtin < 0) && !ib) return false;
+        if (!n->exprtype) return false;
+        TypeExpr *rt = nullptr;
+        if (ib) {
+            rt = InlineAs(ib);
+        } else {
+            auto sp = c->spec ? c->spec : !c->dispatch.empty() ? c->dispatch[0] : nullptr;
+            if (sp && !sp->rets.empty()) rt = sp->rets[0];
+        }
+        if (!rt) return false;
         auto arr = rt->kind == TY_ARRAY &&
                    (rt->arr->akind == A_LIMITED || rt->arr->akind == A_FIXED || IsVarArr(rt) ||
                     IsGrow(rt));
@@ -4580,7 +4624,8 @@ struct TgFn {
             auto res = Slot32();
             if (Is<Block>(n)) {
                 BuildArm(n, n->line, [&](Node *v) { PrefInto(AtL(res), v); });
-            } else if (Is<IfExpr>(n) || Is<MatchExpr>(n) || Is<EarlyBlock>(n) || Is<LoopExpr>(n)) {
+            } else if (Is<IfExpr>(n) || Is<MatchExpr>(n) || Is<EarlyBlock>(n) || Is<LoopExpr>(n) ||
+                       Is<InlineBlock>(n)) {
                 prefctl = true;
                 prefloc = res;
                 Gen(n);
@@ -4642,10 +4687,14 @@ struct TgFn {
     V GenFvCall(Call *c) {
         auto et = c->fvbody->exprtype;
         auto wantsval = !cg.IsVoidT(et);
-        if (wantsval && !M.TypeOk(et)) {   // An image or a resizable: built on a temporary's stack.
+        // An image or a resizable: built on a temporary's stack. Also a fixed array the checker typed
+        // as one (a tail the optimizer unwrapped from an inlined call), built as that.
+        auto want = wantsval && c->exprtype && !cg.TEq(c->exprtype, et) && !M.TypeOk(c->exprtype) ?
+            c->exprtype : et;
+        if (wantsval && !M.TypeOk(want)) {
             V x;
-            if (InPlaceValue(c, et, c->line, x)) return x;
-            No(c->line, cat("function value of type ", M.Name(et)));
+            if (InPlaceValue(c, want, c->line, x)) return x;
+            No(c->line, cat("function value of type ", M.Name(want)));
         }
         if (c->fvparams.size() > c->args.size()) No(c->line, "function value parameters");
         if (Ended()) return Dummy(et);
@@ -4851,6 +4900,11 @@ struct TgFn {
         if (fc && fc->builtin < 0 && rs && !rs->rets.empty() && rs->rets[0]->kind == TY_REF &&
             IsPlainRef(rs->rets[0])) {
             auto x = Gen1(a);
+            if (Ended()) return P {};
+            return RefTarget(x);
+        }
+        if (auto ib = Is<InlineBlock>(a); ib && InlineAs(ib) && IsPlainRef(InlineAs(ib))) {
+            auto x = Gen1(a);   // An inlined call's reference, as a call's.
             if (Ended()) return P {};
             return RefTarget(x);
         }
@@ -6017,8 +6071,8 @@ struct TgFn {
     }
     // A value wanted of a type neither scalar nor held in a register: in place if an image or a
     // resizable.
-    bool WantInPlace(Node *n, bool discard, V &x) {
-        auto et = n->exprtype;
+    bool WantInPlace(Node *n, bool discard, V &x, TypeExpr *as = nullptr) {
+        auto et = as ? as : n->exprtype;
         if (discard || !et || et->kind == TY_VOID || M.TypeOk(et) || M.VrOk(et)) return false;
         return InPlaceValue(n, et, n->line, x);
     }
@@ -6032,12 +6086,12 @@ struct TgFn {
     };
     // Starts construct n: true if built in place (value in k.w), else k is set up. `gate` false: n
     // gives no value (an if without else, a loop without a break value).
-    bool CtlBegin(Ctl &k, Node *n, bool discard, const InPlace *ip, bool gate) {
+    bool CtlBegin(Ctl &k, Node *n, bool discard, const InPlace *ip, bool gate, TypeExpr *as = nullptr) {
         k.pr = prefctl;
         k.res = prefloc;
         prefctl = false;
-        if (gate && !ip && !k.pr && WantInPlace(n, discard, k.w)) return true;
-        auto et = n->exprtype;
+        if (gate && !ip && !k.pr && WantInPlace(n, discard, k.w, as)) return true;
+        auto et = as ? as : n->exprtype;
         k.valued = gate && !ip && !discard && et && et->kind != TY_VOID;
         if (k.valued && !M.TypeOk(et) && !M.VrOk(et)) No(n->line, cat("value of type ", M.NameWhy(et)));
         // Carried between blocks, a relative reference is the plain one: an offset is from its own
@@ -6128,12 +6182,78 @@ struct TgFn {
         return CtlValue(k, e->line);
     }
 
+    // A call the optimizer inlined (InlineBlock::EmitBody): the argument bindings first, in the
+    // enclosing scope as an ordinary call's arguments are (a slice argument can view a temporary the
+    // value still views after the block), then the body in a scope of its own. Its value is the
+    // tail's or a `return` of this function's, which leaves like a `break` out of a `block`.
+    // The type an inlined call's value has: the callee's own, as a call's, for its consumer to adapt
+    // (a reference decayed, a varint, an array of another kind). Null if it has none.
+    static TypeExpr *InlineAs(InlineBlock *ib) {
+        auto rt = ib->spec && ib->spec->rets.size() == 1 ? ib->spec->rets[0] : nullptr;
+        return rt && ib->exprtype && ib->exprtype->kind != TY_VOID ? rt : nullptr;
+    }
+    V GenInline(InlineBlock *ib, bool discard, const InPlace *ip = nullptr) {
+        if (ib->spec && ib->spec->rets.size() > 1) No(ib->line, "inlined call with several results");
+        auto as = InlineAs(ib);
+        hasinline = true;
+        CheckFrame();
+        if (ip && as && !cg.TEq(ip->t, as)) Unreachable(ib->line, "inlined call built as another type");
+        // A frame object or resizable struct is built in a temporary of its own, as a call's result is.
+        if (!ip && !discard && !prefctl && as && (M.FoOk(as) || M.RsOk(as)))
+            return BuildTemp(ib, as, ib->line);
+        Ctl k;
+        if (CtlBegin(k, ib, discard, ip, true, as)) return k.w;
+        auto body = ib->body;
+        size_t first = 0;
+        while (first < body->stmts.size()) {
+            auto arg = Is<VarDecl>(body->stmts[first]);
+            if (!arg || !arg->inline_arg) break;
+            Open();
+            Loc(arg->line);
+            Stmt1(arg);
+            first++;
+        }
+        auto done = NewBlock();
+        auto lt = CtlTarget(k, done, done, true, ip);
+        lt.ibsf = ib->sf;
+        loops.push_back(lt);
+        InScope([&] {
+            for (auto i = first; i < body->stmts.size(); i++) Stmt(body->stmts[i]);
+            if (Ended() || !body->tail) return;
+            Open();
+            Loc(body->tail->line);
+            // The tail is a return of its value: delivered as a `return` does (a reference stays
+            // the reference the callee gives, not a copy of its target).
+            auto tail = body->tail;
+            if (k.valued && !ip && tail->exprtype && tail->exprtype->kind != TY_VOID) {
+                OpenScope(true);
+                BreakValue(tail, tail->line, lt);
+                CloseScope();
+            } else {
+                CtlArm(k, ip, tail, ib->line);
+            }
+        });
+        loops.pop_back();
+        Jump(done);
+        SetBlock(done);
+        Loc(ib->line);   // What the call's value is used for happens at the call's line.
+        return CtlValue(k, ib->line);
+    }
+
+    // Whether a `break` with a value leaves the loop whose body n is. Found in the tree, not in the
+    // loop's `breaks`, which the optimizer's copy of a loop (an inlined body's) leaves empty.
+    static bool BreakGivesValue(Node *n) {
+        if (auto b = Is<Break>(n)) return b->val != nullptr;
+        if (Is<While>(n) || Is<ForLoop>(n) || Is<LoopExpr>(n) || Is<EarlyBlock>(n)) return false;
+        auto found = false;
+        RunChildren(n, [&](Node *ch) { found = found || BreakGivesValue(ch); });
+        return found;
+    }
+
     // `loop { ... }`, its value a break's.
     V GenLoopX(LoopExpr *lp, bool discard, const InPlace *ip = nullptr) {
         Ctl k;
-        auto brkval = std::any_of(lp->breaks.begin(), lp->breaks.end(), [](Break *b) {
-            return b->val;
-        });
+        auto brkval = BreakGivesValue(lp->body);
         if (CtlBegin(k, lp, discard, ip, brkval)) return k.w;
         auto body = NewBlock(), done = NewBlock();
         tyg_jump(p, body);
@@ -6472,16 +6592,16 @@ struct TgFn {
         CloseScope();
     }
     // A break's value, delivered as its target wants it (CodeGen::GenExitValue, LandValue).
-    void BreakValue(Break *b, const LoopTargets &t) {
+    void BreakValue(Node *val, Line line, const LoopTargets &t) {
         if (t.pref) {
-            PrefInto(AtL(t.res), b->val);
+            PrefInto(AtL(t.res), val);
         } else if (t.ip.mode == 5) {
-            BuildInto(b->val, t.ip, b->line);   // Built where it lies: nothing to move.
+            BuildInto(val, t.ip, line);   // Built where it lies: nothing to move.
         } else if (t.ip.mode) {
             // Built at the top, which something under construction may have moved up: the value then
             // moves down to where the exit's value starts.
             auto st = Local(Top(t.ip.stk));
-            BuildInto(b->val, t.ip, b->line);
+            BuildInto(val, t.ip, line);
             if (Ended()) return;
             auto start = LdL(st), top0 = LdL(t.top0);
             If(Cmp(TYG_NE, start, top0), [&] {
@@ -6493,9 +6613,9 @@ struct TgFn {
                 if (t.ip.mode == 3) St(AddrPlus(t.ip.hdr, M.FoHdrOff(t.ip.t)), top0);
             });
         } else if (t.rt) {
-            Into(P { AtL(t.res), t.rt }, b->val);
+            Into(P { AtL(t.res), t.rt }, val);
         } else {
-            Stmt1(b->val);
+            Stmt1(val);
         }
     }
     void Stmt1(Node *n) {
@@ -6543,12 +6663,28 @@ struct TgFn {
             case NK_EarlyBlock:
                 GenEarly(static_cast<EarlyBlock *>(n), true);
                 return;
+            case NK_InlineBlock:
+                GenInline(static_cast<InlineBlock *>(n), true);
+                return;
             case NK_MatchExpr:
                 GenMatch(static_cast<MatchExpr *>(n), true);
                 return;
             case NK_ForLoop: return StmtFor(static_cast<ForLoop *>(n));
             case NK_Return: {
                 auto r = static_cast<Return *>(n);
+                for (auto i = loops.size(); i-- > 0;) {
+                    if (loops[i].ibsf != r->target) continue;
+                    // Out of an inlined body (Return::CgStmt): its value, then the stacks left.
+                    auto t = loops[i];
+                    if (r->vals.size() > 1) No(n->line, "result count");
+                    if (!r->vals.empty()) {
+                        BreakValue(r->vals[0], r->line, t);
+                        if (Ended()) return;
+                    }
+                    RestoreFrom(t.depth);
+                    tyg_jump(p, t.brk);
+                    return;
+                }
                 if (!sp) No(n->line, "return in a global initializer");
                 if (r->target != sp->sf) return GenFromReturn(r);
                 return DoReturn(r->vals, r->line);
@@ -6560,7 +6696,7 @@ struct TgFn {
                 if (loops.empty()) No(n->line, "break target");
                 auto t = loops.back();
                 if (b->val) {
-                    BreakValue(b, t);
+                    BreakValue(b->val, b->line, t);
                     if (Ended()) return;
                 }
                 RestoreFrom(t.depth);
@@ -6576,6 +6712,7 @@ struct TgFn {
                 return;
             }
             case NK_FnDecl: case NK_StructDecl: case NK_EnumDecl: case NK_AliasDecl: return;
+            case NK_StrLit: return;   // A discarded string has no effect, whatever array it is typed as.
             case NK_Block:
                 GenBlock(static_cast<Block *>(n), true);
                 return;
@@ -6832,7 +6969,7 @@ struct TgFn {
                 indirect.insert(d);
             } else {
                 // The tail's elements go on the stack, the tail empty.
-                loc = tyg_local_new(p, hdr ? 16 : M.Size(t), 8);
+                loc = Frame(hdr ? 16 : M.Size(t), 8);
                 if (!hdr) tyg_zero(p, AtL(loc), M.Size(t));
                 StL(loc, Top(stk), hdr ? 0 : M.FoHdrOff(t));
                 if (hdr) StL(loc, I64(0), 8);
@@ -7292,7 +7429,7 @@ struct TgFn {
     // points at the elements where they lie.
     P FoView(const P &src) {
         auto t = src.t;
-        auto tmp = AtL(tyg_local_new(p, M.Size(t), 8));
+        auto tmp = AtL(Frame(M.Size(t), 8));
         tyg_zero(p, tmp, M.Size(t));
         FoBytesCopy(t, tmp, src.a, false);
         auto hb = AddrPlus(tmp, M.FoHdrOff(t));
@@ -7327,7 +7464,7 @@ struct TgFn {
         }
         auto at = Local(Top(stk));
         SetTop(stk, Add(LdL(at), I64(cg.FoBytesPrefix(t))));
-        auto h = AtL(tyg_local_new(p, M.Size(t), 8));
+        auto h = AtL(Frame(M.Size(t), 8));
         GenFo(n, P { h, t, stk }, l);
         if (Ended()) return;
         FoBytesCopy(t, h, AtV(LdL(at)), true);

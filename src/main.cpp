@@ -790,8 +790,7 @@ starts threads needs goose build. The C TinyCC compiles is tinygen's; a
 program tinygen cannot take whole runs on the C generator's C.
 
 Options:
-  -O0, -O1, -O2         Inlining level (default -O0). tinygen leaves inlined
-                        code to C, so -O1 and -O2 run the C generator's C.
+  -O0, -O1, -O2         Inlining level (default -O2).
 )", DEBUGOPTION, COMPILEOPTIONS,
 R"(  --cc name|path        The C compiler for packages' native parts: msvc,
                         clang-cl, clang, gcc, cc or a path (or GOOSE_CC).
@@ -806,7 +805,9 @@ R"(  --cc name|path        The C compiler for packages' native parts: msvc,
 R"(usage: goose debug file.goose [options] [-- program args...]
 
 Builds the program as goose run --backend=tinygen does and starts lldb on
-it, with Goose's formatters loaded and the program's arguments set.
+it, with Goose's formatters loaded and the program's arguments set. Inlining
+defaults to -O0 here, so that every Goose function is a function in the
+debugger.
 
 Options:
 )", DEBUGOPTION, COMPILEOPTIONS);
@@ -832,9 +833,10 @@ R"(  --cc name|path        The C compiler: msvc, clang-cl, clang, gcc, cc or a
   --dry-run             Print the commands the build would run, and run none.
   --backend name        c (the default) or tinygen, which writes the machine
                         code itself, with debug info naming the Goose source
-                        (default -O0); what it does not support goes through
-                        C. tinygen-c has tinygen write C instead (also
-                        -O0), which the C compiler optimizes unless --debug;
+                        (default -O0, the debug build); what it does not
+                        support goes through C. tinygen-c has tinygen write C
+                        instead (default -O2), which the C compiler optimizes
+                        unless --debug;
                         with -o out.c it writes that C and builds nothing (a
                         whole program only; it links with the tinygen
                         support object and the runtime, as -v shows).
@@ -1603,12 +1605,12 @@ int Main(int argc, char **argv) {
                     backendname.c_str());
             return 1;
         }
-        // A debug build: no inlining unless asked for, so that every Goose
-        // function is a function in the debugger, and the C half compiled
-        // with debug information and no optimization (--debug adds the
-        // checks of GS_DEBUG on both halves). tinygen-c inlines no more:
-        // tinygen leaves an inlined body to C, and the C compiler inlines.
-        if (!optgiven) optlevel = 0;
+        // The C half is compiled with debug information and no optimization
+        // (--debug adds the checks of GS_DEBUG on both halves). The native
+        // tinygen build is the debug build: no inlining unless asked for, so
+        // that every Goose function is a function in the debugger. tinygen-c
+        // is the optimized build and inlines like the C backend, -O2.
+        if (!optgiven && (debugverb || !tinygenc)) optlevel = 0;
     }
     if (verb == "toolchain") {
         try {
@@ -1694,8 +1696,7 @@ int Main(int argc, char **argv) {
     auto jit = !building && (forcejit || outname.empty());
     // A run in this process with no --backend: tinygen writes the program as C (TYG_OUTPUT_C),
     // which TinyCC compiles beside the tinygen support unit. A program tinygen cannot take whole
-    // runs the C generator's C instead (--backend=c asks for that). Inlining as for tinygen-c:
-    // tinygen leaves an inlined body to C.
+    // runs the C generator's C instead (--backend=c asks for that).
     auto tgjit = false;
     #if GOOSE_HAVE_TINYGEN
         tgjit = jit && !backendgiven && !nocgen && !parseonly && !dump && !tokens;
@@ -1709,7 +1710,6 @@ int Main(int argc, char **argv) {
                                     "program (-D%s: tinygen's data stack count is not checked "
                                     "against it yet)\n", d.c_str());
             }
-        if (tgjit && !optgiven) optlevel = 0;
     #endif
     if (!headername.empty() && (jit || multitest)) {
         fprintf(stderr, "--header requires C output for a single input file\n");

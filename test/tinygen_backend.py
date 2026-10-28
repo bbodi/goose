@@ -145,6 +145,16 @@ PROGRAMS = [
     ("test/codegen/cnames.goose", False, []),
     ("test/codegen/wider_slot_operations.goose", False, []),
     ("samples/21_raytrace.goose", False, []),
+    # Inlined code (-O2, the default; -O0 inlines nothing): a body spliced into its caller, its
+    # returns leaving the block. Whole programs, so a fallback to C fails.
+    ("samples/21_raytrace.goose", True, ["-O2"]),
+    ("test/tinygen/tinygen_inline.goose", True, ["-O2"]),
+    ("test/tinygen/tinygen_inline.goose", True, ["-O1"]),
+    ("test/tinygen/tinygen_inline.goose", True, ["-O0"]),
+    ("test/tinygen/tinygen_inline.goose", True, ["-O2", "--debug"]),
+    ("test/codegen/recursive_loop_walk.goose", True, ["-O2"]),
+    ("test/codegen/exit_value_destination.goose", True, ["-O2"]),
+    ("test/codegen/exit_value_destination.goose", True, ["-O0"]),
     ("samples/20_life.goose", True, []),
 ]
 
@@ -172,7 +182,7 @@ PROGRAMS += [
      ["--tinygen-skip=scaled,by_ref,grow,first_tok,turn,circle"]),
     ("samples/05_shapes.goose", False, []),
 ]
-WHOLE_PROGRAM |= {"tinygen_adts", "cnames"}
+WHOLE_PROGRAM |= {"tinygen_adts", "cnames", "tinygen_inline", "recursive_loop_walk"}
 WHOLE_PROGRAM |= {"wider_slot_operations", "05_shapes"}
 
 
@@ -345,6 +355,10 @@ def expected(source):
 def build(exe, source, out, flags, backend="tinygen"):
     """Builds source with the tinygen backend (or tinygen-c); (ok, the
     compiler's output, functions compiled by tinygen, functions in all)."""
+    # The entries' function counts and skips are those of un-inlined code: -O0 unless they ask
+    # for a level (the compiler's default is -O2, as the C backend's).
+    if not any(f.startswith("-O") for f in flags):
+        flags = ["-O0", *flags]
     code, o, e = tc.run_capture([exe, "build", f"--backend={backend}", "-v", *flags, "-o", out,
                                  source])
     m = re.search(r"tinygen: (\d+) of (\d+) function", o + e)
@@ -422,6 +436,7 @@ def check_tinygen_backend(exe, base, ok, fail, say):
     check_tinygen_c(exe, base, ok, fail, say, builtin)
     check_run(exe, base, ok, fail)
     check_jit(exe, base, ok, fail)
+    check_default_inlining(exe, base, ok, fail)
     check_debug(exe, base, ok, fail)
     check_lldb(exe, base, ok, fail, say)
     check_lldb_limited(exe, base, ok, fail)
@@ -572,14 +587,13 @@ C_JIT = "jit: the C generator's C"
 def check_jit(exe, base, ok, fail):
     """Plain goose run (tinygen's C in TinyCC) and goose run --backend=c (the
     C generator's): the blessed output, exit status and stderr markers on
-    both, -v naming the path, and -O2 (inlined code) falling back whole."""
+    both, -v naming the path, and -O2 (inlined code, the default) and -O0 on tinygen's C."""
     exe = Path(exe).resolve()
     for rel in JIT_PROGRAMS:
         source = ROOT / rel
         want, aborts, markers = expected(source)
-        # Of these only index_type_abort inlines nothing at -O2.
-        o2 = [] if source.stem == "index_type_abort" else [(["-O2"], C_JIT)]
-        for flags, says in [([], TINYGEN_JIT), (["--backend=c"], None)] + o2:
+        for flags, says in [([], TINYGEN_JIT), (["-O2"], TINYGEN_JIT), (["-O0"], TINYGEN_JIT),
+                            (["--backend=c"], None)]:
             label = f"goose run {' '.join(flags + ['-v'])} {source.name}"
             code, got, err = tc.run_capture([exe, "run", "-v", *flags, source], cwd=source.parent)
             missing = [mk for mk in markers if mk not in err]
@@ -604,7 +618,30 @@ def check_jit(exe, base, ok, fail):
         fail("goose run without -v: quiet", err)
         return
     ok(f"goose run on tinygen's C and with --backend=c: {len(JIT_PROGRAMS)} programs, -O2 "
-       "falling back, arguments, exit code, resources")
+       "and -O0, arguments, exit code, resources")
+
+
+def check_default_inlining(exe, base, ok, fail):
+    """Without -O, tinygen-c inlines as the C backend does (-O2): a build
+    leaves fewer functions than the source has. The native tinygen build is
+    the debug build and keeps every function unless -O is given."""
+    source = ROOT / "test/tinygen/tinygen_inline.goose"
+    counts = {}
+    for backend, flags in (("tinygen-c", []), ("tinygen-c", ["-O0"]), ("tinygen", []), ("tinygen", ["-O2"])):
+        code, o, e = tc.run_capture([exe, "build", f"--backend={backend}", "-v", *flags, "-o",
+                                     base / f"inline_default{tc.EXE_SUFFIX}", source])
+        m = re.search(r"tinygen: (\d+) of (\d+) function", o + e)
+        if code != 0 or not m or m.group(1) != m.group(2):
+            fail(f"{backend} {' '.join(flags) or 'default'}: not whole", o + e)
+            return
+        counts[(backend, " ".join(flags))] = int(m.group(2))
+    if not counts[("tinygen-c", "")] < counts[("tinygen-c", "-O0")]:
+        fail("tinygen-c: the default should inline (-O2)", str(counts))
+        return
+    if not counts[("tinygen", "-O2")] < counts[("tinygen", "")]:
+        fail("tinygen: the default should not inline (-O0, the debug build)", str(counts))
+        return
+    ok("tinygen-c inlines by default (-O2); the native tinygen build does not (-O0)")
 
 
 def check_debug(exe, base, ok, fail):

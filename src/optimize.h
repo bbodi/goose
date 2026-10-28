@@ -830,9 +830,15 @@ inline Node *Optimizer::TryInline(Call *c) {
     // ADT result received in its other mode, must keep the InlineBlock, whose
     // exprtype records the type it converts to).
     auto unwrapok = [&](Node *v) {
+        // A string built as the array the callee returns is made in the construction context of its
+        // destination, which the call's value already was: it stays a block there.
+        auto call = Is<Call>(v);
+        if (v->exprtype && v->exprtype->kind == TY_ARRAY &&
+            (Is<StrLit>(v) || (call && call->builtin == B_STR))) return false;
         if (SameType(v->exprtype, c->exprtype)) return true;
         auto a = v->exprtype, b = c->exprtype;
-        return a && b && a->kind == b->kind && a->kind != TY_REF && a->kind != TY_ENUM;
+        return a && b && a->kind == b->kind && a->kind != TY_REF && a->kind != TY_ENUM &&
+               a->kind != TY_ARRAY;
     };
     if (body->stmts.empty() && body->tail && !ReturnsTo(body->tail, K->sf) &&
         unwrapok(body->tail))
