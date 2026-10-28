@@ -262,14 +262,36 @@ NATIVE = sorted(p for d in NATIVE_DIRS for p in (HERE / d).glob("*.goose")
 PROGRAMS += [(str(p.relative_to(ROOT)), True, []) for p in NATIVE]
 WHOLE_PROGRAM |= {p.stem for p in NATIVE}
 
-# Programs of the main suite that sweeping found wrong or refused by the backend (G4.2): whole
-# programs, so that the suite fails on a wrong output and on any function left to C.
+# Programs of the main suite that sweeping found wrong or refused by the backend (G4.2, G4.3): whole
+# programs, so that the suite fails on a wrong output and on any function left to C. The G4.3 ones are
+# a result with relative links built at its receiver, thread_wait with a message, a break in a while's
+# condition, qpoll of an image, and a dispatch on a variable-mode enum in a recursive cycle.
 REGRESSIONS = ["test/codegen/forward_adaptation.goose", "test/codegen/bytes_value_equality.goose",
                "test/codegen/reference_element_results.goose", "test/codegen/relative_operands.goose",
                "test/codegen/rendered_pools.goose", "test/threads/queue_producers.goose",
-               "test/threads/qlimit_negative.goose", "test/threads/qlimit_zero.goose"]
+               "test/threads/qlimit_negative.goose", "test/threads/qlimit_zero.goose",
+               "test/storage/relative_block_results.goose",
+               "test/storage/relative_destination_results.goose",
+               "test/storage/alloc_built_in_slot.goose", "test/codegen/relative_receiver_values.goose",
+               "test/threads/thread_contained_many.goose", "test/optimizer/bce_while_break_exit.goose",
+               "test/threads/qpoll_zero_padded.goose",
+               "test/codegen/recursive_dispatch_fixed_variant.goose"]
+# Programs whose header asks for the debug checks (a runtime-debug or GS_DEBUG=1 line), built with
+# --debug: thread_contained answers only in a debug build, and the others, also listed above, have
+# links the checks verify.
+DEBUG_REGRESSIONS = ["test/threads/thread_contained.goose", "test/storage/relative_block_results.goose",
+                     "test/storage/relative_destination_results.goose",
+                     "test/storage/alloc_built_in_slot.goose",
+                     "test/codegen/relative_receiver_values.goose"]
 PROGRAMS += [(path, True, []) for path in REGRESSIONS]
-WHOLE_PROGRAM |= {Path(path).stem for path in REGRESSIONS}
+PROGRAMS += [(path, True, ["--debug"]) for path in DEBUG_REGRESSIONS]
+WHOLE_PROGRAM |= {Path(path).stem for path in REGRESSIONS + DEBUG_REGRESSIONS}
+# Results with relative links written by the callee into its caller's slot (and a return from's channel)
+# across the two halves: the callee, or the caller, left to C.
+PROGRAMS += [("test/storage/relative_destination_results.goose", False,
+              ["--tinygen-skip=distant,make"]),
+             ("test/codegen/relative_receiver_values.goose", False,
+              ["--tinygen-skip=choose,make_pair"])]
 
 # The windowed samples: built whole and not run, since they loop until their
 # window closes.

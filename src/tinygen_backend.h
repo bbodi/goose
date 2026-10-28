@@ -1552,7 +1552,8 @@ struct TgFn {
     // Where a value is built, at the top of stk: mode 1 a T[] image (BuildInto returns its address), 2
     // a resizable of any kind (header at hdr), 3 a frame object (its struct at hdr), 4 a frame object's
     // bytes (the innermost count stored at hdr). A match, block or loop delivers modes 1 and 2 this
-    // way.
+    // way. Mode 5 is a fixed value with relative links (CodeGen::NeedsResultLocation), built where it
+    // lies, at hdr, as the C does for a destination that is an lvalue; no stack.
     struct P;
     struct InPlace {
         int mode = 0;
@@ -1603,6 +1604,7 @@ struct TgFn {
             case 1: return GenImg(n, d.stk, d.t, l);
             case 2: GenRz(n, d.stk, d.hdr, d.t, l); break;
             case 3: GenFo(n, *d.fo, l); break;
+            case 5: Into(P { d.hdr, d.t }, n); break;
             default: GenFoBytes(n, d.stk, d.t, d.hdr, l);
         }
         return 0;
@@ -1721,12 +1723,40 @@ struct TgFn {
         if (auto ie = Is<IfExpr>(n); ie && ie->elseb) BuildIf(ie, l, arm);
         else if (auto b = Is<Block>(n); b && b->tail) BuildArm(b, l, arm);
         else if (auto c = Is<Call>(n); c && c->fvbody && c->fvbody->tail) BuildFv(c, l, arm);
-        else if (d.mode > 2 || M.IsRs(d.t)) return false;
+        else if ((d.mode > 2 && d.mode != 5) || M.IsRs(d.t)) return false;
         else if (auto me = Is<MatchExpr>(n)) GenMatch(me, false, &d);
         else if (auto e = Is<EarlyBlock>(n)) GenEarly(e, false, &d);
         else if (auto lp = Is<LoopExpr>(n)) GenLoopX(lp, false, &d);
         else return false;
         return true;
+    }
+    // Whether n gives a value of type t, a fixed one with relative links, to the place it is built at
+    // (CodeGen::ConstructCall, GenAdtAdapted): a call whose first result is a t, or a function value,
+    // if, block, match, early block or loop delivering one. Its links measure from where the value
+    // stays, which a temporary copied from is not.
+    bool Delivers(Node *n, TypeExpr *t) {
+        if (!t || !cg.NeedsResultLocation(t) || !n->exprtype || !M.TypeOk(t)) return false;
+        if (auto c = Is<Call>(n)) {
+            if (c->fvbody) return c->fvbody->tail && cg.TEq(c->fvbody->exprtype, t);
+            auto sp = DestSpec(c);
+            return sp && cg.TEq(sp->rets[0], t);
+        }
+        if (auto ie = Is<IfExpr>(n)) return ie->elseb && cg.TEq(n->exprtype, t);
+        if (auto b = Is<Block>(n)) return b->tail && cg.TEq(n->exprtype, t);
+        if (Is<MatchExpr>(n) || Is<EarlyBlock>(n) || Is<LoopExpr>(n)) return cg.TEq(n->exprtype, t);
+        return false;
+    }
+    // A delivering n (Delivers) built at pl: a call writes its result there, a construct builds each
+    // arm's value there.
+    void DeliverInto(const P &pl, Node *n) {
+        if (auto c = Is<Call>(n); c && !c->fvbody) {
+            RelDests at { pl.a };
+            reldst = &at;
+            GenCall(c);
+            reldst = nullptr;
+            return;
+        }
+        if (!BuildCtl(n, InPlace { 5, 0, pl.t, pl.a }, n->line)) No(n->line, "value delivered to a slot");
     }
     // A call returning d.t (the same by name, or by TEq if !bymangle) is handed d to build its first
     // result at; false if n is not one.
@@ -2106,6 +2136,10 @@ struct TgFn {
     struct RzDst { tyg_val stk; tyg_addr hdr; };
     const RzDst *rzdst = nullptr;
     tyg_val imgdst = 0;
+    // Where GenCall has each result with relative links built, where the callee writes it (the channel
+    // `T *gs_r<i>` is the receiver's own, CodeGen::NeedsResultLocation); none for the others.
+    using RelDests = vector<std::optional<tyg_addr>>;
+    const RelDests *reldst = nullptr;
     static bool IsVarArr(TypeExpr *t) { return TgModule::IsVarArr(t); }
     bool IsImg(TypeExpr *t) { return M.IsImg(t); }
 
@@ -2239,12 +2273,14 @@ struct TgFn {
     }
     // Appended to a limited u8 array, each part copied under the capacity check.
     void ToBytesIntoLim(const P &out, Node *a, Line l) {
-        ToBytesVia(a, l, [&](tyg_val from, tyg_val n) {
-            auto ol = Local(LimLen(out));
-            AbortUnless(Cmp(TYG_SLE, Add(LdL(ol), n), LimCapOf(out)), "CAPACITY", l);
-            tyg_move_dyn(p, ElemAddr(LimView(out), LdL(ol)), from, n);
-            LimSetLen(out, Add(LdL(ol), n));
-        });
+        ToBytesVia(a, l, [&](tyg_val from, tyg_val n) { AppendToLim(out, from, n, l); });
+    }
+    // n bytes at `from` appended to the limited u8 array out, under its capacity (CodeGen::AppendBytes).
+    void AppendToLim(const P &out, tyg_val from, tyg_val n, Line l) {
+        auto ol = Local(LimLen(out));
+        AbortUnless(Cmp(TYG_SLE, Add(LdL(ol), n), LimCapOf(out)), "CAPACITY", l);
+        tyg_move_dyn(p, ElemAddr(LimView(out), LdL(ol)), from, n);
+        LimSetLen(out, Add(LdL(ol), n));
     }
 
     V RzTemp(TypeExpr *t, Line l) { return MemV(t, NewHdr(), Stk(AllocStk(false, l), l)); }
@@ -2570,7 +2606,7 @@ struct TgFn {
             // An `in pool` link is the pool's offset, but its `self` is the slot's.
             if (TgModule::IsRel(ft))
                 return ft->ref->pool ? Is<SelfRef>(init) != nullptr : !Is<NullLit>(init);
-            return SelfRelLit(init) && cg.TEq(init->exprtype, ft);
+            return (SelfRelLit(init) && cg.TEq(init->exprtype, ft)) || Delivers(init, ft);
         };
         if (auto sl = Is<StructLit>(n)) {
             auto any = false;
@@ -2722,6 +2758,10 @@ struct TgFn {
     void Into(const P &pl, Node *n) {
         if (SelfRelLit(n) && cg.TEq(n->exprtype, pl.t)) {
             SelfRelInto(pl, n);
+            return;
+        }
+        if (Delivers(n, pl.t)) {
+            DeliverInto(pl, n);
             return;
         }
         if (auto al = Is<ArrayLit>(n);
@@ -3802,15 +3842,21 @@ struct TgFn {
     // The element a push or alloc stores: evaluated now into x, or, for a literal linking to itself,
     // left to be built in its slot (CodeGen's atslot). False when the block ended.
     bool PushOperand(Node *arg, TypeExpr *et, Line l, bool &atslot, V &x) {
-        atslot = cg.HasRelRef(et) && SelfRelLitOk(arg) && cg.TEq(arg->exprtype, et);
+        atslot = (cg.HasRelRef(et) && SelfRelLitOk(arg) && cg.TEq(arg->exprtype, et)) ||
+                 Delivers(arg, et);
         if (atslot) return true;
         x = GenAs(arg, et);
         if (Ended()) return false;
         if (!M.IsScalar(et) && !x.mem) No(l, "aggregate value");
         return true;
     }
+    // A push's or alloc's operand built in its slot: a literal linking to itself, or what delivers.
+    void IntoSlot(const P &pl, Node *arg) {
+        if (SelfRelLitOk(arg)) SelfRelInto(pl, arg);
+        else Into(pl, arg);
+    }
     void StoreOperand(tyg_val at, TypeExpr *et, bool atslot, Node *arg, const V &x) {
-        if (atslot) SelfRelInto(P { AtV(at), et }, arg);
+        if (atslot) IntoSlot(P { AtV(at), et }, arg);
         else Store(P { AtV(at), et }, x);
     }
 
@@ -4236,6 +4282,8 @@ struct TgFn {
         rzdst = nullptr;
         auto idst = imgdst;
         imgdst = 0;
+        auto rdst = reldst;
+        reldst = nullptr;
         auto b = c->builtin;
         auto an = c->ArgNodes();
         auto nargs = an.size();
@@ -4365,7 +4413,7 @@ struct TgFn {
         if (b == B_QGET || b == B_QPOLL) return GenQget(c, idst);
         if (b >= 0) No(line, cat("builtin ", BuiltinByKind(b).name));
         if (c->fvbody) return GenFvCall(c);
-        if (!c->dispatch.empty()) return GenDispatch(c, idst, dst);
+        if (!c->dispatch.empty()) return GenDispatch(c, idst, dst, rdst);
         if (!c->spec) No(line, "call kind");
         auto callee = c->spec;
         if (nargs < callee->argtypes.size()) No(line, "argument count");
@@ -4388,7 +4436,7 @@ struct TgFn {
             for (auto r : callee->rets) lastrets.push_back(Dummy(r));
             return Dummy(callee->rets.empty() ? nullptr : callee->rets[0]);
         }
-        auto rets = RetChans(callee, ci, idst, dst, args, line);
+        auto rets = RetChans(callee, ci, idst, dst, rdst, args, line);
         if (ci.needssp) args.push_back(ArgOfVal(CalleeSp(callee, line)));
         auto sym = M.FnSym(ci.cname);
         auto x = Result(callee, ci.cret, M.Sig(callee), tyg_direct(sym), args);
@@ -4405,7 +4453,7 @@ struct TgFn {
     // for the first), a resizable's stack (dst for the first) and count, a frame object's stack and
     // struct, an out-pointer for a fixed result the C does not return. Returns where each result lies.
     vector<V> RetChans(FnSpec *callee, CodeGen::SpecInfo &ci, tyg_val idst, const RzDst *dst,
-                       vector<tyg_arg> &args, Line l) {
+                       const RelDests *rdst, vector<tyg_arg> &args, Line l) {
         vector<V> rets(callee->rets.size());
         for (size_t i = 0; i < callee->rets.size(); i++) {
             auto &r = rets[i];
@@ -4427,7 +4475,8 @@ struct TgFn {
                 args.push_back(ArgOfVal(r.stk));
                 args.push_back(ArgOfVal(AddrOf(len)));
             } else if ((int)i != ci.cret) {
-                r.a = AtL(Temp(r.t));
+                auto given = rdst && i < rdst->size() && (*rdst)[i] && cg.NeedsResultLocation(r.t);
+                r.a = given ? *(*rdst)[i] : AtL(Temp(r.t));
                 args.push_back(ArgOfVal(AddrOf(r.a)));
                 if (!M.IsScalar(r.t)) r.mem = true;
             }
@@ -4574,12 +4623,13 @@ struct TgFn {
         }
         if (!IsGrow(pl.t) || !M.RzOk(pl.t) || !pl.stk) No(c->line, "push to an array of this kind");
         auto et = pl.t->arr->sub;
-        auto selfrel = SelfRelLit(an[1]) || (cg.HasRelRef(et) && SelfRelLitOk(an[1]));
+        auto selfrel = SelfRelLit(an[1]) || (cg.HasRelRef(et) && SelfRelLitOk(an[1])) ||
+                       Delivers(an[1], et);
         if (selfrel && cg.TEq(an[1]->exprtype, et)) {
             // Built in its slot at the top, then counted.
             auto slot = Top(pl.stk);
             auto sv = Local(slot);
-            SelfRelInto(P { AtV(slot), et }, an[1]);
+            IntoSlot(P { AtV(slot), et }, an[1]);
             if (Ended()) return Dummy(c->exprtype);
             auto at = LdL(sv);
             SetTop(pl.stk, Add(at, I64(cg.FixedSize(et))));
@@ -5280,12 +5330,27 @@ struct TgFn {
         }
         return { r, ValV(M.ast.booltype, tyg_convert(p, TYG_TRUNC, TYG_I8, LdL(okl))) };
     }
-    vector<V> GenCallAll(Node *n, size_t count) {
+    // The destinations of the results with relative links of a call forwarded to results of rets
+    // (CodeGen::GenForward's chans), where(i) their places; the call's own must be those types.
+    RelDests ForwardDests(Node *n, const vector<TypeExpr *> &rets, const std::function<tyg_addr(size_t)> &where) {
+        RelDests rd(rets.size());
+        for (size_t i = 0; i < rets.size(); i++) {
+            if (!cg.NeedsResultLocation(rets[i])) continue;
+            auto sp = DestSpec(Is<Call>(n));
+            if (!sp || i >= sp->rets.size() || !cg.TEq(sp->rets[i], rets[i]))
+                No(n->line, "forwarded result linking to its place");
+            rd[i] = where(i);
+        }
+        return rd;
+    }
+    vector<V> GenCallAll(Node *n, size_t count, const RelDests *rd = nullptr) {
         auto c = Is<Call>(n);
         if (c && c->builtin == B_FROM_BYTES && count == 2) return GenFromBytes(c);
         if (!(c && (c->builtin == B_QPOLL || c->builtin == B_QGET) && count == 2) && !DestSpec(c))
             No(n->line, "multiple results of this kind");
+        reldst = rd;
         GenCall(c);
+        reldst = nullptr;
         if (lastrets.size() != count) No(n->line, "result count");
         return lastrets;
     }
@@ -5301,7 +5366,8 @@ struct TgFn {
         if (!t || t->kind == TY_REF) return false;
         if (cg.IsFix(t)) return M.TypeOk(t);
         if (M.Resz(t)) return (IsGrow(t) && (M.RzOk(t) || M.VeOk(t))) || M.FoOk(t);
-        return (M.IsRc(t) && M.RcOk(t)) || (IsVarArr(t) && M.RzOk(t)) || (M.IsVs(t) && M.VsOk(t));
+        return (M.IsRc(t) && M.RcOk(t)) || (IsVarArr(t) && M.RzOk(t)) || (M.IsVs(t) && M.VsOk(t)) ||
+               (M.IsVm(t) && M.VmOk(t));
     }
     // The bytes of one freelist unit of pool d (CodeGen::FlEntrySize, GS_SPAN_NODE of a slice pool).
     static int64_t FlEntry(const VarDef *d) { return d->reusable == RU_SLICES ? 512 : 8; }
@@ -5349,19 +5415,39 @@ struct TgFn {
         return start;
     }
 
-    // thread_wait(id): whether the worker returned rather than aborted. The form that takes the
-    // abort's message goes through C.
+    // thread_wait(id): whether the worker returned rather than aborted. thread_wait(id, msg) also
+    // appends the abort's message to msg, if this wait takes it (CodeGen's B_THREAD_WAIT): the
+    // receiver is named after the wait, and the message freed once appended.
     V GenThreadWait(Call *c) {
         cg.usesthreads = true;
         auto an = c->ArgNodes();
-        if (an.size() != 1) No(c->line, "thread_wait with a message");
+        if (an.size() != 1 && an.size() != 2) No(c->line, "thread_wait arguments");
         auto id = GenAs(an[0], M.ast.inttypes[IS_I64]).v;
         if (Ended()) return Dummy(c->exprtype);
         auto ptr = tyg_type_ptr(m);
         auto null = I64(0);
-        return ValV(c->exprtype,
-                    CallC("gs_thread_wait", { IT(TYG_I64), ptr, ptr, ptr, IT(TYG_I32) },
-                          { id, null, null, FileArg(c->line), LineArg(c->line) }, IT(TYG_I8, false)));
+        if (an.size() == 1)
+            return ValV(c->exprtype,
+                        CallC("gs_thread_wait", { IT(TYG_I64), ptr, ptr, ptr, IT(TYG_I32) },
+                              { id, null, null, FileArg(c->line), LineArg(c->line) },
+                              IT(TYG_I8, false)));
+        auto msg = Slot(), len = Slot();
+        StL(msg, null);
+        auto ok = Local(tyg_convert(p, TYG_ZEXT, TYG_I64,
+                                    CallC("gs_thread_wait", { IT(TYG_I64), ptr, ptr, ptr, IT(TYG_I32) },
+                                          { id, AddrOf(AtL(msg)), AddrOf(AtL(len)), FileArg(c->line),
+                                            LineArg(c->line) }, IT(TYG_I8, false))));
+        auto out = Deref(Place(an[1]));
+        if (Ended()) return Dummy(c->exprtype);
+        auto lim = TgModule::IsLim(out.t);
+        if (!(lim || IsGrow(out.t)) || !IsU8(out.t->arr->sub) || (lim ? !M.LimHeld(out.t) : !out.stk))
+            No(c->line, "thread_wait message into this kind");
+        If(Cmp(TYG_NE, LdL(msg), null), [&] {
+            if (lim) AppendToLim(out, LdL(msg), LdL(len), c->line);
+            else CopyBytes(out.stk, CountAt(out.a), LdL(msg), LdL(len), LdL(len));
+            CallC("gs_free_msg", { ptr }, { LdL(msg) }, nullptr);
+        });
+        return ValV(c->exprtype, tyg_convert(p, TYG_TRUNC, TYG_I8, LdL(ok)));
     }
 
     // thread_spawn(worker, args...) (CodeGen::EmitThreadSpawn): arguments and the worker's globals
@@ -5502,13 +5588,11 @@ struct TgFn {
     }
 
     // qget<T>(), qget<T>(ms) and qpoll<T>() (CodeGen's B_QGET): the oldest node's bytes, the node freed;
-    // qpoll and qget(ms) say whether a value came, and a miss gives the zero value and false (a miss of
-    // an image is left to C).
+    // qpoll and qget(ms) say whether a value came, and a miss gives the zero value and false.
     V GenQget(Call *c, tyg_val idst) {
         auto t = c->rettypes[0];
         auto poll = c->rettypes.size() > 1;
-        if (!QueueOk(t) || (poll && !cg.IsFix(t) && !M.Resz(t)))
-            No(c->line, cat("queue element of type ", M.NameWhy(t)));
+        if (!QueueOk(t)) No(c->line, cat("queue element of type ", M.NameWhy(t)));
         tyg_val node;
         if (c->builtin == B_QPOLL) {
             node = CallC("gs_qpoll", { tyg_type_ptr(m) }, { QueueAddr(t) }, IT(TYG_I64));
@@ -5555,10 +5639,17 @@ struct TgFn {
         }
         if (!cg.IsFix(t)) {
             auto stk = idst ? idst : Stk(AllocStk(false, c->line), c->line);
-            auto size = Ld(AtV(node, 8));
-            auto top = PushBytes(stk, Add(node, I64(QNODE)), size);
-            CallC("free", { tyg_type_ptr(m) }, { node }, nullptr);
-            return result(MemV(t, AtV(top)));
+            // A miss still gives a valid value: the zero one, every byte of it written (CodeGen's
+            // MinBytes(t, true)), an explicit pad's too.
+            auto top = Local(Top(stk));
+            auto zero = cg.MinBytes(t, true);
+            auto copy = [&] {
+                PushBytes(stk, Add(node, I64(QNODE)), Ld(AtV(node, 8)));
+                CallC("free", { tyg_type_ptr(m) }, { node }, nullptr);
+            };
+            if (poll) IfElse(got(), copy, [&] { PushZero(stk, zero); });
+            else copy();
+            return result(MemV(t, AtV(LdL(top))));
         }
         auto size = cg.FixedSize(t);
         auto at = AtL(Temp(t));
@@ -5898,7 +5989,7 @@ struct TgFn {
         lt.pref = k.valued && k.pr;
         if (ip) {
             lt.ip = *ip;
-            lt.top0 = Local(Top(ip->stk));
+            if (ip->mode != 5) lt.top0 = Local(Top(ip->stk));
         }
         return lt;
     }
@@ -6145,7 +6236,7 @@ struct TgFn {
 
     // A case-function call dispatched on its ADT argument's tag (§8.2): every argument evaluated once,
     // in order, then the variant's case called with its payload by value and the others shared.
-    V GenDispatch(Call *c, tyg_val idst, const RzDst *dst) {
+    V GenDispatch(Call *c, tyg_val idst, const RzDst *dst, const RelDests *rdst) {
         auto sp0 = c->dispatch[0];
         size_t pos = c->dispatcharg;
         auto an = c->ArgNodes();
@@ -6179,16 +6270,34 @@ struct TgFn {
         tyg_local copied = 0;
         auto havecopy = false;
         vector<vector<tyg_arg>> shared(an.size());   // The others' arguments, built once.
+        // A by-value case's variant, copied before the later arguments run (CodeGen::EmitDispatch): the
+        // whole variable-mode value on a data stack if one is of variable size, else each fixed-size
+        // one on its own (zero where the tag is another), so a call into a recursive cycle, whose
+        // by-value parameters are fixed-size (§7.8), holds no stack across it.
+        vector<std::optional<tyg_local>> snaps(c->dispatch.size());
         auto copyval = [&] {
-            // The whole variable-mode value copied before the later arguments run
-            // (CodeGen::EmitDispatch).
-            if (Ended() || !M.IsVm(adt) ||
-                !std::any_of(c->dispatch.begin(), c->dispatch.end(), [&](FnSpec *k) {
-                    return k->argtypes[pos]->kind != TY_REF;
-                }))
+            if (Ended() || !M.IsVm(adt)) return;
+            auto byval = false, whole = false;
+            for (size_t vi = 0; vi < c->dispatch.size(); vi++) {
+                if (c->dispatch[vi]->argtypes[pos]->kind == TY_REF) continue;
+                byval = true;
+                whole = whole || !cg.IsFix(cg.VariantType(adt, (int)vi));
+            }
+            if (!byval) return;
+            if (whole) {
+                copied = Local(ImgCopy(Stk(AllocStk(false, c->line), c->line), AddrOf(s.v.a), adt));
+                havecopy = true;
                 return;
-            copied = Local(ImgCopy(Stk(AllocStk(false, c->line), c->line), AddrOf(s.v.a), adt));
-            havecopy = true;
+            }
+            for (size_t vi = 0; vi < c->dispatch.size(); vi++) {
+                auto pt = c->dispatch[vi]->argtypes[pos];
+                if (pt->kind == TY_REF || !cg.FixedSize(cg.VariantType(adt, (int)vi))) continue;
+                snaps[vi] = Temp(pt);
+                tyg_zero(p, AtL(*snaps[vi]), M.Size(pt));
+                If(Cmp(TYG_EQ, LdL(s.tag), I64((int64_t)vi)), [&] {
+                    CopyPayload(s, (int)vi, AtL(*snaps[vi]));
+                });
+            }
         };
         for (size_t i = 0; i < an.size(); i++) {
             auto pt = sp0->argtypes[i];
@@ -6228,7 +6337,7 @@ struct TgFn {
             return lastrets.empty() ? V {} : lastrets[0];
         }
         vector<tyg_arg> chanargs;
-        auto rets = RetChans(sp0, cg.sinfo[sp0], idst, dst, chanargs, c->line);
+        auto rets = RetChans(sp0, cg.sinfo[sp0], idst, dst, rdst, chanargs, c->line);
         auto done = NewBlock();
         auto nvar = adt->enu->en->variants.size();
         vector<tyg_block> arms;
@@ -6250,10 +6359,10 @@ struct TgFn {
                     args.push_back(ArgOfVal(Add(LdL(copied), I64(M.TagSize(adt)))));
                 } else if (i == pos) {
                     if (pt->kind != TY_VARIANT) No(c->line, "dispatch to a case of this kind");
-                    auto t = Temp(pt);
+                    auto t = snaps[vi] ? *snaps[vi] : Temp(pt);
                     auto cs = s;
                     if (havecopy) cs.v.a = AtV(LdL(copied));
-                    CopyPayload(cs, (int)vi, AtL(t));
+                    if (!snaps[vi]) CopyPayload(cs, (int)vi, AtL(t));
                     args.push_back(cg.IsLargeFixed(pt) ? ArgOfVal(AddrOf(AtL(t))) : ArgOfMem(AtL(t)));
                 } else {
                     args.insert(args.end(), shared[i].begin(), shared[i].end());
@@ -6292,6 +6401,8 @@ struct TgFn {
     void BreakValue(Break *b, const LoopTargets &t) {
         if (t.pref) {
             PrefInto(AtL(t.res), b->val);
+        } else if (t.ip.mode == 5) {
+            BuildInto(b->val, t.ip, b->line);   // Built where it lies: nothing to move.
         } else if (t.ip.mode) {
             // Built at the top, which something under construction may have moved up: the value then
             // moves down to where the exit's value starts.
@@ -6331,16 +6442,18 @@ struct TgFn {
                 tyg_jump(p, head);
                 SetBlock(head);
                 Loc(w->cond->line);
+                // The condition is inside the loop: a break in it leaves, a continue tests again
+                // (CodeGen::GenLoopBody).
+                loops.push_back({ done, head, sscopes.size() });
                 if (IsShortCircuit(w->cond)) {
                     CondBranch(w->cond, body, done, true);
                 } else {
                     OpenScope(true);
                     auto c = Truth(w->cond);
                     CloseScope();
-                    Branch(c, body, done);
+                    if (!Ended()) Branch(c, body, done);
                 }
                 SetBlock(body);
-                loops.push_back({ done, head, sscopes.size() });
                 GenBlock(w->body, true);
                 loops.pop_back();
                 Jump(head);
@@ -6428,7 +6541,9 @@ struct TgFn {
             tyg_ret(p, 0);
             return;
         }
-        auto selfrel = [&](Node *v, TypeExpr *t) { return SelfRelLit(v) && cg.TEq(v->exprtype, t); };
+        auto selfrel = [&](Node *v, TypeExpr *t) {
+            return (SelfRelLit(v) && cg.TEq(v->exprtype, t)) || Delivers(v, t);
+        };
         if (rets.size() == 1 && cret == 0) {
             if (vals.size() == 1 && selfrel(vals[0], rets[0])) {   // Built where the result lies.
                 auto tmp = AtL(Temp(rets[0]));
@@ -6447,14 +6562,18 @@ struct TgFn {
             return;
         }
         vector<V> xs;
-        if (vals.size() == 1 && rets.size() > 1) xs = GenCallAll(vals[0], rets.size());
-        else if (vals.size() != rets.size()) No(l, "result count");
         P first {};
         if (cret >= 0) first = P { AtL(Temp(rets[cret])), rets[cret] };
         // Where result i goes: the C return value's temporary, or through its out-pointer.
         auto dest = [&](size_t i) {
             return (int)i == cret ? first : P { AtV(LdL(chans[i].a)), rets[i] };
         };
+        if (vals.size() == 1 && rets.size() > 1) {
+            auto rd = ForwardDests(vals[0], rets, [&](size_t i) { return dest(i).a; });
+            xs = GenCallAll(vals[0], rets.size(), &rd);
+        } else if (vals.size() != rets.size()) {
+            No(l, "result count");
+        }
         for (size_t i = 0; i < rets.size(); i++) {
             if (IsImg(rets[i]) || M.Resz(rets[i])) {
                 auto dst = LdL(chans[i].a);
@@ -6463,7 +6582,9 @@ struct TgFn {
                 BuildAt(xs.empty() ? vals[i] : nullptr, xs.empty() ? nullptr : &xs[i], dst, rets[i],
                         rl, l);
             } else if (xs.empty() && selfrel(vals[i], rets[i])) {
-                SelfRelInto(dest(i), vals[i]);
+                Into(dest(i), vals[i]);
+            } else if (!xs.empty() && cg.NeedsResultLocation(rets[i])) {
+                // The call wrote it there.
             } else {
                 auto x = xs.empty() ? GenAs(vals[i], rets[i]) : Fit(xs[i], rets[i], l);
                 if (Ended()) return;
@@ -6499,8 +6620,8 @@ struct TgFn {
         M.NeedShim(name, cat("void *", name, "(void) { return (void *)&gs_", kind, "_", tid, "_", i,
                              "; }\n"));
         auto rt = t->rets[i];
-        M.channels[name] = string(kind) == "lret" && !IsGrow(rt) && !M.IsRs(rt) && !M.IsRb(rt) ?
-            M.Size(rt) : 8;
+        M.channels[name] = string(kind) == "lret" && !IsGrow(rt) && !M.IsRs(rt) && !M.IsRb(rt) &&
+                           !cg.NeedsResultLocation(rt) ? M.Size(rt) : 8;   // The latter a pointer.
         return AtV(LdL(AccessorLocal(name)));
     }
     tyg_addr LretAt(FnSpec *t, size_t i) { return ChanAt(t, i, "lret"); }
@@ -6534,13 +6655,21 @@ struct TgFn {
         for (size_t i = 0; i < rets.size(); i++)
             if (NonFixedRet(rets[i])) St(ChanAt(t, i, "fval"), Top(Ld(ChanAt(t, i, "fdst"))));
         vector<V> xs;
-        if (vals.size() == 1 && rets.size() > 1) xs = GenCallAll(vals[0], rets.size());
-        else if (vals.size() != rets.size()) No(l, "result count");
+        // A result with relative links is built at the receiver the target's channel points to.
+        auto receiver = [&](size_t i) { return AtV(Ld(LretAt(t, i))); };
+        if (vals.size() == 1 && rets.size() > 1) {
+            auto rd = ForwardDests(vals[0], rets, receiver);
+            xs = GenCallAll(vals[0], rets.size(), &rd);
+        } else if (vals.size() != rets.size()) {
+            No(l, "result count");
+        }
         for (size_t i = 0; i < rets.size(); i++) {
             if (NonFixedRet(rets[i])) {
                 BuildAt(xs.empty() ? vals[i] : nullptr, xs.empty() ? nullptr : &xs[i],
                         Ld(ChanAt(t, i, "fdst")),
                         rets[i], M.Resz(rets[i]) ? LretAt(t, i) : tyg_addr {}, l);
+            } else if (cg.NeedsResultLocation(rets[i])) {
+                if (xs.empty()) Into(P { receiver(i), rets[i] }, vals[i]);
             } else {
                 auto x = xs.empty() ? GenAs(vals[i], rets[i]) : Fit(xs[i], rets[i], l);
                 NeedMem(x, rets[i], l);
@@ -6582,7 +6711,8 @@ struct TgFn {
                     auto &rets = sp->rets;
                     auto cret = cg.sinfo[sp].cret;
                     for (size_t i = 0; i < rets.size(); i++) {
-                        if ((int)i == cret) continue;
+                        if ((int)i == cret || cg.NeedsResultLocation(rets[i])) continue;   // The latter
+                        // are written in place.
                         if (NonFixedRet(rets[i])) LandChannel(i);
                         else
                             Store(P { AtV(LdL(chans[i].a)), rets[i] },
@@ -6661,10 +6791,14 @@ struct TgFn {
         if (vd->defs.size() > 1 && vd->inits.size() == 1) {
             // let a, b = f(): the locals, then the call into them.
             for (auto d : vd->defs) Declare(d, l);
-            auto xs = GenCallAll(vd->inits[0], vd->defs.size());
+            vector<TypeExpr *> types;
+            for (auto d : vd->defs) types.push_back(d->type);
+            auto rd = ForwardDests(vd->inits[0], types, [&](size_t i) { return AtL(locals[vd->defs[i]]); });
+            auto xs = GenCallAll(vd->inits[0], vd->defs.size(), &rd);
             for (size_t i = 0; i < xs.size(); i++) {
                 auto d = vd->defs[i];
                 auto t = d->type;
+                if (cg.NeedsResultLocation(t)) continue;   // The call wrote it there.
                 // The local's header or image was left empty at its stack's top by Declare, where the
                 // result is built.
                 if (!Ended() && (IsVarArr(t) || M.IsVs(t) || (M.IsVm(t) && !M.IsRb(t)) || M.FoOk(t) ||
@@ -7337,6 +7471,7 @@ struct TgFn {
         if (!isvv) n = StripCopy(n);
         auto sl = Is<StructLit>(n);
         if (sl && cg.TEq(sl->exprtype, t) && (isvv || (sl->sinst && !sl->variant))) {
+            SelfScope scope(selfbase, LdL(start));   // `self` is where the value starts (§3.9).
             RunLit(sl, stk, M.RunOfType(t));
         } else if (!CallAt(n, InPlace { 1, stk, t }, false)) {
             auto pl = Deref(Place(n));
@@ -7489,6 +7624,13 @@ struct TgFn {
         if (cg.fromids.count(sp)) {
             // A `return from` target: values in flight to it are built on its destinations (EmitSpec).
             for (size_t i = 0; i < sp->rets.size(); i++) {
+                // A result with relative links: the channel names our receiver (EmitSpec).
+                if (cg.NeedsResultLocation(sp->rets[i])) {
+                    auto at = LretAt(sp, i);
+                    fdstsaves.emplace_back(at, Local(Ld(at)));
+                    St(at, LdL(chans[i].a));
+                    continue;
+                }
                 if (!NonFixedRet(sp->rets[i])) continue;
                 auto at = ChanAt(sp, i, "fdst");
                 auto sav = Local(Ld(at));
