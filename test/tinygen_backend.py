@@ -262,6 +262,12 @@ NATIVE = sorted(p for d in NATIVE_DIRS for p in (HERE / d).glob("*.goose")
 PROGRAMS += [(str(p.relative_to(ROOT)), True, []) for p in NATIVE]
 WHOLE_PROGRAM |= {p.stem for p in NATIVE}
 
+# Programs of the main suite that sweeping found wrong or refused by the backend: whole
+# programs, so that the suite fails on a wrong output and on any function left to C.
+REGRESSIONS = ["test/codegen/forward_adaptation.goose"]
+PROGRAMS += [(path, True, []) for path in REGRESSIONS]
+WHOLE_PROGRAM |= {Path(path).stem for path in REGRESSIONS}
+
 # The windowed samples: built whole and not run, since they loop until their
 # window closes.
 BUILD_ONLY = ["samples/27_gfx_cube.goose", "samples/28_physics_boxes.goose", "samples/29_ui_todo.goose",

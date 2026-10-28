@@ -2316,6 +2316,13 @@ struct TgFn {
     // §3.8), a scalar converted.
     V Fit(V x, TypeExpr *want, Line l) {
         if (!want || want->kind == TY_VOID || !x.t) return x;
+        // A reference to a fixed array where a slice is wanted: a view of the array where it lies. Reading
+        // the reference's target would copy the array into a frame temporary, and the view would outlive it.
+        if (IsAddrRef(x.t) && want->kind == TY_SLICE && x.t->ref->sub->kind == TY_ARRAY &&
+            x.t->ref->sub->arr->akind == A_FIXED && cg.Mangle(x.t->ref->sub->arr->sub) == cg.Mangle(want->sub)) {
+            auto v = ViewOf(RefTarget(x), l);
+            return PairV(want, v.elems, v.len);
+        }
         // A relative reference too, as its slot's decoded address (RelLoad).
         while ((IsAddrRef(x.t) || (TgModule::IsRel(x.t) && M.RelOk(x.t, 1) && !x.mem)) &&
                want->kind != TY_REF)
