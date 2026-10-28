@@ -1473,7 +1473,13 @@ struct TgModule {
 struct TgFn {
     // ---- IR shorthands --------------------------------------------------------------------------
     tyg_val I64(int64_t v) { return tyg_iconst(p, TYG_I64, v); }
-    tyg_addr AtL(tyg_local l, int64_t off = 0) { return tyg_at_local(l, off); }
+    // A large fixed value's "local" is a pointer slot (Temp): its place is what the slot holds.
+    set<tyg_local> viaptr;
+    tyg_addr AtL(tyg_local l, int64_t off = 0) {
+        if (!viaptr.empty() && viaptr.count(l))
+            return tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(l, 0), 0), off);
+        return tyg_at_local(l, off);
+    }
     tyg_addr AtV(tyg_val v, int64_t off = 0) { return tyg_at_val(v, off); }
     tyg_val Ld(tyg_addr a) { return tyg_load(p, TYG_I64, a, 0); }
     void St(tyg_addr a, tyg_val v) { tyg_store(p, TYG_I64, a, v, 0); }
@@ -1637,13 +1643,20 @@ struct TgFn {
     struct Mark {
         int k;
         tyg_local top;
+        // Set where the value lies on a data stack (Temp), which a branch may skip: the mark holds
+        // zero until then (Finish), and a restore without a mark does nothing.
+        bool maybe = false;
     };
+    vector<tyg_local> maybemarks;
     struct SScope {
         bool stmt;
         vector<Mark> marks;
         // The `defer` bodies of this block (§6.6), each with how many marks came before it: an exit
         // runs them among the restores, latest first (CodeGen::EmitRestores).
         vector<pair<size_t, Defer *>> defers;
+        // The first index free on entry; and the lowest the scope may leave free, above a local of
+        // an outer block made inside it (CodeGen::AllocStk's stkbase), so no later index is reused.
+        int base = 0, floor = 0;
     };
     vector<SScope> sscopes;
     // The globals of the C half's instance this body names, each with the local holding its address.
@@ -1721,16 +1734,30 @@ struct TgFn {
     }
 
     // A local for a value of type t, aligned to the largest power of two up to 8 its size allows.
-    tyg_local Temp(TypeExpr *t) {
+    tyg_local Temp(TypeExpr *t, bool forlocal = false) {
         auto sz = M.Size(t);
+        // A fixed value above the C generator's limit (CodeGen::LargeFixedOnStack) lies on a data
+        // stack, restored with its scope (a local's with its block, a temporary's with its
+        // statement): calls inlined into a function do not add it to the native frame. In a function
+        // of a recursive cycle it stays native, as there.
+        if (cg.IsLargeFixed(t) && hassp && !sscopes.empty() && !(sp && sp->incycle)) {
+            auto stk = Stk(AllocStk(forlocal, here, true), here);
+            auto top = Top(stk);
+            auto at = Slot();
+            StL(at, top);
+            SetTop(stk, Add(top, I64(sz)));
+            viaptr.insert(at);
+            return at;
+        }
         int64_t align = 1;
         while (align < 8 && align * 2 <= sz) align *= 2;
         return Frame(sz, align);
     }
-    // A slot of the native frame. The C generator keeps a large fixed value on a data stack, so that
-    // calls inlined into a function do not add their values to its frame (a thread's native stack
-    // can be 1 MiB, as under MSVC). Here the frame is counted, and a function with inlined calls that
-    // outgrows 1 MiB is left to the C generator.
+    // A slot of the native frame. A large fixed value lies on a data stack (Temp), as in the C, so that
+    // calls inlined into a function do not add their values to its frame (a thread's native stack can
+    // be 1 MiB, as under MSVC). What stays native is counted: a function with inlined calls whose
+    // frame outgrows 1 MiB is left to the C generator. Only a large value in a recursive cycle (native
+    // there too, as in the C) could reach it.
     static constexpr int64_t MAX_FRAME = 1 << 20;
     int64_t framebytes = 0;
     bool hasinline = false;
@@ -1867,13 +1894,16 @@ struct TgFn {
 
     // The next free index, for a local (innermost non-statement scope) or a temporary (the
     // statement's), its top saved to restore (AllocStk(forlocal) in the C).
-    int AllocStk(bool forlocal, Line l) {
+    int AllocStk(bool forlocal, Line l, bool maybe = false) {
         auto k = live++;
         maxown = std::max(maxown, live);
         auto mark = Local(Top(Stk(k, l)));
+        if (maybe) maybemarks.push_back(mark);
         auto i = sscopes.size() - 1;
+        for (auto j = sscopes.size(); forlocal && j-- > 0 && sscopes[j].stmt;)
+            sscopes[j].floor = std::max(sscopes[j].floor, live);
         while (forlocal && i > 0 && sscopes[i].stmt) i--;
-        sscopes[i].marks.push_back({ k, mark });
+        sscopes[i].marks.push_back({ k, mark, maybe });
         return k;
     }
     // A body registered after k marks runs after the marks made later are restored and before the k
@@ -1887,7 +1917,14 @@ struct TgFn {
                 if (Ended()) return;
                 DeferBody(defers[di].second);
             }
-            if (k > 0) SetTop(Stk(marks[k - 1].k, Line {}), LdL(marks[k - 1].top));
+            if (k == 0) continue;
+            auto &mk = marks[k - 1];
+            auto reset = [&] { SetTop(Stk(mk.k, Line {}), LdL(mk.top)); };
+            if (!mk.maybe) reset();
+            else If(Cmp(TYG_NE, LdL(mk.top), I64(0)), [&] {
+                reset();
+                StL(mk.top, I64(0));
+            });
         }
     }
     // One run of a deferred body at an exit of its block: its statements as written, in a block of
@@ -1904,12 +1941,12 @@ struct TgFn {
     void RestoreFrom(size_t depth) {
         for (size_t i = sscopes.size(); i-- > depth;) Restore(sscopes[i]);
     }
-    void OpenScope(bool stmt) { sscopes.push_back({ stmt, {} }); }
+    void OpenScope(bool stmt) { sscopes.push_back({ stmt, {}, {}, live, 0 }); }
     void CloseScope() {
         auto sc = std::move(sscopes.back());
         sscopes.pop_back();
         if (!Ended()) Restore(sc);
-        live -= (int)sc.marks.size();
+        live = std::max(sc.base, sc.floor);
     }
 
     // A call handed gs_sp + the indices in use: none into the recursive cycle this function is in
@@ -6949,6 +6986,12 @@ struct TgFn {
     }
 
     void DebugVar(decltype(&tyg_debug_var) fn, VarDef *d, const tyg_dtype *dt, tyg_local loc) {
+        // A value on a data stack is described as the pointer slot holding its address.
+        if (viaptr.count(loc)) {
+            fn(p, string(d->name).c_str(), tyg_dt_pointer(m, dt), tyg_at_local(loc, 0), M.File(d->line.fileidx),
+               d->line.line);
+            return;
+        }
         fn(p, string(d->name).c_str(), dt, AtL(loc), M.File(d->line.fileidx), d->line.line);
     }
     // A local's header or image, empty, with a stack of its own (rzstk): a resizable's header, a frame
@@ -6990,7 +7033,7 @@ struct TgFn {
         }
         if (!M.TypeOk(t)) No(l, cat("variable type of ", d->name, ": ", M.NameWhy(t)));
         // A pool reference is a gs_pref: the fat reference and the pool's freelist (CodeGen::VarCT).
-        auto loc = cg.PrefVar(d) ? Slot32() : Temp(t);
+        auto loc = cg.PrefVar(d) ? Slot32() : Temp(t, true);
         locals[d] = loc;
         DebugVar(tyg_debug_var, d, M.DT(t), loc);
     }
@@ -8163,6 +8206,7 @@ struct TgFn {
         if (stksl)
             StL(stksl, M.fixedaddrs ? Ld(AtV(data("gs_tg_stkpp"))) :
                 CallC("gs_tg_stks", {}, {}, tyg_type_ptr(m)));
+        for (auto loc : maybemarks) StL(loc, I64(0));
         for (auto &[acc, loc] : gaddrs)
             StL(loc, M.DirectAcc(acc) ? data(acc) : CallC(acc, {}, {}, tyg_type_ptr(m)));
         tyg_jump(p, gstart);

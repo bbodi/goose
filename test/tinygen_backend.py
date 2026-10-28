@@ -315,6 +315,12 @@ DEBUG_REGRESSIONS = ["test/threads/thread_contained.goose", "test/storage/relati
 PROGRAMS += [(path, True, []) for path in REGRESSIONS]
 PROGRAMS += [(path, True, ["--debug"]) for path in DEBUG_REGRESSIONS]
 WHOLE_PROGRAM |= {Path(path).stem for path in REGRESSIONS + DEBUG_REGRESSIONS}
+# Fixed values above the C generator's 4096-byte limit lie on a data stack, as there: a local, a
+# temporary and a result slot, restored with their scope. Inlined (-O2) they used to pass the native
+# stack (a 1 MiB guard refused them), so both inlining levels are whole programs.
+LARGE_FIXED = ["test/codegen/large_fixed_values.goose", "test/codegen/large_fixed_exits.goose"]
+PROGRAMS += [(path, True, [level]) for path in LARGE_FIXED for level in ("-O0", "-O2")]
+WHOLE_PROGRAM |= {Path(path).stem for path in LARGE_FIXED}
 # Programs the backend does not yet build whole: each leaves the named functions to the C generator
 # (the reference semantics), so the suite proves the fallback gives the blessed output today. An entry
 # moves to REGRESSIONS once its refusal is lifted, and each comment names the refusal it reaches.
