@@ -300,6 +300,10 @@ GAPS = [
     # "resizable struct built from this value": a struct with a resizable ADT as its tail, held in a
     # local and returned by name.
     "test/codegen/resizable_struct_returns.goose",
+    # "append of this call": a call's T[] result appended to a limited array.
+    "test/codegen/append_resizable_call_to_limited.goose",
+    # "value of type Frame": copy() of a frame object returned from a function.
+    "test/codegen/frame_object_copy_result.goose",
 ]
 PROGRAMS += [(path, False, []) for path in GAPS]
 # Results with relative links written by the callee into its caller's slot (and a return from's channel)
