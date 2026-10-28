@@ -196,6 +196,11 @@ inline string TgSupportBody(string_view runtimeh) {
     return s;
 }
 
+// How deep the backend's walks over a type nest before they stop. A type is finite and a recursive
+// one is cut by `Within` and `seen`, so this guards only the native stack of the compiler against a
+// pathological program; the C generator has no limit. A struct nested a hundred levels is far below it.
+constexpr int kTypeDepthMax = 1000;
+
 // One tinygen module and what its procedures share: types, debug types, symbols, file names, and the
 // shims and extern trampolines their calls need from the C half.
 struct TgModule {
@@ -433,7 +438,7 @@ struct TgModule {
     // A type this backend holds: a machine integer, a float, a bool, a plain reference to a fixed value
     // it holds, or a fixed struct of those.
     bool TypeOk(TypeExpr *t, int depth = 0) {
-        if (!t || depth > 32) return false;
+        if (!t || depth > kTypeDepthMax) return false;
         auto d = depth + 1;
         switch (t->kind) {
             // A varint on its own is an i64, as the C holds it; in a bytes value it is zigzag ULEB128.
@@ -474,7 +479,7 @@ struct TgModule {
     }
     // Why TypeOk refuses a type, as a class: what -v says beside the type, so a sweep ranks reasons.
     string Blocker(TypeExpr *t, int depth = 0) {
-        if (!t || depth > 32) return "unknown type";
+        if (!t || depth > kTypeDepthMax) return "unknown type";
         auto d = depth + 1;
         // Field ft's blocker under `pre`; skipvs: bar the variable size such a struct has by nature.
         auto why = [&](TypeExpr *ft, const char *pre, bool skipvs) {
@@ -555,7 +560,7 @@ struct TgModule {
     // { base, len } with the elements on a data stack. Held behind a reference or as a by-value
     // parameter.
     bool RzOk(TypeExpr *t, int depth = 0) {
-        if (!t || t->kind != TY_ARRAY || depth > 32) return false;
+        if (!t || t->kind != TY_ARRAY || depth > kTypeDepthMax) return false;
         return (IsVarArr(t) || IsGrow(t)) && cg.IsFix(t->arr->sub) && TypeOk(t->arr->sub, depth + 1);
     }
     // A variable-size struct (VsOk) is an image too, read where it lies.
@@ -570,10 +575,10 @@ struct TgModule {
     // A T[] of images (u8[][]), and a resizable one: the elements back to back, each walked by its size
     // (CodeGen::SizeFn) and never indexed.
     bool VarImgOk(TypeExpr *t, int depth = 0) {
-        return IsVarArr(t) && depth <= 32 && ImgElemOk(t->arr->sub, depth);
+        return IsVarArr(t) && depth <= kTypeDepthMax && ImgElemOk(t->arr->sub, depth);
     }
     bool VeOk(TypeExpr *t, int depth = 0) {
-        return IsGrow(t) && depth <= 32 && ImgElemOk(t->arr->sub, depth);
+        return IsGrow(t) && depth <= kTypeDepthMax && ImgElemOk(t->arr->sub, depth);
     }
     static bool IsGrow(TypeExpr *t) {
         return t && t->kind == TY_ARRAY && (t->arr->akind == A_GROW || t->arr->akind == A_GROWSHRINK);
@@ -793,7 +798,7 @@ struct TgModule {
     // A runtime-capacity T[..]: [cap u32][len u32][cap slots].
     bool IsRc(TypeExpr *t) { return IsLim(t) && cg.ArrSize(t->arr) < 0; }
     bool RcOk(TypeExpr *t, int depth = 0) {
-        return IsRc(t) && depth <= 32 && cg.IsFix(t->arr->sub) && TypeOk(t->arr->sub, depth + 1);
+        return IsRc(t) && depth <= kTypeDepthMax && cg.IsFix(t->arr->sub) && TypeOk(t->arr->sub, depth + 1);
     }
     // A limited array this backend holds, of either kind.
     bool LimHeld(TypeExpr *t) { return TypeOk(t) || RcOk(t); }
@@ -804,7 +809,7 @@ struct TgModule {
                cg.ArrSize(t->arr) == 0;
     }
     bool ZeroOk(TypeExpr *t, int depth) {
-        return ZeroArr(t) && cg.IsFix(t) && depth <= 32 && TypeOk(t->arr->sub, depth + 1);
+        return ZeroArr(t) && cg.IsFix(t) && depth <= kTypeDepthMax && TypeOk(t->arr->sub, depth + 1);
     }
     bool LimOk(TypeExpr *t, int depth) {
         return cg.IsStaticLimited(t) && cg.ArrSize(t->arr) > 0 && TypeOk(t->arr->sub, depth + 1);
@@ -847,7 +852,7 @@ struct TgModule {
     // A frame object (C.2, CodeGen::IsFrameObj): a struct whose last field is a resizable: its fixed
     // fields, packed, then the tail's header { base, len } (EmitCFields), the elements on a data stack.
     bool FoOk(TypeExpr *t, int depth = 0) {
-        if (!t || t->kind != TY_STRUCT || depth > 32 || !cg.IsFrameObj(t)) return false;
+        if (!t || t->kind != TY_STRUCT || depth > kTypeDepthMax || !cg.IsFrameObj(t)) return false;
         return Within(t, true, [&] {
             auto &fs = StFields(t);
             if ((size_t)fs.var + 1 != fs.f.size()) return false;
@@ -888,7 +893,7 @@ struct TgModule {
     // Held: the fields before the tail as a variable-size struct's (FieldsOk), the tail a resizable of
     // fixed elements.
     bool RsOk(TypeExpr *t, int depth = 0) {
-        if (!IsRs(t) || depth > 32) return false;
+        if (!IsRs(t) || depth > kTypeDepthMax) return false;
         return Within(t, true, [&] {
             auto &fs = StFields(t);
             if (fs.last < 0) return false;
@@ -903,7 +908,7 @@ struct TgModule {
     }
     // Held: its fields are fixed values held, T[]s of fixed elements (RzOk), or such structs.
     bool VsOk(TypeExpr *t, int depth = 0) {
-        if (!IsVs(t) || depth > 32 || cg.SI(t)->sclass != SC_VARIABLE) return false;
+        if (!IsVs(t) || depth > kTypeDepthMax || cg.SI(t)->sclass != SC_VARIABLE) return false;
         return Within(t, true, [&] { return FieldsOk(StFields(t), depth); });
     }
     // The fewest bytes an image of t takes: its fields up to the first variable-size one, and that
@@ -1018,7 +1023,7 @@ struct TgModule {
     // decodes to.
     static bool IsRel(const TypeExpr *t) { return t && t->kind == TY_REF && t->ref->lenstorage >= 0; }
     bool RelOk(TypeExpr *t, int depth = 0) {
-        if (!IsRel(t) || depth > 32) return false;
+        if (!IsRel(t) || depth > kTypeDepthMax) return false;
         auto w = t->ref->lenstorage;
         return (w == IS_U8 || w == IS_U16 || w == IS_U32 || w == IS_U64 || w == IS_VARINT) &&
             RelSubOk(t, depth);
@@ -1027,7 +1032,7 @@ struct TgModule {
     // self-relative), so the value is variable-size, a bytes value a uint8_t * points at, as a T[] is
     // (SC_VARIABLE).
     static bool IsVr(const TypeExpr *t) { return IsRel(t) && t->ref->lenstorage == IS_VARINT; }
-    bool VrOk(TypeExpr *t, int depth = 0) { return IsVr(t) && depth <= 32 && RelSubOk(t, depth); }
+    bool VrOk(TypeExpr *t, int depth = 0) { return IsVr(t) && depth <= kTypeDepthMax && RelSubOk(t, depth); }
     bool RelSubOk(TypeExpr *t, int depth) {
         auto sub = t->ref->sub;
         if (cg.IsFix(sub)) return TypeOk(sub, depth + 1);
@@ -1049,7 +1054,7 @@ struct TgModule {
             return AllVariants(t, [&](int, const FieldSet &fs) { return FieldsOk(fs, depth + 1); });
         });
     }
-    bool VmOk(TypeExpr *t, int depth = 0) { return IsVm(t) && depth <= 32 && PayloadsOk(t, depth); }
+    bool VmOk(TypeExpr *t, int depth = 0) { return IsVm(t) && depth <= kTypeDepthMax && PayloadsOk(t, depth); }
     // Whether the first n fields (all by default) are ones this backend reads and builds: fixed ones it
     // holds, T[]s and variable-size structs it holds as images.
     bool FieldsOk(const FieldSet &fs, int depth, size_t n = SIZE_MAX) {
@@ -1065,7 +1070,7 @@ struct TgModule {
     // A variant type whose payload has a variable-size field (`Msg.Text` with a u8[]): an image of its
     // fields, as a variable-size struct is.
     bool IsVv(TypeExpr *t) { return t && t->kind == TY_VARIANT && !cg.IsFix(t); }
-    bool VvOk(TypeExpr *t, int depth = 0) { return IsVv(t) && depth <= 32 && PayloadsOk(t, depth); }
+    bool VvOk(TypeExpr *t, int depth = 0) { return IsVv(t) && depth <= kTypeDepthMax && PayloadsOk(t, depth); }
 
     // ---- Resizable ADTs -------------------------------------------------------------------------
 
@@ -1134,7 +1139,7 @@ struct TgModule {
                (!tail || (sh.fo ? FoOk(tail, d) && RzOk(cg.FoTailArr(tail), d) : RzOk(tail, d)));
     }
     bool RbOk(TypeExpr *t, int depth = 0) {
-        if (!IsRb(t) || depth > 32) return false;
+        if (!IsRb(t) || depth > kTypeDepthMax) return false;
         return Within(t, true, [&] {
             if (t->kind == TY_STRUCT) {   // Its fixed fields held, its tail a resizable ADT.
                 auto &fs = StFields(t);
@@ -1158,7 +1163,7 @@ struct TgModule {
     bool Recursive(TypeExpr *t) {
         set<string> seen;
         function<bool(TypeExpr *, int)> walk = [&](TypeExpr *x, int depth) -> bool {
-            if (!x || depth > 32) return true;
+            if (!x || depth > kTypeDepthMax) return true;
             auto sub = [&](TypeExpr *y) { return walk(y, depth + 1); };
             switch (x->kind) {
                 case TY_REF: return sub(x->ref->sub);
@@ -1551,7 +1556,7 @@ struct TgFn {
     unordered_map<const VarDef *, tyg_local> locals;
     // Where a value is built, at the top of stk: mode 1 a T[] image (BuildInto returns its address), 2
     // a resizable of any kind (header at hdr), 3 a frame object (its struct at hdr), 4 a frame object's
-    // bytes (the innermost count stored at hdr). A match, block or loop delivers modes 1 and 2 this
+    // bytes (the innermost count stored at hdr). A match, block or loop delivers modes 1, 2 and 3 this
     // way. Mode 5 is a fixed value with relative links (CodeGen::NeedsResultLocation), built where it
     // lies, at hdr, as the C does for a destination that is an lvalue; no stack.
     struct P;
@@ -1730,7 +1735,7 @@ struct TgFn {
         if (auto ie = Is<IfExpr>(n); ie && ie->elseb) BuildIf(ie, l, arm);
         else if (auto b = Is<Block>(n); b && b->tail) BuildArm(b, l, arm);
         else if (auto c = Is<Call>(n); c && c->fvbody && c->fvbody->tail) BuildFv(c, l, arm);
-        else if ((d.mode > 2 && d.mode != 5) || M.IsRs(d.t)) return false;
+        else if ((d.mode > 3 && d.mode != 5) || M.IsRs(d.t)) return false;
         else if (auto me = Is<MatchExpr>(n)) GenMatch(me, false, &d);
         else if (auto e = Is<EarlyBlock>(n)) GenEarly(e, false, &d);
         else if (auto lp = Is<LoopExpr>(n)) GenLoopX(lp, false, &d);
@@ -3823,7 +3828,7 @@ struct TgFn {
     // the elements (moved as memmove moves them) and the length.
     void LimAppendView(const P &pl, const View &v, Line l) {
         auto et = pl.t->arr->sub;
-        if (cg.Mangle(v.elem) != cg.Mangle(et)) No(l, "array of another element type");
+        if (cg.Mangle(v.elem) != cg.Mangle(et)) Unreachable(l, "array of another element type");
         auto nl = Local(v.len), ol = Local(LimLen(pl));
         auto total = [&] { return Add(LdL(ol), LdL(nl)); };
         AbortUnless(Cmp(TYG_SLE, total(), LimCapOf(pl)), "CAPACITY", l);
@@ -4942,7 +4947,7 @@ struct TgFn {
     // what they refer to, a scalar by gs_fmt_*, u8 elements as their bytes (quoted when nested), other
     // arrays and slices as `[a, b]`, a struct as `Name { a, b }`.
     void RenderInto(tyg_val stk, tyg_addr len, P pl, bool nested, Line l, int depth = 0) {
-        if (depth > 32) No(l, "text of a type this deep");
+        if (depth > kTypeDepthMax) No(l, "text of a type this deep");
         // A reference renders what it refers to, a relative one decoded (CodeGen::RenderLoc).
         while (IsPlainRef(pl.t) || (TgModule::IsRel(pl.t) && !IsOptional(pl.t) && M.RelOk(pl.t, 1)))
             pl = Step(pl);
@@ -5290,9 +5295,9 @@ struct TgFn {
         auto an = c->ArgNodes();
         P src0;
         if (Is<Call>(an[0]) && an[0]->exprtype && an[0]->exprtype->kind == TY_SLICE) {
-            // A call's array result handed as the slice: viewed where it lies.
+            // A call's array result handed as the slice, viewed where it lies, or a call's slice (bytes_of).
             auto x = Gen1(an[0]);
-            if (!Ended() && (!x.mem || !x.t || x.t->kind != TY_ARRAY))
+            if (!Ended() && (!x.mem || !x.t || (x.t->kind != TY_ARRAY && x.t->kind != TY_SLICE)))
                 No(c->line, "from_bytes of this source");
             src0 = P { x.a, x.t, x.stk };
         } else {
@@ -5916,20 +5921,26 @@ struct TgFn {
     }
 
     // An arm whose value `build` makes in place: its statements, then its tail built there.
+    // An arm whose value is built by `build`, or that diverges (abort, exit: the checker types it
+    // void) and gives none: it runs as a statement, as CodeGen::GenBlockInner runs such a tail.
     template <class F> void BuildArm(Node *n, Line l, F build) {
+        auto value = [&](Node *v) {
+            if (!v->exprtype || v->exprtype->kind == TY_VOID) Stmt(v);
+            else build(v);
+        };
         if (auto b = Is<Block>(n)) {
             InScope([&] {
                 for (auto st : b->stmts) Stmt(st);
                 if (Ended()) return;
-                if (!b->tail) No(l, "arm without a value");
+                if (!b->tail) return;   // It ends in a diverging statement (the checker's word), as in GenBlock.
                 Open();
                 Loc(b->tail->line);
-                build(b->tail);
+                value(b->tail);
             });
             return;
         }
         OpenScope(true);
-        build(n);
+        value(n);
         CloseScope();
     }
     void BindFvParams(Call *c) {
@@ -6456,6 +6467,8 @@ struct TgFn {
                 tyg_move_dyn(p, top0, start, n);
                 SetTop(t.ip.stk, Add(top0, n));
                 if (t.ip.mode == 2) St(t.ip.hdr, top0);
+                // A frame object: its innermost tail's header points at the elements' new start.
+                if (t.ip.mode == 3) St(AddrPlus(t.ip.hdr, M.FoHdrOff(t.ip.t)), top0);
             });
         } else if (t.rt) {
             Into(P { AtL(t.res), t.rt }, b->val);
@@ -6994,14 +7007,14 @@ struct TgFn {
         if (op == a->op) No(a->line, "assignment operator");
         tyg_val r;
         if (op == T_SHL || op == T_SHR) {
-            if (t->kind != TY_INT) No(a->line, "shift type");
+            if (t->kind != TY_INT) Unreachable(a->line, "shift type");
             auto n = GenAs(a->rhs, M.ast.inttypes[IS_I64]).v;
             r = ShiftOp(op, t, old, n);
         } else {
             auto rv = GenAs(a->rhs, t).v;
             if (t->kind == TY_FLT) {
-                if (op != T_PLUS && op != T_MINUS && op != T_MUL && op != T_DIV)
-                    No(a->line, "float compound assignment");
+                if (op != T_PLUS && op != T_MINUS && op != T_MUL && op != T_DIV && op != T_MOD)
+                    No(a->line, "float compound assignment");   // %= is fmod, as in the C.
                 r = ScalarArith(op, t, old, rv, a->line);
             } else if (t->kind == TY_INT) {
                 r = IntOp(op, t, old, rv, a->line);
@@ -7174,9 +7187,14 @@ struct TgFn {
         if (!sl && nt && cg.TEq(nt, pl.t)) {
             P src;
             if (Is<Call>(n)) {
-                if (IsPlainRef(n->exprtype)) No(l, "reference result copied as a frame object");
                 auto x = Gen1(n);
-                src = P { x.a, x.t, x.stk };
+                // A reference result is the pair (header, stack) in memory: read through it.
+                if (IsPlainRef(n->exprtype)) {
+                    if (Ended()) return;
+                    src = Deref(P { x.a, n->exprtype });
+                } else {
+                    src = P { x.a, x.t, x.stk };
+                }
             } else {
                 src = Deref(Place(n));
             }
