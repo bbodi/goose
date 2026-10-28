@@ -127,7 +127,7 @@ PROGRAMS = [
     ("test/tinygen/tinygen_retfrom.goose", False,
      ["--tinygen-skip=deep,outer,after_owner,give,nest,point"]),
     # An --include header reads a struct its extern takes by reference, while every Goose
-    # function, the extern's callers among them, is tinygen's.
+    # function, the extern's callers among them, is tinygen's: whole, the header in the extern unit.
     ("samples/24_call_c.goose", True, ["--include", str(ROOT / "samples" / "call_c.h")]),
     ("test/tinygen/tinygen_render.goose", True, []),
     ("test/tinygen/tinygen_render.goose", True, ["--debug"]),
@@ -260,6 +260,7 @@ PROGRAMS += [
 ]
 WHOLE_PROGRAM |= {"tinygen_optionals"}
 WHOLE_PROGRAM |= {"tinygen_extern", "21_raytrace"}   # libm and package externs called directly
+WHOLE_PROGRAM |= {"24_call_c"}   # the --include header's externs through the extern unit
 
 # The native modules' fixtures (gfx, ui, audio, physics): whole programs that
 # call into the packages' C layers. They run headless, as the suite runs
@@ -638,7 +639,7 @@ DEFAULT_C_PATH = "build: the C generator's C, compiled by the C compiler"
 
 def check_build_defaults(exe, base, ok, fail):
     """Plain goose build runs tinygen-c, --debug the native tinygen backend (both -v named, the
-    program's output right); --include or --standalone builds through the C generator's C,
+    program's output right); --standalone builds through the C generator's C,
     -v naming why; -o x.c writes tinygen's C or, for the fallback, the generator's."""
     exe = Path(exe).resolve()
     work = base / "defaults"
@@ -671,10 +672,8 @@ def check_build_defaults(exe, base, ok, fail):
                                            "tinygen: whole program"])]:
             if built(source, flags, says, " ".join(flags)) is None:
                 return
-    header = work / "trivial.h"
-    tc.write_text(header, "#define TRIVIAL_HEADER 1\n")
     source = ROOT / DEFAULT_BUILD_PROGRAMS[0]
-    for flags, why in [(["--include", header], "--include"), (["--standalone"], "--standalone"),
+    for flags, why in [(["--standalone"], "--standalone"),
                        (["--debug", "--standalone"], "--standalone")]:
         log = built(source, flags, ["build: backend", f"{DEFAULT_C_PATH}, for the whole program "
                                     f"(tinygen cannot take it whole: {why})"], " ".join(map(str, flags)))
@@ -690,7 +689,7 @@ def check_build_defaults(exe, base, ok, fail):
             fail(f"goose build {' '.join(flags)} -o out.c (fallback: {fallback})", o + e)
             return
     ok(f"goose build: tinygen-c by default and tinygen with --debug on {len(DEFAULT_BUILD_PROGRAMS)} "
-       "programs, the C generator's C for --include and --standalone, -o out.c")
+       "programs, the C generator's C for --standalone, -o out.c")
 
 
 def check_c_path_flags(exe, base, ok, fail):
@@ -729,7 +728,20 @@ def check_c_path_flags(exe, base, ok, fail):
     # -D: every define reaches the support unit, GS_STACK_STATS's report among them.
     if not each(ROOT / "test/runtime/stack_stats.goose", ["-DGS_STACK_STATS=1"], "-D"):
         return
-    ok("the C path's flags on tinygen: -D")
+    # --include: the externs' trampolines are in a unit that includes the header after the
+    # program's C types, so a struct by reference and a static inline function work; the -D given
+    # reach the header there.
+    if not each(ROOT / "samples/24_call_c.goose", ["--include", ROOT / "samples/call_c.h"],
+                "--include"):
+        return
+    header = work / "scaled.h"
+    tc.write_text(header, "#ifndef SCALE\n#error SCALE is a -D of the build\n#endif\n"
+                          "static inline int64_t scaled(int64_t x) { return x * SCALE; }\n")
+    source = work / "scaled.goose"
+    tc.write_text(source, "extern fn scaled(x: i64) -> i64;\n\nfn main() { print(scaled(14)); }\n")
+    if not each(source, ["--include", header, "-DSCALE=3"], "static inline, -D", want="42\n"):
+        return
+    ok("the C path's flags on tinygen: -D, --include (a static inline extern, a -D in the header)")
 
 
 def check_default_inlining(exe, base, ok, fail):

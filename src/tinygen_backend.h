@@ -8506,15 +8506,42 @@ struct TinyGenBackend : CodeGen::SpecBackend {
             auto name = sp->sf->cname;
             if (!declared.count(sp) && runtime_ext_text.find(cat(" ", name, "(")) == string_view::npos)
                 s += cg.ExternProto(sp);
-            auto ret = sp->rets.empty() ? string("void") : cg.CT(sp->rets[0]);
-            string params, args;
-            for (size_t i = 0; i < sp->argtypes.size(); i++) {
-                Append(params, i ? ", " : "", cg.CT(sp->argtypes[i]), " a", i);
-                Append(args, i ? ", " : "", "a", i);
-            }
-            Append(s, ret, " gs_tg_x_", name, "(", params.empty() ? "void" : params, ") { ",
-                   sp->rets.empty() ? "" : "return ", name, "(", args, "); }\n");
+            s += Trampoline(cg, sp, false);
         }
+        return s;
+    }
+
+    // gs_tg_x_<name>, calling the extern fn sp by its C name with the same parameters, after a
+    // prototype of the extern when `proto`.
+    static string Trampoline(CodeGen &cg, FnSpec *sp, bool proto) {
+        auto &name = sp->sf->cname;
+        auto ret = sp->rets.empty() ? string("void") : cg.CT(sp->rets[0]);
+        string params, args, types;
+        for (size_t i = 0; i < sp->argtypes.size(); i++) {
+            Append(types, i ? ", " : "", cg.CT(sp->argtypes[i]));
+            Append(params, i ? ", " : "", cg.CT(sp->argtypes[i]), " a", i);
+            Append(args, i ? ", " : "", "a", i);
+        }
+        string s;
+        if (proto) Append(s, ret, " ", name, "(", types.empty() ? "void" : types, ");\n");
+        Append(s, ret, " gs_tg_x_", name, "(", params.empty() ? "void" : params, ") { ",
+               sp->rets.empty() ? "" : "return ", name, "(", args, "); }\n");
+        return s;
+    }
+
+    // With --include (externunit), a whole program's extern fns are called through trampolines in a
+    // unit of the program's own (TinygenExternSource in main.cpp) that includes the headers, after the
+    // program's C types they are written against: there a static or inline function of a header, or a
+    // macro, is callable. The object then forwards none itself (ForwardExterns).
+    bool externunit = false;
+
+    // That unit's trampolines: one for each extern fn the object calls that the support object does not
+    // hold, with a prototype, which a header's earlier definition or declaration agrees with (no runtime
+    // header declares these: ExternHeld).
+    string ExternTrampolines(CodeGen &cg) {
+        string s;
+        for (auto sp : mod->externs)
+            if (!SupportHolds(sp->sf->cname)) s += Trampoline(cg, sp, true);
         return s;
     }
 
@@ -8581,6 +8608,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     // The trampolines the object holds itself: gs_tg_x_<name> calls the C symbol with the same
     // parameters.
     void ForwardExterns() {
+        if (externunit) return;
         for (auto sp : mod->externs) {
             auto &name = sp->sf->cname;
             if (SupportHolds(name)) continue;

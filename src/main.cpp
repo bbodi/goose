@@ -610,6 +610,29 @@ string TinygenSupportSource(bool checks, bool jit = false) {
 #endif
 }
 
+// The C of a whole tinygen program's extern unit, with --include: the runtime's headers, the
+// program's C types (CodeGen::types), the headers, which are written against them, and the
+// trampolines through which tinygen's object calls the extern fns (ExternTrampolines). Compiled
+// with the program, beside the support object; `jit` as for TinygenSupportSource.
+string TinygenExternSource(bool checks, bool jit, const string &types,
+                           const vector<string> &headers, const string &trampolines) {
+    string includes;
+    for (auto inc : headers) {
+        // As the C generator writes them (CodeGen): forward slashes, which every C compiler takes.
+        for (auto &c : inc) if (c == '\\') c = '/';
+        Append(includes, "#include \"", inc, "\"\n");
+    }
+    return cat("/* The extern fns of a program the tinygen backend compiled, with its --include\n"
+               "   headers (docs/design/tinygen_backend.md), written by the Goose compiler. */\n\n",
+               jit ? cat("#define GS_EMBEDDED_JIT 1\n", RuntimeSections({ "jit_c.h" }),
+                         "#define GS_SEPARATE_RUNTIME 1\n")
+                   : cat("#define GS_SEPARATE_RUNTIME 1\n#define GS_RUNTIME_VERSION ",
+                         RuntimeVersion(), "\n"),
+               checks ? "#define GS_DEBUG 1\n" : "", RuntimeSections({ "runtime.h" }), types,
+               RuntimeSections({ "runtime_ext.h" }), "\n/* ---- includes ---- */\n", includes,
+               "\n/* ---- trampolines ---- */\n", trampolines);
+}
+
 // tinygen's C as a TinyCC unit of a goose run: the embedded JIT has no C headers of its own
 // (jit.h), so the prelude's includes give way to the declarations of jit_c.h and TinyCC's
 // va_list.
@@ -820,9 +843,9 @@ the packages the program uses. Intermediates go under GOOSE_HOME.
 
 tinygen compiles the program: its C, optimized by the C compiler, or with
 --debug its machine code with debug info naming the Goose source. A program
-tinygen cannot take whole (--include, --standalone, a library or an export
-fn) builds through the C generator's C instead; -v says why. --backend picks
-a path.
+tinygen cannot take whole (--standalone, a library or an export fn, or
+--include with -o x.c) builds through the C generator's C instead; -v says
+why. --backend picks a path.
 
 Options:
   -o exe                Where the executable goes.
@@ -1780,6 +1803,9 @@ int Main(int argc, char **argv) {
     bool tgwhole = false, tgchecks = false, tgfallback = false;
     // With --backend=tinygen-c, the C tinygen wrote, which the build compiles to tgobject.
     string tgcsource;
+    // With --include, a whole program's extern unit (TinygenExternSource), which the build compiles
+    // and links beside tgobject.
+    string tgextern;
     // The program's Ast outlives the compile: a build and a JIT run read
     // its packages, for the native parts the program needs (native.h).
     unique_ptr<Ast> astp;
@@ -1943,7 +1969,8 @@ int Main(int argc, char **argv) {
                 string whynot;
                 if (!building && !tgjit) whynot = "not goose build";
                 else if (standalone) whynot = "--standalone";
-                else if (!includenames.empty()) whynot = "--include";
+                // tinygen's C alone does not hold the --include headers' functions.
+                else if (!includenames.empty() && !tgcout.empty()) whynot = "--include with -o x.c";
                 else if (tinygenmixed) whynot = "--tinygen-mixed";
                 // Every -D reaches the support unit (DefinesSource), the C that includes the
                 // runtime's headers; tinygen's C reads none.
@@ -1956,7 +1983,11 @@ int Main(int argc, char **argv) {
                     for (auto sp : calls)
                         if (!sp->sf->dylib.empty()) whynot = cat("extern ", sp->sf->cname, " of a shared library");
                 }
+                tgb->externunit = !includes.empty();
                 tgwhole = whynot.empty() && tgb->WholeProgram(cg, whynot);
+                if (tgwhole && tgb->externunit)
+                    tgextern = TinygenExternSource(tgb->checks, tgjit, cg.types, includes,
+                                                   tgb->ExternTrampolines(cg));
                 // The default build takes the C generator's C for all of a program tinygen
                 // cannot take whole, as a JIT run does; no mixed build unless asked for.
                 tgfallback = tgdefault && !tgwhole;
@@ -1974,6 +2005,7 @@ int Main(int argc, char **argv) {
                             throw CompileError { cat("tinygen: cannot write the C: ", err) };
                         jitunits = { TinygenSupportSource(tgchecks, true),
                                      TinygenJitUnit(std::move(text)) };
+                        if (!tgextern.empty()) jitunits.push_back(tgextern);
                     }
                     // --jit with -o writes the C generator's C as well.
                     if (!tgwhole || !outfile.empty())
@@ -2085,6 +2117,7 @@ int Main(int argc, char **argv) {
             // runtime's headers; tinygen's C reads none.
             if (!jitunits.empty()) {
                 jitunits[0].insert(0, defines);
+                if (jitunits.size() > 2) jitunits[2].insert(0, defines);
                 program = std::move(jitunits);
             } else {
                 program = { assemble(true, true) };
@@ -2133,6 +2166,7 @@ int Main(int argc, char **argv) {
         program.clear();
         tgobject.clear();
         tgcsource.clear();
+        tgextern.clear();
         tgwhole = false;
         tgfallback = false;
         astp.reset();
@@ -2170,6 +2204,22 @@ int Main(int argc, char **argv) {
                     !b.CompileObject(tgcsource, tgobject, "compiling tinygen's C",
                                      cat(builddir, "/tgc.log")))
                     return 1;
+                // The extern unit, compiled as tinygen's C is, with the -D given.
+                vector<string> tgobjects;
+                if (!tgobject.empty()) tgobjects.push_back(tgobject);
+                if (!tgextern.empty()) {
+                    auto src = cat(builddir, "/", PathStem(filename), ".tgx.c");
+                    auto obj = cat(builddir, "/", PathStem(filename), ".tgx.o");
+                    if (!buildopts.dryrun &&
+                        !WriteFileMakingDirs(src, DefinesSource(cdefines, false) + tgextern)) {
+                        fprintf(stderr, "cannot write %s\n", src.c_str());
+                        return 1;
+                    }
+                    if (!b.CompileObject(src, obj, "compiling the extern unit",
+                                         cat(builddir, "/tgx.log")))
+                        return 1;
+                    tgobjects.push_back(obj);
+                }
                 pair<string, std::function<string()>> tgsupport;
                 if (tgwhole) {
                     // The -D given reach it, and make it a support object of their own.
@@ -2187,9 +2237,7 @@ int Main(int argc, char **argv) {
                 auto built = BuildExecutable(filename, tgwhole ? string() : outfile, builddir, tc,
                                              buildopts, msgs, rsps,
                                              astp->packages[0].output,
-                                             tgobject.empty() ? vector<string> {}
-                                                              : vector<string> { tgobject },
-                                             tgsupport);
+                                             tgobjects, tgsupport);
                 if (built || !tgrun || buildopts.dryrun) return built;
                 fflush(msgs);
                 fflush(stdout);

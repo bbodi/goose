@@ -157,7 +157,7 @@ beyond those in [§5](#5-options-for-run-build-and-check):
 | `--debug` | Turn on the overflow, range and tag checks (`GS_DEBUG=1`), and build the C without optimization and with debug information (`/Od /Zi`, or `-O0 -g`), for a debugger. |
 | `--cc name\|path` | The C compiler, as above. |
 | `--standalone` | Compile the runtime into the program, rather than linking the runtime object built once per C compiler. |
-| `--backend name` | Without it, a compiler with tinygen builds through tinygen's C (`tinygen-c`), or with `--debug` through tinygen's machine code (`tinygen`); a program tinygen cannot take whole (`--include`, `--standalone`, a library or an `export fn`) builds through the C generator's C (`c`), and `-v` says why. `-o x.c` writes that C and builds nothing. |
+| `--backend name` | Without it, a compiler with tinygen builds through tinygen's C (`tinygen-c`), or with `--debug` through tinygen's machine code (`tinygen`); a program tinygen cannot take whole (`--standalone`, a library or an `export fn`; `--include` with `-o x.c`) builds through the C generator's C (`c`), and `-v` says why. `-o x.c` writes that C and builds nothing. |
 | `-v` | Print each command the build runs, and what it prints. |
 | `--dry-run` | Print the commands the build would run, with their paths, and run none of them. A Makefile or CMake project can take them from here. |
 
@@ -323,7 +323,7 @@ against it (`goose version` prints the runtime's hash, which must match).
 | `-o out.c` | Write the program's C, and do not run it. |
 | `--standalone` | Write C that holds the whole runtime, and builds on its own: `cc -O2 tour.c -o tour -lm -pthread`. |
 | `--header out.h` | Also write a header for a C host, declaring the program's `export fn`s, of which there must be one at least. The C then has no `main`: the host calls `goose_init(argc, argv)` once, which runs the program's `main`, and then calls the exported functions. |
-| `--include header.h` | Have the generated C include this header, for small shims written against the generated types (spec §7.10). May be repeated. |
+| `--include header.h` | Have the generated C include this header, for small shims written against the generated types (spec §7.10). May be repeated. `goose build` and `goose run` take it too: with tinygen the header goes into a unit of the program's own, with the program's C types and the calls to its extern fns, so a static or inline function of the header can implement one. |
 | `--jit` | Also run the program in this process. |
 | `--emit-runtime out.c` | Write the runtime's C. |
 | `--<package>-link msvc\|cc` | Print the path of the response file that links the native part of a package compiled into `goose`, for the `msvc` or `cc` style of command line. |

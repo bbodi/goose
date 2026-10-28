@@ -1456,6 +1456,7 @@ struct CodeGen {
     // runtime's extern support (runtime_ext.h), which is written against
     // the types in the first.
     string head;     // Types and data.
+    string types;    // The types part of head, for the tinygen backend's extern unit.
     string result;   // Includes, prototypes and code.
     string ExportHeader();
 
@@ -1584,8 +1585,9 @@ struct CodeGen {
             for (auto &c : inc) if (c == '\\') c = '/';
             Append(includes, "#include \"", inc, "\"\n");
         }
-        Append(head, "\n/* ---- types ---- */\n#pragma pack(push, 1)\n", tdecls, pdata,
-               "#pragma pack(pop)\n\n/* ---- data ---- */\n", data);
+        types = cat("\n/* ---- types ---- */\n#pragma pack(push, 1)\n", tdecls, pdata,
+                    "#pragma pack(pop)\n");
+        Append(head, types, "\n/* ---- data ---- */\n", data);
         Append(result, "\n/* ---- includes ---- */\n", includes,
                "\n/* ---- extern prototypes ---- */\n", externs,
                "\n/* ---- prototypes ---- */\n", protos, "\n/* ---- code ---- */\n", code);
