@@ -3123,7 +3123,13 @@ struct TgFn {
                 return;
             }
             case TY_STRUCT: case TY_VARIANT:
-                cg.EachField(t, [&](TypeExpr *ft) { EqWalk(ft, ca, cb, fail, l); });
+                for (auto &run : cg.FieldRuns(t))
+                    for (size_t i = 0; i < run.fields->size(); i++) {
+                        auto &f = (*run.fields)[i];
+                        if (!f.ispad) EqWalk((*run.ftypes)[i], ca, cb, fail, l);
+                        // Stepped over, never compared (§4.5); a bare pad has no bytes here.
+                        else if (f.padsize > 0) adv(I64(f.padsize));
+                    }
                 return;
             case TY_ENUM: {
                 ContinueIf(Cmp(TYG_EQ, LoadTag(AtV(A()), t), LoadTag(AtV(B()), t)), fail);
@@ -3152,7 +3158,9 @@ struct TgFn {
         if (cg.IsFix(x)) return cg.BitwiseEq(x);
         switch (x->kind) {
             case TY_INT: case TY_REF: return true;
-            case TY_ARRAY: return EqBitwise(x->arr->sub);
+            // A runtime-capacity limited array's capacity and the slots past its length are no part of
+            // its value.
+            case TY_ARRAY: return x->arr->akind != A_LIMITED && EqBitwise(x->arr->sub);
             case TY_STRUCT: case TY_VARIANT: case TY_ENUM:
                 for (auto &run : cg.FieldRuns(x))
                     for (size_t i = 0; i < run.fields->size(); i++)
@@ -3808,6 +3816,16 @@ struct TgFn {
 
     // v.push(x) (EmitPush): the element, then the capacity check, the slot, the length. Its value is
     // the slot's address.
+    // What push and alloc_ref return for the element just added at `at` (CodeGen::NewElemResult): a
+    // reference to it (§3.3). An element that is itself a reference gives the one it holds instead,
+    // decoded if relative, as `&` of it does: there are no references to references (§3.8).
+    V NewElemResult(tyg_val at, TypeExpr *elem, TypeExpr *rt, Line l) {
+        if (elem->kind != TY_REF) return ValV(rt, at);
+        auto held = Load(P { AtV(at), elem }, l);
+        if (!held.mem) held.t = rt;
+        return held;
+    }
+
     V LimPush(Call *c, const P &pl) {
         auto dp = discardpush;
         discardpush = false;
@@ -3824,7 +3842,7 @@ struct TgFn {
         if (Ended()) return Dummy(c->exprtype);
         LimSetLen(pl, Add(LdL(nl), I64(1)));
         pushed = P { AtV(at), et };
-        if (c->exprtype && c->exprtype->kind == TY_REF) return ValV(c->exprtype, at);
+        if (c->exprtype && c->exprtype->kind == TY_REF) return NewElemResult(at, et, c->exprtype, c->line);
         if (!dp && c->exprtype && c->exprtype->kind != TY_VOID && M.TypeOk(et))
             return Load(*pushed, c->line);
         return V {};
@@ -4034,6 +4052,7 @@ struct TgFn {
         auto r = slot();
         if (c->exprtype && c->exprtype->kind != TY_REF && !M.IsScalar(c->exprtype) && M.TypeOk(elem))
             return Load(P { AtV(r), elem }, c->line);
+        if (c->exprtype && c->exprtype->kind == TY_REF) return NewElemResult(r, elem, c->exprtype, c->line);
         return ValV(c->exprtype, r);
     }
 
@@ -4342,6 +4361,7 @@ struct TgFn {
         if (b == B_THREAD_WAIT) return GenThreadWait(c);
         if (b == B_THREAD_SPAWN || b == B_THREAD_SPAWN_CONTAINED) return GenThreadSpawn(c);
         if (b == B_QPUT) return GenQput(c);
+        if (b == B_QLIMIT) return GenQlimit(c);
         if (b == B_QGET || b == B_QPOLL) return GenQget(c, idst);
         if (b >= 0) No(line, cat("builtin ", BuiltinByKind(b).name));
         if (c->fvbody) return GenFvCall(c);
@@ -4542,10 +4562,8 @@ struct TgFn {
             auto et = c->exprtype;
             if (et && et->kind != TY_REF && !cg.IsVoidT(et) && M.IsScalar(et))
                 return Fit(Load(ElemPlace(at, pl.t->arr->sub), c->line), et, c->line);
-            V r;
-            r.t = et && et->kind == TY_REF ? et : nullptr;
-            if (r.t) r.v = at;
-            return r;
+            if (et && et->kind == TY_REF) return NewElemResult(at, pl.t->arr->sub, et, c->line);
+            return V {};
         };
         if (IsGrow(pl.t) && M.VeOk(pl.t) && pl.stk) {
             // An image element: built at the top of the array's own stack, then counted.
@@ -4576,8 +4594,7 @@ struct TgFn {
         PushVal(pl.stk, et, x);
         St(la, Add(Ld(la), I64(1)));
         V r;
-        r.t = c->exprtype && c->exprtype->kind == TY_REF ? c->exprtype : nullptr;
-        if (r.t) r.v = top;
+        if (c->exprtype && c->exprtype->kind == TY_REF) r = NewElemResult(top, et, c->exprtype, c->line);
         // The element itself, as a value, where one is wanted.
         pushed = P { AtV(top), et };
         bool wanted = !r.t && !dp && c->exprtype && c->exprtype->kind != TY_VOID && M.TypeOk(et);
@@ -4646,14 +4663,25 @@ struct TgFn {
 
     // A user `format` overload rendering the value at pl (EmitUserFormat): handed the builder as a
     // gs_rref (its header and stack) and the value as the overload takes it.
-    void UserFormat(tyg_val stk, tyg_addr len, P pl, FnSpec *sp, Line l) {
+    // The node naming the pool a format(out, ...) renders into, while it renders: an overload whose
+    // specialization is keyed to a pool takes it as a pool reference (CodeGen::EmitUserFormat's out).
+    Node *outpool = nullptr;
+    // valnode is the argument being rendered when it is rendered whole, which a specialization keyed to a
+    // pool takes as a pool reference.
+    void UserFormat(tyg_val stk, tyg_addr len, P pl, FnSpec *sp, Line l, Node *valnode = nullptr) {
         string why;
         if (!M.SigOk(sp, false, why)) No(l, cat("format overload: ", why));
         auto &ci = cg.sinfo[sp];
         if (!ci.freevars.empty()) No(l, "format overload with free variables");
         auto pt = sp->argtypes[1];
-        auto r = PairLocal(AddrOf(AddrPlus(len, -8)), stk);
-        vector<tyg_arg> args { ArgOfMem(AtL(r)) };
+        vector<tyg_arg> args;
+        if (cg.IsPoolParam(sp, 0)) {
+            if (!outpool) No(l, "format overload keyed to a pool, for an output that names none");
+            PrefArg(outpool, args);
+        } else {
+            auto r = PairLocal(AddrOf(AddrPlus(len, -8)), stk);
+            args.push_back(ArgOfMem(AtL(r)));
+        }
         if (pl.enc || TgModule::IsVarint(pl.t)) {
             // A varint holds no i64: the overload is handed a temporary holding its value (RefArg).
             auto i64t = M.ast.inttypes[IS_I64];
@@ -4662,7 +4690,11 @@ struct TgFn {
             pl = P { AtL(tmp), i64t };
         }
         tyg_arg v {};
-        if (pt->kind == TY_REF && cg.IsFatRef(pt)) {   // A resizable by reference: gs_rref.
+        auto poolval = cg.IsPoolParam(sp, 1);
+        if (poolval) {   // A pool reference: gs_pref's four members.
+            if (!valnode) No(l, "format overload keyed to a pool, for a part of a value");
+            PrefArg(valnode, args);
+        } else if (pt->kind == TY_REF && cg.IsFatRef(pt)) {   // A resizable by reference: gs_rref.
             if (!pl.stk) No(l, "format overload taking a resizable without its stack");
             v = ArgOfMem(AtL(PairLocal(AddrOf(pl.a), pl.stk)));
         } else if (pt->kind == TY_REF) {
@@ -4676,7 +4708,7 @@ struct TgFn {
         } else {
             v = ArgOfMem(pl.a);
         }
-        args.push_back(v);
+        if (!poolval) args.push_back(v);
         if (ci.needssp) args.push_back(ArgOfVal(CalleeSp(sp, l)));
         auto sym = M.FnSym(ci.cname);
         Result(sp, ci.cret, M.Sig(sp), tyg_direct(sym), args);
@@ -4707,12 +4739,16 @@ struct TgFn {
         return Place(a);
     }
 
-    void TextInto(tyg_val stk, tyg_addr len, Call *c, const vector<Node *> &an, size_t from) {
+    void TextInto(tyg_val stk, tyg_addr len, Call *c, const vector<Node *> &an, size_t from,
+                  Node *outnode = nullptr) {
         auto outer = fmtc;
+        auto outerpool = outpool;
+        outpool = outnode;
         struct Restore {
             Call *&at, *was;
-            ~Restore() { at = was; }
-        } restore { fmtc, outer };
+            Node *&poolat, *poolwas;
+            ~Restore() { at = was; poolat = poolwas; }
+        } restore { fmtc, outer, outpool, outerpool };
         auto i64t = M.ast.inttypes[IS_I64];
         for (size_t i = from; i < an.size(); i++) {
             auto a = an[i];
@@ -4742,7 +4778,9 @@ struct TgFn {
                     if (d.enc) pl = d;
                 }
                 // The overload found for the argument's checked type, an i64 for a varint place.
-                if (pl.enc || TgModule::IsVarint(pl.t))
+                if (cg.IsPoolParam(cg.FmtSpecFor(fmtc, bt), 1))
+                    UserFormat(stk, len, pl, cg.FmtSpecFor(fmtc, bt), a->line, a);
+                else if (pl.enc || TgModule::IsVarint(pl.t))
                     UserFormat(stk, len, pl, cg.FmtSpecFor(fmtc, bt), a->line);
                 else RenderInto(stk, len, pl, false, a->line);
                 continue;
@@ -5069,7 +5107,7 @@ struct TgFn {
         }
         if (!IsGrow(pl.t) || !M.RzOk(pl.t) || !pl.stk || !IsU8(pl.t->arr->sub))
             No(c->line, "format into an array of this kind");
-        TextInto(pl.stk, CountAt(pl.a), c, an, 1);
+        TextInto(pl.stk, CountAt(pl.a), c, an, 1, an[0]);
         return V {};
     }
     // Arguments that are all simple text into a static-capacity u8[..k] (CodeGen::EmitFormatInto):
@@ -5245,7 +5283,7 @@ struct TgFn {
     vector<V> GenCallAll(Node *n, size_t count) {
         auto c = Is<Call>(n);
         if (c && c->builtin == B_FROM_BYTES && count == 2) return GenFromBytes(c);
-        if (!(c && c->builtin == B_QPOLL && count == 2) && !DestSpec(c))
+        if (!(c && (c->builtin == B_QPOLL || c->builtin == B_QGET) && count == 2) && !DestSpec(c))
             No(n->line, "multiple results of this kind");
         GenCall(c);
         if (lastrets.size() != count) No(n->line, "result count");
@@ -5418,6 +5456,17 @@ struct TgFn {
                                 IT(TYG_I64)));
     }
 
+    // qlimit<T>(n): the most messages the queue holds, n at least one (checked by the runtime).
+    V GenQlimit(Call *c) {
+        if (!QueueOk(c->qtype)) No(c->line, cat("queue element of type ", M.NameWhy(c->qtype)));
+        auto n = GenAs(c->ArgNodes()[0], M.ast.inttypes[IS_I64]);
+        if (Ended()) return V {};
+        auto ptr = tyg_type_ptr(m);
+        CallC("gs_qlimit", { ptr, IT(TYG_I64), ptr, IT(TYG_I32) },
+              { QueueAddr(c->qtype), n.v, FileArg(c->line), LineArg(c->line) }, nullptr);
+        return V {};
+    }
+
     V GenQput(Call *c) {
         auto an = c->ArgNodes();
         auto t = an[0]->exprtype;
@@ -5447,20 +5496,29 @@ struct TgFn {
             size = I64(cg.FixedSize(t));
         }
         if (Ended()) return V {};
-        CallC("gs_qput", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64) },
-              { QueueAddr(t), ptr, size }, nullptr);
-        return V {};
+        // Whether the queue took it: false when it is full (§11.2).
+        return ValV(M.ast.booltype, CallC("gs_qput", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64) },
+                                         { QueueAddr(t), ptr, size }, IT(TYG_I8, false)));
     }
 
-    // qget<T>() and qpoll<T>() (CodeGen's B_QGET): the oldest node's bytes, the node freed; a missed
-    // poll gives the zero value and false (a poll of an image is left to C).
+    // qget<T>(), qget<T>(ms) and qpoll<T>() (CodeGen's B_QGET): the oldest node's bytes, the node freed;
+    // qpoll and qget(ms) say whether a value came, and a miss gives the zero value and false (a miss of
+    // an image is left to C).
     V GenQget(Call *c, tyg_val idst) {
         auto t = c->rettypes[0];
-        auto poll = c->builtin == B_QPOLL;
+        auto poll = c->rettypes.size() > 1;
         if (!QueueOk(t) || (poll && !cg.IsFix(t) && !M.Resz(t)))
             No(c->line, cat("queue element of type ", M.NameWhy(t)));
-        auto node = CallC(poll ? "gs_qpoll" : "gs_qget", { tyg_type_ptr(m) }, { QueueAddr(t) },
-                          IT(TYG_I64));
+        tyg_val node;
+        if (c->builtin == B_QPOLL) {
+            node = CallC("gs_qpoll", { tyg_type_ptr(m) }, { QueueAddr(t) }, IT(TYG_I64));
+        } else if (poll) {   // Waits up to the given milliseconds.
+            auto ms = GenAs(c->ArgNodes()[0], M.ast.inttypes[IS_I64]);
+            if (Ended()) return Dummy(t);
+            node = CallC("gs_qwait", { tyg_type_ptr(m), IT(TYG_I64) }, { QueueAddr(t), ms.v }, IT(TYG_I64));
+        } else {
+            node = CallC("gs_qget", { tyg_type_ptr(m) }, { QueueAddr(t) }, IT(TYG_I64));
+        }
         auto got = [&] { return Cmp(TYG_NE, node, I64(0)); };
         // The node is taken and freed where there is one.
         auto take = [&](auto body) {
@@ -6146,6 +6204,9 @@ struct TgFn {
                 for (int k = 0; k < 4 && !Ended(); k++) shared[i].push_back(ArgOfVal(LdL(l, 8 * k)));
             } else if (M.RzParam(pt)) {
                 ValArg(an[i], pt, shared[i]);
+            } else if (TgModule::IsRel(pt)) {
+                // A relative parameter takes the offset, encoded once here, before the tag picks the case.
+                shared[i].push_back(Arg(an[i], pt));
             } else {
                 if (!M.TypeOk(pt)) No(an[i]->line, "argument of this type");
                 auto x = GenAs(an[i], pt);
@@ -7960,6 +8021,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                 case B_QPUT:
                 case B_QGET:
                 case B_QPOLL:
+                case B_QLIMIT:   // QueueFor sets usesthreads in the C generator.
                     return true;
                 default:
                     break;

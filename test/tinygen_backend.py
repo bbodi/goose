@@ -262,9 +262,12 @@ NATIVE = sorted(p for d in NATIVE_DIRS for p in (HERE / d).glob("*.goose")
 PROGRAMS += [(str(p.relative_to(ROOT)), True, []) for p in NATIVE]
 WHOLE_PROGRAM |= {p.stem for p in NATIVE}
 
-# Programs of the main suite that sweeping found wrong or refused by the backend: whole
+# Programs of the main suite that sweeping found wrong or refused by the backend (G4.2): whole
 # programs, so that the suite fails on a wrong output and on any function left to C.
-REGRESSIONS = ["test/codegen/forward_adaptation.goose"]
+REGRESSIONS = ["test/codegen/forward_adaptation.goose", "test/codegen/bytes_value_equality.goose",
+               "test/codegen/reference_element_results.goose", "test/codegen/relative_operands.goose",
+               "test/codegen/rendered_pools.goose", "test/threads/queue_producers.goose",
+               "test/threads/qlimit_negative.goose", "test/threads/qlimit_zero.goose"]
 PROGRAMS += [(path, True, []) for path in REGRESSIONS]
 WHOLE_PROGRAM |= {Path(path).stem for path in REGRESSIONS}
 
