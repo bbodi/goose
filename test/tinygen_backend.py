@@ -296,8 +296,17 @@ WHOLE_PROGRAM |= {Path(path).stem for path in REGRESSIONS + DEBUG_REGRESSIONS}
 # Programs the backend does not yet build whole: each leaves the named functions to the C generator
 # (the reference semantics), so the suite proves the fallback gives the blessed output today. An entry
 # moves to REGRESSIONS once its refusal is lifted, and each comment names the refusal it reaches.
-# None is left now.
 GAPS = [
+    # "reference result copied as a frame object": copy() of a call returning Fo&.
+    "test/codegen/frame_object_copy_of_reference.goose",
+    # "from_bytes of this source": the source is a bytes_of view.
+    "test/codegen/from_bytes_of_view.goose",
+    # "variable type of x: S33 [...]": a local struct nested 34 levels deep.
+    "test/codegen/deep_nested_structs.goose",
+    # "float compound assignment": %= on a float.
+    "test/codegen/float_remainder_assign.goose",
+    # "value of type Fo": a block breaking with a frame object.
+    "test/codegen/frame_object_block_value.goose",
 ]
 PROGRAMS += [(path, False, []) for path in GAPS]
 # Results with relative links written by the callee into its caller's slot (and a return from's channel)
