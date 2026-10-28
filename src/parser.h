@@ -140,7 +140,7 @@ struct Parser {
             case T_IMPORT: case T_NAMESPACE: case T_STRUCT: case T_ENUM: case T_TYPE:
                 return declaration;
             case T_IF: case T_MATCH: case T_LOOP: case T_WHILE: case T_FOR: case T_GUARD:
-            case T_RETURN: case T_BREAK: case T_CONTINUE:
+            case T_DEFER: case T_RETURN: case T_BREAK: case T_CONTINUE:
                 return !declaration;
             default:
                 return AtInline() || AtCheckfree();
@@ -1235,6 +1235,8 @@ struct Parser {
             }
             case T_GUARD:
                 Error("guard is a statement: it guards the rest of the block it is in");
+            case T_DEFER:
+                Error("defer is a statement: it runs its body when the block it is in ends");
             case T_RETURN: {
                 lex.Next();
                 auto sub = Sub(no_struct_lit);
@@ -1966,8 +1968,20 @@ struct Parser {
             case T_GUARD:
                 ParseGuard(b);
                 return false;
+            case T_DEFER:
+                b->stmts.push_back(ParseDefer());
+                return true;
             default: break;
         }
+        return ParseExprStatement(b, true);
+    }
+
+    // The statements that start with an expression: an assignment, an
+    // increment, several targets taking a call's results, or the expression
+    // itself for its effect; and the block's tail, where `tailok`, which ends
+    // the block (returns false). Without it the statement must end in a `;`
+    // or be a block-ended construct.
+    bool ParseExprStatement(Block *b, bool tailok) {
         stmt_level = true;
         auto e = ParseExpr();
         stmt_level = false;
@@ -2001,7 +2015,7 @@ struct Parser {
             b->stmts.push_back(e);
             return true;
         }
-        if (IsNext(T_RCURLY)) {
+        if (tailok && IsNext(T_RCURLY)) {
             b->tail = e;  // Trailing expression: the block's value.
             return false;
         }
@@ -2011,6 +2025,33 @@ struct Parser {
             return true;
         }
         Error(cat("\';\' expected after expression, found \'", TokStr(), "\'"));
+    }
+
+    // `defer { ... }` and `defer s;` (§6.6), the latter a body of the one
+    // statement s, which is one of the expression statements: a declaration
+    // would be out of scope as soon as it ran, and a guard guards the rest
+    // of a block, which the body has none of.
+    Node *ParseDefer() {
+        auto line = CurLine();
+        lex.Next();
+        Block *body;
+        if (lex.tok == T_LCURLY) {
+            body = ParseBlockExpr("defer body");
+            IsNext(T_SEMI);  // A redundant ';' after the block.
+        } else {
+            switch (lex.tok) {
+                case T_LET: case T_VAR: case T_CONST: case T_REUSABLE: case T_GUARD: case T_DEFER:
+                case T_FN: case T_RECURSIVE: case T_THREADFN: case T_EXTERN: case T_EXPORT:
+                case T_SIMD:
+                    Error(cat("defer takes a statement or a block, not `", TokStr(), "`"));
+                default: break;
+            }
+            body = New<Block>(line);
+            stmt_ended = false;
+            ParseExprStatement(body, false);
+            Finish(body);
+        }
+        return Finish(New<Defer>(line, body));
     }
 
     // `a, b = f();` assigns a call's results to places that exist (§7.1),

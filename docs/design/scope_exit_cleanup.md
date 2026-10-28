@@ -28,10 +28,13 @@
 
 </details>
 
-Research note, October 2026. Nothing described here is implemented. The
-question is whether Goose should run code when a scope ends, and if so in
-which of the forms other languages have settled on: an explicit `defer`
-statement, destructors on types, or something shaped by Goose's own pools.
+Research note, October 2026. Of what is described here, `defer` (3.1) is
+implemented as section 6 recommends, with `exception::try`'s `finally`
+(3.5); the pool finalizers, scoped allocations, `errdefer` and destructor
+types are not. The question was whether Goose should run code when a scope
+ends, and if so in which of the forms other languages have settled on: an
+explicit `defer` statement, destructors on types, or something shaped by
+Goose's own pools.
 
 ## 1. Where Goose stands
 

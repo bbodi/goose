@@ -268,6 +268,12 @@ function per construct. Points that matter to later passes:
   in a tail, and as its last statement otherwise. No later pass has a guard
   node, and `--dump` prints the `if`. A guard anywhere other than among a
   block's statements is a parse error.
+* `defer s;` parses to a `Defer` node whose body is a block of the one
+  statement `s`, which is an assignment, an increment, several targets
+  taking a call's results, or an expression statement (`ParseDefer`);
+  `defer { … }` keeps its block. `--dump` writes the statement form back
+  where the body is one statement. Like a guard, a defer is a parse error
+  anywhere but among a block's statements.
 * Recovery (`docs/design/language_server.md` §5 D). When a statement
   raises an error, the error is reported (`Ast::Report`) and the statement
   is dropped. `ParseBlockBody` catches the `CompileError` and then:
@@ -3967,6 +3973,43 @@ when checking shrinking, construction conflicts, optional narrowing and
 when retaining bounds facts. Optimizations may remove effects only after
 the program has passed the language's static checks.
 
+### 3.16 `defer`
+
+A `defer` (§6.6) is checked where it is written (`CheckDefer`). Its body is
+a block in a scope of its own kind (`SK_DEFER`), so a `break` or `continue`
+looking for its loop (`FindBreakScope`) and a `return` of any kind
+(`CheckReturn`, `InDeferBody`) stop at it and are rejected, a `return` in a
+function value written in the body included, since the value's frame is
+lexically inside the body's scopes (`Frame::lexframe`). The flow state the
+body is checked in is the statement's less the narrowing of every `var`,
+which an assignment between the statement and an exit may undo; the flow
+after the statement is the flow before it, since the body's assignments
+happen at exits that nothing in the block observes. The body's stores,
+growths and shrinks are recorded like any statement's, and the lifetime
+rules see the variables live at the statement, which are at least those
+live at any exit.
+
+Two rules need the whole program and run after every root (`CheckDefers`).
+The body may call nothing that uses long-distance return machinery: a
+specialization with a `return … from` site or on a propagation path
+(`FnSpec::needs`), one that catches one, or one that calls either, which is
+one flag per specialization computed as a fixpoint over the call graph; the
+error names the chain of calls. A body runs in the epilogue of a frame a
+long-distance return passes through, while `gs_rf` and the target's
+channels hold the return in flight (§6.6 below), and a contained throw and
+catch in a callee would clear `gs_rf` on its way out, so the rule covers
+the catch too. And the body may not name the local a function returns by
+name (`NamedResultOf`, for a non-fixed result): that local is built at the
+result destination, and the return records its count before the body runs.
+Every identifier a body names of a variable declared outside it is recorded
+as the body is checked (`NoteDeferMention`), through the function values
+and nested functions written in it; a program without a `defer` pays one
+test per identifier for this (`deferbodies`). A nested function the body
+calls, or a named function it passes as a value, may have been checked
+before the `defer` and be reused there, so what such a callee names is read
+from its record of the variables outside its activation
+(`FnSpec::envreads`), which every call site fills, reused or not.
+
 ---
 
 ## 4. The optimizer
@@ -4228,7 +4271,9 @@ calls, so `1 + check(l) + check(r)` loses its right spine only. Parameters
 must be rebindable (scalars, or plain non-fat, non-pool, non-relative
 references whose new value points outside the activation). Tails inside
 loops or function-value bodies are skipped, and a callee that can
-`return ... from` the function disables the transform. The recursion keeps
+`return ... from` the function disables the transform, as does a `defer`
+anywhere in the body, whose run after a tail call's return the loop could
+not reproduce. The recursion keeps
 each caller's locals and by-value parameters alive and unchanged under its
 call, whereas the loop reinitializes and rebinds them for the next
 iteration. So the loop cannot carry a reference that a tail call passes
@@ -4489,6 +4534,12 @@ These invalidate facts:
   (`ChainOf`); as for a place, crossing the root itself does not count as
   reading a stored reference;
 * a rebind of a reference variable (`RebindKill`);
+* a `defer` body (`Defer::BceWalk`), which runs at every exit of its block
+  rather than where it is written: its kills apply where it is written and
+  again where its block ends (`Block::BceWalk`), and the loops and
+  `block`s a break leaves strip their whole body's kills, this body's
+  among them. Its own checks are judged without the facts of its position,
+  which a write before an exit may have undone;
 * a reference stored into a field or an element, either by rebinding one
   held there or by storing a value that holds one (`RefSlotWriteKill`).
   This kills every place whose path reads a stored reference
@@ -4966,7 +5017,14 @@ dedicated stacks outside the indexed block. Scopes mirror C braces
 (`CScope`): every nonfixed local's base pointer doubles as the watermark
 restored at scope exit. Every exit path (fallthrough, `break`, `continue`,
 `return`, propagation) emits the restores of the scopes it leaves, in
-reverse declaration order (`EmitExitRestores`). A statement gets a scope of
+reverse declaration order (`EmitExitRestores`). A `defer` registers its
+body in its block's scope beside the restores (`RegisterDefer`), and every
+exit emits the body where it meets it in that order: after the restores of
+what was declared after it, before those of what was declared before it
+(`EmitRestores`, `EmitDeferBody`). The body is emitted once per exit, in a
+C block of its own, with its declarations named afresh each time
+(`NameScope`); a scope without a `defer` emits as it always did. A
+statement gets a scope of
 its own (`SC_STMT`), so that a temporary's stack is free again at the next
 statement. So does the right operand of `&&` and `||`, whose temporaries
 exist only when it runs. A local's allocation skips the statement scopes
@@ -5346,8 +5404,9 @@ destination stacks for nonfixed ones (`gs_fdst_<id>_<i>`, recorded at the
 target's entry and restored at its exit). A propagating function's ordinary
 exit writes nothing. A call on a propagation path costs one load and a
 never-taken branch, and an intermediate frame returns a dummy value after
-restoring its watermarks. `--unsafe-no-rf-check` omits the checks, for
-measurement only.
+restoring its watermarks and running its `defer` bodies (§6.6), which the
+checker keeps free of this machinery (§3.16). `--unsafe-no-rf-check` omits
+the checks, for measurement only.
 A fixed relative aggregate's `gs_lret` channel is a pointer to the target's
 receiving storage, saved and restored at target entry/exit. The nonlocal
 return constructs through it, and the catch has no value to copy.
@@ -6018,8 +6077,9 @@ TinyCC and other targets get no overhead from it. A build can lower it with
   `gs_mul_add_separate` (`x * y + z`, two roundings under the contraction
   pragma), so a call gets the mode in force where it is emitted.
   `runtime.h` sets the mode to `GS_MUL_ADD_BASE`: fused where the whole
-  translation unit has FMA (`__FMA__`, arm64, MSVC's `/arch:AVX2`), and
-  separate elsewhere and under TinyCC. `EmitSimdVersions` sets it to fused
+  translation unit has FMA (`__FMA__`, arm64), and separate elsewhere,
+  under TinyCC and under MSVC, whose `fma()` is a call into the C library
+  even with `/arch:AVX2` (a matrix multiply ran 2.7x slower fused). `EmitSimdVersions` sets it to fused
   before each version past the baseline, whose target attribute includes
   FMA, and back to the base after, so the baseline's copy of the body keeps
   the target's mode.
@@ -6057,6 +6117,59 @@ TinyCC and other targets get no overhead from it. A build can lower it with
   it, so the programmer says which functions get versions. The cost of
   `simd` is the body once per level and one predicted branch on a load per
   call.
+
+### 6.14 Elementwise float arithmetic as vectors
+
+Elementwise arithmetic (spec §6.1) is emitted member by member
+(`GenElemwiseInto`, `GenElemwiseNegInto`), and clang's SLP vectorizer then
+has to find the vectors again, which it only partly does. In goose-fft's
+radix-8 pass, whose butterflies are arithmetic on structs of four `f64`, the
+AVX2 version had 208 two-lane operations next to 175 four-lane ones, and
+spilled. So where the C compiler has GCC's vector extensions, a `+`, `-`,
+`*`, `/` or negation of a value whose leaves are all floats of one width,
+2, 4, 8 or 16 of them in 16, 32 or 64 bytes with nothing else in it, is one
+operation on a vector type of the same size (`gs_vf64_4` and the others in
+`runtime.h`). `VecShape` decides which values qualify: structs, nested
+structs and fixed arrays alike. It rejects a type over 64 bytes before
+looking at its leaves, and stops at the seventeenth, so a large nested array
+costs nothing to check.
+
+* **Same results.** The vector type's lanes are the members in order, and
+  each lane rounds as the member's own operation would: IEEE operations
+  don't depend on how many happen at once, and contraction is off (§6.13).
+  A scalar operand of `*` or `/` goes to every lane through a vector
+  literal.
+* **Same layout.** The value stays its struct. Both operands are first
+  copied to temps of the struct's own type, so a destination that is one of
+  them, or whose member a scalar operand reads, works as it does member by
+  member. The temps are read and the destination written through the vector
+  type (`GS_VLD`, `GS_VST`), which is `aligned(1)`, since a struct of
+  floats may sit anywhere (structs are packed), and `may_alias`, since it
+  reads memory written as floats.
+* **Only in expressions.** The vector code uses the vector types only
+  inside expressions, never for a local (the generated code gathers
+  declarations at the top of a function, outside the `#if`) and never as a
+  parameter or result. A first version loaded and stored through inline
+  functions: inside a `simd fn`'s AVX2 version that passed a 32-byte vector
+  between code built for AVX and code that wasn't, which the x86-64 ABI
+  forbids, and clang rejected it for Linux and macOS (Windows accepted it).
+* **Where.** The vector form is under `#if GS_VEC`, temps included, with
+  the member-by-member form under `#else`, so TinyCC pays nothing for it.
+  `runtime.h` sets `GS_VEC` under clang and gcc, not MSVC or TinyCC, which
+  have no vector extensions; `-DGS_VEC=0` turns it off.
+* **Effect.** In goose-fft the radix-8 pass's AVX2 version came to 12
+  two-lane operations next to 261 four-lane ones, a third fewer spills and
+  no shuffles, and transforms of 16 to 16,384 points ran 1.25-1.6x faster
+  (memory-bound lengths about even). Code that computes a whole struct and
+  then takes it apart member by member can pay instead: computing a vector
+  and extracting every lane costs more than the scalars did. goose-fft had
+  one such loop, which was 10% slower until its multiplies were written per
+  lane.
+* **Tests.** `test/codegen/vec_elemwise.goose` covers each vector type, in
+  plain functions and in a `simd fn`, and shapes that don't qualify. The
+  runner's `clang_vec` builds it with `GS_VEC` on and off. The `simd fn`
+  cases are the ones that failed on x86-64 Linux and macOS (above), whose CI
+  runs that task.
 
 ---
 
@@ -6120,15 +6233,12 @@ the rest of a partial page committed at its end.
 On Windows, pages are
 committed on fault by a vectored handler that tells a commit from an
 overrun. When the system refuses a commit (because its commit limit is
-reached), the handler reports it as out of memory. macOS also commits on
-fault, through the runtime's signal handler: the whole region is mapped
-`PROT_NONE`, and the handler opens the usable part 1 MB at a time, starting
-from the page that faulted. Linux reserves with overcommit and protects only
-the gap. Runtime C therefore writes to a stack only in user mode (`memcpy`,
+reached), the handler reports it as out of memory. macOS and Linux map the
+usable region read/write and protect only the gap; the kernel supplies
+physical pages on demand, without calling the runtime's signal handler.
+To support Windows, runtime C writes to a stack only in user mode (`memcpy`,
 `gs_bld_append`) and never through a system call, because a system call
-would fail on an unopened page instead of faulting. A debugger sees each
-such fault first (lldb stops on its `EXC_BAD_ACCESS` unless it is passed on
-to the program).
+would fail on an uncommitted page instead of faulting.
 
 If the platform refuses a region (because its address
 space, an address-space limit or strict overcommit accounting is exhausted),
@@ -6155,15 +6265,17 @@ thread program's regions.
 
 **Trimming.** `os.trim_memory` (`gs_trim_memory`) walks the calling thread
 program's registry and gives back each region's complete pages above its
-stack's top. Windows decommits them, macOS marks them reusable
-(`MADV_FREE_REUSABLE`) and closes them again, and Linux drops them with
-`MADV_DONTNEED`. Windows and macOS stop at the highest page the fault
-handler has opened (`gs_region::committed`), so a trim never sweeps the
-whole reservation. macOS also records the stretch it trimmed, so that as
-growth reopens those pages, its handler declares them reused
-(`MADV_FREE_REUSE`) and the footprint counts them again. Each region records
-its stack's descriptor, and the descriptor's top in memory must be current
-at the call. The extern is therefore marked `SFunction::readsalltops`, so
+stack's top. Windows decommits them, stopping at the highest page the fault
+handler has committed (`gs_region::committed`). Linux drops them with
+`MADV_DONTNEED`. macOS replaces the unused suffix of the reservation with
+a fresh read/write anonymous mapping using `MAP_FIXED`. XNU replaces the
+mapping atomically, so another thread cannot claim the addresses during
+the trim. The live partial page and guard gap remain outside that range.
+Trimming covers the full unused reservation on macOS; ordinary allocation
+and regrowth need neither a high-water mark nor a runtime-handled fault.
+Each region records its stack's descriptor, and the descriptor's top in
+memory must be current at the call. The extern is therefore marked
+`SFunction::readsalltops`, so
 that a call to it writes back every cached top. `CodeGen::CollectSpecs`
 marks every function that may reach the extern, and the callers of those
 functions also write back all their cached tops around the call

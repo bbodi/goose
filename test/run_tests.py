@@ -501,7 +501,12 @@ class Runner:
     def goose_argv(self, args):
         # Resource-bound regressions use the same runtime configuration
         # through generated C and TinyCC, at every optimization level.
-        return [self.exe] + ["-D" + d for d in runtime_defines(args[-1])] + [str(a) for a in args]
+        # --stats for the parsed ok and typechecked ok lines the checks read,
+        # after the command where the arguments start with one.
+        args = [str(a) for a in args]
+        verb = args[:1] if args and not args[0].startswith("-") and len(args) > 1 else []
+        return ([self.exe] + verb + ["--stats"] + ["-D" + d for d in runtime_defines(args[-1])] +
+                args[len(verb):])
 
     def screened(self, what, result):
         """A compiler run's result, failing the current piece of work if the
@@ -540,7 +545,7 @@ class Runner:
         as theirs. A batch that exits with an error after every mark, or
         prints anything after the last one (a leak report), gets through
         none."""
-        argv = [self.exe, "--multi-test"] + [str(a) for a in args] + [str(f) for f in files]
+        argv = [self.exe, "--multi-test", "--stats"] + [str(a) for a in args] + [str(f) for f in files]
         code, out, err = tc.run_capture(argv)
         outs, outrest = split_multi(out, files)
         errs, errrest = split_multi(err, files)
@@ -1760,6 +1765,24 @@ def main():
         else:
             r.ok(f"member stores {f.name}")
     r.show_task(member_stores)
+    # A constant array of listed elements is static data at any length, and
+    # a long fill keeps its runtime initialization (MAXSTATICELEMS).
+    def static_arrays():
+        f = HERE / "codegen" / "const_global_folding.goose"
+        cfile = gendir / "const_global_folding-static.c"
+        code, out, err = r.goose("-O1", "-o", cfile, f)
+        if code != 0:
+            r.fail(f"static arrays {f.name}", out + err)
+            return
+        text = cfile.read_text()
+        listed = re.search(r"^static const a260_i64 LONG_g\w* = ", text, re.MULTILINE)
+        filled = re.search(r"^static const \w+ FILLED_g", text, re.MULTILINE)
+        if not listed or filled:
+            r.fail(f"static arrays {f.name}",
+                   f"LONG static: {bool(listed)}, FILLED static: {bool(filled)}")
+        else:
+            r.ok(f"static arrays {f.name}")
+    r.show_task(static_arrays)
 
     # Every annotated regression, including the expected-abort cases. These
     # describe the default O1 pass; O0/O2 execution checks semantics.
@@ -1970,6 +1993,43 @@ def main():
                     else:
                         r.ok(label)
 
+        # Elementwise float arithmetic as one vector operation (GS_VEC,
+        # runtime.h): vec_elemwise's struct and array shapes are computed
+        # through each of the six vector types where the compiler has vector
+        # extensions, and nothing else is. Built by clang with GS_VEC on and
+        # off, both print the member-by-member results.
+        def clang_vec():
+            name = "vec_elemwise"
+            src = gendir / "vecclang.c"
+            code, out, err = r.goose("-O2", "-o", src, HERE / "codegen" / f"{name}.goose")
+            if code != 0:
+                r.fail(f"vec-clang {name}.goose", out + err)
+                return
+            ctext = src.read_text(encoding="utf-8")
+            missing = [v for v in ("gs_vf64_2", "gs_vf64_4", "gs_vf64_8", "gs_vf32_4", "gs_vf32_8", "gs_vf32_16")
+                       if f"GS_VST({v}," not in ctext]
+            if missing:
+                r.fail(f"vec-clang {name}.goose", f"no vector operations on {', '.join(missing)}")
+                return
+            # The generated code's tests are indented; runtime.h's are not.
+            opens = len(re.findall(r"^\s+#if GS_VEC$", ctext, re.M))
+            elses = len(re.findall(r"^\s+#else$", ctext, re.M))
+            if opens == 0 or opens > elses:
+                r.fail(f"vec-clang {name}.goose", f"{opens} vector operations, {elses} member-by-member ones")
+                return
+            for on in ("1", "0"):
+                label = f"vec{on}"
+                out_exe = gendir / f"vecclang-{on}{tc.EXE_SUFFIX}"
+                ok, log = clang.compile(src, out_exe, opt=2, warn="off", strict_decls=True,
+                                        defines=[f"GS_VEC={on}"], runtime=r.runtime,
+                                        log=gendir / f"vecclang-{on}.log")
+                if not ok:
+                    r.fail(f"{label}-clang {name}.goose", "\n".join(log.splitlines()[:8]))
+                    continue
+                out = r.run_expected([out_exe], name, f"clang-{label} {name}.goose")
+                if out is not None and r.check_stdout(name, f"clang-{label}", out):
+                    r.ok(f"{label}-clang {name}.goose")
+
         if args.profile == "sanitize":
             pass  # The full generated-C suite already ran through Clang.
         elif not clang:
@@ -1981,14 +2041,15 @@ def main():
             r.show_task(clang_simd, "stdlib_base64", HERE / "stdlib" / "stdlib_base64.goose",
                         clang_simd_named("base64_encode", "base64_decode"))
             r.show_task(clang_mul_add)
+            r.show_task(clang_vec)
 
     r.section("driver, diagnostics and language server")
 
     def driver_verbs():
         """The verb forms of the command line against the flag forms they
         stand for: `goose run`, `goose check` and `goose version`, the help, a
-        mistyped command, --color, -q, the completion scripts and the man
-        page."""
+        mistyped command, --color, --stats, the completion scripts and the
+        man page."""
         probe = gendir / "verbs.goose"
         tc.write_text(probe, 'fn main() { print("verbs"); }\n')
         checks = []
@@ -1996,7 +2057,9 @@ def main():
             code, out, err = tc.run_capture([exe, "run", probe])
             checks.append(("run", code == 0 and out.strip() == "verbs", out + err))
         code, out, err = tc.run_capture([exe, "check", probe])
-        checks.append(("check", code == 0 and "typechecked ok" in out + err and
+        checks.append(("check", code == 0 and not out and not err, out + err))
+        code, out, err = tc.run_capture([exe, "check", "--stats", probe])
+        checks.append(("check --stats", code == 0 and "typechecked ok" in out + err and
                        "verbs" not in out, out + err))
         code, out, err = tc.run_capture([exe, "run", "-o", str(gendir / "verbs.c"), probe])
         checks.append(("run -o (refused)", code != 0 and "takes no -o" in err, out + err))
@@ -2031,9 +2094,6 @@ def main():
         code, out, err = tc.run_capture([exe, "check", "--color", "sometimes", probe])
         checks.append(("--color sometimes (refused)", code == 1 and "auto, always or never" in err,
                        out + err))
-        # -q leaves only what the program prints.
-        code, out, err = tc.run_capture([exe, "check", "-q", probe])
-        checks.append(("check -q", code == 0 and not out and not err, out + err))
         # The completion scripts, from the help: each names every command,
         # and bash's, run, completes a command, an option and a file.
         for shell in ["bash", "zsh", "fish", "powershell"]:

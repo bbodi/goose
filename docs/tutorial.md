@@ -95,8 +95,9 @@ goose build hello.goose && ./hello
 
 `goose -o hello.c hello.goose` writes the C for you to build yourself, and
 `goose build --dry-run hello.goose` prints the commands.
-[packages.md](packages.md) describes the rest of `goose build`, and how a
-program uses libraries from other repositories.
+[command_line.md](command_line.md) describes the rest of `goose build` and
+the other commands, and [packages.md](packages.md) how a program uses
+libraries from other repositories.
 
 The bundled TinyCC backend needs no separate C compiler. With no verb, or
 with `goose run`, the program is compiled into the compiler's own process and
@@ -192,6 +193,21 @@ let verdict = block {
     "standing"
 };
 ```
+
+`defer` runs a statement or a block when the enclosing block ends, whichever
+way it ends: the end of the block, `break`, `continue`, `return`, or a
+`return … from` passing through. The cleanup stays next to what it cleans
+up, and runs on the ways out that the code after it does not mention:
+
+```goose
+guard gfx::open("demo", 640, 480, 0) else { return; }
+defer gfx::close();                 // every way out of this block from here on
+```
+
+A `defer` in a loop body runs at the end of each iteration, and an exit runs
+only the defers it has run past, latest first. The body cannot jump out, and
+it cannot use long-distance returns, since it may run while one is in
+flight.
 
 Loops are `for x in range_or_array`, `while`, and `loop`:
 
@@ -1142,7 +1158,7 @@ The [`exception` module](stdlib.md#exception) packages this mechanism as
 `exception::try<E>(body) { error => ... }` and `exception::throw(value)`.
 It can catch owned text or application-defined error values without naming
 the application's outer function at each throw site. See its reference for
-the ownership and recursion restrictions; it does not provide `finally`.
+the ownership and recursion restrictions. Its `finally` is a `defer`.
 
 The same machinery lets a block `return` from its enclosing function rather
 than from the HOF that calls it
@@ -1506,6 +1522,8 @@ fn blur_row(above: u8[:], here: u8[:], below: u8[:], out: u8[:]) {
     }
 }
 ```
+
+`goose check --stats` reports what it removed:
 
 ```
 bce: elided 11/11 index and 0/4 slice checks

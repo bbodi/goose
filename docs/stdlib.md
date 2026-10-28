@@ -104,9 +104,10 @@ The library uses these conventions:
   §3.9).
 * The `std`, `dictionary`, `vec`, `math`, and `os` names are global;
   `ffi`, `binary`, `base64`, `csv`, `json`, `regex`, `audio`, `gfx`,
-  `physics`, `ui` and `exception` use their own namespaces. A local named
-  `fill` or `count` shadows the global function of that name, so a call to
-  that function is an error. A global variable of such a name does not
+  `physics`, `ui` and `exception` use their own namespaces, and so do the
+  helpers `std` and `json` read and write float text with, in `float_text`.
+  A local named `fill` or `count` shadows the global function of that name,
+  so a call to that function is an error. A global variable of such a name does not
   shadow it, because the name in a call resolves past global variables to
   the functions (spec §11.1).
 
@@ -160,6 +161,8 @@ fn hash_combine(seed: u64, h: u64) -> u64
 
 These hashes mix all of their input into the low 32 bits. `dictionary`
 masks those bits to find the home slot and keeps them as the slot's tag.
+A float hashes as its bits, `-0.0` as `0.0`, and an `f32` as the `f64` of
+its value.
 `dictionary` also picks up a `hash` overload for a user key type, declared
 globally or in the key type's namespace (it calls `key.hash()`, §11.1), and
 that overload should do the same, as `hash_combine` of the fields' hashes
@@ -175,7 +178,7 @@ fn hash(k: key) -> u64 { hash_combine(hash(k.a), hash(k.b)) }
 ```goose
 struct rng { s: u64 }                    // splitmix64; the seed is the state
 fn rand_u64(r: rng&) -> u64
-fn rand_int(r: rng&, n: i64) -> i64      // uniform in [0, n)
+fn rand_int(r: rng&, n: i64) -> i64      // uniform in [0, n), without modulo bias; asserts n > 0
 fn rand_flt(r: rng&) -> f64              // uniform in [0, 1)
 fn shuffle<T>(xs: T[:], r: rng&)         // Fisher-Yates
 ```
@@ -351,7 +354,7 @@ fn format_int<B>(out: B&, v: i64, base: i64, width: i64, padc: u8)   // base 2..
 fn format_uint<B>(out: B&, v: u64, base: i64, width: i64, padc: u8)   // B: u8[>..] or u8[..k]
 fn format_flt(out: u8[>..]&, v: f64, decimals: i64)        // fixed decimals, rounded half up; inf/-inf/nan as print writes them
 fn parse_int(s: u8[:], base: i64 = 10) -> i64, bool        // optional sign, whole string; false outside i64
-fn parse_flt(s: u8[:]) -> f64, bool                        // sign, fraction, exponent
+fn parse_flt(s: u8[:]) -> f64, bool                        // sign, fraction, exponent; correctly rounded
 fn format_uleb(out: u8[>..]&, v: i64)                     // LEB128 (3.6), 1-10 bytes
 fn parse_uleb(s: u8[:]) -> i64, i64                       // value and byte count; 0, 0 if malformed
 fn compare(a: u8[:], b: u8[:]) -> i64                      // bytewise: -1, 0, 1
@@ -366,15 +369,24 @@ fn each_word<F>(s: u8[:])                                  // F(word)
 fn join<T>(out: u8[>..]&, parts: T[:], sep: u8[:])         // T any u8 array/slice type
 fn format_replaced(out: u8[>..]&, s: u8[:], old: u8[:], with: u8[:])
 fn each_utf8<F>(s: u8[:])                                  // F(codepoint); malformed bytes give 0xFFFD
-fn push_utf8(out: u8[>..]&, cp: i64)
+fn push_utf8(out: u8[>..]&, cp: i64)                       // 0xFFFD's bytes for cp outside 0..0x10FFFF
 ```
 
 The builtins `format`/`str`/`print` do the plain rendering of scalars and
 strings; the functions here add control over the output, and parsing. In
 base 10, `format_int` and `format_uint` write the same text as `format`
-(after any padding) and run as fast. Strings are `u8` arrays: input is a
+(after any padding) and run as fast. `parse_flt` gives the double nearest to
+the decimal, as C's `strtod` does, so a float's text from `print` or
+`format` reads back as the same value. Strings are `u8` arrays: input is a
 `u8[:]`, output goes to a `u8[>..]&` builder, and storage is a `u8[]` or
 `u8[..k]`.
+
+`each_utf8` decodes as the WHATWG decoder does. A sequence cut short, an
+overlong form, a surrogate or a code point past 0x10FFFF gives one 0xFFFD
+for each maximal subpart (Unicode §3.9), and the byte that broke a sequence
+starts the next one: `[0xC3, 'A']` gives 0xFFFD and then `A`. `push_utf8`
+writes a surrogate as the three bytes of its own code, which is how `json`
+keeps a lone `\u` escape.
 
 ```goose
 var line: u8[>..] = [];
@@ -405,9 +417,10 @@ inspired by [Lobster's exception module](https://github.com/aardappel/lobster/bl
 Import `exception`; its functions are in namespace `exception`.
 
 ```goose
-fn try<E, Body, Catch>()     // Body(); on an error, Catch(error)
-fn try<E, Body>()            // Body(); discard an error
-fn throw(value)             // exit the nearest enclosing handler
+fn try<E, Body, Catch>()            // Body(); on an error, Catch(error)
+fn try<E, Body>()                   // Body(); discard an error
+fn try<E, Body, Catch, Finally>()   // as the first, then Finally() on every way out
+fn throw(value)                    // exit the nearest enclosing handler
 ```
 
 ```goose
@@ -456,10 +469,11 @@ The language's checks and limitations still apply:
 * Only calls to `throw` are caught. Runtime failures, `abort` and `exit`
   remain uncatchable. There is no stack-trace facility.
 
-There is no `protect`/`finally` helper because it could not guarantee cleanup on
-every exit. A callback can clean up after normal completion or a caught
-exception. However, a block's lexical `return` or a `return ... from` targeting
-another function bypasses that callback.
+`try<E>(body, catch, finally)` runs `finally` after the body completes, after
+a caught throw, and when a throw or a lexical `return` aimed at another
+function leaves through the call. It is `defer finally();` ahead of the try
+(reference, "defer"), so `finally` follows the rules of a defer body: it
+cannot leave, and it may not throw, catch, or call anything that does.
 
 ## dictionary
 
@@ -577,9 +591,9 @@ widths equally well, so the call has to name one (`sqrt(n as f64)`);
 `mul_add(x, y, z)`, at both widths, is `x * y + z` rounded once where the
 code is built for FMA and twice where it is not. Which one a call gets is
 up to the implementation (spec §7.12). The C backend rounds once on arm64,
-on x86-64 built for AVX2 or later (`-march=x86-64-v3`, `/arch:AVX2`), and
-in a `simd fn`'s AVX2 and AVX-512 versions. It rounds twice elsewhere and
-under the JIT. `x * y + z` written out always rounds twice.
+on x86-64 built for AVX2 or later (`-march=x86-64-v3`, clang-cl's
+`/arch:AVX2`), and in a `simd fn`'s AVX2 and AVX-512 versions. It rounds
+twice elsewhere, under MSVC and under the JIT. `x * y + z` written out always rounds twice.
 
 The two roundings can give very different results, not just a different
 last bit:
@@ -607,8 +621,9 @@ The module also has:
 
 ```goose
 let PI = 3.141592653589793;   let TAU = 6.283185307179586;
-fn radians(deg: f64) -> f64   fn degrees(rad: f64) -> f64
-fn is_nan(x: f64) -> bool     fn is_inf(x: f64) -> bool
+fn radians(deg: f64) -> f64   fn degrees(rad: f64) -> f64      // and f32
+fn is_nan(x: f64) -> bool     fn is_inf(x: f64) -> bool        // and f32
+fn is_finite(x: f64) -> bool                                   // not inf or NaN; and f32
 ```
 
 ## os
@@ -652,15 +667,13 @@ workload, such as replacing a document, rather than after every temporary
 value. Ordinary scope exit keeps pages available for cheap reuse, while a
 trimmed page causes a page fault when the stack grows into it again.
 
-The
-pages are released immediately. Windows decommits them, which also returns
-their commit charge, and Linux drops them from the resident set at once;
-on both, a stack that grows again gets fresh zeroed pages. macOS marks the
-pages reusable, which takes them out of the footprint at once, and
-declares them reused when the stack grows back into them. A page the
-kernel has not reclaimed by then may still hold its old bytes; nothing
-ever reads the bytes above a stack's top. `false` means at least one OS
-request failed.
+The pages are released immediately. Windows decommits them, which also
+returns their commit charge, and Linux drops them from the resident set
+at once. macOS replaces the unused suffix of each reservation with fresh
+anonymous memory at the same addresses. On all three platforms, a stack
+that grows again gets fresh zeroed pages. macOS trimming covers the full
+unused reservation so ordinary growth needs no runtime tracking or signal
+handling. `false` means at least one OS request failed.
 
 Paths are UTF-8 on every platform; on Windows the runtime converts them to
 UTF-16 for the system's wide APIs. Environment values and the program's

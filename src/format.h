@@ -148,12 +148,22 @@ inline vector<Item> Collect(const string &src, const vector<pair<const char *, u
     }
     vector<Item> items;
     auto linestart = src.c_str();
+    // The column of `at` on its line, counted on from the last one asked for
+    // rather than from the line's start, since one line can hold a whole table.
+    auto colfrom = linestart;
+    auto colat = 0;
+    auto column = [&](const char *at) {
+        if (colfrom < linestart || colfrom > at) colfrom = linestart, colat = 0;
+        colat = Width(colfrom, at, colat);
+        colfrom = at;
+        return colat;
+    };
     auto nl = 0;
     auto space = false;
     auto add = [&](Item it, const char *at) {
         it.nl = nl;
         it.space = space;
-        it.oldcol = Width(linestart, at);
+        it.oldcol = column(at);
         for (auto p = it.text.data(); p < it.text.data() + it.text.size(); p++)
             if (*p == '\n') linestart = p + 1;
         items.push_back(it);
@@ -182,7 +192,7 @@ inline vector<Item> Collect(const string &src, const vector<pair<const char *, u
                 auto code = p;
                 while (code > linestart && (code[-1] == ' ' || code[-1] == '\t' || code[-1] == '\r'))
                     code--;
-                it.oldcodeend = Width(linestart, code);
+                it.oldcodeend = column(code);
                 add(it, p);
                 p = q;
             } else if (c == '/' && p[1] == '*') {
@@ -355,8 +365,10 @@ inline string Layout(const string &src, const vector<pair<const char *, uint8_t>
         L.depth = (int)stack.size();
         auto closerfirst = Closes(first) > 0;
         L.blank = out.empty() || closerfirst || prevhang ? 0 : min(max(first.nl - 1, 0), 1);
-        auto hascode = false;
-        for (auto k = i; k < j; k++) hascode = hascode || items[k].kind == Item::TOKEN;
+        auto lasttoken = j;   // The line's last token, where it has one.
+        for (auto k = i; k < j; k++)
+            if (items[k].kind == Item::TOKEN) lasttoken = k;
+        auto hascode = lasttoken < j;
         auto oldindent = first.oldcol;
         auto indent = 0;
         // An `else` continues the statement its `if` began, wherever the
@@ -451,8 +463,7 @@ inline string Layout(const string &src, const vector<pair<const char *, uint8_t>
                     stack.pop_back();
                 }
                 if (IsOpener(it)) {
-                    auto last = true;
-                    for (auto q = k + 1; q < j; q++) last = last && items[q].kind != Item::TOKEN;
+                    auto last = k == lasttoken;
                     auto block = IsBlockCurly(it);
                     auto lineindent = block && !(it.roles & R_FUNVAL) ? min(openindent, bodyindent)
                                                                      : openindent;
@@ -466,8 +477,7 @@ inline string Layout(const string &src, const vector<pair<const char *, uint8_t>
         // How the line ends, for the next.
         prevhang = false;
         if (hascode) {
-            auto k = j;
-            while (items[k - 1].kind != Item::TOKEN) k--;
+            auto k = lasttoken + 1;
             auto &last = items[k - 1];
             auto inblock = cur().block;
             auto comma = last.comma || IsTok(last, T_COMMA);

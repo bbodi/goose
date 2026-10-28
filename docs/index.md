@@ -21,9 +21,12 @@ specification. The other documents cover the library, tools, and compiler.
   `exception`, and `gfx`, `audio`, `physics` and `ui` for graphics, sound,
   rigid bodies and widgets. All are written in readable Goose under
   `stdlib/`.
-* [Building programs and using packages](packages.md): `goose build`,
-  libraries from git repositories or directories, a program's own C, and
-  how to make a package.
+* [The command line](command_line.md): every command and option of
+  `goose`: running, building and checking programs, what the compiler
+  prints, writing the C yourself, the formatter and the language server.
+* [Building programs and using packages](packages.md): libraries from git
+  repositories or directories, a program's own C, and how to make a
+  package.
 * [Samples](../samples/README.md): thirty-one complete programs in reading
   order, from a tour of the language to a JSON parser, a threaded
   Mandelbrot, a spinning cube and two small games.
@@ -75,6 +78,10 @@ and the reference describe what was built; these say why.
 * [Cleanup at scope exit](design/scope_exit_cleanup.md): `defer`,
   destructor types and pool finalizers compared against the compiler's
   exit paths and `return … from`; a proposal.
+* [Nested growth](design/nested_growth.md): building a recursive tree
+  (a JSON tape) in place on one stack by growing a container on the open
+  path; the type relaxations, append handles with a checked push, and the
+  static proofs that elide the check, compared.
 * [Standard library design](design/stdlib_design.md): the library's
   original scope and conventions.
 * [Compiler analyses](design/analysis_inventory.md): an inventory of the

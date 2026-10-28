@@ -1407,6 +1407,8 @@ fn main() {
         write_stderr(str("gfx: ", gfx::error(), "\n"));
         return;
     }
+    // close releases every remaining GPU object, including chunk buffers.
+    defer gfx::close();
     let atlas = make_atlas();
     let sampler = gfx::sampler(gfx::NEAREST, gfx::CLAMP);
     let world_pipeline = gfx::pipeline(embed_shader("vert", world_vertex),
@@ -1635,6 +1637,4 @@ fn main() {
         let saved = gfx::screenshot("mini_minecraft.png");
         print("drew ", drawn, " frames; saved mini_minecraft.png: ", saved);
     }
-    // close releases every remaining GPU object, including chunk buffers.
-    gfx::close();
 }
