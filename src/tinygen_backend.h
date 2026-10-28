@@ -2053,11 +2053,13 @@ struct TgFn {
         if (CallAt(n, InPlace { 2, stk, t, hdr })) return;
         auto lit = sl && sl->exprtype && cg.TEq(sl->exprtype, t);
         if (isst) {   // Its fixed fields in turn, then its tail, a resizable ADT of its own.
-            if (!lit || !sl->sinst || sl->variant) No(l, "resizable struct built from this value");
-            begin(0);
-            fields(sl, M.StFields(t), M.StFields(t).var);
-            return;
-        }
+            if (lit && sl->sinst && !sl->variant) {
+                begin(0);
+                fields(sl, M.StFields(t), M.StFields(t).var);
+                return;
+            }
+            if (lit) No(l, "resizable struct built from this value");
+        }   // Otherwise a value held elsewhere, a local's or a forwarded call's: copied by RbFrom.
         if (lit && (!adt || sl->variant)) {
             auto vi = adt ? ei->en->VariantIndex(sl->variant) : M.VariantIdx(t);
             auto &fs = M.VarFields(ei, vi);
@@ -2278,6 +2280,11 @@ struct TgFn {
         if (Is<ArrayLit>(n) || Is<StrLit>(n) || LimCallResult(n) || OwnTypedCall(n) || IsStrCall(n) ||
             !n->exprtype || !cg.TEq(n->exprtype, t))
             return false;
+        // A copy of an array of another kind (a T[], a T[>..]) is built as the elements, the capacity
+        // their count.
+        auto from = StripCopy(n)->exprtype;
+        if (from && IsPlainRef(from)) from = from->ref->sub;
+        if (!from || !cg.TEq(from, t)) return false;
         auto src = Deref(Place(n));
         if (!Ended()) ImgCopy(stk, AddrOf(src.a), t);
         return true;
@@ -2570,7 +2577,7 @@ struct TgFn {
 
     P Place(Node *n) {
         if (auto id = Is<Ident>(n)) {
-            if (!id->vdef) No(n->line, "function as a value");
+            if (!id->vdef) Unreachable(n->line, "function as a value");
             return VarPlace(id->vdef, n->line);
         }
         if (auto d = Is<Dot>(n); d && d->IsField())
@@ -2957,7 +2964,7 @@ struct TgFn {
         auto x = GenAs(u->child, ot);
         switch (u->op) {
             case T_MINUS:
-                if (ot->kind != TY_FLT && ot->kind != TY_INT) No(u->line, "negation type");
+                if (ot->kind != TY_FLT && ot->kind != TY_INT) Unreachable(u->line, "negation type");
                 x.v = ScalarNeg(ot, x.v, u->line);
                 return x;
             case T_NOT:
@@ -2965,7 +2972,7 @@ struct TgFn {
                 x.t = M.ast.booltype;
                 return x;
             case T_BITNOT:
-                if (ot->kind != TY_INT) No(u->line, "~ type");
+                if (ot->kind != TY_INT) Unreachable(u->line, "~ type");
                 x.v = tyg_un(p, TYG_NOT, x.v);
                 return x;
             default: No(u->line, "unary operator");
@@ -3038,7 +3045,7 @@ struct TgFn {
         auto isflt = lt->kind == TY_FLT;
         auto sgn = TgModule::IsSigned(lt);
         if (op == T_SHL || op == T_SHR) {
-            if (lt->kind != TY_INT) No(b->line, "shift type");
+            if (lt->kind != TY_INT) Unreachable(b->line, "shift type");
             auto l = GenAs(b->left, lt);
             auto r = GenAs(b->right, M.ast.inttypes[IS_I64]);
             return ValV(lt, ShiftOp(op, lt, l.v, r.v));
@@ -3263,7 +3270,7 @@ struct TgFn {
     void ElemLeaves(TypeExpr *t, int64_t off, Line l, F leaf, ElemDyn dy = ElemDyn { false, 0 }) {
         switch (t->kind) {
             case TY_INT: case TY_FLT:
-                if (t->kind == TY_INT && t->intstorage == IS_VARINT) No(l, "elementwise varint");
+                if (t->kind == TY_INT && t->intstorage == IS_VARINT) Unreachable(l, "elementwise varint");
                 leaf(t, off, dy);
                 return;
             case TY_STRUCT:
@@ -3403,7 +3410,7 @@ struct TgFn {
         auto l = ViewOf(Place(b->left), b->line);
         auto r = ViewOf(Place(b->right), b->line);
         auto et = l.elem;
-        if (cg.Mangle(et) != cg.Mangle(r.elem)) No(b->line, "array comparison of another element type");
+        if (cg.Mangle(et) != cg.Mangle(r.elem)) Unreachable(b->line, "array comparison of another element type");
         if (!(et->kind == TY_INT || et->kind == TY_BOOL) || et->intstorage == IS_VARINT)
             return EqViaFail(b, [&](tyg_block fail) {
                 ContinueIf(Cmp(TYG_EQ, l.len, r.len), fail);
@@ -3472,11 +3479,11 @@ struct TgFn {
         if (!M.IsScalar(st) || !M.IsScalar(tt) || st->kind == TY_REF || tt->kind == TY_REF)
             No(c->line, "cast types");
         if (tt->kind == TY_FLT) {
-            if (st->kind == TY_BOOL) No(c->line, "bool cast");
+            if (st->kind == TY_BOOL) Unreachable(c->line, "bool cast");
             return ValV(tt, Conv(x.v, st, tt, c->line));
         }
         if (tt->kind != TY_INT || tt->intstorage == IS_VARINT) No(c->line, "cast target");
-        if (st->kind == TY_BOOL) No(c->line, "bool cast");
+        if (st->kind == TY_BOOL) Unreachable(c->line, "bool cast");
         auto is = tt->intstorage;
         auto i64t = M.ast.inttypes[IS_I64];
         auto rng = IntRange(is);
@@ -3592,7 +3599,7 @@ struct TgFn {
         return { Add(base, I64(w)), n, pl.t->arr->sub, -1 };
     }
     tyg_val ElemAddr(const View &v, tyg_val i) {
-        if (!cg.IsFix(v.elem)) No(Line {}, "an element of variable size by its index");
+        if (!cg.IsFix(v.elem)) Unreachable(Line {}, "an element of variable size by its index");
         return Add(v.elems, Mul(i, I64(cg.FixedSize(v.elem))));
     }
 
@@ -3712,7 +3719,7 @@ struct TgFn {
         }
         if (pl.t->kind != TY_ARRAY) return Fit(Load(pl, n->line), t, n->line);
         auto v = ViewOf(pl, n->line);
-        if (cg.Mangle(v.elem) != cg.Mangle(t->sub)) No(n->line, "slice of another element type");
+        if (cg.Mangle(v.elem) != cg.Mangle(t->sub)) Unreachable(n->line, "slice of another element type");
         return PairV(t, v.elems, v.len);
     }
 
@@ -4162,9 +4169,16 @@ struct TgFn {
             if (!IsU8(et)) No(c->line, "string of this type");
             v = { BytesAddr(s->val), I64((int64_t)s->val.size()), et, -1 };
         } else {
-            if (Is<Call>(src) && src->exprtype && (IsGrow(src->exprtype) || IsVarArr(src->exprtype)))
-                No(c->line, "append of this call");
-            auto from = Place(src);
+            P from;
+            if (Is<Call>(src) && src->exprtype && (IsGrow(src->exprtype) || IsVarArr(src->exprtype))) {
+                // A resizable or variable-size result: built on a temporary stack of the statement's,
+                // and its elements viewed there.
+                if (!TempOk(src->exprtype)) No(c->line, "append of this call");
+                auto x = BuildTemp(src, src->exprtype, c->line);
+                from = P { x.a, x.t, x.stk };
+            } else {
+                from = Place(src);
+            }
             if (Ended()) return V {};
             v = ViewOf(from, c->line);
         }
@@ -4343,7 +4357,7 @@ struct TgFn {
             // The checker proved the reference is an element of this very array (§3.3): the distance in
             // whole elements, unchecked.
             auto v = ViewOf(Place(an[0]), line);
-            if (!cg.IsFix(v.elem)) No(line, "index_of of elements of variable size");
+            if (!cg.IsFix(v.elem)) Unreachable(line, "index_of of elements of variable size");
             auto r = Gen(an[1]);
             if (Ended()) return Dummy(c->exprtype);
             auto esz = I64(std::max<int64_t>(cg.FixedSize(v.elem), 1));
@@ -4382,8 +4396,8 @@ struct TgFn {
                 ToBytesIntoLim(out, an[0], line);
                 return V {};
             }
-            if (!IsGrow(out.t) || !IsU8(out.t->arr->sub) || !out.stk)
-                No(line, "to_bytes into this kind");
+            if (!IsGrow(out.t) || !IsU8(out.t->arr->sub)) Unreachable(line, "to_bytes into this kind");
+            if (!out.stk) No(line, "to_bytes into this kind");
             ToBytesInto(out.stk, CountAt(out.a), an[0], line);
             return V {};
         }
@@ -4397,7 +4411,7 @@ struct TgFn {
             auto rt = an[0]->exprtype;
             while (rt && IsAddrRef(rt)) rt = rt->ref->sub;
             if (!rt || (rt->kind != TY_ARRAY && rt->kind != TY_SLICE))
-                No(line, "bytes_of of this type");
+                Unreachable(line, "bytes_of of this type");
             auto v = ViewOf(Place(an[0]), line);
             if (Ended()) return Dummy(c->exprtype);
             return PairV(c->exprtype, v.elems, RunBytes(v));
@@ -7151,10 +7165,16 @@ struct TgFn {
         InPlace d { 3, pl.stk, pl.t, pl.a, &pl };
         if (BuildCtl(n, d, l)) return;
         auto sl = Is<StructLit>(n);
-        // Any other: a call's result or variable, copied.
-        if (!sl && n->exprtype && cg.TEq(n->exprtype, pl.t)) {
+        // Any other: a call's result or variable, copied (a copy() of one, the source's storage type
+        // kept, a reference to it read through).
+        n = StripCopy(n);
+        sl = Is<StructLit>(n);
+        auto nt = n->exprtype;
+        while (nt && IsPlainRef(nt)) nt = nt->ref->sub;
+        if (!sl && nt && cg.TEq(nt, pl.t)) {
             P src;
             if (Is<Call>(n)) {
+                if (IsPlainRef(n->exprtype)) No(l, "reference result copied as a frame object");
                 auto x = Gen1(n);
                 src = P { x.a, x.t, x.stk };
             } else {

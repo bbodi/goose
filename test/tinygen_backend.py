@@ -279,7 +279,10 @@ REGRESSIONS = ["test/codegen/forward_adaptation.goose", "test/codegen/bytes_valu
                "test/threads/qpoll_zero_padded.goose",
                "test/codegen/recursive_dispatch_fixed_variant.goose",
                "test/codegen/defer_exits.goose", "test/codegen/defer_return_from.goose",
-               "test/codegen/defer_results.goose"]
+               "test/codegen/defer_results.goose", "test/codegen/resizable_struct_returns.goose",
+               "test/codegen/limited_capacity_copies.goose",
+               "test/codegen/append_resizable_call_to_limited.goose",
+               "test/codegen/frame_object_copy_result.goose"]
 # Programs whose header asks for the debug checks (a runtime-debug or GS_DEBUG=1 line), built with
 # --debug: thread_contained answers only in a debug build, and the others, also listed above, have
 # links the checks verify.
@@ -292,18 +295,9 @@ PROGRAMS += [(path, True, ["--debug"]) for path in DEBUG_REGRESSIONS]
 WHOLE_PROGRAM |= {Path(path).stem for path in REGRESSIONS + DEBUG_REGRESSIONS}
 # Programs the backend does not yet build whole: each leaves the named functions to the C generator
 # (the reference semantics), so the suite proves the fallback gives the blessed output today. An entry
-# moves to REGRESSIONS once its refusal is lifted. Each comment names the refusal it reaches.
+# moves to REGRESSIONS once its refusal is lifted, and each comment names the refusal it reaches.
+# None is left now.
 GAPS = [
-    # "value conversion from i64[] to i64[..]" and "from i64[>..] to i64[..]": a copy of a
-    # variable-size or growable array as a limited array whose capacity is chosen at construction.
-    "test/codegen/limited_capacity_copies.goose",
-    # "resizable struct built from this value": a struct with a resizable ADT as its tail, held in a
-    # local and returned by name.
-    "test/codegen/resizable_struct_returns.goose",
-    # "append of this call": a call's T[] result appended to a limited array.
-    "test/codegen/append_resizable_call_to_limited.goose",
-    # "value of type Frame": copy() of a frame object returned from a function.
-    "test/codegen/frame_object_copy_result.goose",
 ]
 PROGRAMS += [(path, False, []) for path in GAPS]
 # Results with relative links written by the callee into its caller's slot (and a return from's channel)
