@@ -50,7 +50,7 @@ def _check_case(exe, compiler, base):
         source = base / f"{name}.goose"
         tc.write_text(source, 'import std;\nimport shared from "./pkgs/shared";\n'
                               "fn main() { print(shared::one()); }\n")
-        argv = [str(a) for a in (exe, "build", "--cc", compiler, "-o",
+        argv = [str(a) for a in (exe, "build", "--backend=c", "--cc", compiler, "-o",
                                  base / (name + tc.EXE_SUFFIX), source)]
         p = subprocess.Popen(argv, cwd=base, env=env, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT)

@@ -341,6 +341,22 @@ Two things of tinygen's C output are worked around here:
   `typedef _Bool _Bool;`. In C output the `bool` base type is named `bool`,
   which tinygen leaves to the C type.
 
+## Defaults of `goose build`
+
+With a compiler built with tinygen, `goose build` without `--backend` means
+`--backend=tinygen-c` (the optimized build), and `goose build --debug` means
+`--backend=tinygen` (the fast debug build, GS_DEBUG checks as before). `-o x.c`
+selects tinygen-c, also with `--debug`. A program that tinygen cannot take
+whole builds through the C generator's C, all of it, as the JIT of `goose run`
+does: `--include`, `--standalone`, a `-D` other than GS_DEBUG and the GS_STACK_*
+ones, a library or `export fn` (`WholeProgram`), or any function left to C.
+`-v` prints `build: backend tinygen-c (the default)` and, for a fallback,
+`build: the C generator's C, compiled by the C compiler, for the whole program
+(tinygen cannot take it whole: why)`. There is no mixed build unless
+`--tinygen-mixed` or an explicit `--backend` asks for one. `-o x.c` of a
+fallback program writes the C generator's C to `x.c`. `--backend=c` is the old
+path; a compiler without tinygen only has it.
+
 ## Testing
 
 * `test/tinygen/` holds fixtures for each area: scalars, structs, arrays,

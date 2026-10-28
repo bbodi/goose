@@ -818,6 +818,12 @@ Builds an executable beside the source with a C compiler on this machine
 (goose toolchain says which), linking the runtime and the native parts of
 the packages the program uses. Intermediates go under GOOSE_HOME.
 
+tinygen compiles the program: its C, optimized by the C compiler, or with
+--debug its machine code with debug info naming the Goose source. A program
+tinygen cannot take whole (--include, --standalone, -D other than the GS_*
+ones, a library or an export fn) builds through the C generator's C instead;
+-v says why. --backend picks a path.
+
 Options:
   -o exe                Where the executable goes.
   -O0, -O1, -O2         Inlining level (default -O2). The C compiler
@@ -831,15 +837,18 @@ R"(  --cc name|path        The C compiler: msvc, clang-cl, clang, gcc, cc or a
                         the runtime object built once per C compiler.
   -v                    Print each command the build runs and what it prints.
   --dry-run             Print the commands the build would run, and run none.
-  --backend name        c (the default) or tinygen, which writes the machine
-                        code itself, with debug info naming the Goose source
+  --backend name        Without it: tinygen-c, or tinygen with --debug, and c
+                        for a program tinygen cannot take whole. c is the C
+                        generator's C. tinygen writes the machine code
+                        itself, with debug info naming the Goose source
                         (default -O0, the debug build); what it does not
                         support goes through C. tinygen-c has tinygen write C
                         instead (default -O2), which the C compiler optimizes
                         unless --debug;
-                        with -o out.c it writes that C and builds nothing (a
-                        whole program only; it links with the tinygen
-                        support object and the runtime, as -v shows).
+                        with -o out.c it writes that C and builds nothing:
+                        tinygen's for a whole program (it links with the
+                        tinygen support object and the runtime, as -v shows),
+                        else the C generator's, which is the whole program.
 )");
     if (topic == "check") return cat(
 R"(usage: goose check file.goose [options]
@@ -1586,6 +1595,18 @@ int Main(int argc, char **argv) {
         verb = "run";
         backendname = "tinygen";
     }
+    // goose build without --backend builds through tinygen when this compiler has it: tinygen-c
+    // (the optimized build), or with --debug the native tinygen backend (the fast debug build
+    // with debug information). A program tinygen cannot take whole builds through the C
+    // generator instead (tgdefault, tgfallback below). -o x.c asks for C, which is tinygen-c's.
+    auto tgdefault = false;
+    #if GOOSE_HAVE_TINYGEN
+        if (verb == "build" && !backendgiven) {
+            tgdefault = true;
+            auto wantsc = outname.size() > 2 && outname.compare(outname.size() - 2, 2, ".c") == 0;
+            backendname = debug && !wantsc ? "tinygen" : "tinygen-c";
+        }
+    #endif
     if (backendname != "c" && backendname != "tinygen" && backendname != "tinygen-c") {
         fprintf(stderr, "unknown backend: %s (c, tinygen or tinygen-c)\n", backendname.c_str());
         return 1;
@@ -1739,7 +1760,7 @@ int Main(int argc, char **argv) {
     // The tinygen backend's object, when it compiled anything, and whether
     // it is the whole program (no C half to compile), with GS_DEBUG's checks.
     string tgobject;
-    bool tgwhole = false, tgchecks = false;
+    bool tgwhole = false, tgchecks = false, tgfallback = false;
     // With --backend=tinygen-c, the C tinygen wrote, which the build compiles to tgobject.
     string tgcsource;
     // The program's Ast outlives the compile: a build and a JIT run read
@@ -1886,7 +1907,10 @@ int Main(int argc, char **argv) {
         #if GOOSE_HAVE_TINYGEN
             if (tgb) {
                 // A plain goose run says nothing of its backend unless asked.
-                if (!tgjit || verbose)
+                if (verbose)
+                    fprintf(msgs, "build: backend %s%s\n", backendname.c_str(),
+                            tgdefault ? " (the default)" : "");
+                if ((!tgjit && !tgdefault) || verbose)
                     fprintf(msgs, "tinygen: %d of %d function(s) compiled, %d left to C\n",
                             (int)tgb->taken.size(), (int)cg.livespecs.size(),
                             (int)tgb->left.size());
@@ -1923,6 +1947,9 @@ int Main(int argc, char **argv) {
                         if (!sp->sf->dylib.empty()) whynot = cat("extern ", sp->sf->cname, " of a shared library");
                 }
                 tgwhole = whynot.empty() && tgb->WholeProgram(cg, whynot);
+                // The default build takes the C generator's C for all of a program tinygen
+                // cannot take whole, as a JIT run does; no mixed build unless asked for.
+                tgfallback = tgdefault && !tgwhole;
                 tgchecks = tgb->checks;
                 if (tgwhole) tgb->EmitMain(cg);
                 // Compile after WholeProgram: it may add gs_init_globals to
@@ -1948,6 +1975,13 @@ int Main(int argc, char **argv) {
                                                 "for the whole program (tinygen cannot take it "
                                                 "whole: %s)\n",
                                 whynot.c_str());
+                } else if (tgfallback) {
+                    cgalone = make_unique<CodeGen>(ast, runtime_ext_text, includes, norfcheck,
+                                                   library, stackcfg);
+                    if (verbose)
+                        fprintf(msgs, "build: the C generator's C, compiled by the C compiler, "
+                                      "for the whole program (tinygen cannot take it whole: %s)\n",
+                                whynot.c_str());
                 } else if (verbose)
                     fprintf(msgs, tgwhole ? "tinygen: whole program: no C compiled for it\n"
                                           : "tinygen: mixed: the C half compiled by the C compiler (%s)\n",
@@ -1958,11 +1992,11 @@ int Main(int argc, char **argv) {
                     if (auto py = FindLldbFormatters(exe); !py.empty())
                         fprintf(msgs, "tinygen: lldb formatters: command script import \"%s\"\n",
                                 py.c_str());
-                if (!tgcout.empty() && !tgwhole)
+                if (!tgcout.empty() && !tgwhole && !tgfallback)
                     throw CompileError { cat("-o ", tgcout, ": the program needs the C half too "
                                              "(mixed: ", whynot, "); goose build without -o "
                                              "builds both") };
-                if (!tgb->taken.empty() && !outfile.empty()) {
+                if (!tgb->taken.empty() && !outfile.empty() && !tgfallback) {
                     tgobject = cat(DirOf(outfile), PathStem(outfile), ".tg.o");
                     if (tinygenc) tgcsource = tgcout.empty() ? cat(DirOf(outfile), PathStem(outfile),
                                                                    ".tg.c") : tgcout;
@@ -2022,9 +2056,12 @@ int Main(int argc, char **argv) {
         };
         if (!outfile.empty() && !nocgen && (!tgwhole || cgalone)) {
             auto out = assemble(!standalone);
-            if (!WriteFileMakingDirs(outfile, out))
-                throw CompileError { cat("cannot write output file: ", outfile) };
-            if (stats) fprintf(msgs, "wrote %s (%d bytes)\n", outfile.c_str(), (int)out.size());
+            // goose build -o x.c of a program the default could not give to tinygen: the C
+            // generator's C goes where tinygen's would have, and nothing is built.
+            auto &where = tgfallback && !tgcout.empty() ? tgcout : outfile;
+            if (!WriteFileMakingDirs(where, out))
+                throw CompileError { cat("cannot write output file: ", where) };
+            if (stats) fprintf(msgs, "wrote %s (%d bytes)\n", where.c_str(), (int)out.size());
         }
         if (!headername.empty()) {
             auto header = cg.ExportHeader();
@@ -2092,6 +2129,7 @@ int Main(int argc, char **argv) {
         tgobject.clear();
         tgcsource.clear();
         tgwhole = false;
+        tgfallback = false;
         astp.reset();
         nativepkgs.clear();
         found.clear();

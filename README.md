@@ -517,7 +517,10 @@ committed as it is used, and `--stack-reserve 16G` changes that size.
 option, including how to write the C for a build system or a C host of your
 own (`goose -o tour.c tour.goose`).
 
-`goose build --backend=tinygen` (experimental) makes a debug build through
+`goose build` goes through [tinygen](docs/design/tinygen_backend.md) when the compiler
+has it (`--backend=tinygen-c`, or with `--debug` `--backend=tinygen`), and through
+the C generator for a program tinygen cannot take whole; `--backend=c` asks for
+that. `goose build --backend=tinygen` (experimental) makes a debug build through
 [tinygen](docs/design/tinygen_backend.md), a code generator that writes
 machine code with debug info directly. The compiler must be built with a
 tinygen checkout beside this one (`TINYGEN_DIR`). The debugger then shows

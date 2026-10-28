@@ -37,7 +37,7 @@ def _check_case(exe, compiler, base, debug):
     def command(name, extra=()):
         source = base / f"{name}.goose"
         tc.write_text(source, 'fn main() { print("cache"); }\n')
-        return [str(arg) for arg in (exe, "build", "--cc", compiler, *flags, *extra,
+        return [str(arg) for arg in (exe, "build", "--backend=c", "--cc", compiler, *flags, *extra,
                                     "-o", base / (name + tc.EXE_SUFFIX), source)]
 
     def run(name, extra=()):
