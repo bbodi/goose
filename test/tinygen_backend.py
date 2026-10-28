@@ -290,6 +290,18 @@ DEBUG_REGRESSIONS = ["test/threads/thread_contained.goose", "test/storage/relati
 PROGRAMS += [(path, True, []) for path in REGRESSIONS]
 PROGRAMS += [(path, True, ["--debug"]) for path in DEBUG_REGRESSIONS]
 WHOLE_PROGRAM |= {Path(path).stem for path in REGRESSIONS + DEBUG_REGRESSIONS}
+# Programs the backend does not yet build whole: each leaves the named functions to the C generator
+# (the reference semantics), so the suite proves the fallback gives the blessed output today. An entry
+# moves to REGRESSIONS once its refusal is lifted. Each comment names the refusal it reaches.
+GAPS = [
+    # "value conversion from i64[] to i64[..]" and "from i64[>..] to i64[..]": a copy of a
+    # variable-size or growable array as a limited array whose capacity is chosen at construction.
+    "test/codegen/limited_capacity_copies.goose",
+    # "resizable struct built from this value": a struct with a resizable ADT as its tail, held in a
+    # local and returned by name.
+    "test/codegen/resizable_struct_returns.goose",
+]
+PROGRAMS += [(path, False, []) for path in GAPS]
 # Results with relative links written by the callee into its caller's slot (and a return from's channel)
 # across the two halves: the callee, or the caller, left to C.
 PROGRAMS += [("test/storage/relative_destination_results.goose", False,
