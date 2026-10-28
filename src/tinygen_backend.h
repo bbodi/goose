@@ -1633,6 +1633,9 @@ struct TgFn {
     struct SScope {
         bool stmt;
         vector<Mark> marks;
+        // The `defer` bodies of this block (§6.6), each with how many marks came before it: an exit
+        // runs them among the restores, latest first (CodeGen::EmitRestores).
+        vector<pair<size_t, Defer *>> defers;
     };
     vector<SScope> sscopes;
     // The globals of the C half's instance this body names, each with the local holding its address.
@@ -1833,9 +1836,29 @@ struct TgFn {
         sscopes[i].marks.push_back({ k, mark });
         return k;
     }
-    void Restore(const SScope &sc) {
-        for (auto mk = sc.marks.rbegin(); mk != sc.marks.rend(); ++mk)
-            SetTop(Stk(mk->k, Line {}), LdL(mk->top));
+    // A body registered after k marks runs after the marks made later are restored and before the k
+    // are. Emitting a body opens scopes of its own, which may move sscopes, so the lists are copied.
+    void Restore(const SScope &scope) {
+        auto marks = scope.marks;
+        auto defers = scope.defers;
+        auto di = (int)defers.size() - 1;
+        for (auto k = (int)marks.size(); k >= 0; k--) {
+            for (; di >= 0 && (int)defers[di].first == k; di--) {
+                if (Ended()) return;
+                DeferBody(defers[di].second);
+            }
+            if (k > 0) SetTop(Stk(marks[k - 1].k, Line {}), LdL(marks[k - 1].top));
+        }
+    }
+    // One run of a deferred body at an exit of its block: its statements as written, in a block of
+    // their own. It cannot leave (§6.6), so the exit goes on after it. Its temporaries take indices
+    // above everything the exit still holds (CodeGen::EmitDeferBody).
+    void DeferBody(Defer *d) { GenBlock(d->body, true); }
+    // `defer`: the body joins the exits of the innermost block that is not a statement's.
+    void StmtDefer(Defer *d) {
+        auto i = sscopes.size() - 1;
+        while (i > 0 && sscopes[i].stmt) i--;
+        sscopes[i].defers.push_back({ sscopes[i].marks.size(), d });
     }
     // The restores of every scope from `depth` in, innermost first (a break's, continue's, return's).
     void RestoreFrom(size_t depth) {
@@ -2888,7 +2911,7 @@ struct TgFn {
             case NK_LoopExpr: return GenLoopX(static_cast<LoopExpr *>(n), false);
             case NK_MatchExpr: return GenMatch(static_cast<MatchExpr *>(n), false);
             case NK_Return: case NK_Break: case NK_Continue: case NK_VarDecl: case NK_Assign:
-            case NK_IncDec: case NK_While: case NK_ForLoop:
+            case NK_IncDec: case NK_While: case NK_ForLoop: case NK_Defer:
                 Stmt(n);
                 return Dummy(n->exprtype && n->exprtype->kind != TY_VOID ? n->exprtype : nullptr);
             default: No(n->line, cat("expression kind ", (int)n->nkind));
@@ -6426,6 +6449,7 @@ struct TgFn {
         switch (n->nkind) {
             case NK_VarDecl: return StmtVarDecl(static_cast<VarDecl *>(n));
             case NK_Assign: return StmtAssign(static_cast<Assign *>(n));
+            case NK_Defer: return StmtDefer(static_cast<Defer *>(n));
             case NK_IncDec: {
                 auto id = static_cast<IncDec *>(n);
                 auto pl = Deref(Place(id->lval));

@@ -266,6 +266,8 @@ WHOLE_PROGRAM |= {p.stem for p in NATIVE}
 # programs, so that the suite fails on a wrong output and on any function left to C. The G4.3 ones are
 # a result with relative links built at its receiver, thread_wait with a message, a break in a while's
 # condition, qpoll of an image, and a dispatch on a variable-mode enum in a recursive cycle.
+# The defer ones cover every exit a defer runs at: fall-through, break, continue, return, a block's
+# return, return from, exception::try's finally, and results built before the defers run.
 REGRESSIONS = ["test/codegen/forward_adaptation.goose", "test/codegen/bytes_value_equality.goose",
                "test/codegen/reference_element_results.goose", "test/codegen/relative_operands.goose",
                "test/codegen/rendered_pools.goose", "test/threads/queue_producers.goose",
@@ -275,7 +277,9 @@ REGRESSIONS = ["test/codegen/forward_adaptation.goose", "test/codegen/bytes_valu
                "test/storage/alloc_built_in_slot.goose", "test/codegen/relative_receiver_values.goose",
                "test/threads/thread_contained_many.goose", "test/optimizer/bce_while_break_exit.goose",
                "test/threads/qpoll_zero_padded.goose",
-               "test/codegen/recursive_dispatch_fixed_variant.goose"]
+               "test/codegen/recursive_dispatch_fixed_variant.goose",
+               "test/codegen/defer_exits.goose", "test/codegen/defer_return_from.goose",
+               "test/codegen/defer_results.goose"]
 # Programs whose header asks for the debug checks (a runtime-debug or GS_DEBUG=1 line), built with
 # --debug: thread_contained answers only in a debug build, and the others, also listed above, have
 # links the checks verify.
