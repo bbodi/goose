@@ -1580,7 +1580,7 @@ def main():
     # The optimizer runs in every typecheck above, at -O1 for bce annotations
     # and -O2 otherwise; also exercise every level (and the --specs dump path)
     # on the optimizer coverage file.
-    r.section("optimizer, stack report and C shapes")
+    r.section("optimizer and stack report")
 
     def optimize(lvl):
         code, out, err = r.goose(lvl, "--check", "--specs", HERE / "optimizer" / "optimize.goose")

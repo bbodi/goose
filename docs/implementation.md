@@ -43,7 +43,7 @@ means the same type and lifetime decisions within that supported subset,
 the same evaluation, mutation, results and required runtime failures, and
 the specified layouts where bytes or C interfaces expose them. It does not
 require the same AST, specialization count, stack numbering, optimization
-thresholds, generated C text, or diagnostic wording. Bounds checks may be
+thresholds, generated code, or diagnostic wording. Bounds checks may be
 removed whenever sound; acceptance must not depend on an optimization
 proving an otherwise illegal lifetime safe. Debug arithmetic has the
 specific optimization latitude given in spec §6.2.
@@ -67,17 +67,21 @@ single translation unit, included in the order the driver lists them.
 | Typecheck | `typecheck*.h` (`TypeCheckProgram`) | the `Ast` | one `FnSpec` per specialization with a cloned, annotated body; `StructInst`/`EnumInst`; `VarDef`s; the store record; every diagnostic of §3--§11; the shader blobs `embed_shader` compiles (`gfx.h`, `shaderc.c`) |
 | Optimize | `optimize.h`, `optimize_basecase.h`, `optimize_tre.h`, `optimize_loops.h`, `optimize_reassoc.h` (`Optimizer`) | live specializations | bodies rewritten in place (inlined, folded, loops), liveness and use counts, loop shapes (`ForLoop::stripk`, `sumred`, `While::countdown`) |
 | BCE | `bce.h` (`BCE::RunAll`) | live specializations | `Index::nobc`, `SliceExpr::nobc`, `ForLoop::fixedlen` and `lenbound`, per-loop `hoistrefs` and `hoistfields` |
-| Codegen | `codegen*.h` (`CodeGen`) | live specializations, globals | one C file, with `src/runtime/` (or the part of it that a program's unit holds) around it |
-| tinygen | `tinygen_backend.h` | live specializations, with codegen's call interfaces and layouts | with `goose build --backend=tinygen`: an object holding the specializations it supports, which codegen then declares and leaves out of the C; when that is all of them and the C would hold only `main` and program-independent shims, the object holds `main` too and no C of the program is compiled (`docs/design/tinygen_backend.md`) |
-| JIT | `jit.h` | the C text | the program run in-process through libtcc, when no `-o` was given |
+| Analyses | `codegen.h`, `codegen_types.h`, `codegen_program.h`, `codegen_stacks.h` (`CodeGen`) | live specializations, globals | the call interface of each specialization (C name, `gs_sp`, free variables, `return from` ids), layouts, the globals' names and static initializers, the C spelling of types |
+| Backend | `tinygen_backend.h` (`TinyGenBackend`, `TgModule`, `TgFn`) | live specializations, with the analyses' call interfaces and layouts | each function lowered to tinygen's IR (`docs/design/tinygen_backend.md`), written as a native object with debug info (`--backend=tinygen`, `goose build --debug`) or as C (`--backend=tinygen-c`, the `goose build` default, `goose run`, `goose -o x.c`), with `src/runtime/` (or the part of it that a program's unit holds) around it |
+| JIT | `jit.h` | tinygen's C | the program run in-process through libtcc, when no `-o` was given |
 
 The passes are virtual methods on `Node` (`ast.h`): `Dump`, `Clone1`,
-`Children`, `Check`, `Cp1`/`Opt`, `BceWalk`/`BceMark`, `CgX`/`CgAny`/`CgStmt`.
+`Children`, `Check`, `Cp1`/`Opt`, `BceWalk`/`BceMark`. The backend does not
+add a virtual: it dispatches on the node kind itself.
 The per-node bodies of each pass live together in one file (`dump.h`,
 `clone.h`, `typecheck_nodes.h`, the tail of `optimize.h`, the tail of
-`bce.h`, `codegen_nodes.h`) so that each pass can be read in one place. Shared
-state and helpers belong to the pass object (`TypeCheck`, `Optimizer`, `BCE`, `CodeGen`),
-split across the `typecheck_*.h` and `codegen_*.h` files by topic.
+`bce.h`) so that each pass can be read in one place. Shared state and
+helpers belong to the pass object (`TypeCheck`, `Optimizer`, `BCE`,
+`CodeGen`), split across the `typecheck_*.h` and `codegen*.h` files by topic.
+The backend (`TinyGenBackend`, `TgModule`, `TgFn`) lives in
+`tinygen_backend.h`; a construct it does not compile is a compile error
+(`tinygen backend: X is not supported yet (file:line)`), with no fallback.
 
 **Ownership.** `Ast` owns every node, type expression, type detail, symbol,
 `VarDef`, instantiation and specialization in append-only tables; the trees
@@ -89,7 +93,7 @@ the node it was copied from, as the source has it (`Node::origin`). The
 optimizer's inliner copies with `Cp1`, which preserves annotations and
 remaps the callee's `VarDef`s to fresh ones.
 
-**The compile thread.** `Main` runs the phases up to the finished C on a
+**The compile thread.** `Main` runs the phases up to the finished object or C on a
 thread of its own with a 64 MB stack (`RunOnCompilerStack`, `COMPILERSTACK`
 in `main.cpp`). The typechecker recurses as deep as the program's
 compile-time call path (§3.1 below), and the platforms' main threads get
@@ -110,8 +114,9 @@ which nothing in the executable sets.
 * `goose debug file.goose [-- args]` builds it the same way and starts lldb
   on it with the formatters of `src/lldb/goose_lldb.py` imported
   (`FindLldbFormatters`).
-* `goose build file.goose` writes the C to the program's build directory
-  under `GOOSE_HOME`, and compiles and links it into an executable beside
+* `goose build file.goose` has the backend write tinygen's C (or, with
+  `--debug`, a native object) to the program's build directory under
+  `GOOSE_HOME`, and compiles and links it into an executable beside
   the source (`build.h`: the runtime object compiled once per toolchain and
   configuration, the native modules' response files, `-o`, `--debug`,
   `--standalone`, `-v`, `--dry-run`; `-O2` by default).
@@ -138,7 +143,7 @@ which nothing in the executable sets.
 once per toolchain, a response file for the link, and, for a run, a shared
 library whose one export hands the C functions to `RunJit` by name). They
 also build the native parts of the packages whose extern fns the program
-calls (`NativePackagesUsed`, from codegen's `usedexterns`). An extern bound
+calls (`NativePackagesUsed`, from the backend's `usedexterns`). An extern bound
 from a shared library at run time is skipped, since it comes from no
 package's C. Each package comes before the ones it requires, and is built
 under `GOOSE_HOME/build/pkg`. A package with a `cmake_target` is built
@@ -204,7 +209,7 @@ their whitespace) and parses both (the same `Ast::Dump` and `DumpDocs`).
 | `--specs` | print every live specialization's optimized body |
 | `--stacks` | print the data stack count of the main program and of each worker, the number of regions these add up to, the thread cap that determines `hardware_threads()`, and every function's share (`codegen_stacks.h`); with `--check` it runs the backend for the counts and writes nothing |
 | `--stack-reserve size` | the address space reserved per data stack, written as `-DGS_STACK_RESERVE` (K/M/G/T suffixes; at least 64 KB, at most 2^48) |
-| `--no-bce` | skip bounds-check elimination (this also loses the loop-view hoist, §6.10, and the restated array loops that need BCE's facts, §6.12) |
+| `--no-bce` | skip bounds-check elimination |
 | `--bce-test` | verify `// bce:elide` / `// bce:keep` annotations in the sources |
 | `--bce-lines` | print elided/kept counts per source line |
 | `--unsafe-no-rf-check` | omit the `return from` discriminant checks after calls: a measurement aid, unsound |
@@ -214,8 +219,8 @@ their whitespace) and parses both (the same `Ast::Dump` and `DumpDocs`).
 | `--compile-shader f [--shader-source msl\|hlsl]` | hidden: what a shader compiles to, without a program around it |
 | `--backend=tinygen\|tinygen-c` | with `goose build` or `goose run`: `tinygen` has the tinygen backend (`tinygen_backend.h`, `docs/design/tinygen_backend.md`) write a native object with debug info naming the Goose source, `-O0` unless an `-O` is given; `tinygen-c` has it write C for the C compiler, `-O2` unless given. Without it a build takes `tinygen-c`, or `tinygen` with `--debug`; `-v` says which |
 
-The debug build of the *generated* C is `-DGS_DEBUG=1` on the C compiler (or
-`-DGS_DEBUG=1` to `goose`, which writes it into the file): it enables the
+The debug build of the *generated* code is `-DGS_DEBUG=1` on the C compiler (or
+`-DGS_DEBUG=1` to `goose`, which writes it into the file; `goose build --debug` sets it for the object the backend writes): it enables the
 overflow, `as` range and ADT tag checks of §9.3. The Goose compiler's own
 build configuration is unrelated.
 
@@ -510,8 +515,7 @@ function and no existing specialization matches. `GetOrCreateSpec`
 | `needs` | the concrete specializations of every `return ... from` target enclosing the call must be the same on this path |
 
 `RootArg::exact` and `RootArg::concrete` are excluded from the key: they are
-ANDed over every call site that reaches the specialization, and only codegen
-(section 6.10) and the growth checks (§3.10) read them. A back edge into a
+ANDed over every call site that reaches the specialization, and only the growth checks (§3.10) read them. A back edge into a
 specialization still being checked (`inprogress`) reuses it regardless of
 its roots (§3.11).
 
@@ -767,7 +771,7 @@ validate them, and compute the derived properties every later pass reads:
 * `flat` (no references anywhere), what threads and queues require;
 * `frameobj` (C.2): a resizable-tailed struct whose other fields are all
   fixed-size and free of relative references, and whose tail is an array or
-  itself a frame object. This is the shape that codegen keeps in the frame
+  itself a frame object. This is the shape that the backend keeps in the frame
   as a C struct, with the tail's header last;
 * `validated`, which is false while the instantiation is being built and so
   detects a struct or enum that contains itself by value, and per variant
@@ -812,7 +816,7 @@ only, since a whole assignment replaces its variant (§4.4, `CheckMatch`).
 So `GetEnumInst` rejects an instance whose `varclass` is resizable if a
 payload that is not itself resizable holds self-relative references. It
 does so at the enum's declaration, once all variants are built. A
-resizable payload, which the C backend does not bind at all yet, is left
+resizable payload, which the backend does not bind at all yet, is left
 alone.
 
 An array literal uses its destination's type when one is available.
@@ -825,13 +829,13 @@ the pending-array rule below deliberately chooses an owned string element
 instead. Array adaptation requires equal element types, not elementwise
 numeric conversions. Fixed-array destinations require their exact length;
 an arbitrary slice is not implicitly checked and converted into `T[k]`.
-A fixed literal at a slice destination is a temporary that codegen holds
+A fixed literal at a slice destination is a temporary that the backend holds
 in a C local and slices in full. A `T[]` literal has no such temporary:
 `NoTemporaryLiteral` rejects it at a slice destination, as a `for`
 iterable, as the base of a path (`[..]`) and as `bytes_of`'s argument,
 which are the places that would view it (spec §4.2). To compare two kinds
 of array, `==` takes a whole slice of an operand (`WholeSlice`, marked
-`cmpview`), and that slice may view a `T[]` literal: codegen builds the
+`cmpview`), and that slice may view a `T[]` literal: the backend builds the
 literal on a statement-scoped stack, like a call result, and the
 comparison's result holds no view of it.
 
@@ -865,7 +869,7 @@ again at the parameter type that overload resolution finds for it
 (`UnifyArg`). A construct whose branches are all such literals is such a
 placeholder as well (`MergeVals` keeps the flag, as it keeps a null's), so
 it takes a parameter's type too. A `[]` beside a branch of another type is
-an error, since, unlike a constant, it adapts to no other type. Codegen
+an error, since, unlike a constant, it adapts to no other type. The backend
 could not build the placeholder, so every consumer with no type to give it
 rejects it. These consumers do so through `IsUntypedEmptyArray` and
 `NoUntypedEmptyArray`:
@@ -887,7 +891,7 @@ The other consumers reject it by its type, which a diagnostic shows as the
 literal (`TypeStr`).
 
 **Named initializer order.** `CheckInits` resolves names and checks each
-initializer in declaration order, the order codegen evaluates and constructs
+initializer in declaration order, the order the backend evaluates and constructs
 them directly in their destinations. It then checks each source-order inversion
 with `InitOrderSafe`: both expressions, and any omitted defaults between their
 fields, must be free of observable effects, runtime failures and nonlocal exits.
@@ -975,8 +979,8 @@ condition (`CheckCond`), an integer `match`'s scrutinee (`CheckMatch`) and
 a `for` loop's count (`CheckFor`) decay the same way. A reference to an
 ADT scrutinee is kept, and its tag and payload are read where the value
 lies; so is a reference to the array or slice that a `for` iterates in
-place. The node's `exprtype` is then the pointee's type, which codegen
-follows: a written `&x` there reads as `x` (`Unary::CgX`). An assignment
+place. The node's `exprtype` is then the pointee's type, which the backend
+follows: a written `&x` there reads as `x`. An assignment
 to a reference-typed location writes the pointee (`Assign::pointee`); `.=`
 rebinds it (`CheckRebind`). In generic code (`InGenericBody`: the current
 function or one it is nested in has type parameters or untyped parameters)
@@ -1060,7 +1064,7 @@ which `BindsRef`, `AutoRef`, `FitsAt` and `UnifyArgRaw` bind by), never an
 a construct whose branches are such references binds as `varint&` at a
 reference parameter. Neither is `i64` storage: a format overload taking an
 `i64` by reference is rooted at a read-only temporary (`CheckPrintable`),
-which codegen fills with the decoded value (`EmitUserFormat`). A varint
+which the backend fills with the decoded value. A varint
 part of a printed value keeps its own type, which no `i64` overload takes.
 
 **The statement's operands.** Values evaluated earlier in a statement stay
@@ -1086,8 +1090,7 @@ evaluated, and, inside the condition of an `if`, the scrutinee of a
 
 A `for`'s sequence is the only operand held across a construct's parts: it
 is held while the loop's body is checked (`HoldForSequence`, §6.5).
-Codegen writes the path to the sequence into the loop (`ForLoop::CgStmt`,
-`GenLoc`). So each reference or slice that the path loads out of a field
+The backend writes the path to the sequence into the loop. So each reference or slice that the path loads out of a field
 or element (a `Dot` or `Index` of such a type; `&` of a path counts as the
 path) is held as a view of the storage it lies in (`Held::reread`). The
 sequence itself is held as a view of its elements, unless it is a
@@ -1165,7 +1168,7 @@ depth: `temproot` (what a reference variable not bound yet points at).
 **Temporaries.** A value made without a name (a literal or a call's
 result, `str`'s text, a popped element) is rooted at a `VarDef` of its
 own (`TempRoot`, `istemp`), one past the depth of the scope it is made in.
-Codegen frees it when its statement ends (§6.2), or when the block whose
+The backend frees it when its statement ends (§6.2), or when the block whose
 tail made it ends. So it outlives the variables of the scopes that the
 statement opens (a `for` body over it, a `match` arm on it), but not the
 variables the statement itself declares. What a temporary holds is read
@@ -1180,8 +1183,8 @@ element pointed, and is as writable as its slot.
 The by-value result of an `if`, `match`, block, loop or bare `{ }`, of a
 function value's call, and of `copy(x)` and `default<T>()` is also such a
 temporary, except where `default<T>()` gives a null reference or an empty
-slice, which are static data. Codegen builds it in storage of its own
-(`CtlValX`, or `GenLoc` for any other value it addresses), and copies a
+slice, which are static data. The backend builds it in storage of its own
+and copies a
 branch's value there even where the branch names a variable. `TempCopy`
 roots a construct's value, the value of a function value's call
 (`CheckFunValCall`) and a default there, and `CheckBuiltin` roots a copy
@@ -1362,7 +1365,7 @@ these body depths, so a temporary ranks after every variable here too,
 whatever depth it shares with one at the call site.
 
 Only the call sites know whether two *different* classes are different
-arrays. Codegen's stack-top caching (section 6.10) and the growth checks
+arrays. The growth checks
 (§3.10) ask `RootArg::exact`/`concrete`, which `SettleParamRootExactness`
 propagates through the `via` links after every call site has been seen.
 The shrink rules have each call check the pairs of roots that its callee
@@ -1962,7 +1965,7 @@ and `match` bindings are copies; writes to them are rejected by
 `NoCopyWrite` using `VarDef::copybind`. A `for` element that is itself a
 reference binds as the reference it holds either way, loaded and rooted by
 the read-back rule where it is relative. `&x` only makes it a binding that
-writes through (`ForLoop::CgStmt` loads it, never the slot's address). A
+writes through (the loop loads it, never the slot's address). A
 variable's `const` type works the other way round. A bare name's
 `LVal::writable` is its *contents'* writability, which `&x` and the paths
 into it inherit, while a write of the variable itself (`=`, a compound
@@ -2056,7 +2059,7 @@ the call never runs. A branch that diverges has the null "bottom" type,
 which unifies with anything (`UnifyBranch`, `MergeVals`), and reads as
 `void` once the construct's node is left (`VoidIfBottom`). An `if` that
 ends its block (as the `if` a guard parses to does) and whose `else`
-diverges is marked `IfExpr::flat` (`CheckIf`, by `blockpos`). Codegen puts
+diverges is marked `IfExpr::flat` (`CheckIf`, by `blockpos`). The backend puts
 its then-block after the `else` in the C block the `if` is in (§6.2), and
 the inliner counts no block for it (§4).
 
@@ -2692,8 +2695,7 @@ format call's receiver if the text is written there, or a temporary otherwise.
 `UserFormatIn` applies the overload as a call using `ApplyCalleeShrinks`,
 `ApplyCalleeRebinds`, and `ApplyCalleeGrows`. It also uses `NoteWritableRef`
 when a variable is taken whole by a writable reference.
-Codegen evaluates each argument just before rendering it (`EmitFormatInto`,
-`EmitStr`), so while argument i is checked the ones after it are later
+The backend evaluates each argument just before rendering it, so while argument i is checked the ones after it are later
 operands (`LaterOperands`). A shrink in its evaluation (a call) or its
 rendering (an overload) finds a variable they name used after it.
 
@@ -2711,8 +2713,8 @@ for the error). What is held is:
 
 The parts that `CheckRenderable` is walking in place where it meets the
 overload are held too (`renderwalks`): a variable-mode ADT, whose tag
-codegen reads once, and an array of a size that is not fixed, whose count
-codegen reads once, each as a reference to where it lies (`Held::inplace`).
+the backend reads once, and an array of a size that is not fixed, whose count
+the backend reads once, each as a reference to where it lies (`Held::inplace`).
 Such a reference is not the path to a resizable that a reference to a
 resizable otherwise is. A shrink of either kind of the storage it lies in
 may free its elements or rebuild it, as a whole assignment rebuilds every
@@ -2730,7 +2732,7 @@ its fields and elements, lies where the reference points and is as
 writable as the reference (`DecayRef`, §3.8), and what the overload stores
 there is judged against that storage. That pointee is storage whatever
 roots the reference has (`Val::pointee`). An argument that is no storage
-lies in the temporary that codegen renders it from (`GenLoc`), and so do
+lies in the temporary that the backend renders it from, and so do
 its parts. A call's result, a struct or array literal and a control
 construct's value are rooted at such a temporary already. Any other such
 argument has no roots (an operator's result, a scalar literal, a cast, a
@@ -2738,14 +2740,13 @@ variant constant, a `.len`, a literal parameter), which every rule would
 take for static data outliving whatever an overload stores a reference
 into, so it is rooted at a fresh temporary (`CheckPrintable`).
 
-An overload taking a slice by reference is given the slice's slot, which
-codegen passes (`EmitUserFormat`), bound as `RefSliceArgs` binds a slice
+An overload taking a slice by reference is given the slice's slot, which the backend passes, bound as `RefSliceArgs` binds a slice
 lvalue (`SlotRoots`, `NoteHeld`). Every slice rendered has a slot
 (`Val::slot`):
 
 * the variable, field or element it was read from;
 * where a reference argument points (`DecayRef`), a reference a call
-  returns included, which codegen holds and renders the pointee of
+  returns included, which the backend holds and renders the pointee of
   (`RenderedLoc`);
 * for a nested slice, the part it lies in (a field's struct, an element's
   array or slice, a reference's pointee), as writable as that part is;
@@ -2758,17 +2759,16 @@ lvalue (`SlotRoots`, `NoteHeld`). Every slice rendered has a slot
 
 What the overload stores there rebinds the caller's variable or is recorded
 in its container (`ApplyCalleeStores`), and it re-points no slot that `&`
-could not write. The temporary is read-only (§9.5), and codegen passes a
+could not write. The temporary is read-only (§9.5), and the backend passes a
 temporary wherever the optimizer reduces the argument to the storage it was
 copied from (`OptRendered`, **Views of copies**). The parts of a
-fixed-mode ADT's payload lie in a temporary too: the copy codegen renders
+fixed-mode ADT's payload lie in a temporary too: the copy the backend renders
 them from (§3.15). `CheckRenderable` takes them out of a `TempCopy` of the
 ADT, whose contents are the ADT's, so an overload given such a part by
 reference can neither keep it nor write it, as nothing may refer into the
 payload itself (§3.5). No fixed-mode payload holds self-relative references
 (`ValidateType`), so the copy keeps every link. An overload that takes a
-value holding self-relative references by value (`UserFormatIn`), which
-`EmitUserFormat` would copy, is rejected.
+value holding self-relative references by value (`UserFormatIn`), which the rendering would copy, is rejected.
 
 A type that reaches itself through references renders every level below the
 first with a function of its own that runs no overload (§6.9). So
@@ -2785,14 +2785,13 @@ array's top or slot is under construction while its expression is checked,
 and nothing may grow or shrink that array meanwhile. Such values are:
 
 * a pushed or pool-allocated element that is variable-size or holds
-  relative references of either form (`BuiltInPlace`: `EmitPush` and
-  `EmitAlloc` build such an element in its slot, whatever expression gives
+  relative references of either form (`BuiltInPlace`: a push or an allocation builds such an element in its slot, whatever expression gives
   it; any other fixed-size element is evaluated before its slot is claimed,
   §6.5);
 * a call's array result being appended to a non-limited array (a `T[..]`
-  result too, though `EmitAppend` builds it on a temporary, §6.5);
+  result too, though an append builds it on a temporary, §6.5);
 * an appended literal of elements that are variable-size or hold relative
-  references of either form (which `EmitAppend` builds in place);
+  references of either form (which an append builds in place);
 * the new contents of a whole assignment of a resizable (`CheckAssign`,
   `PointeeAssign`).
 
@@ -2913,7 +2912,7 @@ The call's own non-fixed result is checked by its position
 outward from its call, through the constructs whose value is the call's
 value, the path must reach one of these:
 
-* a `return` (or the body's tail) of the same result types, where codegen
+* a `return` (or the body's tail) of the same result types, where the backend
   forwards the result to the caller's destination (for a long-distance
   return, into its channels);
 * a `push` or `append`, which builds the result at the receiver's top (and
@@ -2924,13 +2923,12 @@ call. A function value's body and a default are checked in frames of their
 own, on the path of the statement that takes them, so a call there is
 checked the same way up to the top of the body or default. A default's
 value is the argument or field that takes it. A function value's body's
-value is the value of its call, whose destination `EmitFvCall` takes
-before the body runs. That is known once the body's check ends: `NoteTemp`
+value is the value of its call, whose destination the call takes before the body runs. That is known once the body's check ends: `NoteTemp`
 then uses the same path walk, in the frame making the call, to check a
 call of a function value whose non-fixed value was built across a call
 into the cycle.
 
-Codegen asserts the outcome. At every call emitted with a stack index,
+The backend asserts the outcome. At every call emitted with a stack index,
 `NoStackAcrossCycleCall` fails with an internal error if the callee is in
 the caller's cycle and any of the caller's stack indices is in use, so a
 gap in the checker cannot silently take a stack per activation. For the
@@ -3236,7 +3234,7 @@ adapts to a type (`FitsAt`, `UnifyNumeric`, branch merging) records a
 `LitAdapt` on the owning specialization, and passing it on as a literal
 records a `LitFlow`. After the whole program is checked, `VerifyLiterals`
 checks each call site's literal against the closure of those records.
-Codegen passes the parameter at its nominal type and casts at each use.
+The backend passes the parameter at its nominal type and casts at each use.
 
 **Parameter defaults** (§7.1): `TryMatch` binds the written arguments to
 the leading parameters (`MatchInfo::nwritten`). Function values for the
@@ -3349,7 +3347,7 @@ they do a function's.
 Rechecking a declaration, loop or match binding resets its checking state
 while preserving its `VarDef` identity, capture flag and the marks of
 §3.14 (`ResetLocal`), so cached specializations still name the binding
-codegen declares. A loop's next pass, or a cycle's next round, finds such
+the backend declares. A loop's next pass, or a cycle's next round, finds such
 a variable as its own, as the first pass did, so a specialization checked
 then serves it. A call that reuses such a specialization sets the variables it
 read to the state its check left them in (`envexits`, `ReplayEnvExits`;
@@ -3397,7 +3395,7 @@ locals (§7.5). Each check clones the body afresh and makes a new
 environment with it, so a specialization keyed on one environment captures
 that clone's variables. Another call site of the value, or the same call
 checked again as an argument, therefore specializes anew instead of
-reusing a specialization whose captured variables codegen never declares.
+reusing a specialization whose captured variables the backend never declares.
 `NamedSpec` gives the named function around such an environment, which is
 what a plain `return` inside it targets (`CheckReturn`). This is how
 HOF-based iteration returns. A call path (the frames, or a path that a
@@ -3512,12 +3510,12 @@ The named result is `return x`, or a tail `x`, where:
 
 A result type still to be inferred is taken to be x's type. Only the whole
 body can tell whether every return gives x. So `CheckNamedResultUses`, at
-the end of `CheckSpecBody`, runs codegen's structural test
+the end of `CheckSpecBody`, runs the backend's structural test
 (`NamedResultOf`, as `CodeGen::NamedResult`; a return it cannot place
 counts against it), and if the test fails it reports each return of x. A
 body relying on the named result is marked (`FnSpec::relnamedresult`) and
 never inlined (`Optimizer::Scan`), so its result is built by
-`DetectNrvo`'s named result at every call. Codegen fails loudly if a
+`DetectNrvo`'s named result at every call. The backend fails loudly if a
 return or an inlined body's exit ever copies such a local instead
 (`NoSelfRelCopy`).
 
@@ -3599,14 +3597,13 @@ storage:
   signatures (`ExternValueOk`), and `IsU8` is false for one, so no text
   sink writes into an array of them.
 
-Codegen erases the type. The C type is the storage's type. `Mangle`
+The backend erases the type. The C type is the storage's type. `Mangle`
 numbers the array into the name, so that per-type artifacts such as a
 `from_bytes` verifier stay apart, and the verifier checks each value
 against the array's current length. A conversion wraps its operand in
 `IndexTypeCheck` (`GS_IDX`, or `<= len` for a bound) unless the
 bounds-check pass set `AsCast::nobc`. The optimizer folds no such
-conversion, and `DivisorKey` and `Speculatable` treat one as the check it
-is.
+conversion, and the optimizer and BCE treat one as the check it is.
 
 `checkfree` (spec §7.14) is a parse-time flag on `SFunction`, inherited by
 nested functions. The typechecker's half is the call rule
@@ -3670,7 +3667,7 @@ through the initializer of a named constant that names another
 `RelyOnConstant`). So does a fold of two named constants, for the constant
 whose chain the fold drops. `FoldInt` leaves a zero divisor from a named
 constant to run time. An adapted read is emitted at its use's type
-(`Ident::CgX`), as a literal parameter's is, where the optimizer did not
+as a literal parameter's is, where the optimizer did not
 already propagate the value. An array size is evaluated once per type and
 cached (`ArraySize`), which does not affect the marks, since they do not
 follow the flow. `ConstIntValue` takes a name to be the global of that
@@ -3718,8 +3715,7 @@ local or global, bound to such a float (or a float constant) is marked
 constant) and `Val::constfrom`, which binary and unary float operations
 and float branch joins carry on. Where it meets an `f32` (`MustFit`,
 `UnifyNumeric`, `MergeVals`), `RelyOnNamed` marks it, and `RetypeFlex`
-gives the identifier the `f32` type, at which `Ident::CgX` reads the `f64`
-variable rounded. `ResetLocal` keeps `constuse` across a loop's passes, so
+gives the identifier the `f32` type, at which the read gives the `f64` variable rounded. `ResetLocal` keeps `constuse` across a loop's passes, so
 a writable reference after a relying use is an error in each pass.
 
 An integer computed from constants, with a shift by a non-constant count
@@ -3734,8 +3730,7 @@ below take the new type. `~c` of a constant `c >= 0` is also such an
 integer, with `Val::notconst` saying it is exactly i64's `~c`. Unary `-`
 takes it as that constant, and an untyped `let` global of it is a named
 constant with `VarDef::constnot`, read back as such a value. Its value at
-a narrower use is `~c` wrapped, which is what `Ident::CgX`'s cast and the
-optimizer's propagated copy (`CloneLit`, `WrapStorage`) give.
+a narrower use is `~c` wrapped, which is what the read's cast and the optimizer's propagated copy (`CloneLit`, `WrapStorage`) give.
 `ConstIntValue` also reports `~c` of a literal or of a named constant (an
 annotated global is not one) with `Val::notconst`, with i64's `~c` as its
 value for the arithmetic around it. A match pattern is `~c` wrapped to the
@@ -3766,7 +3761,7 @@ it (`MustFit`). The range's or the count's `exprtype` is the type the loop
 counts at. That is the binder's type, except for a literal end one past
 the type's largest value (`pastend`). Such a loop counts at i64, whose
 counter cannot overflow at the end, and binds the binder to a copy of the
-counter each iteration (`ForLoop::CgStmt`). `pastend` does not evaluate an
+counter each iteration. `pastend` does not evaluate an
 end that names anything (`ConstExprNames`), since a name is not a literal.
 `ConstIntValue` would fold the global of each name, which a local, a type
 parameter or a nested function of the name may hide. It would also fail on
@@ -3883,7 +3878,7 @@ whose type can carry the freelist, a plain reference to a grow-only array
 (`CarriesPool`), keeps the bits. `BindProv` drops them for any other
 variable, and `GetOrCreateSpec` for any other parameter, so an optional
 reference to a pool is an optional reference to an array. A pool reference
-variable keeps its first binding's bits, since codegen gives it one
+variable keeps its first binding's bits, since the backend gives it one
 representation for its life (§6.1): `CheckRefRebindRoot` rejects a rebind
 to a value lacking one of them. A function checked standalone
 (`CheckUnreached`) assumes both bits, which no reached binding has, and
@@ -3897,7 +3892,7 @@ that it belongs elsewhere. It reports an error when the slice is rooted
 exactly at a global or a variable of the checked function, and every receiver
 alternative names a different such global or variable. Loops defer this
 decision to their settled pass (§3.7).
-Otherwise the call sets `Call::poolcheck`, which codegen turns into a
+Otherwise the call sets `Call::poolcheck`, which the backend turns into a
 range test. `alloc_slice` and `realloc_slice` need an element type with a
 default value, and `realloc_slice` also needs one without self-relative
 references (`HasRelRefT`), since it may copy the slice.
@@ -3906,8 +3901,7 @@ references (`HasRelRefT`), since it may copy the slice.
 
 Left-to-right evaluation in spec §2 includes taking a value, not merely
 computing a path that C might read later. These distinctions matter in the
-presence of aliases (`Snapshot`, `IndexLoc`, `GenSlice`, `Assign::CgStmt`,
-`EmitDispatch`):
+presence of aliases (snapshots, indexing, slicing, assignment and dispatch):
 
 * An earlier scalar or fixed by-value argument is sampled before later
   operands or arguments run. A reference or slice samples its address or
@@ -3942,8 +3936,7 @@ presence of aliases (`Snapshot`, `IndexLoc`, `GenSlice`, `Assign::CgStmt`,
   own view length, not its owner's current length. A sequential cursor
   advances past the current element even on `continue`. A body that
   re-points a slice or rebinds a reference on the path moves the traversal
-  to the elements the path now leads to, at the next index, as the re-read
-  length does (`ForLoop::CgStmt`). A sequential cursor walks there from
+  to the elements the path now leads to, at the next index, as the re-read length does. A sequential cursor walks there from
   the start of those elements, and the start of elements behind a varint
   length prefix is computed again.
 * print, str and format render a value where it lies, around its format
@@ -4036,7 +4029,7 @@ After that, in order, come:
   `TailRecurse`, `Scan`);
 * globals again (now able to inline);
 * a final reachability pass, so that specializations whose every call was
-  inlined go dead and codegen skips them;
+  inlined go dead and the backend skips them;
 * loop shaping over the live bodies.
 
 **Constant propagation** (`OptStmt`, `Ident::Opt`): a single-name declaration
@@ -4075,19 +4068,17 @@ to it or write it.
 the callee's parameter bindings as `VarDecl`s, followed by a `Cp1` copy of
 the body. The bindings are marked `inline_arg` and evaluated in the
 caller's scope, so that an argument temporary outlives the returned value.
-A `Return` whose target is the inlined function exits the block with its
-values (`Return::CgStmt`), which keeps early returns, `return from` and
+A `Return` whose target is the inlined function exits the block with its values, which keeps early returns, `return from` and
 function-value returns working through any nesting. The copy is re-folded
 so substituted constants cascade. A trivial result unwraps to a plain
 expression when its type survives. A call passed where a slice is expected
 keeps that slice as its checked type, while the body returns the array.
-Codegen builds the array where the call would have put its result, a
-temporary of the caller's scope, and slices it whole
-(`InlineBlock::CgAny`), since the body's own scopes release their storage
+The backend builds the array where the call would have put its result, a
+temporary of the caller's scope, and slices it whole, since the body's own scopes release their storage
 when it exits. The body's `return` may deliver another type than the call
 was checked as: the reference itself where the call site decayed it to its
 pointee, or a slice where a limited array is wanted. There the destination
-loads or adapts the value as its type asks (`GenXD`, `CallVal0`). Every
+loads or adapts the value as its type asks. Every
 lvalue destination an inlined body can reach names that type (`Dst::t`),
 including the temporary that receives a function value's call's value and
 the global an initializer sets.
@@ -4105,9 +4096,7 @@ applies in a cold branch (`colddepth`): the else of a guard (an
 `exit` where the other path continues. Such an arm runs at most once per
 run of its function or loop, mostly on an error path. A callee used only
 there, and too big for the size rules, would grow the hot path of its
-caller to save at most one call. So it stays out of line, and is declared
-`GS_NOINLINE` in C (`FnSpec::outofline`), since the C compiler otherwise
-inlines a static function with one caller whatever its size. A branch that
+caller to save at most one call. So it stays out of line, (`FnSpec::outofline`). A branch that
 a constant condition decides is folded away first and is not cold.
 
 The single-use rule also gives way to the caller's own inlining
@@ -4130,12 +4119,8 @@ saves nothing.
 
 * a `recursive` function or cycle member;
 * a `thread_fn`;
-* a `simd` function (its callers would run the baseline only, §6.13);
-* a function returning more than one value. Where that is the only reason
-  (`InlineInfo::c_inlinable`) and the thresholds pass at a call site, the
-  function is declared `GS_INLINE` in C instead (`FnSpec::cinline`), so
-  the C compiler inlines it: always_inline under gcc and clang,
-  `__forceinline` under MSVC;
+* a `simd` function (§6.13);
+* a function returning more than one value;
 * a body that a *separate* live tree still references in a way a copy
   cannot follow. A remaining call to a specialization with bound function
   values reaches the body's locals as free variables, and a remaining
@@ -4152,7 +4137,7 @@ inlined like any other (`InlineInfo::nestedcalls`):
   `Inliner::RemapFreeVars`, composed through further copies; a nested
   function inlined from such a call names those copies, `Inliner::outer`).
 
-Codegen passes `Call::FreeVarArg` for each of the callee's free variables,
+The backend passes `Call::FreeVarArg` for each of the callee's free variables,
 and follows those edges when it collects a body's free variables
 (`CollectSpecs`). BCE's call kills name the copies the callee's effects
 reach (`CallKills`). Those records, and the provenance of the copied
@@ -4185,8 +4170,7 @@ statement write or shrink that storage. Those places are:
 * the base of a field or element that is itself viewed, or is an array
   that a slice destination takes whole.
 
-In those places such a path, or `&` of one (which codegen addresses as the
-path, `GenLoc`), is put back into a block, which codegen evaluates into a
+In those places such a path, or `&` of one (which the backend addresses as the path), is put back into a block, which the backend evaluates into a
 temporary as the construct would have. Otherwise `f(get()[..], a.pop())`
 for `fn get() -> i64[3] { a[0] }` would hand `f` a view of the slot the
 pop frees. An argument that print, str or format renders while user
@@ -4210,7 +4194,7 @@ build. So, whatever the thresholds say, a call is inlined only while the C
 blocks around it plus those the callee's body nests stay within `MAXNEST`.
 Such a chain then folds into one body per 64 levels, each calling the next,
 and takes 2 s and 240 MB (0.7 s and 170 MB at `-O0`). Both counts are of
-what codegen opens a C block for:
+what the backend opens a scope for:
 
 * every `Block` (a function or inlined body, an arm, a loop body; not a
   flat `if`'s then-block, §6.2, which `Around` takes back);
@@ -4225,7 +4209,7 @@ nesting of each final body (`InlineInfo::nest`, the `nest` of `--specs`).
 The walk keeps the count around the node it is at (`depth`), taken as the
 blocks stand when it gets there; a block that folds away afterwards only
 makes the walk more cautious. The other half of MSVC's limit is for the
-blocks codegen opens around runtime work, which are not counted. Ordinary
+scopes the backend opens around runtime work, which are not counted. Ordinary
 programs stay far below the limit: the deepest inline in the tests,
 samples and benchmarks is 18 blocks deep.
 
@@ -4242,7 +4226,7 @@ f(p...) } }`. A UFCS self-call
 as the checker left it (including an `&` it binds by reference), and the
 recursing arm's receiver is that binding. This removes half the calls of a
 complete tree walk. The bindings are marked `inline_arg`, like an inlined
-call's, and made in the scope around the block (`GenInlineArgs`): a slice
+call's, and made in the scope around the block : a slice
 argument can view a temporary, which has to last while the callee runs and
 while the block's value is used. The guarded form
 (`SetupGuarded`) is the shape other languages build trees in: `s1...; if c {
@@ -4307,12 +4291,12 @@ and commutative, so the value is the same; a wrong guess about which
 operand carries the dependence has no effect beyond the regrouping itself.
 
 **Loop shaping** (`LoopShaper`, `optimize_loops.h`, every level). Some
-loops compile to C that clang cannot make fast, although it can make an
-equivalent restatement of the same loop fast. Once the final bodies are
-known, this pass marks such loops. It rewrites no tree, and codegen
-restates a marked loop only where its own conditions hold too (§6.12).
-Each mark records a fact about the loop as written that makes the
-restatement compute the same values and abort at the same point:
+loops compile to code that a C compiler cannot make fast, although it can
+make an equivalent restatement of the same loop fast. Once the final bodies
+are known, this pass marks such loops. It rewrites no tree. The backend
+reads none of the marks (§6.12), so the marks are facts only. Each records a
+fact about the loop as written that makes the restatement compute the same
+values and abort at the same point:
 
 * `ForLoop::stripk` and `lanemods`: the counter starts at 0 and steps by 1
   (an array's `i64` index, a count's variable, or a range's counter from a
@@ -4338,8 +4322,7 @@ restatement compute the same values and abort at the same point:
   statement of the body assigns or steps. The trip count is `v`'s value at
   entry, and the decrement can neither wrap nor overflow.
 
-A body over 300 nodes is not marked, since the first two restatements emit
-the body twice.
+A body over 300 nodes is not marked.
 
 ---
 
@@ -4347,10 +4330,11 @@ the body twice.
 
 `BCE` (`bce.h`) runs over every live specialization after the optimizer. It
 marks the `Index` and `SliceExpr` nodes whose runtime check cannot fire, and
-codegen then omits those checks. The pass is required only to be sound: a
-program's meaning never depends on it (§10.5). The pass also makes some
-codegen decisions that are not about checks: `ForLoop::fixedlen` and
-`lenbound`, and the per-loop `hoistrefs` and `hoistfields` (§5.10).
+the backend then omits those checks. The pass is required only to be sound: a
+program's meaning never depends on it (§10.5). The pass also records
+facts that are not about checks: `ForLoop::fixedlen` and `lenbound`, and the
+per-loop `hoistrefs` and `hoistfields` (§5.10); the backend reads only the
+check marks (`nobc`).
 
 ### 5.1 The domain
 
@@ -4757,7 +4741,7 @@ against the length as it stood when the receiver was evaluated.
 judged in the state it was evaluated in. It also records the slice's length
 as `hi - lo` when the domain can name it (both bounds on one base, or a
 constant lower bound); the declaration binding the slice then takes that
-length (`slicelen`). Codegen separately elides a constant index into a
+length (`slicelen`). The backend separately elides a constant index into a
 fixed array (`IndexLoc`). It also merges leading checks in the two arms of an
 `if` (`LeadingCheck`,
 `SameCheck`). Both checks must test the same index, a variable or constant,
@@ -4765,7 +4749,7 @@ against the same array, a variable or field path. Neither arm may evaluate
 anything before its check. An assignment through the element as each arm's
 first statement is one example. One check then
 runs after the condition, ahead of the branch, and reports the location of
-the arm the condition selects (`EmitHoistedCheck`), so it fails exactly
+the arm the condition selects, so it fails exactly
 where either arm's check would have. The arms' addresses are then
 unchecked, which lets the C compiler turn the two stores into one store of
 a select (the merge step
@@ -4775,20 +4759,20 @@ a select (the merge step
 
 * `ForLoop::fixedlen`: for an array or slice loop, whether the body's kill
   summary leaves the iterated place alone (for a sequence that an element
-  holds, this is the element place of §5.4). If it does, codegen reads the
+  holds, this is the element place of §5.4). If it does, a loop may read the
   view once. Otherwise it re-reads the length, and the slices and
   references on the way to it, every iteration; section 3.15 makes growth
   during iteration legal, so the re-read is the default.
 * `ForLoop::lenbound` and `lenexact`: for an array or slice loop, the
   smallest constant that the facts bound the length by once the body's
   kills are stripped (so the bound holds wherever an iteration tests the
-  length), and whether the facts prove the length equal to it. Codegen may
-  bound the loop by that constant (§6.12).
+  length), and whether the facts prove the length equal to it. A loop may be
+  bounded by that constant (§6.12).
 * `hoistrefs` on every loop: the reference variables that the loop indexes
   and whose array cannot be grown, shrunk, rewritten whole or reached
   through a call by the body, or by a `while` condition or a `for` loop's
-  iteration expression (which runs after the views are read). Codegen reads
-  their base and length into locals before the loop (section 6.10).
+  iteration expression (which runs after the views are read). The backend does not use
+  them (section 6.10).
 * `hoistfields` on every loop: the same, for the grow-only and grow-shrink
   arrays that the loop indexes in fields of a struct that a variable holds
   or references, reached by fields alone (`FieldIndexed`). They are
@@ -4800,8 +4784,8 @@ a select (the merge step
 * `Binary::specidx` on a `&&` or `||` whose right operand contains an index
   and is made only of operators, variables, fields, elements, casts and
   constants (`ProbeShape`): whether every bounds check in that operand
-  holds without what the left operand establishes. Codegen needs this to
-  evaluate the operand unconditionally (section 6.11). The judging walk
+  holds without what the left operand establishes. The backend does not read it
+  (section 6.11). The judging walk
   probes such an operand once more (`ProbeRight`), from the state after the
   left operand. The probe takes no facts from the left operand, nor from
   any `&&` or `||` nested in the operand, and the flow, the memo of derived
@@ -4811,11 +4795,11 @@ a select (the merge step
   usual, so the program's own elisions are the ones it would have without
   the probe. A nested `&&` probes its own right operand in the state that
   its enclosing operands' facts allow. That result holds where the
-  enclosing operator short-circuits; where it does not, codegen asks the
+  enclosing operator short-circuits; where it does not, the backend asks the
   enclosing operator's probe, which took none of those facts.
 * `Binary::nonneg` on a signed `/`, `%` or `>>` whose divisor is provably
   at least 1 and whose left operand is provably non-negative, by its term
-  or as a difference `a - b` with `0 <= b <= a` (`JudgeUnsigned`). Codegen
+  or as a difference `a - b` with `0 <= b <= a` (`JudgeUnsigned`). The backend
   computes such an operation in unsigned arithmetic, which gives the same
   value, with no zero or overflow check. Release builds compute signed
   arithmetic with wrapping (§6.2), so the C compiler cannot derive such a
@@ -4879,19 +4863,28 @@ after a shrink.
 
 ---
 
-## 6. Code generation: representation
+## 6. The backend: representation
 
-`CodeGen` (`codegen.h`) emits one C file. The runtime (`src/runtime/`) is
-embedded in the compiler (`runtime_inline.h`, regenerated by
-`--gen-runtime-header`), and the driver assembles the file around what
-codegen emits (§7 says which parts of the runtime go where). The
-representation follows Appendix C, with the choices recorded in Appendix E.
-The following sections describe the representations and their
-implementation.
+The backend (`tinygen_backend.h`, `docs/design/tinygen_backend.md`) lowers each
+live specialization to tinygen's IR. `TgModule` holds what depends on types
+alone (representations, layouts, debug types, signatures, shims and
+accessors), `TgFn` builds one function, and `TinyGenBackend` builds every
+function, `main`, the globals, the exports and the worker thunks. The
+analyses and type services that fix the representation stay in `CodeGen`
+(`codegen.h`, `codegen_types.h`, `codegen_program.h`, `codegen_stacks.h`):
+`CollectSpecs` (call interfaces), `FixedSize` and `LayoutFields` (layouts),
+`NameGlobals` and `StaticInitX` (globals), `CT` and `Mangle` (the C spelling
+of types, for the extern unit, `--include` headers and the export header),
+and the data stack accounting. The runtime (`src/runtime/`) is embedded in
+the compiler (`runtime_inline.h`, regenerated by `--gen-runtime-header`) and
+is compiled or linked around what the backend writes (§7 says which parts of
+the runtime go where). The representation follows Appendix C, with the
+choices recorded in Appendix E. The following sections describe the
+representations and how the backend implements them.
 
 ### 6.1 Values
 
-The C backend targets 64-bit, little-endian hosts with unaligned packed
+The backend targets 64-bit, little-endian hosts with unaligned packed
 accesses. Integer and floating widths are their declared widths; `bool`
 occupies one byte and valid values encode as 0 or 1. Array metadata is
 counted in elements, except the outer serialization frame, which counts
@@ -4899,10 +4892,6 @@ payload bytes (section 6.9). A stored length must represent the actual
 count exactly; truncating it would change where subsequent fields start.
 Known counts are checked statically; dynamic counts are checked before
 storing or patching the length field.
-
-Generated scalar and pointer typedefs carry one-byte alignment on GCC and
-Clang. References and slices retain that alignment when a packed field's
-address escapes its containing struct; aggregate types use `#pragma pack(1)`.
 
 Layout details needed for byte/C compatibility (`FixedSize`, `LayoutFields`,
 `LenStore`, `TagStore`):
@@ -4920,203 +4909,166 @@ Layout details needed for byte/C compatibility (`FixedSize`, `LayoutFields`,
   references and slices; 1 for composite fields). It adds nothing in a
   variable layout or without a following field. There is no implicit
   aggregate tail padding. A struct with no bytes of its own (no fields, and
-  no `pad n`: `EmptyLayout`) occupies one byte, the `gs_empty` byte that C
-  gives it. A variant with no bytes of its own occupies none behind its
-  ADT's tag and has no member in a fixed-mode ADT's union. Its own C struct
-  still has that byte, which is why spec §3.4 keeps its type out of fields
-  and elements.
+  no `pad n`: `EmptyLayout`) occupies one byte in the C types of the extern
+  unit and the headers (the `gs_empty` byte that C gives it). A variant with
+  no bytes of its own occupies none behind its ADT's tag and has no member
+  in a fixed-mode ADT's union. Spec §3.4 keeps such types out of fields and
+  elements.
 * Padding, inactive ADT payload bytes and unused limited-array slots are
   not value-bearing. Structural equality ignores them. Raw byte images
   can include them, so equal values need not serialize byte-for-byte
   identically, and callers must not infer zeroing from fresh OS pages.
 
-* **Fixed-size types** are packed C types (`#pragma pack(1)`): scalars;
-  packed structs; fixed and static-capacity limited arrays wrapped in
-  structs (`{ T e[k]; }`, `{ len; T e[k]; }`); fixed-mode ADTs as
-  `{ tag; union }`; plain references as pointers; slices as
-  `{ data, len }`; and relative references as their stored integer. A
-  wrapped array has one slot where `k` is 0, since C has no empty arrays.
-  That slot would take bytes the layout does not count, which is why spec
-  §3.4 keeps such arrays out of fields and elements. An empty slice's
-  `data` is null where the slice was zero-filled (`default<T>()`, a default
-  element). C leaves `memcpy` and `memcmp` undefined on a null pointer even
-  for zero bytes, so element-run copies and compares go through the
-  runtime's `gs_memcpy`, `gs_memmove` and `gs_memeq` (`CopyFn`,
-  `GenRangeEq`). `gs_memeq` compares runs of up to 16 bytes inline, as two
-  overlapping word loads per side. It compares runs of up to 256 bytes 16
-  bytes at a time, with the last 16 overlapping, and calls `memcmp` only for
-  longer runs. Keys and names are mostly that short, and a call, with
-  `memcmp`'s own dispatch on the length, costs more than the compare itself
-  (a fifth of the time, on lookups of strings of about 60 bytes). The longer
-  compares are in a separate function (`gs_memeq_long`). Inside `gs_memeq`
-  itself, they made it too large for the C compiler to inline at compares
-  of a known short length, such as a key against a literal. `gs_memcpy`
-  copies the same way: inline up to 256 bytes, and with `memcpy` beyond
-  that. String building that appends many runs of a few dozen bytes ran up
-  to a fifth faster without the library call. `CT` emits typedefs on first
-  use. Struct-like kinds get a forward typedef, so that a node type can
-  reference itself (`NameCT`), and get their body at the first use by value
-  or through a pointer (`PointeeLv`). A struct that the program reaches only
-  through references gets its body at the first access through one. A
-  slice of a struct-like element is typedef'd over the element's forward
-  name and emits the element's body right after it. So a type holding a
-  slice of itself (`enum Op { Loop { body: Op[:] } }`) comes out in order,
-  whichever of the two a signature names first. A variant type emits its
-  enum; the enum's union holds the variant's struct by value, and so emits
-  the struct first. Every program name carries the `_g` suffix
-  (`Sanitize`), and a namespaced name also carries the namespace's length.
-  A type's mangle names its C type, its per-type functions (`gs_eq_<T>`,
-  `gs_size_<T>`, ...) and its queue. The mangle writes the type's parts in
-  a row, so some pairs of types come out the same (`E<F..>` and `E<F>..`,
+The representations:
+
+* **Fixed-size types** are packed: every record the backend declares to
+  tinygen is aligned to 1. They are scalars; packed structs; fixed and
+  static-capacity limited arrays (`{ T e[k]; }`, `{ len; T e[k]; }`);
+  fixed-mode ADTs as `{ tag; union }`; plain references as pointers; slices
+  as `{ data, len }`; and relative references as their stored integer. A
+  wrapped array has one slot in the C types where `k` is 0, since C has no
+  empty arrays; spec §3.4 keeps such arrays out of fields and elements. An
+  empty slice's `data` is null where the slice was zero-filled
+  (`default<T>()`, a default element). Element-run copies and compares go
+  through the runtime's `gs_memcpy`, `gs_memmove` and `gs_memeq`, which
+  accept a null pointer with a length of zero and compare and copy short
+  runs inline. Every program name carries the `_g` suffix (`Sanitize`), and
+  a namespaced name also carries the namespace's length. A type's mangle
+  names its C type and its queue. The mangle writes the type's parts in a
+  row, so some pairs of types come out the same (`E<F..>` and `E<F>..`,
   `E<G.B>` and `E<G>.B`, `A<B>` and a struct `A_g_B`). The first type to
   produce a given mangle keeps it, and a later type with other parts gets a
   suffix, `_m1` and up (`Mangle`, `SameMangle`). So does an instance's
   prefix of tag constants when another instance produced the same prefix
-  first (`EnsureTagEnum`).
+  first (`EnsureTagEnum`). `CT` spells a type for the C output of the extern
+  unit and the headers: a struct-like kind gets a forward typedef first so
+  that a node type can reference itself, and its body at the first use by
+  value or through a pointer.
 * **Bytes values** (variable class) are self-describing byte images held as
-  a `uint8_t *` to the value's start; a field behind a variable-size field
-  is reached by a cursor that walks the intervening sizes (`FieldPtr`,
-  `SizeX`, with a generated `gs_size_<T>` walker per dynamic type).
+  a pointer to the value's start; a field behind a variable-size field is
+  reached by a cursor that walks the intervening sizes (`FieldPlace`, which
+  finds a field in any representation).
 * **Resizable values** are a header in the owning frame (`gs_rhdr { base,
-  len }`) with the elements on a data stack. A frame object is instead the C
-  struct of the fixed fields, with the tail's header (or nested frame
-  object) as its last member (`EmitCFields`). Growth bumps the stack
-  top and the count; the base never moves. A frame object type used as the
-  tail of a resizable that is not a frame object is stored as bytes of that
-  value, like the value's other fields (`FoBytes`). A literal builds it that
-  way directly. Anything else builds it as a C frame object whose elements
-  are placed behind room left for the fixed fields (`GenFoAsBytes`). A
-  whole read loads it into a C frame object that views the elements in
-  place (`FoView`). The base is a `uint8_t *`, so an element is generally
-  reached at a byte offset, `*(T *)(base + i * size)`. A number of 2, 4 or 8
-  bytes is instead indexed through a pointer to its type, `((T *)base)[i]`
-  (`IndexLoc`), which keeps the scale in the address. With a byte offset,
-  clang folds `(j >> 5) * 4` into `(j >> 3) & -4` and loses the scaled
-  addressing mode (nsieve's bit array: 150 against 138 ms).
+  len }`) with the elements on a data stack. A frame object is instead a
+  record of the fixed fields, with the tail's header (or nested frame
+  object) as its last member. Growth bumps the stack top and the count; the
+  base never moves. A frame object type used as the tail of a resizable that
+  is not a frame object is stored as bytes of that value, like the value's
+  other fields (`FoBytes`). A literal builds it that way directly. Anything
+  else builds it as a frame object whose elements are placed behind room
+  left for the fixed fields. A whole read loads it into a frame object that
+  views the elements in place (`FoView`). The base is a byte pointer, so an
+  element is reached at a byte offset, `base + i * size`.
 * **Fat references** (`gs_rref { hdr, stk }`) are references to
   resizable-class values: the header address plus the stack, so a callee can
   push through them. A reference with `reusable`-pool provenance is a
   `gs_pref`, which adds the freelist's header and stack. Whether a parameter
   is fat or pool-shaped comes from the specialization's types and
-  `RootArg::reusable`, not from surface syntax. A variable is pool-shaped
-  (`PrefVar`) by its binding's bits, which its rebinds keep (§3.14). Each
-  binding and rebind stores a whole `gs_pref` (`GenPrefVal`). An `if`,
-  `match` or block that chooses among pools builds a `gs_pref` in each
-  branch, into a temporary; the construct is generated with that temporary
-  as its destination, asking for the pool form (`Dst::pool`).
-* String literals are `static const` byte arrays (`StrRaw`), sliced as
-  `{ data, len }` or emitted as static `[len][bytes]` images when used as a
-  `u8[]` value (`GenStrBytes`).
+  `RootArg::reusable`, not from surface syntax (`CodeGen::IsFatRef`,
+  `IsPoolParam`). A variable is pool-shaped by its binding's bits, which its
+  rebinds keep (§3.14). Each binding and rebind stores a whole `gs_pref`
+  (`PoolRefParts`). An `if`, `match` or block that chooses among pools
+  builds a `gs_pref` in each branch, as the construct's value.
+* String literals are static byte arrays, sliced as `{ data, len }` or
+  placed as static `[len][bytes]` images when used as a `u8[]` value.
 
 ### 6.2 Stack assignment
 
 Stack assignment uses the hidden-argument strategy that §10.3 permits.
-Every function that uses data stacks takes `int64_t gs_sp`, and addresses
-its own nonfixed locals and temporaries as `GS(gs_sp + k)` with a
-per-function constant `k` (`AllocStk`). It calls callees with
-`gs_sp + <indices in use>` (`SpTop`), and asks the runtime once at entry to
+Every function that uses data stacks takes an `i64 gs_sp`, and addresses
+its own nonfixed locals and temporaries as stack `gs_sp + k` with a
+per-function constant `k` (`AllocStk`). It calls callees with `gs_sp` plus
+the number of indices in use, and asks the runtime once at entry to
 have that many stacks. (The thread program reserves all of them as it
 starts, `gs_stack_block`, using the compiler's count.) Globals own
-dedicated stacks outside the indexed block. Scopes mirror C braces
-(`CScope`): every nonfixed local's base pointer doubles as the watermark
-restored at scope exit. Every exit path (fallthrough, `break`, `continue`,
-`return`, propagation) emits the restores of the scopes it leaves, in
-reverse declaration order (`EmitExitRestores`). A `defer` registers its
-body in its block's scope beside the restores (`RegisterDefer`), and every
-exit emits the body where it meets it in that order: after the restores of
-what was declared after it, before those of what was declared before it
-(`EmitRestores`, `EmitDeferBody`). The body is emitted once per exit, in a
-C block of its own, with its declarations named afresh each time
-(`NameScope`); a scope without a `defer` emits as it always did. A
-statement gets a scope of
-its own (`SC_STMT`), so that a temporary's stack is free again at the next
-statement. So does the right operand of `&&` and `||`, whose temporaries
-exist only when it runs. A local's allocation skips the statement scopes
-inside its block (`AllocStk(forlocal)`), but no further: its index is free
-again once the block ends, for the locals and calls that follow. This is
-what lets a recursive cycle's functions own scratch (§7.8).
+dedicated stacks outside the indexed block. The backend reports what each
+body owns and hands its callees to the stack accounting (`stackown`,
+`stackcalls`), which `--stacks`, the thread cap and `GS_MAX_STACKS` read.
 
-One scope has no braces: the then-block of a flat `if` (§3.9). Its `else`
-cannot complete normally, so the code after `if (!c) { else }` runs exactly
-where `c` holds. The then-block's contents are emitted there, in the C
-block that contains the `if`, and its restores still close its scope. So a
-run of guards nests no C blocks, however long it is (MSVC stops at 128
-levels, clang at 256). C names are unique within a function (`T`,
-`Unique2`), so what the then-block declares clashes with nothing there.
+Scopes follow Goose's blocks: every nonfixed local's base pointer doubles as
+the watermark restored at scope exit. Every exit path (fallthrough, `break`,
+`continue`, `return`, propagation) restores the scopes it leaves, in reverse
+declaration order. A `defer` registers its body in its block's scope beside
+the restores, and every exit builds the body where it meets it in that
+order: after the restores of what was declared after it, before those of
+what was declared before it (`DeferBody`). The body is built once per exit,
+with its declarations of its own each time. A statement gets a scope of its
+own, so that a temporary's stack is free again at the next statement. So
+does the right operand of `&&` and `||`, whose temporaries exist only when
+it runs. A local's allocation skips the statement scopes inside its block,
+but no further: its index is free again once the block ends, for the locals
+and calls that follow. This is what lets a recursive cycle's functions own
+scratch (§7.8).
 
-Because a `uint8_t *` store may alias a stack's `top` in C, the tops of the
-stacks a function can name are cached in locals where the function grows
-them (section 6.10).
+The then-block of a flat `if` (§3.9) has no block of its own: its `else`
+cannot complete normally, so the code after the test runs exactly where the
+condition holds. Its contents are built in the enclosing block, and its
+restores still close its scope. A run of guards therefore nests no deeper,
+however long it is.
 
 ### 6.3 Globals and program instances
 
 Every global that is not read-only static data is a member of one
-`gs_globals_t` struct per program instance, which also holds the dedicated
-stacks of the resizable globals. Main's struct is a static; a worker's is
-allocated by its entry thunk and filled from the spawn image (§6.8). Access
-is `GS_GL->name`, where `GS_GL` is `(&gs_globals_main)` in a program
-without workers, and the thread-local `gs_gl` in a program with them. A
-`let` (or `const`) global of a `const` flat fixed type with a compile-time
-initializer (`StaticInitX`, up to 256 array elements) is a C `static const`
-shared by every instance, which the C compiler folds into the code reading
-it. The initializer may name earlier globals of that kind, anywhere a
-literal could stand. C cannot read another object in an initializer, so the
-named global's own initializer is written out in its place (`gstatic`
-keeps them). A `var` of such a type can be assigned as a whole and is a
-member like any other. Everything but the statics is initialized by
-`gs_init_globals` in declaration order.
+globals record per program instance, which also holds the dedicated
+stacks of the resizable globals. Main's record is a static; a worker's is
+allocated by its entry thunk and filled from the spawn image (§6.8). Each
+function reads the stack block and the addresses of its globals once, on
+entry. Without threads (`TgModule::fixedaddrs`) each address is fixed at
+load, and the function loads it from a data pointer. With threads, each
+thread has its own instance, and the function calls an accessor that reads
+the thread-local. `UsesThreads` scans for thread and queue builtins before
+any body is built, and the build stops if that scan missed a thread use.
+
+A `let` (or `const`) global of a `const` flat fixed type with a compile-time
+initializer (`StaticInitX`, up to 256 array elements) is read-only static
+data shared by every instance. The initializer may name earlier globals of
+that kind, anywhere a literal could stand; the named global's own
+initializer is written out in its place (`gstatic` keeps them). A `var` of
+such a type can be assigned as a whole and is a member like any other.
+Everything but the statics is initialized by `gs_init_globals` in
+declaration order.
 
 ### 6.4 The calling convention (C.3)
 
 `SigParams` lists, in order:
 
-* the declared parameters (a by-value resizable adds its `gs_stack *`; a
-  pool parameter is a `gs_pref`; a bytes value is a `uint8_t *`);
+* the declared parameters (a by-value resizable adds its stack; a pool
+  parameter is a `gs_pref`; a bytes value is a pointer to its start);
 * the free variables of a nested function or function value (fixed ones by
   pointer, resizables as header pointer plus stack, pools as `gs_pref`);
 * result channels in source result order (out-pointers for fixed results
   other than the first fixed result; per nonfixed result, a destination
-  `gs_stack *` and, for a resizable, the count out-parameter or frame
-  object out-parameter);
+  stack and, for a resizable, the count out-parameter or frame object
+  out-parameter);
 * `gs_sp`, when the function touches stacks.
 
-The C return value is the first small fixed result eligible for native
-return, even when it is not result zero; with none it is `void`. A fixed
-aggregate containing relative references (`NeedsResultLocation`) always
-uses a typed output pointer. Returns, forwarding and case dispatch pass
-that pointer through; a stack receiver claims the fixed slot and supplies
-its address (`ConstructCall`). A block gets the same lvalue destination.
+The return value is the first small fixed result eligible for native
+return, even when it is not result zero; with none the function returns
+nothing. A fixed aggregate containing relative references
+(`NeedsResultLocation`) always uses a typed output pointer. Returns,
+forwarding and case dispatch pass that pointer through; a stack receiver
+claims the fixed slot and supplies its address. A block gets the same
+destination.
 
 Slices, fat references, and a pool's `gs_pref` are passed member by member
-(`ParamFields`), whether declared as parameters or passed as captured pools.
-Each member becomes its own C parameter: `data` (as `void *`) and `len` for a
-slice; `hdr` and `stk` for a fat reference; and `hdr`, `stk`, `fl`, and
-`flstk` for a pool.
-The body's opening lines put the members back together into a local of the
-struct's type, under the parameter's name (`paramcopies`). Every caller
-passes each member of its argument's temporary (`PushArg`). In the Windows
-x64 convention, a struct of 16 or 32 bytes passed whole is passed by
-reference to a copy made by the caller (in AArch64's convention, so is a
-struct above 16 bytes). Clang then reloads the struct through that pointer
-after every byte store the body makes, since the store may alias the copy:
-a slice walk that stores bytes reloads the slice at every iteration. And
-where a caller stores the copy's fields one by one and the callee reads the
-copy as one vector, to hand it on, that load waits for the stores to
-retire. A recursive descent parser that handed its parser state down spent
-half its time there, with its parameters copied into locals at entry.
-Passed as members, no part of these values is in memory that the body can
-reach.
+(`ParamFields`, `TgModule::SplitParam`), whether declared as parameters or
+passed as captured pools. Each member becomes its own parameter: `data` and
+`len` for a slice; `hdr` and `stk` for a fat reference; and `hdr`, `stk`,
+`fl`, and `flstk` for a pool. The body puts the members back together into a
+local under the parameter's name, and every caller passes each member of its
+argument. Passing a slice as one 16-byte record would work under SysV and on
+arm64, which put it in the same two registers, but not on Windows x64, which
+passes it by reference to a copy. Passed as members, no part of these values
+is in memory that the body can reach.
 
-A multi-value binding takes each fixed result directly into its variable
-(`EmitCallInto`). The exception is a reference result that the checker
-decayed to a copy of its fixed-size pointee (§4.1): that result arrives in a
-temporary and is loaded through it, as the destination's type (`Dst::t`)
-asks. A resizable or bytes result is built where a declaration of its
-variable alone would build it: on a data stack of its own, with a reusable
-pool's freelist beside it (`DeclStackLocal`, which `BindLocal` also uses
-for declarations). A return that forwards a call's results, to the
-function's caller or to a `return from` target's channels, converts each
-result that the checker adapted (`GenForward`, §6.5).
+A multi-value binding takes each fixed result directly into its variable.
+The exception is a reference result that the checker decayed to a copy of
+its fixed-size pointee (§4.1): that result arrives in a temporary and is
+loaded through it. A resizable or bytes result is built where a declaration
+of its variable alone would build it: on a data stack of its own, with a
+reusable pool's freelist beside it. A return that forwards a call's
+results, to the function's caller or to a `return from` target's channels,
+converts each result that the checker adapted (§6.5).
 
 `CollectSpecs` computes, per specialization and to a fixpoint over the call
 graph, the free variables it or its callees need, the stack-owning globals
@@ -5135,46 +5087,44 @@ shows:
   a fixed-mode ADT;
 * anything rendered structurally into a limited array.
 
-`EmitSpec` rejects a body that allocates a stack without `gs_sp` as an
-internal error. A global initializer's locals belong to no specialization.
-They are free variables of every function that names them, and
-`gs_init_globals` passes them as a function passes its own.
+A body that allocates a stack without `gs_sp` is an internal error. A global
+initializer's locals belong to no specialization. They are free variables
+of every function that names them, and `gs_init_globals` passes them as a
+function passes its own.
 
 ### 6.5 Destinations and in-place construction
 
-Every value-producing node is emitted against a destination (`Dst`): discard,
-a C lvalue, or the top of a data stack together with, for resizable
-results, the lvalue that receives the count (or the frame object). `GenAny`
-routes a node to its destination. Control constructs recurse, so that every
-branch constructs at the same place (§4.3). `GenConstruct` writes a value
-front-to-back at a stack top. Calls pass the destination stack down as the
-hidden argument, and a call in `v.append(f())`, or in `v.push(f())` for a
-variable-size element, builds directly at `v`'s top (`EmitPush`,
-`EmitAppend`). Element-run results (§7.3) exist for variable *array*
-results: `EnsureEr` compiles a second, `_er` twin of the callee that emits
-raw elements plus a count, so that `v.append(f())` is contiguous. A callee
-without a twin (a builtin, a dispatch, a `return from` target) delivers the
-value form, and the receiver slides the length prefix out with one
-`memmove` (`EmitSlidePrefix`). A `T[]` result that ends up in a slot of
-another length storage is re-prefixed afterwards (`EmitReprefix`). A
-runtime-capacity limited result (`T[..]`) has no run form: `EmitAppend`
-builds its image on the destination stack, then compacts its live elements
-over the header and discards unused capacity. Inlined calls retain named
-result placement for identical packed layouts, and control expressions pass
-the same destination through their branches. These packed
-layout relocations are the exception in spec §4.3; they do not use a
+Every value-producing node is built against a destination: discard, a
+place, or the top of a data stack together with, for resizable results, the
+place that receives the count (or the frame object). `BuildInto` builds a
+value at a destination (`InPlace`), `CallAt` hands the destination to a
+call, `CopyFrom` copies an existing value, and `BuildTemp` builds on a
+temporary stack of the statement. Control constructs share one skeleton
+(`Ctl`: `CtlBegin` tries to build in place, `CtlArm` builds each arm,
+`CtlTarget` makes a loop's or block's break target), so that every branch
+constructs at the same place (§4.3). A value is written front-to-back at a
+stack top. Calls pass the destination stack down as the hidden argument, and
+a call in `v.append(f())`, or in `v.push(f())` for a variable-size element,
+builds directly at `v`'s top (`AppendSrc`). A result that is appended is built on the receiver's stack and compacted
+there (`AppendSrc`): a `T[]` result is slid out of its length prefix, and a
+runtime-capacity limited result (`T[..]`) has its live elements moved over
+the header and its unused capacity discarded. A `T[]` result that ends up in
+a slot of another length storage is re-prefixed afterwards. Inlined
+calls retain named result placement for identical packed layouts, and
+control expressions pass the same destination through their branches. These
+packed layout relocations are the exception in spec §4.3; they do not use a
 separate result stack. A fresh result appended to a limited receiver still
 requires staging while its final count is unknown, to check capacity before
 writing the receiver; spec §4.3 permits this separate bounded-destination
 exception.
+
 An appended literal of variable-size elements is built the same way: its
-elements go at `v`'s top and its count is added to the length
-(`GenArrayLit`). An appended literal of fixed-size elements holding relative
-references is a fixed array laid over the slots it fills, at the top or in
-a limited array's free slots, and is built there (`FixedArrayLitAt`), so
-each offset is measured from where the element stays. Other fixed-size
-elements are evaluated into a C temporary and copied, in the same way that
-a pushed element is stored after it is evaluated.
+elements go at `v`'s top and its count is added to the length. An appended
+literal of fixed-size elements holding relative references is a fixed array
+laid over the slots it fills, at the top or in a limited array's free slots,
+and is built there, so each offset is measured from where the element stays.
+Other fixed-size elements are evaluated into a temporary and copied, in the
+same way that a pushed element is stored after it is evaluated.
 
 A stack destination also names the slot's type wherever the receiver knows
 it: a local's type, a global's, a parameter's, an array literal's element
@@ -5182,180 +5132,153 @@ type, or a temporary's own type. The value is built as that type, whatever
 the expression's own type says. A call's variable-array result takes the
 slot's length storage, and a reference stores a relative slot's offset
 (§3.9). `str()` and `to_bytes()`, whose results are resizable, reserve the
-slot's length prefix, write their elements behind it and patch it
-(`EmitStr`, `OpenRzDest`), so `[str("a"), str("bc")]` builds each string in
-its element. A varint field or element takes the `i64` that every varint
-read decodes to (§3.6) from whatever produces it, and writes it
-zigzag-encoded (`EmitVarintStore`). The producer can be a control construct
-or an inlined body (through a C temporary, `CtlValX`), a returned
-`varint&` (through its load, `CallVal0`, `GenXD`), or a fill value (once).
-A call reached through `GenAny`, as a branch's value, is constructed by
-`GenConstruct` like any other. A reference's pointee that meets a value
-slot (a returned reference whose value is taken, or the reference an
-inlined body leaves in the slot) is built as the slot's type from where it
-lies (`ConstructFromLoc`). For example, a `u8[]` pointee takes a
-`u8[varint]` element's prefix, or no prefix in an element run.
+slot's length prefix, write their elements behind it and patch it, so
+`[str("a"), str("bc")]` builds each string in its element. A varint field or
+element takes the `i64` that every varint read decodes to (§3.6) from
+whatever produces it, and writes it zigzag-encoded. The producer can be a
+control construct or an inlined body, a returned `varint&` (through its
+load), or a fill value (once). A reference's pointee that meets a value slot
+(a returned reference whose value is taken, or the reference an inlined body
+leaves in the slot) is built as the slot's type from where it lies. For
+example, a `u8[]` pointee takes a `u8[varint]` element's prefix.
 `v.append(copy(x))` appends `x` itself, since the run copies `x`'s elements
-anyway. The `_er` twins are compiled last, after the globals' initializers,
-which can also ask for one.
+anyway.
 
-**Pushes** (`EmitPush`). The receiver is evaluated, then the argument, and
-then the element is added (§2). The argument may itself grow the array
+**Pushes.** The receiver is evaluated, then the argument, and then the
+element is added (§2). The argument may itself grow the array
 (`v.push(v.push(1))`, `v.push(f(v))`). So a fixed-size element is evaluated
 before its slot is claimed: the element then follows whatever the argument
 pushed, and the returned reference names it. For an element that is itself
 a reference, the push instead returns the reference the element holds
-(loaded from the slot if it is relative), as `alloc_ref`'s result does
-(`NewElemResult`), since there are no references to references (§3.8). A
-variable-size element, and a fixed-size one holding relative references of
-either form, are instead built in the slot, for limited arrays too; the
-checker's growth rule (§3.10) is what keeps this safe. (A self-relative
-offset is measured from where the element is stored, and an `in pool`
-`self` is the element's position in the pool.) A relative-reference element
-is the plain reference it is given, evaluated first, and stores the offset
-from its slot. A pool allocation evaluates or builds its element the same
-way (`EmitAlloc`; both go through `ElemValue` and, at a slot named by a
-pointer, `StoreElemAt`). A slot from the freelist is taken before the code
-that builds an element there runs, and a fresh slot at the top is counted
-only once the element is written. So nothing that the element's
-initializers call can read it half-built.
+(loaded from the slot if it is relative), as `alloc_ref`'s result does,
+since there are no references to references (§3.8). A variable-size
+element, and a fixed-size one holding relative references of either form,
+are instead built in the slot, for limited arrays too; the checker's growth
+rule (§3.10) is what keeps this safe. (A self-relative offset is measured
+from where the element is stored, and an `in pool` `self` is the element's
+position in the pool.) A relative-reference element is the plain reference
+it is given, evaluated first, and stores the offset from its slot. A pool
+allocation evaluates or builds its element the same way. A slot from the
+freelist is taken before the code that builds an element there runs, and a
+fresh slot at the top is counted only once the element is written. So
+nothing that the element's initializers call can read it half-built.
 
 **Adaptation into limited arrays.** `FitsAt` lets any array or slice of the
-element type construct a `T[..k]` (§4.2). Codegen copies into the C value
-(`AdaptToFixed`, with the capacity check) from whatever representation the
-source has:
-
-* a variable or field, through `LoadLoc`;
-* a slice expression, in `SliceExpr::CgX`;
-* a call result, through `CallVal0` (`CallResLoc`: the temporary header of
-  a resizable result, the base pointer of a variable one, the pointee of a
-  reference result);
-* a node in another representation than its context wants, through `GenXD`
-  (a `copy` source, a spliced callee body);
-* a stack slot, through `GenArrayFromLoc`.
-
-Where the limited array is already a C lvalue (an assignment's target, a
-local's initialization, any fixed destination: `LeafAny`), the elements go
-directly into its slots instead of through a temporary of its type
-(`GenIntoLimited`, `CopyIntoLimited`). The source's count and elements are
-read before anything is written, and they are moved as `memmove` moves
-them, since the source may be a view of the destination's own slots. A
-bytes-class call result feeding a fixed-class slot is built on a temporary
-of its own rather than on the slot's stack (`GenConstruct`), since the slot
-takes the adapted C value. A runtime-capacity `T[..]` is a bytes value, and
-an assignment into one copies out of a value of that layout (`GenPtr`). A
-slice or an array of another kind is first built as such a value on a
-temporary (`ConstructFromLoc`), so the source is read in full before the
-destination changes, even when the source is a view into the destination
-itself.
+element type construct a `T[..k]` (§4.2). The backend copies into the value
+with the capacity check from whatever representation the source has: a
+variable or field, a slice expression, a call result (the temporary header
+of a resizable result, the base pointer of a variable one, the pointee of a
+reference result), a node in another representation than its context wants
+(a `copy` source, a spliced callee body), or a stack slot. Where the limited
+array is already a place (an assignment's target, a local's initialization,
+any fixed destination), the elements go directly into its slots. The
+source's count and elements are read before anything is written, and they
+are moved as `memmove` moves them, since the source may be a view of the
+destination's own slots. A bytes-class call result feeding a fixed-class
+slot is built on a temporary of its own rather than on the slot's stack,
+since the slot takes the adapted value. A runtime-capacity `T[..]` is a
+bytes value, and an assignment into one copies out of a value of that
+layout. A slice or an array of another kind is first built as such a value
+on a temporary, so the source is read in full before the destination
+changes, even when the source is a view into the destination itself.
 
 **Adaptation into variable-size arrays.** Any array or slice of the element
 type also constructs a variable, resizable or runtime-capacity limited
-array (§4.2). A call's fixed-size array or slice result is a C value, and
-it is constructed as the slot's type from where it lies (`ConstructCall`,
-`ConstructFromLoc`), as a returned reference's pointee is. A variable-size
-result is handed the slot only where the call's convention delivers it in
-the slot's layout (`CallBuildsAt`). That is the case for:
+array (§4.2). A call's fixed-size array or slice result is a value, and it
+is constructed as the slot's type from where it lies, as a returned
+reference's pointee is. A variable-size result is handed the slot only where
+the call's convention delivers it in the slot's layout. That is the case
+for:
 
 * the result's own layout, for the same type;
-* a variable array's elements, as a run or behind the slot's length prefix
-  (`EmitReprefix`);
+* a variable array's elements, as a run or behind the slot's length prefix;
 * a resizable function result, copied from behind a header of its own;
-* a builtin's resizable result, behind a variable array's prefix
-  (`EmitStr`, `OpenRzDest`).
+* a builtin's resizable result, behind a variable array's prefix.
 
 Any other result is built on a temporary of its own and constructed from
 there: a runtime-capacity limited array, or a variable array or `str()` for
 a runtime-capacity limited slot. An inlined callee's `return` builds its
 value in the caller's slot, typed as the callee's result. The inliner
-replaces a call whose body only returns a value with that value.
-`GenConstruct` builds an array that is not fixed-size (an array literal
-included, `GenArrayLit`) in the slot, as the slot's type. It takes a
-fixed-size array or slice as its own type first, as a C value, so that a
-limited array's capacity is checked as the callee's return checks it. It
-then constructs the slot's type from that C value. A `[..cap]` literal that
-takes another type is empty. It is built as its own type on a temporary,
-which checks the capacity's range, and then copied.
+replaces a call whose body only returns a value with that value. An array
+that is not fixed-size (an array literal included) is built in the slot, as
+the slot's type. A fixed-size array or slice is taken as its own type
+first, so that a limited array's capacity is checked as the callee's return
+checks it, and the slot's type is then constructed from that value. A
+`[..cap]` literal that takes another type is empty. It is built as its own
+type on a temporary, which checks the capacity's range, and then copied.
 
 **Adaptation into an ADT.** `FitsAt` also lets a variant construct its ADT,
 and an ADT construct itself in its other mode (§3.5). The node then carries
-the ADT's type, and codegen finds the type that the value arrives as where
-the value is produced. A variable, field or element converts where it is
-read: into a fixed-mode ADT as a C value tagged with the variant
-(`LoadLoc`, `AdaptToFixed`), and into a variable-mode ADT as the tag
-followed by the value's bytes (`GenVarEnumFromLoc`). A call's result
-(including a builtin's element result) and an inlined body arrive as the
-callee's own type (`AdtFrom`). `GenAdtAdapted` builds a variant headed for
-a variable-mode slot in place behind its tag, and builds anything else into
-a temporary that it then converts. For this, the inliner keeps the
-`InlineBlock` of a trivial body whose ADT result changes mode, as it does
-for a decayed reference. Consider a multi-value call forwarded by `return`
-or `return from`, whose values the checker fits to the function's return
-types one by one. It delivers each value of another type into a temporary
-of the callee's type, which is then converted into the return channel
-(`GenForward`). The exception is a variable-size or resizable variant,
-which is built in the channel behind its variable-mode ADT's tag, as
-`GenAdtAdapted` builds one (`VariantBehindTag`).
+the ADT's type, and the backend finds the type that the value arrives as
+where the value is produced. A variable, field or element converts where it
+is read: into a fixed-mode ADT as a value tagged with the variant, and into
+a variable-mode ADT as the tag followed by the value's bytes (`GenAdt`). A
+call's result (including a builtin's element result) and an inlined body
+arrive as the callee's own type. A variant headed for a variable-mode slot
+is built in place behind its tag, and anything else into a temporary that
+is then converted. For this, the inliner keeps the `InlineBlock` of a
+trivial body whose ADT result changes mode, as it does for a decayed
+reference. Consider a multi-value call forwarded by `return` or
+`return from`, whose values the checker fits to the function's return types
+one by one. It delivers each value of another type into a temporary of the
+callee's type, which is then converted into the return channel. The
+exception is a variable-size or resizable variant, which is built in the
+channel behind its variable-mode ADT's tag.
 
-**Named results** (`DetectNrvo`, `OpenIbNrvo`). When the returns of a
-nonfixed result hand back one top-level local and no other local
-(`NamedResultOf`, `clone.h`), that local is allocated at the return
-destination from its declaration on, and its return writes only the count.
-A return of any other value (`[]`, `str(...)`, a parameter, a call's
-result) keeps the local there, provided that building that value cannot
-reach the local (`MayReachLocal`: the value names neither the local nor a
-variable whose provenance may lead into it, and the local is not captured).
-Such a value is an exit that finds the local in front of it (see **Exits**
-below). The local counts as a construction open on the destination from its
-declaration on, so the value is built behind the local's elements and moved
-down over them. An inlined body's own scope is entered as if the local were
-not open yet. A return may name a top-level local while another return
-keeps that local off the destination (another local, a value that may reach
-it, a forwarded multi-value call). The checker then warns at that return
-once the body is checked (`NamedResultCopyWarning`), since the copy this
-causes does not show anywhere in the source. A resizable local returned as
-a variable array reserves the destination's length prefix ahead of its
-elements and patches it at the return (`EmitPrefixPatch`). The elements are
-moved up only when a varint prefix outgrows its one reserved byte. The same
-binding is made for an *inlined* callee's named result that reaches a
-construction context, which is what keeps §7.3's guarantee for the small
-builders the optimizer inlines. A function that is the target of a
-`return from` binds its named result too: a value returned to it from
-below is moved over the named result at the catch (§6.6).
+**Named results.** When the returns of a nonfixed result hand back one
+top-level local and no other local (`NamedResultOf`, `clone.h`), that local
+is allocated at the return destination from its declaration on (`nrvo`,
+`NrvoBind`), and its return writes only the count. A return of any other
+value (`[]`, `str(...)`, a parameter, a call's result) keeps the local
+there, provided that building that value cannot reach the local: the value
+names neither the local nor a variable whose provenance may lead into it,
+and the local is not captured. Such a value is an exit that finds the local
+in front of it (see **Exits** below). The local counts as a construction
+open on the destination from its declaration on, so the value is built
+behind the local's elements and moved down over them. An inlined body's own
+scope is entered as if the local were not open yet. A return may name a
+top-level local while another return keeps that local off the destination
+(another local, a value that may reach it, a forwarded multi-value call).
+The checker then warns at that return once the body is checked
+(`NamedResultCopyWarning`), since the copy this causes does not show
+anywhere in the source. A resizable local returned as a variable array
+reserves the destination's length prefix ahead of its elements and patches
+it at the return (`PrefixPatch`). The elements are moved up only when a
+varint prefix outgrows its one reserved byte. The same binding is made for
+an *inlined* callee's named result that reaches a construction context,
+which is what keeps §7.3's guarantee for the small builders the optimizer
+inlines. A function that is the target of a `return from` binds its named
+result too: a value returned to it from below is moved over the named result
+at the catch (§6.6).
 
-**Exits** (`ExitStart`, `LandValue`). A `return`, a `break` with a value,
-and a return leaving an inlined body all build their value at the top of
-the stack they deliver it to. The receiver, however, expects the value
-where that top was when the function, inlined body or loop was entered. An
-exit can be taken while a construction on that stack is under way: inside
-an element of a literal headed there, a `str()` argument, or an inlined
-callee whose named result is bound there. Such an exit would leave the
-partly built construction in front of its value. So codegen counts the
-constructions open per stack (`openat`: `GenConstruct` for anything but a
-control construct, and a named result from its declaration on). An exit
-that finds more of them open than its scope was entered with takes the top
-before building its value. Afterwards it moves the value down to the
-scope's top on entry, and the stack's top and a frame object's tail base
-follow the value. That entry top is declared where the scope begins, once
-an exit needs it (`ScopeTop0`, `DstTop0`). An exit at statement level emits
+**Exits.** A `return`, a `break` with a value, and a return leaving an
+inlined body all build their value at the top of the stack they deliver it
+to. The receiver, however, expects the value where that top was when the
+function, inlined body or loop was entered. An exit can be taken while a
+construction on that stack is under way: inside an element of a literal
+headed there, a `str()` argument, or an inlined callee whose named result is
+bound there. Such an exit would leave the partly built construction in front
+of its value. So the backend counts the constructions open per stack (every
+in-place build but a control construct's, and a named result from its
+declaration on). An exit that finds more of them open than its scope was
+entered with takes the top before building its value. Afterwards it moves
+the value down to the scope's top on entry, and the stack's top and a frame
+object's tail base follow the value. That entry top is recorded where the
+scope begins, once an exit needs it. An exit at statement level does
 nothing more.
 
 ### 6.6 Calls, dispatch, function values, `return from`
 
-`EmitSpecCall` builds the argument list by the convention above, and flushes
-and reloads the cached tops the callee can reach (`SyncReach`). Where the
-callee can propagate a long-distance return, it checks the long-distance
-discriminant afterwards (`EmitRfCheck`). Tag dispatch (`EmitDispatch`)
-evaluates every argument once, in source order, and passes the arguments
-the cases share by the convention an ordinary call uses (`EmitArg`). It
-snapshots a by-value scrutinee before later arguments run, and switches on
-the tag, with one call per arm sharing the argument temporaries and return
-channels. The arms have no element-run form. A variable-array result
-arrives in the arms' layout, and is slid out of its prefix for a run
-receiver, or re-prefixed once after the switch for a slot of another length
-storage.
+A call builds its argument list by the convention above. Where the callee
+can propagate a long-distance return, the caller checks the long-distance
+discriminant afterwards. Tag dispatch evaluates every argument once, in
+source order, and passes the arguments the cases share by the convention an
+ordinary call uses. It snapshots a by-value scrutinee before later arguments
+run, and branches on the tag, with one call per arm sharing the argument
+temporaries and return channels. A variable-array result arrives in the arms' layout, and is re-prefixed once
+after the dispatch for a slot of another length storage.
 
-A function value is spliced inline (`EmitFvCall`): its parameters and
+A function value is spliced at the call (`GenFv`): its parameters and
 locals are ordinary locals of the enclosing function, and anything declared
 in its body takes them as free variables like any other. The call is
 checked against its destination, and the body's value is checked without
@@ -5367,26 +5290,21 @@ destination names, or as the call's type where the destination names none.
 The call's value is a copy (spec §4.1), so such a slice never points into a
 variable the body names.
 
-An `extern fn` is a direct C call, with prototypes emitted for called
-symbols that the runtime does not define. A member of an
-`extern "lib" { ... }` block (`SFunction::dylib`, spec §7.10) is a call
-through a static function pointer `gs_dl<N>_<symbol>`, where N is its place
-among the used externs; the pointer is declared in the prototypes' place.
-After the prototypes come two tables:
-
-* `gs_dllibs[]`: the libraries that the used members bind from, in the
-  order of their first declaration, each with the sidecars' three platform
-  names (`DlSpelling`: per platform, the program's name takes precedence
-  over the package's, and 0 means the runtime derives one);
-* `gs_dlbinds[]`: a row per used member.
-
-`gs_program_init` hands both tables to `gs_dl_bind` right after
-`gs_rt_init`, before the queues and globals. Nothing is emitted for a
-program with no such member. Codegen emits the types of every checked
-extern signature, including unused ones and the complete pointee types of
-plain references, before user headers. A reusable `--include` adapter can
-therefore use its interface's types independently of which functions the
-program calls.
+An `extern fn` goes through a trampoline per extern (`gs_tg_x_<name>`),
+because the C function may be `static` or a macro; a function the runtime
+object exports needs none (`TgModule::RuntimeApi`). A member of an
+`extern "lib" { ... }` block (`SFunction::dylib`, spec §7.10) is called
+through a pointer in its trampoline (`gs_tgdl_<symbol>`). `main` hands the
+libraries and the used members to `gs_dl_bind` (through `gs_tg_dlbind`) once
+the runtime has started, before the queues and globals; nothing is built for
+a program with no such member. The libraries are listed in the order of
+their first declaration, each with the sidecars' three platform names
+(`DlSpelling`: per platform, the program's name takes precedence over the
+package's, and 0 means the runtime derives one). The C types of every
+checked extern signature, including unused ones and the complete pointee
+types of plain references, are written before user headers. A reusable
+`--include` adapter can therefore use its interface's types independently of
+which functions the program calls.
 
 **The foreign boundary.** `CheckExternSpec` admits scalars and flat
 fixed-size values by value, including fixed-mode ADTs and limited arrays
@@ -5403,106 +5321,95 @@ Goose globals. The builtin runtime shims obey the same boundary.
 
 `return ... from` uses one thread-local `int32_t gs_rf` (zero except between
 a long-distance return and its catch), plus per-target thread-local
-channels: channels for in-flight fixed values (`gs_lret_<id>_<i>`), and
-destination stacks for nonfixed ones (`gs_fdst_<id>_<i>`, recorded at the
-target's entry and restored at its exit). A propagating function's ordinary
-exit writes nothing. A call on a propagation path costs one load and a
-never-taken branch, and an intermediate frame returns a dummy value after
-restoring its watermarks and running its `defer` bodies (§6.6), which the
-checker keeps free of this machinery (§3.16). `--unsafe-no-rf-check` omits
-the checks, for measurement only.
-A fixed relative aggregate's `gs_lret` channel is a pointer to the target's
-receiving storage, saved and restored at target entry/exit. The nonlocal
-return constructs through it, and the catch has no value to copy.
-A nonfixed value is built at its channel's top, which the return records
-first (`gs_fval_<id>_<i>`). The calls it unwinds may have built things
-there, in the destination that the target handed them: a named result, part
-of a value, or a length prefix claimed for a callee's elements. So the
-target's catch moves the value down to its destination's top on entry, as
-an exit does (`LandValue`). A call's result is fixed up (`EmitReprefix`,
-`EmitSlidePrefix`) only after the check, since a value in flight may lie
-behind the prefix the fixup moves.
+channels: channels for in-flight fixed values, and destination stacks for
+nonfixed ones (recorded at the target's entry and restored at its exit). The
+return site writes the target's channels, sets `gs_rf`, and returns. A
+propagating function's ordinary exit writes nothing. A call on a propagation
+path costs one load and a never-taken branch, and an intermediate frame
+returns a dummy value after restoring its watermarks and running its `defer`
+bodies (§6.2), which the checker keeps free of this machinery (§3.16).
+`--unsafe-no-rf-check` omits the checks, for measurement only. A fixed
+relative aggregate's channel is a pointer to the target's receiving storage,
+saved and restored at target entry/exit. The nonlocal return constructs
+through it, and the catch has no value to copy. A nonfixed value is built at
+its channel's top, which the return records first. The calls it unwinds may
+have built things there, in the destination that the target handed them: a
+named result, part of a value, or a length prefix claimed for a callee's
+elements. So the target's catch moves the value down to its destination's
+top on entry, as an exit does (§6.5). A call's result is fixed up (slid out
+of, or given, its length prefix) only after the check, since a value in
+flight may lie behind the prefix the fixup moves.
 
 ### 6.7 Relative references, pools, literals
 
 A relative load is the field's own address (or, `in pool`, the pool's base
 minus one) plus the stored offset, with a null test only for the optional
-form (`LoadLoc`, `RelOrigin`). A store subtracts the same origin
-(`EmitRelStoreAt`). Into an optional slot, the store tests the value for
-null unless the value is a plain `T&`: a node of that type, a call declared
-to return one, or a block or `if` all of whose values are one
-(`RelValue`). Into a self-relative optional slot, the store aborts on a
+form. A store subtracts the same origin (`RelStore`). Into an optional slot,
+the store tests the value for null unless the value is a plain `T&`: a node
+of that type, a call declared to return one, or a block or `if` all of whose
+values are one. Into a self-relative optional slot, the store aborts on a
 non-null target at offset zero (§3.9), unless no target can be at the
-slot's own address. That exception applies when the slot is a field at a nonzero
-offset in a fixed
-struct and does not point at a reference. A target at the slot's address would
-have to be a part of the struct starting there, and the slot itself is the
-only such part. `RelSlotApart` establishes this from the assignment's field
-path or the literal's layout.
+slot's own address. That exception applies when the slot is a field at a
+nonzero offset in a fixed struct and does not point at a reference. A target
+at the slot's address would have to be a part of the struct starting there,
+and the slot itself is the only such part. The assignment's field path or the
+literal's layout establishes this.
 
 Whatever produces the value, the store encodes a plain reference. A
-branch's or an inlined body's value for a relative slot is computed into a
-plain-reference temporary (`CtlValX`). A call's result is encoded where it
-is stored (`ConstructCall`). A frame object literal stores an `in pool`
-field, a C member of the object, through the same helper
-(`GenFrameObjLit`). A local, global or parameter declared with a relative
-type is such a slot too. Its initializer or argument is encoded into it
-(`BindLocal`, `EmitGlobalInit`, `EmitArg`), at varint width on a data stack
-as any variable-size value is (`GenConstruct`). A `var` global without an
-initializer starts as `null` (`DefaultValue`). An identity comparison
-(`.==`) reads the variable as the address it encodes, as every other read
-does. A call's value is plain too, since `default<T>()` of a relative
-reference is the null pointer. So where `default<Rel[N]>()` fills its
-temporary's elements with that null pointer, the lvalue store encodes it
-(`Call::CgAny`). The store's range check is emitted only where a root can
-exceed the width: for `in pool` under `#if GS_STACK_RESERVE >= 2^bits`, and
-for self-relative under `#if GS_STACK_RESERVE > 2^(bits-1)` when no
-fixed-size root in the program is wider than the width (`relrootmax`). So a
-`u32` link on the default 2 GB reservation is stored unchecked. A pool's
-base is loaded once per function into a local (`PoolBase`), and element
-access through a pool global reads that local too. `self` is stored as
-minus the field's own offset (self-relative), or as the value's own pool
-offset (`in pool`, only where the literal is built inside the pool). `pop`
-on an array of relative references loads the element it removes like any
-other load, from the slot it leaves. `resize(n, ref)` evaluates the fill
-once as a plain pointer and encodes an offset at each new slot using the
-same store helper, including its null and range checks. Aggregate fills
-containing self-relative references remain unsupported.
+branch's or an inlined body's value for a relative slot is computed as a
+plain reference. A call's result is encoded where it is stored. A frame
+object literal stores an `in pool` field through the same helper. A local,
+global or parameter declared with a relative type is such a slot too. Its
+initializer or argument is encoded into it, at varint width on a data stack
+as any variable-size value is. A `var` global without an initializer starts
+as `null`. An identity comparison (`.==`) reads the variable as the address
+it encodes, as every other read does. A call's value is plain too, since
+`default<T>()` of a relative reference is the null pointer. So where
+`default<Rel[N]>()` fills its temporary's elements with that null pointer,
+the store encodes it. The store's range check is built only where a root
+can exceed the width: for `in pool` where `GS_STACK_RESERVE >= 2^bits`, and
+for self-relative where `GS_STACK_RESERVE > 2^(bits-1)` when no fixed-size
+root in the program is wider than the width (`relrootmax`). So a `u32` link
+on the default 2 GB reservation is stored unchecked. A pool's base is
+loaded once per function, and element access through a pool global reads
+that value too. `self` is stored as minus the field's own offset
+(self-relative), or as the value's own pool offset (`in pool`, only where
+the literal is built inside the pool). `pop` on an array of relative
+references loads the element it removes like any other load, from the slot
+it leaves. `resize(n, ref)` evaluates the fill once as a plain pointer and
+encodes an offset at each new slot using the same store, including its null
+and range checks. Aggregate fills containing self-relative references
+remain unsupported.
 
-A `reusable[]` pool's operations (`EmitSlicePool`) evaluate the receiver,
-then the slice, then the length (`SliceLen`, which aborts on a length that
-is negative or too large to hold). They turn a non-empty slice back into an
+A `reusable[]` pool's operations (`GenPool`, `GenSlicePool`) evaluate the
+receiver, then the slice, then the length (which aborts on a length that is
+negative or too large to hold). They turn a non-empty slice back into an
 index. Where the checker placed the slice in the pool, this is an exact
 divide. Otherwise (`Call::poolcheck`), the operation first tests that the
 slice lies inside the element region on an element boundary, and aborts
-with `GS_E_POOLSLICE` if it does not. The test uses `uintptr_t` arithmetic,
-so that a slice of other storage compares without undefined pointer
-arithmetic. An empty slice takes index 0. The freelist is the runtime's
-(§7): its base, count and top are passed to the `gs_spans_*` call by
-address, so a cached top works unchanged. A slice that ends the element
-region grows without a call. Growth of the element region is emitted here
-(`EmitSliceExtend`: count and top, as for a push), and so are the default
-values (`EmitDefaultElems`: one `memset`, or the checked default
-construction per element for a type with field defaults). A move is one
-`memmove`. A pool's freelist counts 8-byte slot indices for a slot pool and
+with `GS_E_POOLSLICE` if it does not. The test uses unsigned address
+arithmetic, so that a slice of other storage compares without undefined
+pointer arithmetic. An empty slice takes index 0. The freelist is the
+runtime's (§7): its base, count and top are passed to the `gs_spans_*` call
+by address. A slice that ends the element region grows without a call.
+Growth of the element region (count and top, as for a push) and the default
+values (one `memset`, or the checked default construction per element for a
+type with field defaults) are built inline. A move is one `memmove`. A
+pool's freelist counts 8-byte slot indices for a slot pool and
 `GS_SPAN_NODE`-byte tree nodes for a slice pool (`FlEntrySize`); this is
 what the thread-spawn image copies.
 
 A fixed struct or array literal that holds relative references is built at
-its final address, never in a C temporary that is then copied (`FixedLitAt`,
-`FixedLitAtStk`). A literal with unused limited array slots is
-zero-initialized first, and every aggregate-typed C local is hoisted to the
-function's opening brace (`HoistAggregateDecls`). Both are workarounds for
-MSVC miscompilations described in Appendix E. A zero-length array's literal
-is zero-initialized too (`HasUninitSlots`): nothing writes the one slot its
-C struct has, and copying a C object that nothing wrote is undefined. For
-the same reason, a struct or variant literal without fields zeroes its C
-object (`StructLitAt`): its `gs_empty` byte or its pads.
+its final address, never in a temporary that is then copied. A literal with
+unused limited array slots is zero-initialized first. A zero-length array's
+literal and a struct or variant literal without fields are zero-initialized
+too: nothing writes the byte or the pads they occupy in the C types, and
+copying an object that nothing wrote is undefined.
 
 A string literal read as a `u8[]` value, of any length storage, is an image
-in static data (`GenStrBytes`). A string literal read as a runtime-capacity
-`u8[..]` is built on a temporary as any other value is (`GenConstruct`),
-which gives it the capacity a literal has: its length.
+in static data. A string literal read as a runtime-capacity `u8[..]` is
+built on a temporary as any other value is, which gives it the capacity a
+literal has: its length.
 
 ### 6.8 Threads and queues
 
@@ -5510,77 +5417,57 @@ which gives it the capacity a literal has: its length.
 followed by the worker program's globals as `[size][image]` records (a
 resizable's image is its count, its fixed fields and its tail's elements;
 a pool's image also carries its freelist). It then hands the packet to the
-runtime. The generated thunk (`EnsureThreadThunk`) unpacks the arguments
-onto fresh stacks, allocates the worker's `gs_globals_t`, fills it from the
-image, and runs the body. The runtime frees the instance
-(`gs_thread_release`). `thread_spawn_contained` is the same spawn with the
-runtime's contained flag set (§7). `thread_wait` is emitted into a
-temporary, so a discarded answer still waits. `thread_wait(id, msg)`
-appends the message the runtime hands over to `msg`, as `to_bytes(a, out)`
-appends its image (`AppendBytes`), and then frees it (`gs_free_msg`).
-Queues are one `gs_queue` per element type, carrying one contiguous image
-per value; `main` creates them (`gs_qinit`) before anything else runs. A
-missed `qpoll` yields the all-zero image (`MinBytes`). A queue is a linked
-list of `malloc`'d nodes under a mutex, with a condition variable for its
-receivers, and a count of its messages. `gs_qput` allocates and copies
-before it takes the lock, and checks the queue's limit under the lock; a
-refusal frees the node. A timed `qget` (`gs_qwait`) waits for a deadline on
-a monotonic clock, and a miss yields the zero image, as a missed `qpoll`
-does. On POSIX the condition variable's clock is set to `CLOCK_MONOTONIC`,
-on macOS the wait is for a relative time
+runtime. The worker's entry thunk (`CodeGen::EnsureThreadThunk`, reached
+through an accessor of `TgModule`) unpacks the arguments onto fresh stacks,
+allocates the worker's globals record, fills it from the image, and runs the
+body. The runtime frees the instance (`gs_thread_release`).
+`thread_spawn_contained` is the same spawn with the runtime's contained flag
+set (§7). `thread_wait` stores its result into a temporary, so a discarded
+answer still waits. `thread_wait(id, msg)` appends the message the runtime
+hands over to `msg`, as `to_bytes(a, out)` appends its image, and then
+frees it (`gs_free_msg`). Queues are one `gs_queue` per element type,
+carrying one contiguous image per value; `main` creates them (`gs_qinit`)
+before anything else runs. A missed `qpoll` yields the all-zero image. A
+queue is a linked list of `malloc`'d nodes under a mutex, with a condition
+variable for its receivers, and a count of its messages. `gs_qput` allocates
+and copies before it takes the lock, and checks the queue's limit under the
+lock; a refusal frees the node. A timed `qget` (`gs_qwait`) waits for a
+deadline on a monotonic clock, and a miss yields the zero image, as a missed
+`qpoll` does. On POSIX the condition variable's clock is set to
+`CLOCK_MONOTONIC`, on macOS the wait is for a relative time
 (`pthread_cond_timedwait_relative_np`), and on Windows the runtime reads
 `GetTickCount64`. A value of no bytes (spec §3.4) is sent through a queue
-or a thread's arguments as no bytes, and the receiver zeroes the object C
-gives it rather than reading past the image.
+or a thread's arguments as no bytes, and the receiver zeroes the object
+rather than reading past the image.
 
-### 6.9 Generated walkers
+### 6.9 Rendering and serialization
 
-Codegen generates these per type, on demand:
+The backend builds the procedures that walk a value itself: a render
+procedure (`gs_tg_render_<T>`) for each type that reaches itself, and a
+verifier (`gs_tg_verify_<T>`) for each element type of a `from_bytes`. They
+are queued as bodies ask for them and built after the asking function is done
+(`TgModule::RenderFn`, `VerifyFn`, `TinyGenBackend::BuildRenders`).
 
-* `gs_size_<T>`: the byte size of a dynamic value.
-* `gs_eq_<T>`: structural equality. It is a `memcmp` for gap-free fixed
-  types of more than four scalars, and for canonical-encoding bytes values
-  that hold no floats, pads or runtime-capacity limited arrays. Otherwise
-  it is a cursor walk, which steps over pads and over a limited array's
-  slots past its length. A fixed value of at most four integer or bool
-  scalars compares field by field, through its `gs_eq_<T>`, which the C
-  compiler inlines. Through `memcmp`, an operand just built in registers
-  would be stored field by field and read back in one wider load, which
-  store forwarding cannot serve. A static-capacity limited array of such
-  elements compares its lengths first. Then, for up to 64 bytes of slots,
-  it compares whole 8-byte words of both values' own storage with the
-  bytes past the length masked off, which takes no branch on the data. A
-  last word that would end past the slots ends at the value's end instead,
-  reaching back into slots already compared or into the length, which are
-  equal on both sides by then.
-* `gs_verify_<T>`: the `from_bytes` verifier of
-  `docs/design/serialization.md`. It is one framing pass for fixed
-  elements, and for variable elements a framing pass that sets an
-  element-start bitmap, followed by a link pass.
-* The tag enums.
-
-Text rendering (`codegen_render.h`) formats scalars through `gs_fmt_*`,
-copies `u8` bytes, and renders everything else structurally into a
-`u8[>..]` builder or through the user `format` specialization recorded on
-the call. `print` renders the whole line into a temporary builder before
-writing it, so lines from different threads never interleave. A struct,
-variant or ADT that is met again inside its own rendering (a type that
-reaches itself through references or slices) is rendered from there by
-`gs_render_<T>`, one function per type (`RenderFn`). This function takes
-the builder and a reference to the value, as an overload taking the value
-by reference does. It calls itself, or the functions of the other types of
-a mutual recursion, for each level below. No overload renders a part of
-such a type (§3.7), so none of the rendering depends on the call. The
-function takes no stack index either: the builder's stack is the only one
-it writes, it opens no stacks of its own, and since it runs no overload it
-hands no stack on. So the overloads a rendering runs are all called by the
-function that prints, above its live stacks (`EmitUserFormat`). Some
-overload parameters are keyed to a reusable pool by the overload's
-specialization (`IsPoolParam`), such as the value rendered or the builder a
-`format` writes into. Such a parameter is handed the pool's `gs_pref`
-(`PrefArg`), as a call's argument for such a parameter is (`EmitArg`). A
-resizable tail with no header of its own is rendered in place one level
-more, up to the reference to the next.
+Text rendering formats scalars through `gs_fmt_*`, copies `u8` bytes, and
+renders everything else structurally into a `u8[>..]` builder (`RenderInto`)
+or through the user `format` specialization recorded on the call. `print`
+renders the whole line into a temporary builder before writing it, so lines
+from different threads never interleave. A struct, variant or ADT that is
+met again inside its own rendering (a type that reaches itself through
+references or slices) is rendered from there by its render procedure. This
+procedure takes the builder and a reference to the value, as an overload
+taking the value by reference does. It calls itself, or the procedures of
+the other types of a mutual recursion, for each level below. No overload
+renders a part of such a type (§3.7), so none of the rendering depends on
+the call. The procedure takes no stack index either: the builder's stack is
+the only one it writes, it opens no stacks of its own, and since it runs no
+overload it hands no stack on. So the overloads a rendering runs are all
+called by the function that prints, above its live stacks. Some overload
+parameters are keyed to a reusable pool by the overload's specialization
+(`IsPoolParam`), such as the value rendered or the builder a `format` writes
+into. Such a parameter is handed the pool's `gs_pref`, as a call's argument
+for such a parameter is. A resizable tail with no header of its own is
+rendered in place one level more, up to the reference to the next.
 
 **Serialization contract.** The following is the observable part of
 `docs/design/serialization.md`, independent of how a verifier is organized:
@@ -5673,507 +5560,53 @@ that came in; text mode would hand them over with each `\r\n` turned into
 `\n`, and only up to the first Ctrl-Z. (`read_line` removes a `\r` before
 the newline itself.)
 
-### 6.10 Loop-invariant views and stack-top caching
+### 6.10 Views and divisors
 
-**Views.** An array reached through a reference keeps its base and length
-behind that reference, and the C backend reloads both at every access since
-any byte store may alias the header. For each reference variable BCE named
-in a loop's `hoistrefs`, the view is read into locals before the loop
-(`AddView`, `ViewScope`), and every access inside the loop uses them. The
-length lvalue that growth writes stays on the real header, so a missed
-growth could never miscompile. An array in a field named in `hoistfields`
-is read out the same way (`AddFieldView`), keyed by the variable that an
-alias stands for (`FieldRoot`) and the field indices. Every field path in
-the loop with that key reads the locals (`UseFieldView`), whichever alias
-it is written through. For a `for` over an array with `fixedlen`, the
-elements pointer and length are likewise read once when the length is a
-memory load.
-
-**Tops.** Where the function grows a stack that it can name, it keeps that
-stack's top in a local. The local is synchronized with memory only where
-something else can observe it: it is flushed before and reloaded after
-calls that can reach the stack, and flushed at every exit. What a call
-reaches (`SyncReach`) is the argument text, the callee's globals' stacks,
-and the stack each reference argument carries, where the argument's
-expression says which stack that is (`HandedStacks`). That is the case for
-a reference taken of a variable or of a frame object's tail in one, or one
-held by a parameter, an alias or a captured reference. A call reaches
-everything ("*") when the callee is handed a value holding a reference (in
-a field, a payload, an element, or the array a reference refers to), or
-captures a reference or a pool. It also reaches everything when a cached
-stack may be a global's or the destination of a `return ... from` target
-up the chain, and the callee names a global or can propagate such a
-return. A callee with no stack among its arguments and none of its own,
-such as a pure helper, reaches nothing and needs no sync. The local is
-confined to the loops that grow the stack (`PlanTopCaches`). For growth
-outside every loop, it is confined to the innermost block around the
-growth, which is the whole body for growth at the body's top level. So a
-stack grown in one branch of a long function does not keep a local live,
-synced at every call, through the rest of the function. The local is
-materialized by a text pass over the finished body, which resolves markers
-for region edges, syncs, and jumps out of a region (`ExpandTopMarkers`).
-
-Soundness requires that each cached stack is named in only one way, and a
-fat reference held anywhere could break that: its `.stk` names a stack that
-the body may also name directly. So which stacks are cached is decided
-class by class (`PlanTopClasses`). Each class is cached only where nothing
-the body holds can be a second name for one of its stacks:
-
-* the function's own indexed stacks, `GS(gs_sp + k)`, which no caller
-  expression can name. They are not cached if the body holds a fat
-  reference that could be rooted at one of its own locals: one in a local
-  variable that is not an alias (below), one read out of a field or an
-  element, or one that a call returns. A reference taken of a variable and
-  handed on, to a call or into a value passed to one, does not count, since
-  the call syncs;
-* the globals' dedicated stacks. These also require that there is no
-  fat-reference or pool parameter and no captured reference, since either
-  may be rooted at a global;
-* a nested function's captured resizables' stacks (`<fv>_stk`). These have
-  the same requirement, and also require that there is no `return ... from`
-  in the body: a captured variable may be its function's named result,
-  built at that function's destination, which is where such a return builds
-  its value;
-* the return destinations, `gs_dst<i>`, which a caller may hand over as a
-  global's stack, a parameter's or a captured variable's. These are cached
-  only where the body names none of those, returns to no gs_fdst channel,
-  and is not a `return from` target;
-* the reference parameters' `.stk`, in the **reference-parameter mode**
-  (`RefTopsOk`). This mode requires that every fat reference in the body is
-  a parameter (or an alias of one) named directly, or one taken of a
-  variable and handed on. The fat parameters' root classes must be distinct
-  and exact (and concrete when there are several). There must be no
-  by-value resizable parameter, no nonfixed return destination, no
-  `return from` channel, no captured resizable, and no global whose type
-  could be one of those parameters' pointees.
-
-The function's own stacks never overlap with another class, and no two of
-the other classes that could share a stack are cached together.
-
-**Aliases.** Some fat reference variables are not C variables at all
-(`refalias`, `aliaspath`, `FindRefAliases`). Such an alias is a fat
-reference variable that cannot be rebound and is bound to one of:
-
-* a resizable variable (`&v`);
-* a frame object's tail reached from a resizable variable by fields
-  (`&v.f.g`; not through a reference field, which can be rebound);
-* a parameter, a captured reference or another alias (an inlined callee's
-  `A&` parameter, a base-case inlining's copy of a reference argument, a
-  function value's reference parameter).
-
-Every use of an alias reads what it stands for, its pointee being that
-location (`VarLoc`, `DerefLoc`), and a use as a value makes the `gs_rref`
-on the spot. So the stack and the header are still named in only one way,
-and a local's header does not escape through a pointer that nothing needs.
-An inlined `push_n` or heap operation on a local is therefore cached as a
-push on the local itself is. An alias has a view of its own where BCE named
-it in a loop, never its target's view.
-
-**Counts.** A push bumps the count too. Where the header is reached through
-memory (a reference parameter's `p.hdr->len`, a global's, a captured
-array's), a byte store may alias the count as it may alias the top. So
-where the stack is cached, so is the count (`LenSlot`, noted at the growth
-sites, `NoteLen`), over the same extent and synchronized at the same
-points. The expansion replaces the count's single name with the local. It
-keeps a slot only where the header is mentioned nowhere else in the extent,
-other than as its base or between a call's flush and reload; where it finds
-another mention, it expands again without that slot. A frame object's tail
-is not cached this way, since a whole copy of the object reads its count
-too. Neither is a local's header, which the C compiler keeps in registers
-itself.
-
-**Constructions.** Some values of several fields are built in place at the
-top of a stack that no class caches, such as a pushed literal of
-variable-size elements (or of elements holding relative references)
-through a captured reference. Their fields are still written through a
-local, and the top is stored once after them (`MarkConsBegin`,
-`ConsRegion`). Nothing may grow or shrink that stack while the value is
-under construction (§3.10), so nothing else that names the stack moves its
-top meanwhile, and every call among the field initializers syncs the top,
-whatever the call reaches.
-
-**Fills and stores.** `resize(n, v)` of a resizable fills the new slots
-through a cursor of its own and stores the top once. Where every
-value-bearing byte of a literal fill is the same, the fill is one `memset`
-(`UniformFillByte`). A pushed element that is an aggregate of 2, 4 or 8
-bytes is stored as one integer of that width (`StoreWhole`). If it were
-stored field by field, a load of the whole element soon after (a heap's
-sift, a pop) could not be forwarded from the narrower stores. A cached top
-exposes that stall, since the load's address is ready at once.
-
-**Divisors.** An unsigned `/` or `%` by a divisor that the loop cannot
-change multiplies instead of dividing (`LoopDivisible`, `HoistDivisors`,
-`FixedDivX`), and so does a signed one that `Binary::nonneg` marks (§5.10).
-So does an unsigned `/=` or `%=` (`AsDivision`). A signed `/=` or `%=`
-divides, since BCE judges no compound assignment's operands. The divisor
-must be an integer variable, a field of a fixed-size struct variable
-(through any number of struct fields), or an integer conversion of either
-(`DivisorKey`: `x / (t.total as u64)`). Its variable must be bound before
-the loop, not inside it or by the loop itself, and nothing may be able to
-write it while the loop runs:
-
-* the loop, including its condition, writes no part of it (tail-recursion
-  elimination assigns a function's parameters in the loop it makes);
-* no reference to it is made anywhere in the function (`RefdLocals`: a
-  `&`, written or inserted where an lvalue binds by reference, a `.=`, a
-  by-reference `for` or `match` binding, a function value's reference
-  parameter, an argument that a user `format` overload gets);
-* no other function's code reaches it, as it would if the variable were
-  captured or a named result built at its destination.
-
-A `let` is as writable through a reference as a `var` (§4.4), so being a
-`let` does not settle this. A global, which any function may write, and a
-variable of global initialization code qualify only as an integer `let`
-that no writable reference is bound to (`VarDef::refwrite`).
-
-Ahead of the outermost loop that the divisor is fixed for, `gs_divu_gen`
-computes libdivide's magic number and shift for it once (one 128-by-64-bit
-division). Each division is then the high half of a product, adjusted and
-shifted (`gs_divu_q`); a remainder is the dividend minus the quotient times
-the divisor. Operands of 32 bits or fewer (`NarrowDivision`) use a 32-bit
-magic number instead (`gs_divu32_gen`, one 64-by-32-bit division, and
-`gs_divu32_q`). They get their own magic number even where a 64-bit
-division by the same divisor shares the loop (`DivisionKey`). Each such
-division is then the high half of a 32-by-32-bit product, which a C
-compiler vectorizes; x86-64 has the 64-by-64-bit product only as a scalar
-instruction. A loop summing `u32` remainders runs about seven times as fast
-with AVX-512, and a loop reducing a million `u32`s in place by `x %= m`
-runs 4.3 times as fast at x86-64's baseline (clang-cl 22).
-
-A zero divisor gets `GS_DIVU_NONE`, under which every division uses the
-plain operator and its zero check, so the abort happens where and when a
-division by zero runs. `GS_DIVU_NONE` is also used for a divisor whose
-conversion would fail (the divisor is computed ahead of the loop without
-the conversion's check, `DivisorValue`), and for a 64-bit magic number
-under a C compiler without 128-bit products (TinyCC). Where a zero divisor
-is the only case that can be left without a 32-bit magic number
-(`DivMagic::zeronone`: no conversion is checked), the division instead
-fails outright under `GS_DIVU_NONE`. gcc copies that test of a
-loop-invariant value out of the loop. The plain division's own zero test
-would leave a loop exit, after which the loop's stores might not run, and
-gcc holds such stores in registers, as vectorizing needs, only where they
-always run. Computing the magic number costs about one division, so it is
-worth it from a loop's second division on.
+The backend reads an array's base and length through its reference at every
+access, and a stack's top and count from memory at every push; it hoists no
+views and caches no tops. `ForLoop::fixedlen`, `lenbound` and the per-loop
+`hoistrefs` and `hoistfields` (§5.10) are computed, and the backend reads
+none of them: a loop is built as written. A division by a divisor that is fixed for a loop is an ordinary
+division, not a multiplication by a magic number.
 
 ### 6.11 `&&` and `||`
 
 A `&&` or `||` whose value only decides a branch (the condition of an `if`,
-a `guard`, a `while` or an `assert`) compiles to a chain of conditional
-branches on its operands (`CodeGen::GenBranch`). This is the shape a C
-compiler gives its own operators: `while i < n && y & (1 << i) != 0 { i++; }`
-becomes `if (!(i < n)) goto brk;`, then the right operand's statements,
-then `if (!(<right>)) goto brk;`. A `&&` branches to the target for false
-as soon as an operand is false, and a `||` branches to the target for true
-as soon as an operand is true. An operator nested in an operator of the
-other kind branches past its own right operand to a label of its own, and a
-`!` swaps the targets. An inlined call of a `bool` function in such a
-condition branches too (`CodeGen::BranchCall`). Its `return`s and the end
-of its body branch on the value they give, and a constant value either
-jumps or does nothing, as a C compiler finds the C once it has inlined it.
-For example, `if plain(key)`, over a body that returns false from inside a
-loop, jumps from that loop to the else-arm. An `if` with an `else` branches
-to the else-arm, which the then-arm jumps over. A guard, whose else cannot
-complete normally, branches past the else to the then-contents that follow.
-Each operand at a leaf of the chain is evaluated in a scope of its own.
-Where the operand builds temporaries on data stacks, its truth value is
-taken into a `uint8_t` and their restores follow at once, ahead of its
-branch, so neither path skips them. A branch out of an inlined call
-restores what its scopes and its arguments hold on the way, as its
-`return` does.
+a `guard`, a `while` or an `assert`) is built as a chain of conditional
+branches on its operands (`CondBranch`). A `&&` branches to the target for
+false as soon as an operand is false, and a `||` branches to the target for
+true as soon as an operand is true. An operator nested in an operator of the
+other kind branches past its own right operand to a block of its own, and a
+`!` swaps the targets. Each operand at a leaf of the chain is evaluated in a
+scope of its own, so that a temporary it builds on a data stack is restored
+before its branch, and neither path skips the restore.
 
 As a value (stored, passed or returned), the left operand is stored in a
-`uint8_t` temporary, and the right operand is emitted inside an `if` on it,
-short-circuit style, setting the temporary. In a condition, that flag (or
-an inlined call's result held for the branch) is a value that the C
-compiler may or may not see through, and clang's choices went both ways on
-it. plb2's nqueen, whose inner loop is the `while` above, ran 4-8% slower
-under clang 20 and 22 with the flag than with the chain; the chain is as
-fast as the loop written with a `break`. Over the LangArena port
-(`bench/kostya`), chains for `&&` and `||` alone left the suite's overall
-speed unchanged. A CSV parser got 11-15% faster and a Huffman encoder
-12-17% faster, but a JSON writer got 7% slower and a word counter 9-14%
-slower, in both cases where a small `bool` function's result decided the
-branch. With those calls branching as well, the suite ran 1.5% faster in
-geomean. The JSON writer was level, and the word counter 5% slower, where
-clang now reloads a 64-bit constant inside the loop it tests whitespace
-in. The `bench/run_bench.py` programs whose C changed ran 1.5% faster in
-geomean under v145 and clang, `lru` and `calc` 7% faster under v145, and
-none slower.
-
-In both forms, the right operand may also be evaluated unconditionally.
-This happens where the operator is in the body of a loop that can be
-straight-line code, and evaluating the right operand can neither fail nor
-have an effect, whatever the left operand gave (`CodeGen::Speculatable`).
-The operand is then combined with the left operand's 0 or 1 by `&` or `|`,
-and a condition branches on that one value. A C compiler keeps the branch
-of a short circuit, whether as a flag or as a chain, and in a loop that
-branch blocks if-conversion and vectorization. The compiler does if-convert
-and vectorize the unconditional form: a loop counting the positions of a
-32-byte block where `p1[j] == a && p2[j] == b` ran 5.4 times as fast in
-that form as in the chain, which clang 22 leaves scalar. The operator's
-value is the same either way, and the short circuit that the specification
-promises (§6.1) skips nothing observable in such an operand: the operand
-has no effect to skip and no failure to avoid.
-
-The loop in question is the innermost one around the operator in its
-function. It qualifies when neither its body nor a `while` condition
-contains a loop, a call, `break`, `continue` or `return`
-(`CodeGen::StraightCode`). This is recorded on the loop's scope once its
-condition is emitted, since a `while` condition is the loop's exit.
-Elsewhere, the short circuit's early branch is as good. Ahead of a branch
-that remains, it is better: the left operand usually decides the branch in
-one compare, while the unconditional form makes the branch wait for every
-compare. Measurements from before these limits were added: in the sift
-loops of an A* search's heap, where the comparator
-`a.f < b.f || (a.f == b.f && a.v < b.v)` decides a `break`, the
-unconditional form ran the search 25-30% slower. In a JSON parser's `while`
-conditions, where `c <= ' '` alone ends nearly every whitespace skip, it
-ran 30% slower.
-
-What qualifies is defined over the operand's tree, which may have at most
-24 nodes:
-
-* constants;
-* variables, except an optional reference used other than as its own null
-  test or truth value;
-* the comparisons, and `!`, `&&` and `||`, over those;
-* integer `& | ^ << >>`;
-* `+ - *` on unsigned integers, which wrap in every build, and on floats
-  (and float `/`);
-* casts that cannot fail in any build (to a float, or an integer widening
-  or `as!`);
-* fields of fixed structs reached through such storage;
-* elements whose bounds check the types settle (a `u8` into a `[256]`), or
-  whose check BCE found to hold without the left operand's facts
-  (`Binary::specidx`, section 5.10, and `Index::nobc`);
-* inlined calls and blocks made of scalar `let`s and a value of the same
-  kinds.
-
-All other expressions keep short-circuit evaluation. These include calls,
-writes, division (which checks for zero), signed arithmetic and narrowing casts
-(which check overflow and range in debug builds), and float-to-integer casts.
-Loads through an optional reference also keep it, since the left operand may
-narrow that reference (§3.8). So do fields of variable-size structs and any
-index that BCE did not prove safe in this way. The left operand often supplies
-the bound, as in `i < n && a[i] == c`.
+`bool` local, and the right operand is evaluated inside an `if` on it,
+short-circuit style, setting the local. The right operand is never evaluated
+unconditionally: the short circuit of the specification (§6.1) is the only
+form.
 
 ### 6.12 Restated loops
 
-Four loop shapes are emitted as an equivalent loop clang optimizes better
-(the marks of §4's loop shaping and §5.10's `lenbound`). Each restated loop
-starts with a comment naming its shape (`/* loop shape: ... */`), which the
-test runner reads in `test/optimizer/loop_shapes.goose`'s C.
-
-**Blocks of iterations** (`GenBlocked`). This applies to a `for` marked
-`stripk` or `sumred` with an iteration count fixed at entry. Eligible
-sequences are ranges, counts, fixed arrays, and arrays or slices with
-`fixedlen`. Arrays and slices must be walked in place. BCE must not have
-bounded the loop to fewer than two blocks. Such a loop
-runs `while (at least K left) { K iterations }`, and then runs the rest one
-iteration at a time in a loop of its own; each of the two loops runs a copy
-of the body. Neither copy re-reads a length that the body cannot change,
-so the iterations, their order and every value are the same as in the
-original loop. "At least K left" is computed without overflow at the
-counter's type (`AtLeastLeft`). The copies share one Goose loop scope
-(`OpenLoop`), as a loop run one iteration at a time has one. A `break` in
-either copy leaves both, and a `continue` reaches the end of the copy it is
-in, whose step advances the counter. Both copies divide by the magic number
-of a divisor fixed for the loop (§6.10's divisors), and both take `&&` and
-`||` in the unconditional form where the body can be straight-line code
-(§6.11).
-
-Measured with clang-cl 22 at `/O2` over a million elements, a
-strip-mined loop adding `x / d` into 4 lanes ran 4.4 times as fast with the
-magic number as with the division. An in-order sum of
-`if x > lo && x < hi { x } else { 0.0 }` ran 8 times as fast in the
-unconditional form. clang's choice between a select and a branch for such a
-term is fickle, though: a sum of byte compares that ran 2.9 times as fast
-on its own ran 1.5 times as slow when inlined into each copy of a
-strip-mined loop around it, where clang branched on each compare again.
-
-A
-body is emitted twice only where nothing binds to its locals once per
-function (`Dupable`). That is, the body declares no data-stack local, no
-captured local, no named result built at the destination, no nested
-function and no function value, and builds no variable-size value. Each
-copy names its locals afresh (`NameScope`), and the element binding of the
-remainder copy gets a name of its own, since an aggregate's declaration
-moves to the top of the function (`HoistAggregateDecls`).
-
-* Strip-mined (`stripk`, `K` from 2 to 16): the block is
-  `for (l = 0; l < K; l++, i++)`, and every `lanemods` node is emitted as
-  `l` (`substs`, consulted by `GenX`). clang unrolls the block, and a
-  `T[K]` indexed by the constant positions stays in registers; a SHA-256
-  message schedule's 8 lanes of `u32` become two SSE vectors.
-* An in-order sum (`sumred`, `K` = 8): the block computes its 8 terms into a
-  local array, then adds them to `s` one after another. The term loop
-  vectorizes; the additions are the loop's own, in its order.
-
-**A bound for the trip count**: an array or slice loop whose `lenbound` is
-at most 8, with a body of at most 48 nodes, runs `for (i = 0; i < bound;
-i++)`, testing `i >= len` at the top of each iteration: clang unrolls it
-whole into straight-line code with predictable exits. The length is still
-read at every test, so growth during the walk is seen as before. A count
-over a cell's `(Cell&<u32>)[..8]` neighbors is the case that needs it. A
-loop whose length is known to equal its bound (`lenexact`) is left alone:
-clang mostly knows that length too (a fixed array's length, or one that an
-`assert` compared), and the constant only changes how clang vectorizes the
-loop, which measured slower for the asserted neighbor count.
-
-**Countdowns** (`countdown`): `while (v > 0) { v--; body }` becomes `n =
-v; for (j = 0; j < n; j++) { v = n - 1 - j; body }`. At every statement of
-the body, `v` holds the value the decrement would have left. After the
-loop, `v` holds `0`, or its value at entry when that was not positive. An
-up-counting induction variable is the form clang compiles best.
+The optimizer marks loops that a restatement would speed up (`stripk`,
+`sumred`, `countdown`, §4's loop shaping and §5.10's `lenbound`). The backend
+reads none of these marks and builds every loop as written, one iteration at
+a time.
 
 ### 6.13 `simd` functions
 
-A `simd fn` (spec §7.12) is emitted by `EmitSimdVersions` from the finished
-body text of each of its specializations, including its element-run twin.
-It emits one copy per level above the baseline, named `<cname>_simd<level>`
-and marked `GS_SIMD_TARGET<level>`, and then the baseline under the
-function's own name. The baseline starts by switching on `gs_simd_level()`
-to the highest version that was built and is supported, forwarding its
-parameters (the names of `SigParams`' declarations). Every caller,
-prototype, function value, export wrapper and thread thunk names the
-baseline, so nothing else changes. The versions are under
-`#if GS_SIMD >= <level>` and the switch is under `#if GS_SIMD >= 1`. The
-runtime (`runtime.h`) sets `GS_SIMD` to 2 under clang on x86-64 and to 0
-everywhere else, where the C compiler sees one ordinary function, so MSVC,
-TinyCC and other targets get no overhead from it. A build can lower it with
-`-DGS_SIMD=1` (no AVX-512 version) or `0`.
+A `simd fn` (spec §7.12) is its baseline version: the backend builds one
+copy of the body, named like any other function, and no per-instruction-set
+versions or run-time dispatch. A `simd` function is never inlined (§4).
+`mul_add` (`math`) is an extern bound to the runtime's `gs_mul_add`
+(`gs_mul_addf`), which rounds as the build's runtime does (spec §7.12
+permits either rounding).
 
-* **Levels.** 1 is AVX2 with FMA, BMI1, BMI2, LZCNT and POPCNT; 2 adds
-  AVX-512 F, BW, CD, DQ and VL (x86-64-v4). Clang inlines a
-  baseline callee into a version (a callee whose target features are a
-  subset of the caller's), so a small helper the loop calls is vectorized
-  with it; it never inlines a version into the baseline.
-* **Detection** (`gs_simd_detect`) is the compiler's own: `cpuid` for the
-  feature bits and `xgetbv` for the register state the operating system
-  saves (XCR0's YMM bits for level 1, its opmask and ZMM bits for level 2),
-  in inline assembly. An operating system that enables a register state
-  only at its first use (macOS does so for AVX-512) shows it clear and
-  gets the lower level: the check can miss a version, never pick one the
-  machine cannot run. Clang's `target_clones` would write the dispatch
-  itself, but it needs compiler-rt's `__cpu_model` and
-  `__cpu_indicator_init`, which a Windows link does not have. The level is
-  detected at the first call and kept in a static that every thread reads
-  and may write the same value into, through relaxed atomics, so there is
-  no initialization order to get right and no race.
-* **Exactness.** Clang's default `-ffp-contract=on` fuses a multiply and an
-  add within one C expression wherever FMA exists, which AVX-512 implies
-  and arm64 always has; GCC's default fuses across statements as well.
-  That would make a version's float results differ from the baseline's, and
-  a program's on arm64 from its results elsewhere
-  (`test/codegen/simd_versions.goose` prints other digits without the
-  guard), so `runtime.h` turns contraction off for the whole translation
-  unit: `#pragma clang fp contract(off)`, GCC's `optimize("fp-contract=off")`
-  and MSVC's `fp_contract(off)`. The same contraction measured 2x slower
-  on a matrix multiply under AVX-512, because an FMA's latency lengthens
-  the dot product's dependency chain.
-* **`mul_add`.** `math`'s `mul_add` is the program saying where to fuse,
-  and the one result a version may give differently from its baseline
-  (spec §7.12). It is an extern bound to `gs_mul_add` (`gs_mul_addf`).
-  `runtime_ext.h` defines that name twice: as a function, and then as a
-  macro of the same name, which every call in the generated code names. The
-  macro pastes `GS_MUL_ADD_MODE` into `gs_mul_add_fused` (`__builtin_fma`,
-  always inlined so that it is built with its caller's FMA) or
-  `gs_mul_add_separate` (`x * y + z`, two roundings under the contraction
-  pragma), so a call gets the mode in force where it is emitted.
-  `runtime.h` sets the mode to `GS_MUL_ADD_BASE`: fused where the whole
-  translation unit has FMA (`__FMA__`, arm64), and separate elsewhere,
-  under TinyCC and under MSVC, whose `fma()` is a call into the C library
-  even with `/arch:AVX2` (a matrix multiply ran 2.7x slower fused). `EmitSimdVersions` sets it to fused
-  before each version past the baseline, whose target attribute includes
-  FMA, and back to the base after, so the baseline's copy of the body keeps
-  the target's mode.
-  * **Function values** are resolved at compile time (spec §7.6): a call through
-    one names the macro like a direct call, so a `simd fn` given `mul_add`
-    as a function value fuses in its versions, at `-O0` too. The function
-    definition, in the base mode, is only for C that names it without the
-    macro; the generated code never does.
-  * **Helpers.** A callee stays in the mode it was emitted in, even where
-    clang inlines it into a version later. Only the version's own body
-    fuses, together with the functions Goose inlined into it. So a
-    `mul_add` moved into a plain helper fuses in a `simd` caller at `-O2`,
-    where Goose inlines a small helper, and not at `-O0`. An `inline fn`
-    helper fuses at every level except `-O0`, where Goose inlines nothing
-    (spec §7.13). The stdlib documentation says so.
-  * **Tests.** `test/codegen/simd_mul_add.goose` checks each kind of call
-    (plain, and in a `simd fn` direct, through an `inline fn` helper,
-    through a plain helper and through a function value), generated at Goose
-    `-O2` and `-O0` and built by clang at each level (`clang_mul_add` in the
-    runner). `stdlib_math.goose` checks a cancellation and an overflow case
-    accept either rounding and nothing else.
-  * **Effect.** Making `gemm_block`'s multiply-add in goose-linalg a
-    `mul_add` made its matrix multiply 1.3x faster on an i5-12600K, at 68
-    GFLOP/s at n = 400.
-* **Annotated, not automatic.** Building a suite of 50 benchmark programs,
-  as written, for AVX2 or for AVX-512 without contraction measured 1-4%
-  faster in total. That is inside the run-to-run noise, and no program
-  gained in every run: their loops are scalar, or already vectorize at
-  SSE2. With clang's default contraction, AVX-512 measured 15% slower.
-  Versions of every function with a loop would take two to three times the
-  code size for that. Whether a loop gains depends on its shape (an
-  arithmetic byte mapping vectorizes, a table lookup becomes gathers that
-  are no faster, a memory-bound kernel gains from AVX2 but not from
-  AVX-512). The compiler does not know this, and the programmer measures
-  it, so the programmer says which functions get versions. The cost of
-  `simd` is the body once per level and one predicted branch on a load per
-  call.
+### 6.14 Elementwise float arithmetic
 
-### 6.14 Elementwise float arithmetic as vectors
-
-Elementwise arithmetic (spec §6.1) is emitted member by member
-(`GenElemwiseInto`, `GenElemwiseNegInto`), and clang's SLP vectorizer then
-has to find the vectors again, which it only partly does. In goose-fft's
-radix-8 pass, whose butterflies are arithmetic on structs of four `f64`, the
-AVX2 version had 208 two-lane operations next to 175 four-lane ones, and
-spilled. So where the C compiler has GCC's vector extensions, a `+`, `-`,
-`*`, `/` or negation of a value whose leaves are all floats of one width,
-2, 4, 8 or 16 of them in 16, 32 or 64 bytes with nothing else in it, is one
-operation on a vector type of the same size (`gs_vf64_4` and the others in
-`runtime.h`). `VecShape` decides which values qualify: structs, nested
-structs and fixed arrays alike. It rejects a type over 64 bytes before
-looking at its leaves, and stops at the seventeenth, so a large nested array
-costs nothing to check.
-
-* **Same results.** The vector type's lanes are the members in order, and
-  each lane rounds as the member's own operation would: IEEE operations
-  don't depend on how many happen at once, and contraction is off (§6.13).
-  A scalar operand of `*` or `/` goes to every lane through a vector
-  literal.
-* **Same layout.** The value stays its struct. Both operands are first
-  copied to temps of the struct's own type, so a destination that is one of
-  them, or whose member a scalar operand reads, works as it does member by
-  member. The temps are read and the destination written through the vector
-  type (`GS_VLD`, `GS_VST`), which is `aligned(1)`, since a struct of
-  floats may sit anywhere (structs are packed), and `may_alias`, since it
-  reads memory written as floats.
-* **Only in expressions.** The vector code uses the vector types only
-  inside expressions, never for a local (the generated code gathers
-  declarations at the top of a function, outside the `#if`) and never as a
-  parameter or result. A first version loaded and stored through inline
-  functions: inside a `simd fn`'s AVX2 version that passed a 32-byte vector
-  between code built for AVX and code that wasn't, which the x86-64 ABI
-  forbids, and clang rejected it for Linux and macOS (Windows accepted it).
-* **Where.** The vector form is under `#if GS_VEC`, temps included, with
-  the member-by-member form under `#else`, so TinyCC pays nothing for it.
-  `runtime.h` sets `GS_VEC` under clang and gcc, not MSVC or TinyCC, which
-  have no vector extensions; `-DGS_VEC=0` turns it off.
-* **Effect.** In goose-fft the radix-8 pass's AVX2 version came to 12
-  two-lane operations next to 261 four-lane ones, a third fewer spills and
-  no shuffles, and transforms of 16 to 16,384 points ran 1.25-1.6x faster
-  (memory-bound lengths about even). Code that computes a whole struct and
-  then takes it apart member by member can pay instead: computing a vector
-  and extracting every lane costs more than the scalars did. goose-fft had
-  one such loop, which was 10% slower until its multiplies were written per
-  lane.
-* **Tests.** `test/codegen/vec_elemwise.goose` covers each vector type, in
-  plain functions and in a `simd fn`, and shapes that don't qualify. The
-  runner's `clang_vec` builds it with `GS_VEC` on and off. The `simd fn`
-  cases are the ones that failed on x86-64 Linux and macOS (above), whose CI
-  runs that task.
+Elementwise arithmetic (spec §6.1) is built member by member
+(`ElemwiseInto`), each member rounded as its own operation.
 
 ---
 
@@ -6278,12 +5711,9 @@ the trim. The live partial page and guard gap remain outside that range.
 Trimming covers the full unused reservation on macOS; ordinary allocation
 and regrowth need neither a high-water mark nor a runtime-handled fault.
 Each region records its stack's descriptor, and the descriptor's top in
-memory must be current at the call. The extern is therefore marked
-`SFunction::readsalltops`, so
-that a call to it writes back every cached top. `CodeGen::CollectSpecs`
-marks every function that may reach the extern, and the callers of those
-functions also write back all their cached tops around the call
-(`SyncReach`).
+memory is current at the call, since the backend keeps every top in memory.
+The extern is marked `SFunction::readsalltops`, and `CodeGen::CollectSpecs`
+marks every function that may reach it.
 
 **Stack counts and the thread cap.** Every function's stacks are `gs_sp + k`
 for constants below its own count. A callee's stacks start above the ones
@@ -6351,11 +5781,12 @@ end the process.
 the wide result; otherwise they are macros equal to the release expression
 (when they were functions, they measured 13--37% of runtime under a
 non-inlining backend). Division and modulo are always functions, check for
-zero, and use Euclidean `%`. One table (`CodeGen::ArithX`) writes out the
-scalar operators in C wherever one is applied: a binary operator, a compound
-assignment (its plain operator), `++` and `--`, and each member of an
-elementwise operation. `as` goes through `GS_RANGE`/`GS_F2I`/... macros that
-check in debug builds and cast in release builds. Two kinds of `as` are
+zero, and use Euclidean `%`. The backend applies the scalar operators
+wherever one occurs: a binary operator, a compound assignment (its plain
+operator), `++` and `--`, and each member of an elementwise operation. It
+reaches the checked helpers through exported shims (`gs_tg_add_i32`, ...,
+compiled with the program's defines). `as` goes through `gs_range`-style
+checks in debug builds and casts in release builds. Two kinds of `as` are
 plain C casts in every build: a cast to a float, and a cast from an integer
 type whose every value the target type holds. `as!` and release float-to-int
 casts use the defined wrap of `gs_f2iwrap`. It tests the value itself
@@ -6369,14 +5800,12 @@ signed type, and every checked cast, also take the file and line of the
 operation. A debug check that fails prints them together with the operands
 (or the value) and the type. The release macros drop these arguments without
 evaluating them, so release builds compile to the same code as they would
-without them. The arguments add about 1% to the generated C, and no
-measurable TinyCC compile time. Bounds checks are one unsigned compare
+without them. Bounds checks are one unsigned compare
 (`GS_IDX`).
 
 **Slice pools** (§5.4): the `gs_spans_*` functions (`runtime_impl.h`) keep a
 `reusable[]` pool's freelist on a stack of its own. They are handed the
-freelist's base, node count and stack top (the address of a cached top works
-as well as the memory form). The free spans are stored in the leaves of a B+
+freelist's base, node count and stack top. The free spans are stored in the leaves of a B+
 tree ordered by index. Its nodes are `GS_SPAN_NODE` (512) bytes each and are
 numbered from the base. Node 0 is a header (root, height, the chain of
 emptied nodes), a leaf holds up to 31 spans, and an inner node holds up to
@@ -6412,7 +5841,7 @@ A full node splits in halves. An emptied node is removed from its parent,
 and a root left with one child passes the root down to that child, so a
 freelist that empties becomes a single empty leaf again. Nodes are never
 returned to the stack: emptied nodes are chained for reuse, which keeps node
-numbers valid, and with them a worker's copy of the freelist. The emitted
+numbers valid, and with them a worker's copy of the freelist. The backend's
 code itself keeps the element region's count and top, and fills in the
 default values.
 
@@ -6421,9 +5850,9 @@ of this runtime. They are packages (`docs/design/packages.md`) in
 repositories of their own, which `src/blessed.txt` names. The layers are
 native C over SDL3 and Nuklear in the gfx package, and over Box3D in the
 physics package. That C is compiled once into static libraries, which a
-program links when it is built from the generated C, and which are compiled
+program links when it is built from the backend's output, and which are compiled
 into the compiler itself for JIT runs when the compiler is configured with
-them. The generated C only declares the `gs_gfx_*`, `gs_audio_*`, `gs_ui_*`
+them. The generated code only declares the `gs_gfx_*`, `gs_audio_*`, `gs_ui_*`
 and `gs_phys_*` functions it calls. A JIT run hands their addresses to
 TinyCC with `tcc_add_symbol`. It takes them from the symbol table compiled
 in with the package (`builtin.h`), or, for a package that is not compiled
@@ -6610,44 +6039,18 @@ To help the compiler remove bounds checks:
 
 * Use `--bce-lines` to find lines that retain checks.
 
-On MSVC, a retained check in a hot loop prevents vectorization entirely: `blur`
-is 1.75x slower with its nine checks. On clang, the checks cost little; the
-loop-view hoist described below matters more.
+In C output built by MSVC, a retained check in a hot loop prevents
+vectorization entirely: `blur` is 1.75x slower with its nine checks. Under
+clang the checks cost little.
 
 ### 9.2 Arrays behind references
 
 An array reached through a reference or slice keeps its base and length in
-memory, and the C compiler must reload them after every byte store. Two
-things remove the reloads:
-
-* **View hoisting**: in a loop that only reads and writes *elements* of the
-  array behind a reference variable (no `push`, `pop`, `pop_n`, `resize`,
-  `clear`, whole assignment, rebind, or call that can reach it), the view is
-  read once before the loop. This gives a 4x speedup on `blur` under clang.
-  A loop that grows the array does not get this; move growth out of the read
-  loop, or split the loop.
-* **Stack-top caching**: pushes through a fat reference parameter run with
-  the top and the count in registers when the function qualifies (§6.10). It
-  qualifies when every fat reference in the body is a parameter, the
-  parameters are provably distinct arrays at every call site (exact roots),
-  and the function returns nothing nonfixed, has no `return from` channel,
-  captures no resizable, and names no global that could be one of the
-  parameters' pointees. For this purpose, an inlined helper's reference
-  parameter, or a `let` bound to a variable, counts as that variable. A
-  function that also reads a fat reference out of a field, or holds one in a
-  local bound some other way, keeps the memory form for every stack, except
-  for a literal's fields while the literal is built. For helpers that push
-  frequently, pass distinct pools as parameters to enable this optimization.
-
-A function caches the stack tops of the arrays it owns where it grows them,
-even when it also has reference parameters. A nested function does the same
-for the arrays it captures, and so does a function that builds its result by
-pushes, for its destination. When growth occurs only inside a loop, the
-cache is confined to that loop, so a loop that only updates elements needs
-no register for a cached top. A call to a helper that is handed no array
-needs no synchronization. A call handed a reference to a named array syncs
-only that array's stack, and a call handed a struct holding a reference, or
-an array of them, syncs every cached stack.
+memory, and the generated code reads them at each access. The backend hoists
+no views and keeps no stack tops in registers, so a loop that grows the array
+and one that only reads and writes its elements cost the same per access
+(§6.10). A function that pushes through a reference parameter reads and
+writes the stack's top in memory at each push.
 
 ### 9.3 Construction and copies
 
@@ -6793,83 +6196,55 @@ an array of them, syncs every cached stack.
 
 ### 9.8 Backends
 
-The generated C is the same for every backend; the differences measured in
-`bench/notes.md` come from the backends themselves. clang vectorizes checked
-loops and schedules base-plus-offset loads; MSVC does neither, and is better
-at recursion into a bump allocator. `bench/results.md` reports every row
-under both, and the JIT backend (TinyCC) is for running without a
+A build has three code paths from the same tinygen IR: tinygen's machine
+code (`--backend=tinygen`, `goose build --debug`), tinygen's C built by a C
+compiler (`goose build`), and tinygen's C run by TinyCC (`goose run`). The
+differences measured in `bench/notes.md` come from the C compilers. clang
+vectorizes checked loops and schedules base-plus-offset loads; MSVC does
+neither, and is better at recursion into a bump allocator.
+`bench/results.md` reports every row under both. The machine code
+backend is for debugging, and the TinyCC path is for running without a
 toolchain, not for speed.
 
 ### 9.9 Scanning bytes
 
 A loop that tests one byte at a time runs at about a byte per cycle, and no
-C compiler vectorizes such a loop while it can exit early. There are two
-faster alternatives. First, std's `find_any` and `find_pair`
-(`docs/stdlib.md`) search for a `ByteSet` 16 bytes at a time, with the set
-prepared once outside the loop. Second, a test over a block of fixed size
-that counts hits rather than exiting vectorizes where its `&&` and `||`
-qualify for unconditional evaluation (section 6.11). For example,
-`for j in 32 { if p1[j] == a && p2[j] == b { n += 1; } }` over slices of 32
-bytes, whose indices the loop bounds, takes the vector form, and a block
-with a hit is then searched again one byte at a time. The same test in a
-`while` loop that stops at the first hit stays scalar.
+C compiler vectorizes such a loop while it can exit early. A faster
+alternative is std's `find_any` and `find_pair` (`docs/stdlib.md`), which
+search for a `ByteSet` 16 bytes at a time, with the set prepared once
+outside the loop.
 
 ### 9.10 Loop shapes
 
-Some loops, written in the natural way, compile to code as fast as
-hand-tuned versions, because codegen restates them (§6.12):
-
-* State in a few lanes picked by the counter, `for x, i in data { lanes[i
-  % 8] ... }`, runs in blocks in which every lane index is a constant, so a
-  `T[8]` of lanes is kept in registers; there is no need to write the block
-  loop by hand.
-* A float sum `for x in xs { s += term(x); }` keeps its exact order of
-  additions, and its terms are still computed eight at a time where `term`
-  is a pure expression after inlining.
-* A loop over a small limited array, `for n in cell.neighbors` or
-  `count(cell.neighbors) { ... }` over a `T[..8]`, is bounded by the
-  capacity and unrolls completely; an `assert` of the exact length is not
-  needed for that, though it still helps where the lists are full.
-* `while i > 0 { i--; ... }` runs as a counted loop, as fast as counting up
-  and deriving `i`.
-
-The block forms need the iteration count to be fixed when the loop starts,
-so a loop whose body may change the length of the array it walks (§6.5)
-runs one iteration at a time.
+The optimizer marks loops that a restatement would speed up (lanes picked by
+the counter, an in-order float sum, a small bounded loop, a countdown; §4),
+but the backend builds every loop as written (§6.12). A loop that wants one
+of these shapes is written in it by hand: a block loop with constant lane
+indices for state in a few lanes, a block of partial terms added in order for
+a float sum, and `for i in n { ... }` counting up instead of `while i > 0 {
+i--; ... }`.
 
 ### 9.11 Wider instruction sets
 
-The C is built for the target's baseline (SSE2 on x86-64), where many byte
-loops cannot vectorize profitably; for example, a stride-3 deinterleave
-needs SSSE3's `pshufb`. `simd fn` (§6.13) gives a function AVX2 and AVX-512
-versions under clang, chosen at run time. This helps a loop when:
+The generated code is built for the target's baseline (SSE2 on x86-64),
+where many byte loops cannot vectorize profitably; for example, a stride-3
+deinterleave needs SSSE3's `pshufb`. A `simd fn` (spec §7.12) is its baseline
+version: the backend builds no AVX2 or AVX-512 versions and no run-time
+dispatch (§6.13). The same holds for elementwise float arithmetic, which is
+member by member (§6.14).
 
-* clang can vectorize it: no early exit (accumulate a validity flag, `seen
-  |= a | b | c | d`, instead of breaking), every check elided (§9.1), and
-  nothing in it that syncs a cached stack top (§6.10);
-* the per-element work is arithmetic. A table lookup becomes a gather,
-  which measured no faster than scalar loads on Zen 5, while ranges tested
-  with a wrapping subtraction (`if c - 'a' < 26 { v = c - 71; }`) become
-  compares and blends;
-* the function runs the loop, rather than being called from inside one.
-
-`stdlib/base64.goose` is written to these rules: its arithmetic codec
-encodes and decodes a test input in 0.58/0.55 s at SSE2 (a table codec
-0.64/0.57), 0.15/0.20 with AVX2 and 0.10/0.09 with AVX-512. For floats,
-which clang may not reassociate, a loop has to be vectorizable as written.
-A dot product's running sum is not, while the same sums computed as row
-updates (`c_row[j] += aik * b_row[j]` for k in order) are, and they round
-identically. A matrix multiply written that way goes from 2.67 s to 0.91 at
-SSE2 and 0.49 with AVX2. AVX-512 does not improve on that, because the
-kernel is bound by its reads of `b`.
+For floats, which a C compiler may not reassociate, a loop has to be
+vectorizable as written. A dot product's running sum is not, while the same
+sums computed as row updates (`c_row[j] += aik * b_row[j]` for k in order)
+are, and they round identically. A matrix multiply written that way goes from
+2.67 s to 0.91 at SSE2.
 
 ---
 
 ## 10. Where the compiler is more conservative than the specification
 
 This section lists the rules the current implementation applies beyond, or
-in place of, what the specification allows, and the shapes the C backend
-refuses outright:
+in place of, what the specification allows, and the shapes the backend refuses outright:
 
 * A long-distance return from a named function may carry only references
   rooted at globals or static data (TODO 0d); a long-distance return out of
@@ -7077,7 +6452,7 @@ refuses outright:
   be `xs` or `tmp` is judged at the call by what each holds (std's
   `stable_sort` merges its last pass into `xs` instead of copying back for
   this reason).
-* The C backend rejects:
+* The backend rejects:
   * binding, copying or dispatching a *resizable* ADT payload;
   * a reference to a resizable nested in a variable-size prefix or an ADT
     payload;
@@ -7103,8 +6478,7 @@ levels. Each resolution records the corrected contract. An independent
 implementation should satisfy those contracts, not reproduce the original
 failures.
 
-1. **Length-field overflow corrupts the containing layout.** `EmitLenStore`
-   and the prefix-patching paths narrow counts without establishing that
+1. **Length-field overflow corrupts the containing layout.** The length stores and the prefix-patching paths narrow counts without establishing that
    they fit. For `struct Packet { bytes: u8[u8], tail: i64 }`, constructing
    `Packet { bytes: [1; 256], tail: 42 }` succeeds: `bytes.len` is 0 and
    `tail` reads as 72340172838076673 (eight of the element bytes). A later
@@ -7156,7 +6530,7 @@ failures.
    a value that renders as `true` but compares unequal to `true`. For
    `struct V { x: varint }`, loading `[2, 128, 0]` succeeds with `x == 0`
    but compares unequal to a normally constructed `[V { x: 0 }]`, because
-   `EmitEqBytes` assumes shortest varints. Loaded values must satisfy the
+   the bytes comparison assumes shortest varints. Loaded values must satisfy the
    same representation invariants as constructed ones (section 6.9).
    **Resolved:** verification checks boolean bytes and rejects redundant
    high zero groups in every checked varint, including the image prefix.
@@ -7164,8 +6538,7 @@ failures.
 6. **An optional self-relative link can silently become null.** With
    `struct Node { next: Node&<u8>?, value: i64 }`, the legal-looking
    `nodes[0].next .= nodes[0]` stores offset zero because the field and
-   element start coincide. Reading it gives null. `RelOffset`/`EmitRelStoreAt`
-   check the numeric width but not this collision. The null encoding and
+   element start coincide. Reading it gives null. The relative store checks the numeric width but not this collision. The null encoding and
    acceptance rules need a consistent resolution; silently losing a
    non-null target is not intended reference semantics (spec §3.9).
    **Resolved:** optional self-relative stores reject a non-null target
@@ -7177,7 +6550,7 @@ failures.
    `[Node { value: tick(), next: self }; 3]` calls `tick` three times when
    constructing `Node[3]`, but only once for `Node[>..]`. With an incrementing
    counter, the first array contains 1, 2, 3 and the second 4, 4, 4.
-   `FixedArrayLitAt` and `GenArrayLit` disagree about repeated construction
+   The two ways of building such a literal disagree about repeated construction
    versus copying a fill. The language needs one evaluation rule for this
    form that preserves relative references; this discrepancy should not
    become a representation-dependent side-effect rule.
@@ -7210,7 +6583,7 @@ failures.
    fallbacks in section 6.5 contradict spec §4.3/§7.3's unconditional
    guarantee. For example, `out.append(make())`, with `make` returning a
    runtime-capacity `i64[..]`, constructs a separate limited-array image
-   then copies its live elements into `out`. The generated C contains
+   then copies its live elements into `out`. The generated code contains
    this copy at both optimization levels. This is a performance-contract
    gap, even when the program's values are correct; it is not a license
    for a replacement implementation to ignore the guarantee.

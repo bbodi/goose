@@ -1057,7 +1057,7 @@ NODE(Dot)
         : Node(l, NKind), obj(_obj), name(_name), ns(_ns) {}
     // A field, which lies in its object's storage: a path, as codegen
     // addresses it (CodeGen::GenLoc). A property or a variant constant is a
-    // value computed on the spot (Dot::CgX).
+    // value computed on the spot.
     bool IsField() const { return !variantconst && member < 0; }
 NODE_END
 
@@ -1228,7 +1228,7 @@ NODE(IfExpr)
     // the shape a guard parses to (§6.4). What follows the else then runs
     // exactly where cond holds, so codegen puts the then-block's contents
     // after `if (!cond) { else }`, in the C block the if is in rather than
-    // in one of their own (IfExpr::CgAny), and the optimizer counts no C
+    // in one of their own, and the optimizer counts no C
     // block for the then-block (Optimizer::Around).
     bool flat = false;
     IfExpr(Line l, Node *_cond, Block *_thenb, Node *_elseb)

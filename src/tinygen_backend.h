@@ -4334,7 +4334,7 @@ struct TgFn {
         LimAppendView(pl, v, c->line);
         return V {};
     }
-    // pop, pop_n, resize and clear (codegen_builtins.h): only the length moves.
+    // pop, pop_n, resize and clear: only the length moves.
     V LimShrink(Call *c, const P &pl) {
         if (!M.LimHeld(pl.t)) No(c->line, cat(BuiltinByKind(c->builtin).name, " of ", M.NameWhy(pl.t)));
         auto an = c->ArgNodes();
@@ -5248,7 +5248,7 @@ struct TgFn {
         SetBlock(ok);
     }
 
-    // pop, pop_n, resize and clear of a resizable (codegen_builtins.h): the elements end at the stack's
+    // pop, pop_n, resize and clear of a resizable: the elements end at the stack's
     // top, which moves with the count.
     V GenShrink(Call *c) {
         auto an = c->ArgNodes();
@@ -5954,9 +5954,8 @@ struct TgFn {
 
     // ---- Optionals ------------------------------------------------------------------------------
 
-    // Optionals (§3.8) as the C backend lowers them: a T? is the address a T& would be, 0 for null (a
-    // fat reference with a null hdr), so a narrowed one is used as that reference (Binary::CgX,
-    // GenTruth).
+    // Optionals (§3.8): a T? is the address a T& would be, 0 for null (a fat reference with a null
+    // hdr), so a narrowed one is used as that reference.
 
     // A reference that is an address: a plain one, or an optional one the checker has narrowed.
     static bool IsAddrRef(const TypeExpr *t) { return IsPlainRef(t) || TgModule::OptRef(t); }
@@ -6278,7 +6277,7 @@ struct TgFn {
         if (!Ended()) Branch(c, t, f);
     }
 
-    // `block { ... }` (EarlyBlock::CgAny): its tail's value, or a break's.
+    // `block { ... }`: its tail's value, or a break's.
     V GenEarly(EarlyBlock *e, bool discard, const InPlace *ip = nullptr) {
         Ctl k;
         if (CtlBegin(k, e, discard, ip, true)) return k.w;
@@ -6393,7 +6392,7 @@ struct TgFn {
         Branch(c, hit, next);
         SetBlock(next);
     }
-    // An integer match (MatchExpr::CgAny): the scrutinee evaluated once, the arms tested in order.
+    // An integer match: the scrutinee evaluated once, the arms tested in order.
     V GenMatch(MatchExpr *me, bool discard, const InPlace *ip = nullptr) {
         Ctl k;
         if (CtlBegin(k, me, discard, ip, true)) return k.w;
@@ -6448,7 +6447,7 @@ struct TgFn {
     tyg_val LoadTag(tyg_addr a, TypeExpr *adt) {
         return tyg_convert(p, TYG_ZEXT, TYG_I64, tyg_load(p, M.TagScal(adt), a, 0));
     }
-    // A payload-less variant constant (Dot::CgX).
+    // A payload-less variant constant.
     V GenVariantConst(Dot *d) {
         auto t = d->exprtype;
         if (M.RbOk(t) || M.VmOk(t)) {
@@ -6796,7 +6795,7 @@ struct TgFn {
                 auto r = static_cast<Return *>(n);
                 for (auto i = loops.size(); i-- > 0;) {
                     if (loops[i].ibsf != r->target) continue;
-                    // Out of an inlined body (Return::CgStmt): its value, then the stacks left.
+                    // Out of an inlined body: its value, then the stacks left.
                     auto t = loops[i];
                     if (r->vals.size() > 1) No(n->line, "result count");
                     if (!r->vals.empty()) {
@@ -7193,7 +7192,7 @@ struct TgFn {
         }
     }
 
-    // A plain `=` into pl (Assign::CgStmt): a resizable's stack top goes back to where its elements
+    // A plain `=` into pl: a resizable's stack top goes back to where its elements
     // start, the new value is built there.
     void AssignWhole(Assign *a, P pl) {
         auto l = a->line;
@@ -7373,7 +7372,7 @@ struct TgFn {
         tyg_scope_end(p);
     }
 
-    // for x in a / for &x in a / for x, i in a over a fixed array or slice (ForLoop::CgStmt): the
+    // for x in a / for &x in a / for x, i in a over a fixed array or slice: the
     // length and the elements are read again at every iteration where the path to them leads (a body
     // may re-point a slice, §6.5); anything that is not a path runs once, into a temporary. The binding
     // is the element's address if the checker typed it a reference, else a copy.

@@ -488,8 +488,8 @@ void TypeCheck::HoldAs(Node *n, const Val &v, HoldKind kind, Node *parent, const
 }
 
 // What a `for` over an array or slice, whose sequence has the value v, reads
-// on every iteration while its body runs (§6.5). Codegen spells the path to
-// the sequence into the loop (ForLoop::CgStmt, GenLoc): each reference or
+// on every iteration while its body runs (§6.5). The backend spells the path to
+// the sequence into the loop: each reference or
 // slice the path loads out of a field or element is loaded again, from where
 // it lies, and the sequence is walked in place, as a view of its elements --
 // unless it is a variable, which the loop names and the scans see, or a
