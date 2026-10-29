@@ -236,6 +236,10 @@ PROGRAMS += [(OVERLAPPING_COPIES, ["-O2"]), (OVERLAPPING_COPIES, [])]
 POOL_PUSHES = "test/storage/pool_push_locals.goose"
 PROGRAMS += [(POOL_PUSHES, ["-O2"]), (POOL_PUSHES, []),
              ("test/storage/reloff_u16.goose", ["-O2"]), ("test/storage/inpool_u16.goose", ["-O2"])]
+# A pool's base read once per function, links null-tested and stored through their offsets, varints
+# of one byte and more, from a function a global initializer runs too (check_pool_base_c).
+POOL_BASES = "test/storage/pool_base_locals.goose"
+PROGRAMS += [(POOL_BASES, ["-O2"]), (POOL_BASES, [])]
 
 # The windowed samples: built whole and not run, since they loop until their
 # window closes.
@@ -338,6 +342,7 @@ def check_tinygen_backend(exe, base, ok, fail, say):
     check_typed_c(exe, base, ok, fail)
     check_copy_c(exe, base, ok, fail)
     check_rel_c(exe, base, ok, fail)
+    check_pool_base_c(exe, base, ok, fail)
     check_run(exe, base, ok, fail)
     check_jit(exe, base, ok, fail)
     check_default_inlining(exe, base, ok, fail)
@@ -504,6 +509,26 @@ def check_rel_c(exe, base, ok, fail):
              f"{n16} of u16", log32 + logwide + log16)
         return
     ok("tinygen's C of relative range checks: none for u32 under 2 GB, kept under 4 GB and for u16")
+
+
+def check_pool_base_c(exe, base, ok, fail):
+    """tinygen's C defines the program's functions static, as the old C generator did, so the C
+    compiler inlines one it sees every call of; and a function following a pool's links reads the
+    pool's base once, in its entry block (TgFn::PoolBase), not at each link."""
+    cout = base / "pool_base_locals.tg.c"
+    code, o, e = tc.run_capture([exe, "build", "--backend=tinygen-c", "-O2", "-o", cout,
+                                 ROOT / POOL_BASES])
+    text = tc.decode(cout.read_bytes()) if code == 0 and cout.exists() else ""
+    prog = text.partition("/* ---- the program, written by tinygen ---- */")[2]
+    body = re.search(r"\bstatic int64_t sum_g\(int64_t dir[^)]*\) \{\n(.*?)\n\}\n", prog, re.S)
+    # The entry block (B1, last) reads the base through the global's address into a local.
+    entry = body.group(1).partition("\nB1:;")[2] if body else ""
+    based = re.search(r"TYG_LD64\(&(v\d+), \(\(char \*\)&gs_tg_g\d+\)\);.*"
+                      r"TYG_LD64\(&(v\d+), \1\);\s*TYG_ST64\(\(\(char \*\)l\d+\), &\2\);", entry, re.S)
+    if not based:
+        fail("tinygen's C of a pool's base: static functions, the base read in the entry block", o + e)
+        return
+    ok("tinygen's C of a pool's base: static functions, the base read in the entry block")
 
 
 def check_run(exe, base, ok, fail):

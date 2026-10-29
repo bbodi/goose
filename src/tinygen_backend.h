@@ -245,6 +245,8 @@ struct TgModule {
     // directly without a trampoline.
     map<string, bool> rtapi;
     uint64_t relspan = 0;   // TgFn::RelSpan, once known.
+    set<const VarDef *> poolgs;   // TgFn::IsPoolGlobal, once known.
+    bool poolgsdone = false;
     bool RuntimeApi(const string &name) {
         if (auto it = rtapi.find(name); it != rtapi.end()) return it->second;
         // The C library's math functions are plain symbols (never macros, unlike isnan), so no
@@ -310,7 +312,13 @@ struct TgModule {
         if (auto it = syms.find(name); it != syms.end()) return it->second;
         return syms[name] = tyg_symbol(m, name.c_str(), flags);
     }
-    tyg_sym FnSym(const string &name) { return Sym(name, TYG_SYM_FUNC | TYG_SYM_GLOBAL); }
+    tyg_sym FnSym(const string &name) {
+        return Sym(name, TYG_SYM_FUNC | (localfns.count(name) ? 0 : TYG_SYM_GLOBAL));
+    }
+    // The Goose functions the C output defines static, as the old C generator did: the whole
+    // program is one translation unit, and a C compiler inlines a static function it sees every
+    // call of (one called once, a recursive one's small helper) where it keeps an extern one.
+    set<string> localfns;
 
     // Read-only bytes: a string literal's, or a file name's (with its NUL) for the runtime's abort
     // messages.
@@ -2692,7 +2700,33 @@ struct TgFn {
     tyg_val RelOrigin(const P &pl, Line l) {
         auto pool = pl.t->ref->pool;
         if (!pool) return AddrOf(pl.a);
-        return Sub(Ld(VarPlace(const_cast<VarDef *>(pool), l).a), I64(1));
+        return Sub(PoolBase(pool, l), I64(1));
+    }
+    // A pool's base (§3.9): in a function's body, a global's is read once per invocation in the entry
+    // block, as the old C generator's gs_pb_ locals were, so a relative store does not make the C
+    // compiler read the header again. Its stack's reservation never moves, and global initializers
+    // run in declaration order, so no body sees it change; the initializers themselves read the header.
+    map<const VarDef *, tyg_local> poolbases;
+    bool cachebases = false;
+    // A global some `in pool` type names.
+    bool IsPoolGlobal(const VarDef *vd) {
+        if (!vd->isglobal) return false;
+        if (!M.poolgsdone) {
+            for (auto t : M.ast.alltypes)
+                if (t->kind == TY_REF && t->ref->pool) M.poolgs.insert(t->ref->pool);
+            M.poolgsdone = true;
+        }
+        return M.poolgs.count(vd) != 0;
+    }
+    tyg_val PoolBase(const VarDef *pool, Line l) {
+        auto vd = const_cast<VarDef *>(pool);
+        if (!cachebases || !vd->isglobal || locals.count(vd)) return Ld(VarPlace(vd, l).a);
+        auto it = poolbases.find(pool);
+        if (it == poolbases.end()) {
+            VarPlace(vd, l);   // Its accessors, for the entry block.
+            it = poolbases.emplace(pool, Slot()).first;
+        }
+        return LdL(it->second);
     }
     // The address the slot at pl decodes to, null for a 0 offset.
     tyg_val RelLoad(const P &pl, Line l) {
@@ -2707,19 +2741,36 @@ struct TgFn {
             if (s != TYG_I64) off = tyg_convert(p, pl.t->ref->pool ? TYG_ZEXT : TYG_SEXT, TYG_I64, off);
         }
         auto at = Add(RelOrigin(pl, l), off);
-        if (!pl.t->ref->optional) return at;
+        if (!pl.t->ref->optional) return KnownOff(at, pl.t->ref->pool, off);
         relsel = tyg_select(p, Cmp(TYG_EQ, off, I64(0)), I64(0), at);
         reloff = off;
-        return relsel;
+        return KnownOff(relsel, pl.t->ref->pool, off);
+    }
+    // Addresses decoded from an `in pool` offset, with the pool and the offset: storing one into a
+    // link of the same pool stores the offset (RelOffset), and its null test tests the offset
+    // (OffTest), which the C compiler cannot derive from the address, an integer origin + offset
+    // that may be 0 for all it knows. A pool's base is never 0 (or 1), so the address is null
+    // exactly when the offset is 0.
+    map<tyg_val, pair<const VarDef *, tyg_val>> offof;
+    tyg_val KnownOff(tyg_val at, const VarDef *pool, tyg_val off) {
+        if (pool) offof[at] = { pool, off };
+        return at;
+    }
+    // v != 0 for the address v, through its offset where it has one.
+    tyg_val OffTest(tyg_val v, tyg_cond op = TYG_NE) {
+        auto it = offof.find(v);
+        return Cmp(op, it == offof.end() ? v : it->second.second, I64(0));
     }
     // The latest optional relative load: its address (null for a 0 offset) and its offset.
     tyg_val relsel = 0, reloff = 0;
     // A `let` optional reference bound to such a load, and a local holding the offset: its null
     // test (OptTest) tests that, which the C compiler sees decides the address's too, where a test
     // of the address leaves it a second one (origin + offset may be 0 for all it knows).
-    map<const VarDef *, tyg_local> reloffs;
+    map<const VarDef *, pair<tyg_local, const VarDef *>> reloffs;   // With the pool, if any.
     // The offset the slot at pl holds for the address v, zero for a null.
     tyg_val RelOffset(const P &pl, tyg_val v, Line l) {
+        if (auto it = offof.find(v); it != offof.end() && pl.t->ref->pool && it->second.first == pl.t->ref->pool)
+            return it->second.second;
         auto off = Sub(v, RelOrigin(pl, l));
         if (pl.t->ref->optional) {
             auto isnull = Cmp(TYG_EQ, v, I64(0));
@@ -3110,7 +3161,11 @@ struct TgFn {
                 if (!selfbase) No(n->line, "self outside a literal built in place");
                 return ValV(n->exprtype, selfbase);
             case NK_BoolLit: return ValV(M.ast.booltype, I8(static_cast<BoolLit *>(n)->val ? 1 : 0));
-            case NK_Ident: case NK_Index: return Load(Place(n), n->line);
+            case NK_Ident: case NK_Index: {
+                auto x = Load(Place(n), n->line);
+                IdentOff(n, x);
+                return x;
+            }
             case NK_Dot: {
                 auto d = static_cast<Dot *>(n);
                 if (d->member == B_LEN) return GenLen(d->obj, n);
@@ -3937,6 +3992,9 @@ struct TgFn {
         auto il = Is<IntLit>(ix->idx);
         auto i = Index64(ix->idx);
         auto v = ViewOf(base, ix->line, !ix->nobc);
+        // A pool's elements from the base its links measure from, read once (PoolBase).
+        if (auto id = Is<Ident>(ix->obj); id && id->vdef && IsGrow(base.t) && IsPoolGlobal(id->vdef))
+            v.elems = PoolBase(id->vdef, ix->line);
         auto known = il && v.k >= 0 && il->val >= 0 && il->val < v.k;
         if (!ix->nobc && !known) BoundsCheck(i, v.len, ix->line);
         // An array's own bytes are typed as it is (not an ADT payload's); a slice's or resizable's
@@ -6279,12 +6337,20 @@ struct TgFn {
     }
     // A reference as a test or identity sees it: a variable's own value, even where narrowed; null;
     // anything else's value.
+    // A let bound to a pool link (reloffs): its address, with the offset kept beside it.
+    void IdentOff(Node *n, const V &x) {
+        auto id = Is<Ident>(n);
+        auto it = id && id->vdef ? reloffs.find(id->vdef) : reloffs.end();
+        if (it != reloffs.end() && it->second.second && !x.mem && x.v)
+            KnownOff(x.v, it->second.second, LdL(it->second.first));
+    }
     tyg_val RefAddr(Node *n) {
         if (Is<NullLit>(n)) return I64(0);
         V x;
-        if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->type && id->vdef->type->kind == TY_REF)
+        if (auto id = Is<Ident>(n); id && id->vdef && id->vdef->type && id->vdef->type->kind == TY_REF) {
             x = Load(VarPlace(id->vdef, n->line), n->line);
-        else
+            IdentOff(n, x);
+        } else
             x = Gen(n);
         return Ended() ? I64(0) : Addr(x, n->line);
     }
@@ -6297,13 +6363,16 @@ struct TgFn {
     tyg_val OptTest(Node *n) {
         auto id = Is<Ident>(n);
         auto it = id && id->vdef ? reloffs.find(id->vdef) : reloffs.end();
-        if (it != reloffs.end()) return Cmp(TYG_NE, LdL(it->second), I64(0));
-        return Cmp(TYG_NE, RefAddr(n), I64(0));
+        if (it != reloffs.end()) return Cmp(TYG_NE, LdL(it->second.first), I64(0));
+        return OffTest(RefAddr(n));
     }
     // `a == null`, `a != null`, and identity `a .== b`, `a .!= b`: the addresses, left first.
     V GenRefEq(Binary *b) {
         auto l = RefAddr(b->left);
         auto r = RefAddr(b->right);
+        auto op = b->op == T_EQ || b->op == T_DOTEQ ? TYG_EQ : TYG_NE;
+        if (Is<NullLit>(b->right)) return ValV(M.ast.booltype, OffTest(l, op));
+        if (Is<NullLit>(b->left)) return ValV(M.ast.booltype, OffTest(r, op));
         return ValV(M.ast.booltype, Cmp(b->op == T_EQ || b->op == T_DOTEQ ? TYG_EQ : TYG_NE, l, r));
     }
     // ---- Control --------------------------------------------------------------------------------
@@ -6349,15 +6418,22 @@ struct TgFn {
         tyg_jump(p, head);
         SetBlock(done);
     }
+    // A one-byte varint, the common case, is read straight; a longer one by the loop (the old C
+    // generator's GS_ULEB_READ and GS_ULEB_SIZE).
     tyg_val UlebRead(tyg_val at) {
-        auto v = Local(I64(0)), sh = Local(I64(0)), q = Local(at);
-        DoWhile([&] {
-            auto qa = LdL(q);
-            auto b = LoadN(qa, 1, false);
-            StL(v, Bin(TYG_OR, LdL(v), Bin(TYG_SHL, AndK(b, 0x7f), LdL(sh))));
-            StL(q, Add(qa, I64(1)));
-            StL(sh, Add(LdL(sh), I64(7)));
-            return Cmp(TYG_NE, AndK(b, 0x80), I64(0));
+        auto b0 = LoadN(at, 1, false);
+        auto v = Local(b0);
+        If(Cmp(TYG_NE, AndK(b0, 0x80), I64(0)), [&] {
+            auto sh = Local(I64(0)), q = Local(at);
+            StL(v, I64(0));
+            DoWhile([&] {
+                auto qa = LdL(q);
+                auto b = LoadN(qa, 1, false);
+                StL(v, Bin(TYG_OR, LdL(v), Bin(TYG_SHL, AndK(b, 0x7f), LdL(sh))));
+                StL(q, Add(qa, I64(1)));
+                StL(sh, Add(LdL(sh), I64(7)));
+                return Cmp(TYG_NE, AndK(b, 0x80), I64(0));
+            });
         });
         return LdL(v);
     }
@@ -6368,13 +6444,17 @@ struct TgFn {
     }
     // The bytes of the ULEB128 at `at` (gs_uleb_size).
     tyg_val UlebSize(tyg_val at) {
-        auto q = Local(at);
-        DoWhile([&] {
-            auto qa = LdL(q);
-            StL(q, Add(qa, I64(1)));
-            return Cmp(TYG_NE, AndK(LoadN(qa, 1, false), 0x80), I64(0));
+        auto n = Local(I64(1));
+        If(Cmp(TYG_NE, AndK(LoadN(at, 1, false), 0x80), I64(0)), [&] {
+            auto q = Local(at);
+            DoWhile([&] {
+                auto qa = LdL(q);
+                StL(q, Add(qa, I64(1)));
+                return Cmp(TYG_NE, AndK(LoadN(qa, 1, false), 0x80), I64(0));
+            });
+            StL(n, Sub(LdL(q), at));
         });
-        return Sub(LdL(q), at);
+        return LdL(n);
     }
     // Writes the varint value v at `at`, zigzag ULEB128 (gs_zig_write); its byte count.
     tyg_val ZigWrite(tyg_val at, tyg_val v) {
@@ -7474,7 +7554,12 @@ struct TgFn {
                 auto x = GenAs(init, d->type);
                 if (Ended()) return;
                 Store(P { AtL(locals[d]), d->type }, x);
-                if (relsel && x.v == relsel) reloffs[d] = Local(reloff);
+                if (relsel && x.v == relsel) {
+                    auto it = offof.find(x.v);
+                    reloffs[d] = { Local(reloff), it == offof.end() ? nullptr : it->second.first };
+                } else {
+                    reloffs.erase(d);
+                }
                 continue;
             }
             Init(d, init, l);
@@ -8339,6 +8424,7 @@ struct TgFn {
                        !(Is<IfExpr>(tail) && !Is<IfExpr>(tail)->elseb) && !Is<Return>(tail) &&
                        !Is<Break>(tail) && !Is<Continue>(tail);
         StartPoolCaches();
+        cachebases = true;
         GenBlock(body, true, tailret);
         // The checker's rule: control cannot reach the end of a function with a result.
         if (!Ended()) {
@@ -8639,6 +8725,9 @@ struct TgFn {
         for (auto loc : maybemarks) StL(loc, I64(0));
         for (auto &[acc, loc] : gaddrs)
             StL(loc, M.DirectAcc(acc) ? data(acc) : CallC(acc, {}, {}, tyg_type_ptr(m)));
+        for (auto &[pool, loc] : poolbases) StL(loc, Ld(VarPlace(const_cast<VarDef *>(pool), line).a));
+        poolbases.clear();
+        offof.clear();
         tyg_jump(p, gstart);
         auto bad = tyg_proc_end(p) != 0;
         p = nullptr;
@@ -8848,6 +8937,9 @@ struct TinyGenBackend {
         mod->rtdecls = runtime_decls;
         mod->fixedaddrs = !UsesThreads(cg);
         if (!mod->m) throw CompileError { "tinygen backend: this target is not supported yet" };
+        if (coutput)
+            for (auto sp : cg.livespecs)
+                if (!sp->sf->isextern && !sp->sf->isexport) mod->localfns.insert(cg.sinfo[sp].cname);
         for (auto sp : cg.livespecs) {
             Build(cg, sp);
             taken.push_back(sp);
