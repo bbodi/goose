@@ -1,22 +1,20 @@
-// Goose compiler — the tinygen backend (docs/design/tinygen_backend.md). tinygen (../tinygen, a C99
-// library) lowers a small IR to machine code and writes an object file with debug info. This backend
-// compiles the specializations it supports from the same optimized, annotated bodies the C backend
-// reads, into one object linked beside the C the C backend writes: that C keeps everything else
-// -- main, the globals, the runtime's inline half, and every specialization this backend does not take,
-// which it declares with external linkage (CodeGen::SpecBackend). The two halves call each other
-// through the C calling convention of C.3, so a specialization falls back to C on its own.
-//
-// The runtime's helpers that runtime.h defines as static functions (checked arithmetic, `as` checks,
-// the extern support) are reached through small exported shims appended to that C (Shims), compiled
-// with its defines, so GS_DEBUG means the same on both sides.
+// Goose compiler -- the backend (docs/design/tinygen_backend.md). tinygen (../tinygen, a C99 library)
+// lowers a small IR to machine code with debug info, or to C (TYG_OUTPUT_C). This backend compiles
+// every live specialization from the optimized, annotated bodies, with the analyses and type services
+// of CodeGen (codegen.h), and adds main, the globals' storage and initializers, the exports and the
+// worker thunks: the whole program. A construct it does not compile yet is a compile error
+// (TgFn::No). The runtime's static helpers that runtime.h defines (checked arithmetic, `as` checks,
+// the extern support) are reached through exported shims: in tinygen's C unit and the support object
+// (TgSupportBody), which the driver compiles with the program's defines, so GS_DEBUG means the same
+// on both sides.
 #pragma once
 
 #include "tinygen.h"
 
 namespace goose {
 
-// Thrown wherever the backend meets what it does not compile; the specialization then goes to the C
-// backend.
+// Thrown wherever the backend meets what it does not compile; TinyGenBackend::Attempt turns it into
+// the compile error.
 struct TgUnsupported {
     Line line;
     string why;
@@ -588,7 +586,7 @@ struct TgModule {
         return e && !cg.IsFix(e) && (ImgOk(e, depth + 1) || IsVarint(e));
     }
     // A T[] of images (u8[][]), and a resizable one: the elements back to back, each walked by its size
-    // (CodeGen::SizeFn) and never indexed.
+    // and never indexed.
     bool VarImgOk(TypeExpr *t, int depth = 0) {
         return IsVarArr(t) && depth <= kTypeDepthMax && ImgElemOk(t->arr->sub, depth);
     }
@@ -600,7 +598,7 @@ struct TgModule {
     }
     static bool IsVarArr(TypeExpr *t) { return t && t->kind == TY_ARRAY && t->arr->akind == A_VAR; }
     // A T[] length prefix's bytes: u32 by default, else its storage's; 0 for a varint
-    // (CodeGen::EmitLenStore).
+    //.
     static int LenWidth(TypeExpr *t) {
         auto ls = t->arr->lenstorage;
         return ls < 0 ? 4 : ls == IS_VARINT ? 0 : IntBits((IntStorage)ls) / 8;
@@ -900,7 +898,7 @@ struct TgModule {
     bool IsVs(TypeExpr *t) { return t && t->kind == TY_STRUCT && cg.Cls(t) == SC_VARIABLE; }
     // A resizable struct that is no frame object: its fields before the tail are not all fixed, so they
     // are bytes as a variable-size struct's are, the tail's elements follow on the data stack. The
-    // value is a gs_rhdr { base, len }: the image's start, the tail's count (CodeGen::FieldLocAt,
+    // value is a gs_rhdr { base, len }: the image's start, the tail's count (the C generator's FieldLocAt,
     // BytesLoc).
     bool IsRs(TypeExpr *t) {
         return t && t->kind == TY_STRUCT && cg.IsResz(t) && !cg.IsFrameObj(t) && !IsRb(t);
@@ -1091,7 +1089,7 @@ struct TgModule {
 
     // A resizable-class ADT (`Log..` with a variant ending in a T[>..]) or one of its variants: a
     // gs_rhdr { base, len } and a data stack, the bytes at base being the value's own layout: its tag,
-    // the variant's fixed fields, packed, then the tail's `len` elements (CodeGen::GenStructLit,
+    // the variant's fixed fields, packed, then the tail's `len` elements (the C generator's GenStructLit,
     // VariantBehindTag). A fixed variant has no tail (count zero).
     bool IsRb(TypeExpr *t) {
         if (!t) return false;
@@ -1197,7 +1195,7 @@ struct TgModule {
         return walk(t, 0);
     }
 
-    // The render procedures of types that reach themselves, one per type (CodeGen::RenderFn): named by
+    // The render procedures of types that reach themselves, one per type: named by
     // the type's mangled name, queued as asked for and built once the asking function is done, as only
     // one procedure is built at a time (TinyGenBackend::BuildRenders).
     map<string, string> renderfns;
@@ -1210,7 +1208,7 @@ struct TgModule {
         renderq.emplace_back(name, t);
         return name;
     }
-    // The verifier procedure of an image's element type (CodeGen::VerifyFn): int64(payload, n, bitmap).
+    // The verifier procedure of an image's element type: int64(payload, n, bitmap).
     string VerifyFn(TypeExpr *elem) {
         auto name = cat("gs_tg_verify_", cg.Mangle(elem));
         if (renderfns.emplace(name, name).second) renderq.emplace_back(name, elem);
@@ -1230,7 +1228,7 @@ struct TgModule {
     // the C half's and is reached through an exported accessor returning its address in the running
     // thread's instance (GS_GL; Accessor); a whole program's object defines both
     // (TinyGenBackend::EmitGlobalStorage). A const `let` with a compile-time initializer is static data
-    // here too (StaticGlobal, as in CodeGen::EmitGlobalDecls). A resizable or T[] global lives on its
+    // here too (StaticGlobal, as in the C generator's EmitGlobalDecls). A resizable or T[] global lives on its
     // own stack (CodeGen::gstks), which a second accessor gives (StackAccessor).
     bool GlobalOk(VarDef *d) {
         if (!d->isglobal || !cg.gnames.count(d)) return false;
@@ -1361,7 +1359,7 @@ struct TgModule {
     // ---- Signatures -----------------------------------------------------------------------------
 
     // Whether a call to sp, or sp's own definition (`define`), has a C interface this backend can match
-    // (CodeGen::SigParams): the declared parameters, free variables (FvOk), then a channel per result:
+    //: the declared parameters, free variables (FvOk), then a channel per result:
     // the return value for the first fixed one (cret), `T *gs_r<i>` for other fixed ones, `gs_stack
     // *gs_dst<i>, int64_t *gs_rl<i>` for a resizable one, a destination stack alone for a T[] image;
     // then gs_sp. A `return from` travels in the C half's thread-locals; only a target whose results
@@ -1636,7 +1634,7 @@ struct TgFn {
         }
         return 0;
     }
-    // Each result's channel (CodeGen::SigParams), its parameters kept in locals: an out-pointer in `a`
+    // Each result's channel, its parameters kept in locals: an out-pointer in `a`
     // for a fixed result other than the C return value; for a resizable, its destination stack in `a`,
     // the count's out-parameter in `b`.
     struct Chan {
@@ -1644,7 +1642,7 @@ struct TgFn {
         tyg_local top0 = 0;   // A destination's top on entry (DstTop0).
     };
     vector<Chan> chans;
-    // A named result built where the value ends up (§7.3; CodeGen::DetectNrvo, OpenIbNrvo): a T[] image
+    // A named result built where the value ends up (§7.3; the C generator's DetectNrvo, OpenIbNrvo): a T[] image
     // local the returns hand back is declared on its destination stack, at the top it has on entry, so
     // it needs no stack of its own and `return it` moves nothing. Another value returned meanwhile is
     // built behind it and slid down over it. Only images; a resizable or frame object local still has
@@ -1672,7 +1670,7 @@ struct TgFn {
     // (gs_stks) read once per invocation (gblk). The body's stacks are GS(gs_sp + k), k counted up as
     // locals and temporaries take one (AllocStk); a callee is handed gs_sp + the indices in use. Every
     // scope restores the tops of the stacks it took, on every way out, from marks saved as each was
-    // taken (CodeGen::CScope).
+    // taken.
     tyg_local spl = 0, stksl = 0;
     bool hassp = false;   // spl holds gs_sp (a local's id may be 0).
     int live = 0, maxown = 0;
@@ -1689,7 +1687,7 @@ struct TgFn {
         bool stmt;
         vector<Mark> marks;
         // The `defer` bodies of this block (§6.6), each with how many marks came before it: an exit
-        // runs them among the restores, latest first (CodeGen::EmitRestores).
+        // runs them among the restores, latest first.
         vector<pair<size_t, Defer *>> defers;
         // The first index free on entry; and the lowest the scope may leave free, above a local of
         // an outer block made inside it (CodeGen::AllocStk's stkbase), so no later index is reused.
@@ -1773,7 +1771,7 @@ struct TgFn {
     // A local for a value of type t, aligned to the largest power of two up to 8 its size allows.
     tyg_local Temp(TypeExpr *t, bool forlocal = false) {
         auto sz = M.Size(t);
-        // A fixed value above the C generator's limit (CodeGen::LargeFixedOnStack) lies on a data
+        // A fixed value above the C generator's limit lies on a data
         // stack, restored with its scope (a local's with its block, a temporary's with its
         // statement): calls inlined into a function do not add it to the native frame. In a function
         // of a recursive cycle it stays native, as there.
@@ -1837,7 +1835,7 @@ struct TgFn {
         return true;
     }
     // Whether n gives a value of type t, a fixed one with relative links, to the place it is built at
-    // (CodeGen::ConstructCall, GenAdtAdapted): a call whose first result is a t, or a function value,
+    //: a call whose first result is a t, or a function value,
     // if, block, match, early block or loop delivering one. Its links measure from where the value
     // stays, which a temporary copied from is not.
     bool Delivers(Node *n, TypeExpr *t) {
@@ -1966,7 +1964,7 @@ struct TgFn {
     }
     // One run of a deferred body at an exit of its block: its statements as written, in a block of
     // their own. It cannot leave (§6.6), so the exit goes on after it. Its temporaries take indices
-    // above everything the exit still holds (CodeGen::EmitDeferBody).
+    // above everything the exit still holds.
     void DeferBody(Defer *d) { GenBlock(d->body, true); }
     // `defer`: the body joins the exits of the innermost block that is not a statement's.
     void StmtDefer(Defer *d) {
@@ -2049,10 +2047,10 @@ struct TgFn {
                 }
                 return;
             }
-            // [v; k] (CodeGen::GenArrayLit): v built once, then copied k times (k constant, §4.2).
+            // [v; k]: v built once, then copied k times (k constant, §4.2).
             auto fc = Is<IntLit>(al->fillcount);
             if (!fc || fc->val < 0) Unreachable(l, "fill count");
-            // v built once even for none (CodeGen::FreezeFill), then copied behind itself.
+            // v built once even for none, then copied behind itself.
             if (!fix) {
                 StartHdr(stk, hdr);
                 auto saved = Top(stk);
@@ -2132,7 +2130,7 @@ struct TgFn {
     }
 
     // Builds n's value, a resizable ADT or variant of type t, at the top of stk, its header at hdr
-    // (CodeGen::GenConstruct, GenStructLit, VariantBehindTag): the tag, the fields in turn, the tail's
+    //: the tag, the fields in turn, the tail's
     // elements counted into the header. From a literal, a variant constant, a call handed stk, or a
     // fixed variant of the ADT.
     void GenRb(Node *n, tyg_val stk, tyg_addr hdr, TypeExpr *t, Line l) {
@@ -2243,7 +2241,7 @@ struct TgFn {
         return c && c->builtin == B_STR;
     }
     // The checker types a popped or default fixed array, to_bytes, from_bytes as the T[] they adapt to,
-    // but their own array lies there (CodeGen::EmitBuiltin, B_POP).
+    // but their own array lies there.
     static bool OwnTypedCall(Node *n) {
         auto c = Is<Call>(n);
         return c && (c->builtin == B_POP || c->builtin == B_DEFAULT || c->builtin == B_FROM_BYTES ||
@@ -2375,7 +2373,7 @@ struct TgFn {
         tyg_store(p, TYG_I32, AtV(at), tyg_convert(p, TYG_TRUNC, TYG_I32, cap), 0);
         LimSetLen(P { AtV(at), t }, cnt);
     }
-    // A T[..] built at `at` at the top of stk (CodeGen::GenArrayLit): [..cap] its capacity, no
+    // A T[..] built at `at` at the top of stk: [..cap] its capacity, no
     // elements; another T[..] copied whole. True if n was one of them; any other is built as a
     // resizable's elements.
     bool RcPrelude(Node *n, tyg_val stk, TypeExpr *t, Line l, tyg_val at) {
@@ -2400,7 +2398,7 @@ struct TgFn {
         return true;
     }
 
-    // to_bytes (CodeGen::EmitToBytes, AppendBytes): the payload's size ULEB128, then its bytes, each
+    // to_bytes: the payload's size ULEB128, then its bytes, each
     // handed to append.
     template <class F> void ToBytesVia(Node *a, Line l, F append) {
         auto v = ViewOf(Place(a), l);
@@ -2419,7 +2417,7 @@ struct TgFn {
     void ToBytesIntoLim(const P &out, Node *a, Line l) {
         ToBytesVia(a, l, [&](tyg_val from, tyg_val n) { AppendToLim(out, from, n, l); });
     }
-    // n bytes at `from` appended to the limited u8 array out, under its capacity (CodeGen::AppendBytes).
+    // n bytes at `from` appended to the limited u8 array out, under its capacity.
     void AppendToLim(const P &out, tyg_val from, tyg_val n, Line l) {
         auto ol = Local(LimLen(out));
         AbortUnless(Cmp(TYG_SLE, Add(LdL(ol), n), LimCapOf(out)), "CAPACITY", l);
@@ -2621,7 +2619,7 @@ struct TgFn {
 
     // ---- Relative references (§3.9) -------------------------------------------------------------
 
-    // What an offset measures from (CodeGen::RelOrigin): the slot itself, or an `in pool` reference's
+    // What an offset measures from: the slot itself, or an `in pool` reference's
     // pool base less one, so that 0 stays null.
     tyg_val RelOrigin(const P &pl, Line l) {
         auto pool = pl.t->ref->pool;
@@ -2631,7 +2629,7 @@ struct TgFn {
     // The address the slot at pl decodes to, null for a 0 offset.
     tyg_val RelLoad(const P &pl, Line l) {
         auto s = M.RelScal(pl.t);
-        // Signed from the slot, unsigned from a pool (CodeGen::RelParts).
+        // Signed from the slot, unsigned from a pool.
         tyg_val off;
         if (TgModule::IsVr(pl.t)) {
             auto at = AddrOf(pl.a);
@@ -2644,7 +2642,7 @@ struct TgFn {
         if (!pl.t->ref->optional) return at;
         return tyg_select(p, Cmp(TYG_EQ, off, I64(0)), I64(0), at);
     }
-    // The offset the slot at pl holds for the address v, zero for a null (CodeGen::RelOffset).
+    // The offset the slot at pl holds for the address v, zero for a null.
     tyg_val RelOffset(const P &pl, tyg_val v, Line l) {
         auto off = Sub(v, RelOrigin(pl, l));
         if (pl.t->ref->optional) {
@@ -2656,7 +2654,7 @@ struct TgFn {
         }
         return off;
     }
-    // The address v as a varint-width offset (CodeGen::EmitRelStore): ULEB128 for an `in pool` one,
+    // The address v as a varint-width offset: ULEB128 for an `in pool` one,
     // zigzag for a self-relative one; no range to check.
     tyg_val RelOffsetInto(const P &pl, tyg_val v, Line l) {
         auto off = RelOffset(pl, v, l);
@@ -2742,7 +2740,7 @@ struct TgFn {
     }
 
     // A fixed struct or array literal storing a non-null self-relative link at any depth: built where
-    // it lies, as the C does (CodeGen::FixedLitAtLv), for the offsets to measure from.
+    // it lies, as the C does, for the offsets to measure from.
     bool SelfRelLit(Node *n) {
         if (!SelfRelLitOk(n)) return false;
         auto stores = [&](TypeExpr *ft, Node *init) {
@@ -2814,7 +2812,7 @@ struct TgFn {
             Into(P { AddrPlus(pl.a, off), ft }, init);
         });
     }
-    // A fill [v; k] of a value linking to itself (CodeGen::FreezeFill): v's leaves evaluated once, then
+    // A fill [v; k] of a value linking to itself: v's leaves evaluated once, then
     // each slot built in place (FillStore).
     struct FillLeaf {
         TypeExpr *ft;
@@ -2912,7 +2910,7 @@ struct TgFn {
             al && !al->fillval && !al->capexpr && pl.t->kind == TY_ARRAY && cg.HasRelRef(pl.t) &&
             cg.TEq(n->exprtype, pl.t) && M.TypeOk(pl.t) && cg.ArrSize(pl.t->arr) > 0 &&
             (pl.t->arr->akind == A_FIXED || cg.IsStaticLimited(pl.t))) {
-            // Links built where they lie, so each offset measures from its slot (CodeGen::GenArrayLit).
+            // Links built where they lie, so each offset measures from its slot.
             auto lim = pl.t->arr->akind != A_FIXED;
             auto et = pl.t->arr->sub;
             auto esz = cg.FixedSize(et);
@@ -3074,7 +3072,7 @@ struct TgFn {
             return ValV(M.ast.booltype, Cmp(TYG_EQ, OptTest(u->child), I8(0)));
         auto ot = cg.OperandT(u->child->exprtype);
         if (u->op == T_MINUS && (ot->kind == TY_STRUCT || ot->kind == TY_ARRAY)) {
-            // Elementwise (CodeGen::GenElemwiseNegInto).
+            // Elementwise.
             auto o = ElemOperand(u->child, ot, nullptr);
             if (Ended()) return Dummy(ot);
             auto r = MemTemp(ot, false);
@@ -3211,7 +3209,7 @@ struct TgFn {
         return ValV(M.ast.booltype, b->op == T_NEQ ? Cmp(TYG_EQ, v, I8(0)) : v);
     }
 
-    // Structural equality (§4.5; CodeGen::EqX): a jump to fail on the first difference, else on past.
+    // Structural equality (§4.5; the C generator's EqX): a jump to fail on the first difference, else on past.
     // Fixed values field by field, an ADT's tag then its payload; floats as floats; a bytes value of
     // exact encodings by its bytes.
     void EqJump(const P &a, const P &b, tyg_block fail, Line l) {
@@ -3223,7 +3221,7 @@ struct TgFn {
         if (!cg.IsFix(t)) {
             if (!EqBitwise(t)) {
                 // Floats or pads among its bytes: walked field by field, over a cursor in each
-                // (CodeGen::EmitEqWalk).
+                //.
                 auto ca = Local(AddrOf(a.a)), cb = Local(AddrOf(b.a));
                 EqWalk(t, ca, cb, fail, l);
                 return;
@@ -3267,7 +3265,7 @@ struct TgFn {
         }
         No(l, cat("comparison of type ", M.NameWhy(t)));
     }
-    // The bytes value at each cursor compared, both cursors left behind it (CodeGen::EmitEqWalk):
+    // The bytes value at each cursor compared, both cursors left behind it:
     // fixed parts by value, a varint by its bytes, an array by length then elements, a struct by
     // its fields, an ADT by tag then payload.
     void EqWalk(TypeExpr *t, tyg_local ca, tyg_local cb, tyg_block fail, Line l) {
@@ -3351,7 +3349,7 @@ struct TgFn {
         });
     }
     // Whether a bytes value's bytes are equal exactly when it is: no pad, no float, no fixed-mode ADT
-    // (CodeGen::EmitEqBytes's bitwise).
+    //.
     bool EqBitwise(TypeExpr *x) {
         if (cg.IsFix(x)) return cg.BitwiseEq(x);
         switch (x->kind) {
@@ -3377,7 +3375,7 @@ struct TgFn {
         });
     }
 
-    // Elementwise arithmetic on structs and fixed arrays (§6.1; CodeGen::GenElemwiseInto): each numeric
+    // Elementwise arithmetic on structs and fixed arrays (§6.1; the C generator's GenElemwiseInto): each numeric
     // leaf of the result from the same leaf of each operand, or from a scalar operand. A leaf's place:
     // the constant offset from the callback, plus for an element of an array too big to unroll the
     // bytes from the array's start, kept in a local.
@@ -3453,7 +3451,7 @@ struct TgFn {
     }
     // An operand: a scalar's value, or the struct or array in memory. A place is read where it lies
     // unless `later` (an operand built after it) runs statements that could change it, as
-    // CodeGen::ElemwiseOperands; any other value is in memory of its own already.
+    // the C generator's ElemwiseOperands; any other value is in memory of its own already.
     struct ElemOp {
         bool scalar;
         TypeExpr *t;
@@ -3503,7 +3501,7 @@ struct TgFn {
         return cg.TEq(o.t, tt) ? o.v : Conv(o.v, o.t, tt, l);
     }
     // Leaf i of the result reads only leaf i of each operand, so the leaves go straight into dst even
-    // when it is an operand (p.vel = p.vel + g; CodeGen::GenElemwiseInto). Values of the same type are
+    // when it is an operand (p.vel = p.vel + g; the C generator's GenElemwiseInto). Values of the same type are
     // the same memory or apart, never partly overlapping.
     void ElemwiseInto(const P &dst, Binary *b) {
         auto et = b->exprtype;
@@ -3601,7 +3599,7 @@ struct TgFn {
         auto x = GenAs(c->child, cg.OperandT(st));
         st = x.t;
         // Into an index or bound type: checked against the array first, in every build
-        // (CodeGen::IndexTypeCheck, §3.11).
+        //.
         if (tt->kind == TY_INT && tt->ix && !c->nobc && st->kind == TY_INT &&
             st->intstorage != IS_VARINT) {
             auto i = Conv(x.v, st, M.ast.inttypes[IS_I64], c->line);
@@ -3693,7 +3691,7 @@ struct TgFn {
         auto x = MemTemp(t, true);
         if (t->kind == TY_ENUM) StoreTag(x.a, t, M.EI(t)->en->VariantIndex(sl->variant));
         // `self` in a self-relative field is minus the field's own offset, wherever the value lies
-        // (CodeGen::EmitRelSelfAt), so it survives the copy out of the temporary.
+        //, so it survives the copy out of the temporary.
         SelfScope scope(selfbase, AddrOf(x.a));
         EachLitInit(sl, [&](Node *init, TypeExpr *ft, int64_t off) {
             // Any other self-relative link measures from the slot it lies in, which a literal built
@@ -3781,7 +3779,7 @@ struct TgFn {
         });
     }
 
-    // a[i] (CodeGen::IndexLoc): the check is elided by BCE (Index::nobc) or a constant within a fixed
+    // a[i]: the check is elided by BCE (Index::nobc) or a constant within a fixed
     // array's length.
     P IndexPlace(Index *ix) {
         auto base = Deref(Place(ix->obj));
@@ -3833,7 +3831,7 @@ struct TgFn {
         }
         return count;
     }
-    // A literal's type set to t until the end of the scope, also when it is left to C.
+    // A literal's type set to t until the end of the scope.
     struct LitTypeGuard {
         ArrayLit *al;
         TypeExpr *saved;
@@ -3867,7 +3865,7 @@ struct TgFn {
         return PairV(t, v.elems, v.len);
     }
 
-    // a[lo:hi] (CodeGen::GenSlice): the view, then the bounds (^k counts from the end), checked as the
+    // a[lo:hi]: the view, then the bounds (^k counts from the end), checked as the
     // C checks them unless BCE proved them.
     V GenSlice(SliceExpr *se) {
         auto v = ViewOf(Place(se->obj), se->line);
@@ -3903,7 +3901,7 @@ struct TgFn {
         if (V x; t && InPlaceValue(al, t, al->line, x)) return x;
         if (t && t->kind == TY_SLICE && M.TypeOk(t) && !al->capexpr && cg.IsFix(t->sub)) {
             // A literal in slice position: a temporary fixed array, sliced whole
-            // (CodeGen::GenFixedArrayLit).
+            //.
             auto fc = Is<IntLit>(al->fillcount);
             auto count = al->fillval ? (fc ? fc->val : -1) : (int64_t)al->elems.size();
             if (count < 0) No(al->line, "fill count");
@@ -3927,7 +3925,7 @@ struct TgFn {
 
     // ---- Limited arrays T[..k] ------------------------------------------------------------------
     // The C backend's struct { lenT len; T e[k]; } (TgModule::LimOk), changed where it lies with the C
-    // backend's checks and abort codes (CodeGen::CopyIntoLimited): growing past the capacity aborts
+    // backend's checks and abort codes: growing past the capacity aborts
     // with GS_E_CAPACITY, and other arrays or slices are copied in under that check (§4.2). Slots past
     // the length are zero in a new value, as the C's `{0}`.
 
@@ -4047,7 +4045,7 @@ struct TgFn {
 
     // v.push(x) (EmitPush): the element, then the capacity check, the slot, the length. Its value is
     // the slot's address.
-    // What push and alloc_ref return for the element just added at `at` (CodeGen::NewElemResult): a
+    // What push and alloc_ref return for the element just added at `at`: a
     // reference to it (§3.3). An element that is itself a reference gives the one it holds instead,
     // decoded if relative, as `&` of it does: there are no references to references (§3.8).
     V NewElemResult(tyg_val at, TypeExpr *elem, TypeExpr *rt, Line l) {
@@ -4120,7 +4118,7 @@ struct TgFn {
         r.len = AddrPlus(r.pl.a, 8);
         return r;
     }
-    // A slice pool (§5.4; CodeGen::EmitSlicePool): runs of elements of a reusable array, its freelist
+    // A slice pool (§5.4; the C generator's EmitSlicePool): runs of elements of a reusable array, its freelist
     // of (index, count) spans kept by the runtime's gs_spans_*.
     V GenSlicePool(Call *c) {
         auto an = c->ArgNodes();
@@ -4241,7 +4239,7 @@ struct TgFn {
         return PairV(M.ast.SliceOf(elem, c->line), Add(elems(), Mul(LdL(il), I64(esz))), LdL(nl));
     }
 
-    // pool.alloc_index(x), alloc_ref(x) and free(i) (CodeGen::EmitAlloc, B_FREE): a slot from the
+    // pool.alloc_index(x), alloc_ref(x) and free(i): a slot from the
     // freelist, or a new one at the top that joins the array once its element is written.
     V GenPool(Call *c) {
         auto an = c->ArgNodes();
@@ -4420,7 +4418,7 @@ struct TgFn {
         tyg_arg a {};
         auto x = GenAs(n, pt);
         if (TgModule::IsRel(pt)) {
-            // A relative parameter takes the offset (CodeGen::EmitArg).
+            // A relative parameter takes the offset.
             if (Ended()) return a;
             auto slot = Temp(pt);
             Store(P { AtL(slot), pt }, x);
@@ -4429,7 +4427,7 @@ struct TgFn {
         return M.IsScalar(pt) ? ArgOfVal(x.v) : ArgOfMem(x.a);
     }
 
-    // A large fixed value by value: the address of a copy of its own (CodeGen::SigParams).
+    // A large fixed value by value: the address of a copy of its own.
     tyg_arg CopyArg(tyg_addr src, TypeExpr *pt) {
         auto cp = Temp(pt);
         tyg_copy(p, AtL(cp), src, M.Size(pt));
@@ -4558,7 +4556,7 @@ struct TgFn {
         }
         if (b == B_TO_BYTES && nargs == 1) return BuildTemp(c, cg.GrowU8(), line);
         if (b == B_BYTES_OF && nargs == 1) {
-            // The element region of an array or slice as a u8[:] (CodeGen::PayloadOf).
+            // The element region of an array or slice as a u8[:].
             auto rt = an[0]->exprtype;
             while (rt && IsAddrRef(rt)) rt = rt->ref->sub;
             if (!rt || (rt->kind != TY_ARRAY && rt->kind != TY_SLICE))
@@ -4621,7 +4619,7 @@ struct TgFn {
             else if (M.RzParam(pt)) ValArg(an[i], pt, args);
             else args.push_back(cg.IsLargeFixed(pt) ? LargeArg(an[i], pt) : Arg(an[i], pt));
         }
-        // The callee's free variables (CodeGen::EmitFvArg), by address.
+        // The callee's free variables, by address.
         FvArgs(c, ci, args);
         lastrets.clear();
         if (Ended()) {
@@ -4676,7 +4674,7 @@ struct TgFn {
         return rets;
     }
 
-    // A pool reference argument (CodeGen::GenPrefVal): gs_pref's four members.
+    // A pool reference argument: gs_pref's four members.
     void PrefArg(Node *n, vector<tyg_arg> &args) {
         auto at = GenPref(n);
         for (int k = 0; k < 4; k++)
@@ -4694,7 +4692,7 @@ struct TgFn {
 
     // Whether a variable holds a gs_pref: a pool reference variable, or a parameter handed a pool.
     bool IsPrefStore(const VarDef *vd) { return cg.PrefVar(vd) || (prefs.count(vd) && !vd->reusable); }
-    // The pool reference a node gives (CodeGen::GenPrefVal), the address of its 32 bytes: a pool's,
+    // The pool reference a node gives, the address of its 32 bytes: a pool's,
     // another pool reference variable's, or what a construct choosing among pools builds, each arm into
     // one temporary (prefctl and prefloc hand it to the construct).
     bool prefctl = false;
@@ -4748,7 +4746,7 @@ struct TgFn {
     void FvArgs(Call *c, CodeGen::SpecInfo &ci, vector<tyg_arg> &args) {
         for (auto fv : ci.freevars) {
             auto v = c->FreeVarArg(fv);
-            if (fv->reusable) {   // A pool, as gs_pref's members (CodeGen::SigParams).
+            if (fv->reusable) {   // A pool, as gs_pref's members.
                 for (auto x : PoolRefParts(v, c->line)) args.push_back(ArgOfVal(x));
                 continue;
             }
@@ -4761,7 +4759,7 @@ struct TgFn {
         }
     }
 
-    // A call of a function value (§7.6; CodeGen::EmitFvCall): its body spliced in here in a scope of
+    // A call of a function value (§7.6; the C generator's EmitFvCall): its body spliced in here in a scope of
     // its own, the parameters locals bound to the arguments. Its value is a copy (§4.1), so a slice of
     // it never points into a variable the body names.
     V GenFvCall(Call *c) {
@@ -4884,7 +4882,7 @@ struct TgFn {
         if (st && M.RcOk(st) && ((sc && sc->builtin < 0) || cg.IsCtl(src))) {
             // A T[..] a call or a construct yields: built on the receiving stack itself, its
             // capacity/length header then slid out and its unused capacity dropped, so no stack of
-            // its own is claimed (CodeGen::EmitAppend).
+            // its own is claimed.
             auto base = Local(Top(pl.stk));
             GenImg(src, pl.stk, st, l);
             if (Ended()) return;
@@ -4927,7 +4925,7 @@ struct TgFn {
     // A user `format` overload rendering the value at pl (EmitUserFormat): handed the builder as a
     // gs_rref (its header and stack) and the value as the overload takes it.
     // The node naming the pool a format(out, ...) renders into, while it renders: an overload whose
-    // specialization is keyed to a pool takes it as a pool reference (CodeGen::EmitUserFormat's out).
+    // specialization is keyed to a pool takes it as a pool reference.
     Node *outpool = nullptr;
     // valnode is the argument being rendered when it is rendered whole, which a specialization keyed to a
     // pool takes as a pool reference.
@@ -5115,12 +5113,12 @@ struct TgFn {
         TextLit(stk, len, " }");
     }
 
-    // The value at pl rendered structurally, as CodeGen::RenderLoc renders it: references through to
+    // The value at pl rendered structurally, as the C generator's RenderLoc renders it: references through to
     // what they refer to, a scalar by gs_fmt_*, u8 elements as their bytes (quoted when nested), other
     // arrays and slices as `[a, b]`, a struct as `Name { a, b }`.
     void RenderInto(tyg_val stk, tyg_addr len, P pl, bool nested, Line l, int depth = 0) {
         if (depth > kTypeDepthMax) No(l, "text of a type this deep");
-        // A reference renders what it refers to, a relative one decoded (CodeGen::RenderLoc).
+        // A reference renders what it refers to, a relative one decoded.
         while (IsPlainRef(pl.t) || (TgModule::IsRel(pl.t) && !IsOptional(pl.t) && M.RelOk(pl.t, 1)))
             pl = Step(pl);
         auto t = pl.t;
@@ -5137,7 +5135,7 @@ struct TgFn {
                    [&] { RenderInto(stk, len, Step(pl), nested, l, depth + 1); });
             return;
         }
-        // A struct that reaches itself is rendered by a procedure of its own (CodeGen::EmitRenderCall),
+        // A struct that reaches itself is rendered by a procedure of its own,
         // which runs no overloads (the checker leaves none in such a type) and renders its first level
         // inline (inlinet).
         if ((t->kind == TY_STRUCT || t->kind == TY_ENUM) && M.Recursive(t)) {
@@ -5159,7 +5157,7 @@ struct TgFn {
             case TY_VARIANT:
                 RenderVariant(stk, len, pl, l, depth);
                 return;
-            case TY_ENUM: {   // The variant the tag says, as its literal (CodeGen::RenderLoc).
+            case TY_ENUM: {   // The variant the tag says, as its literal.
                 if (!rb && !M.TypeOk(t) && !M.VmOk(t)) break;
                 auto tag = Local(LoadTag(rb ? AtV(Ld(pl.a)) : pl.a, t));
                 TagSwitch(tag, M.EI(t)->en->variants.size(), [&](size_t vi) {
@@ -5219,7 +5217,7 @@ struct TgFn {
         No(l, cat("text of type ", M.NameWhy(t)));
     }
 
-    // A variant's positional literal (CodeGen::RenderVariant): `E.V` for one without fields, else
+    // A variant's positional literal: `E.V` for one without fields, else
     // `V { a, b }`.
     void RenderVariant(tyg_val stk, tyg_addr len, const P &pl, Line l, int depth) {
         auto t = pl.t;
@@ -5359,7 +5357,7 @@ struct TgFn {
                 FormatIntoLim(pl, an);
                 return V {};
             }
-            // Into a static-capacity u8[..k] (CodeGen::AppendBytes): rendered into a builder of the
+            // Into a static-capacity u8[..k]: rendered into a builder of the
             // statement's, then appended under the capacity check.
             auto b = RzTemp(cg.GrowU8(), c->line);
             auto blen = CountAt(b.a);
@@ -5453,7 +5451,7 @@ struct TgFn {
         SetBlock(done);
         return r;
     }
-    // from_bytes<T[>..]>(bytes) (CodeGen::EmitFromBytes): the framing prefix has to count exactly the
+    // from_bytes<T[>..]>(bytes): the framing prefix has to count exactly the
     // rest of the slice; the payload is verified as an image of elements (plain fixed ones by size
     // alone, others by TgModule::VerifyFn) and copied. Returns the array and whether the bytes held one.
     vector<V> GenFromBytes(Call *c) {
@@ -5529,7 +5527,7 @@ struct TgFn {
         auto moveIn = [&] { PushBytes(r.stk, LdL(pay), LdL(pn)); };
         auto accepted = Cmp(TYG_NE, LdL(okl), I64(0));
         if (isimg) {
-            // The prefix reserved, the payload behind it, the count patched in (CodeGen::OpenRzDest,
+            // The prefix reserved, the payload behind it, the count patched in (the C generator's OpenRzDest,
             // EmitPrefixPatch).
             auto start = Local(Top(r.stk));
             SetTop(r.stk, Add(LdL(start), I64(TgModule::PrefixBytes(t))));
@@ -5549,7 +5547,7 @@ struct TgFn {
         return { r, ValV(M.ast.booltype, tyg_convert(p, TYG_TRUNC, TYG_I8, LdL(okl))) };
     }
     // The destinations of the results with relative links of a call forwarded to results of rets
-    // (CodeGen::GenForward's chans), where(i) their places; the call's own must be those types.
+    //, where(i) their places; the call's own must be those types.
     RelDests ForwardDests(Node *n, const vector<TypeExpr *> &rets, const std::function<tyg_addr(size_t)> &where) {
         RelDests rd(rets.size());
         for (size_t i = 0; i < rets.size(); i++) {
@@ -5587,7 +5585,7 @@ struct TgFn {
         return (M.IsRc(t) && M.RcOk(t)) || (IsVarArr(t) && M.RzOk(t)) || (M.IsVs(t) && M.VsOk(t)) ||
                (M.IsVm(t) && M.VmOk(t));
     }
-    // The bytes of one freelist unit of pool d (CodeGen::FlEntrySize, GS_SPAN_NODE of a slice pool).
+    // The bytes of one freelist unit of pool d.
     static int64_t FlEntry(const VarDef *d) { return d->reusable == RU_SLICES ? 512 : 8; }
     // Whether a thread program's global is one a spawn image carries.
     bool ThreadGlobalOk(VarDef *d) {
@@ -5612,7 +5610,7 @@ struct TgFn {
         return P { x.a, t, x.stk };
     }
     // The flat image of the resizable or frame object at src, at the top of stk: [int64 count][a frame
-    // object's fixed fields][tail elements] (CodeGen::EmitRzImage); its address.
+    // object's fixed fields][tail elements]; its address.
     tyg_val RzImage(tyg_val stk, const P &src, TypeExpr *t) {
         auto start = StackReserve(stk, I64(8));
         auto cnt = AtV(start);
@@ -5668,7 +5666,7 @@ struct TgFn {
         return ValV(c->exprtype, tyg_convert(p, TYG_TRUNC, TYG_I8, LdL(ok)));
     }
 
-    // thread_spawn(worker, args...) (CodeGen::EmitThreadSpawn): arguments and the worker's globals
+    // thread_spawn(worker, args...): arguments and the worker's globals
     // packed on a stack of the statement's, handed to the worker's thunk.
     V GenThreadSpawn(Call *c) {
         auto w = c->spec;
@@ -6109,7 +6107,7 @@ struct TgFn {
 
     // An arm whose value `build` makes in place: its statements, then its tail built there.
     // An arm whose value is built by `build`, or that diverges (abort, exit: the checker types it
-    // void) and gives none: it runs as a statement, as CodeGen::GenBlockInner runs such a tail.
+    // void) and gives none: it runs as a statement, as the C generator's GenBlockInner runs such a tail.
     template <class F> void BuildArm(Node *n, Line l, F build) {
         auto value = [&](Node *v) {
             if (!v->exprtype || v->exprtype->kind == TY_VOID) Stmt(v);
@@ -6714,7 +6712,7 @@ struct TgFn {
         Stmt1(n);
         CloseScope();
     }
-    // A break's value, delivered as its target wants it (CodeGen::GenExitValue, LandValue).
+    // A break's value, delivered as its target wants it.
     void BreakValue(Node *val, Line line, const LoopTargets &t) {
         if (auto nb = t.ip.mode == 1 ? NrvoOf(val) : nullptr; nb && nb->top0 == t.top0) return;
         if (t.pref) {
@@ -6764,7 +6762,7 @@ struct TgFn {
                 SetBlock(head);
                 Loc(w->cond->line);
                 // The condition is inside the loop: a break in it leaves, a continue tests again
-                // (CodeGen::GenLoopBody).
+                //.
                 loops.push_back({ done, head, sscopes.size() });
                 if (IsShortCircuit(w->cond)) {
                     CondBranch(w->cond, body, done, true);
@@ -6814,7 +6812,7 @@ struct TgFn {
                 return DoReturn(r->vals, r->line);
             }
             case NK_Break: {
-                // To the innermost loop or block (CodeGen::GenBreakPath): its value first, then the
+                // To the innermost loop or block: its value first, then the
                 // stacks of the scopes left.
                 auto b = static_cast<Break *>(n);
                 if (loops.empty()) No(n->line, "break target");
@@ -6944,7 +6942,7 @@ struct TgFn {
     }
 
     // ---- return from (§7.9) ---------------------------------------------------------------------
-    // As the C half does it (CodeGen::GenFromReturn, EmitRfCheck): the values go into the target's
+    // As the C half does it: the values go into the target's
     // thread-local channels (gs_lret_<tid>_<i>), gs_rf is set to its id and every frame on the way
     // returns at once; after a call that can propagate one, a nonzero gs_rf is caught by its target or
     // passed on. Both thread-locals are the C half's, reached through its exported accessors.
@@ -6958,7 +6956,6 @@ struct TgFn {
     // A target's channel for result i: gs_lret_ (a fixed value, or a resizable's count), gs_fdst_ (a
     // nonfixed one's destination stack) or gs_fval_ (where its value starts there).
     tyg_addr ChanAt(FnSpec *t, size_t i, const char *kind) {
-        cg.EnsureFromChannels(t);
         auto tid = cg.fromids[t];
         auto name = cat("gs_tg_", kind, "_", tid, "_", i);
         M.NeedShim(name, cat("void *", name, "(void) { return (void *)&gs_", kind, "_", tid, "_", i,
@@ -6975,7 +6972,7 @@ struct TgFn {
         RestoreFrom(0);
         for (auto &[at, sav] : fdstsaves) St(at, LdL(sav));
     }
-    // Return at once with a dummy C return value (CodeGen::PropagateReturn).
+    // Return at once with a dummy C return value.
     void Propagate() {
         Leave();
         auto cret = cg.sinfo[sp].cret;
@@ -7025,7 +7022,7 @@ struct TgFn {
         Propagate();
     }
     // The value a catching frame returns as its own for result i: it lies on our destination behind
-    // what the calls it unwound built there (CodeGen::LandValue), then the channel's header.
+    // what the calls it unwound built there, then the channel's header.
     void LandChannel(size_t i) {
         auto rt = sp->rets[i];
         auto dst = LdL(chans[i].a), top0 = LdL(chans[i].top0);
@@ -7043,7 +7040,7 @@ struct TgFn {
             St(hb, Add(top0, Sub(Ld(hb), start)));
         }
     }
-    // After a call that can propagate a return (CodeGen::EmitRfCheck).
+    // After a call that can propagate a return.
     void RfCheck(FnSpec *callee) {
         if (!cg.sinfo[callee].hasrf || cg.norfcheck || Ended()) return;
         auto rfa = RfAddr();
@@ -7258,7 +7255,7 @@ struct TgFn {
         auto pl = Place(a->lval);
         if (a->pointee) pl = Deref(pl);
         if (a->op == T_DOTASSIGN) {
-            // A reference re-pointed (CodeGen::GenRebind): its slot takes the new address.
+            // A reference re-pointed: its slot takes the new address.
             if (auto id = Is<Ident>(a->lval); id && id->vdef && !a->pointee && IsPrefStore(id->vdef)) {
                 PrefInto(pl.a, a->rhs);   // A pool reference rebound takes the pool's freelist too.
                 return;
@@ -7470,7 +7467,7 @@ struct TgFn {
         }
     }
 
-    // A frame object built at pl, its tail on pl.stk (CodeGen::GenConstruct).
+    // A frame object built at pl, its tail on pl.stk.
     void GenFo(Node *n, P pl, Line l) {
         InPlace d { 3, pl.stk, pl.t, pl.a, &pl };
         if (BuildCtl(n, d, l)) return;
@@ -7563,7 +7560,7 @@ struct TgFn {
         if (cg.IsFrameObj(tail))
             FoBytesCopy(tail, AddrPlus(obj, fs.coff[(size_t)fs.var]), AddrPlus(at, fs.pre), tobytes);
     }
-    // The bytes frame object at src read as a C one (CodeGen::FoView): its innermost tail's header
+    // The bytes frame object at src read as a C one: its innermost tail's header
     // points at the elements where they lie.
     P FoView(const P &src) {
         auto t = src.t;
@@ -7592,7 +7589,7 @@ struct TgFn {
         }
     }
     // Builds n's value, of frame object type t, at the top of stk as the tail of a value that is not
-    // one: its fields as bytes, its innermost tail's count into olen (CodeGen::GenFoAsBytes). Anything
+    // one: its fields as bytes, its innermost tail's count into olen. Anything
     // but a literal is built as a frame object behind room left for the fields, stored there after.
     void GenFoBytes(Node *n, tyg_val stk, TypeExpr *t, tyg_addr olen, Line l) {
         if (BuildCtl(n, InPlace { 4, stk, t, olen }, l)) return;
@@ -7614,7 +7611,7 @@ struct TgFn {
     // stack, its header a gs_rhdr: the prefix packed as a variable-size struct's, the tail's elements
     // behind it, the count in the header.
 
-    // A resizable struct built at the top of stk, its header at hdr (CodeGen::GenConstruct).
+    // A resizable struct built at the top of stk, its header at hdr.
     void GenRs(Node *n, tyg_val stk, tyg_addr hdr, TypeExpr *t, Line l) {
         n = StripCopy(n);
         if (BuildCtl(n, InPlace { 2, stk, t, hdr }, l)) return;
@@ -7651,7 +7648,7 @@ struct TgFn {
     // parameters and results are an image on a stack, a uint8_t * at its start; what differs is here:
     // its size and its fields' addresses walk the variable-size fields before them.
 
-    // The bytes of the image of type t at `at` (CodeGen::SizeX).
+    // The bytes of the image of type t at `at`.
     tyg_val ImgSize(TypeExpr *t, tyg_val at) {
         if (cg.IsFix(t)) return I64(cg.FixedSize(t));
         // Zigzag has ULEB128's shape.
@@ -7672,7 +7669,7 @@ struct TgFn {
         return Sub(FieldAddr(t, at, -1), at);
     }
     // The address of field fi of the image of t (a struct or variant) at `at`, or its end where fi < 0
-    // (CodeGen::FieldPtr): a constant offset until a variable-size field, then a cursor past each.
+    //: a constant offset until a variable-size field, then a cursor past each.
     tyg_val FieldAddr(TypeExpr *t, tyg_val at, int fi) {
         auto &fs = M.RunOfType(t);
         auto n = fi < 0 ? (int)fs.f.size() : fi;
@@ -7695,9 +7692,9 @@ struct TgFn {
         return off ? Add(cur, I64(off)) : cur;
     }
     // Field fi of the struct or variant at base, whatever its representation: a fixed one at its C
-    // offset; a bytes value's (image's) walked (CodeGen::FieldPtr, BytesLoc); a resizable's, behind the
+    // offset; a bytes value's (image's) walked; a resizable's, behind the
     // header base.a, at its offset in the bytes at its base; a frame object's at its C offset, or
-    // packed in bytes (base.bfo). A resizable's tail is a place of its own (CodeGen::FieldLocAt).
+    // packed in bytes (base.bfo). A resizable's tail is a place of its own.
     // `read`: a tail needs no stack, and a resizable ADT's variant has one.
     P FieldPlace(const P &base, int fi, Line l, bool read = false) {
         auto t = base.t;
@@ -7758,7 +7755,7 @@ struct TgFn {
         return PushBytes(stk, src, ImgSize(t, src));
     }
     // A variant or fixed-mode ADT at `src` adapted to the variable-mode ADT t at the top of stk
-    // (CodeGen::GenVarEnumFromLoc): the tag, then the payload; its address.
+    //: the tag, then the payload; its address.
     tyg_val VmFrom(tyg_val stk, tyg_addr src, TypeExpr *srct, TypeExpr *t, Line l) {
         if (M.EI(srct) != M.EI(t) ||
             (srct->kind != TY_VARIANT && !(srct->kind == TY_ENUM && !srct->enu->varmode)))
@@ -7791,7 +7788,7 @@ struct TgFn {
         ~SelfScope() { slot = was; }
     };
 
-    // Builds n's value, of the variable-mode ADT t, at the top of stk (CodeGen::GenConstruct); its
+    // Builds n's value, of the variable-mode ADT t, at the top of stk; its
     // address. A variant literal as its tag then its fields, a call handed stk, else a copy.
     tyg_val GenVm(Node *n, tyg_val stk, TypeExpr *t, Line l) {
         auto start = Local(Top(stk));
@@ -7842,7 +7839,7 @@ struct TgFn {
         }
         return LdL(start);
     }
-    // A literal's fields in layout order (CodeGen::GenFieldInits), each built at the top in turn: a
+    // A literal's fields in layout order, each built at the top in turn: a
     // fixed one evaluated, then stored; a variable-size one built there; explicit padding zeroed.
     void RunLit(StructLit *sl, tyg_val stk, const TgModule::FieldSet &fs, size_t count = (size_t)-1) {
         for (size_t i = 0; i < fs.f.size() && i < count && !Ended(); i++) {
@@ -8027,7 +8024,7 @@ struct TgFn {
         Finish(sp->sf->line);
     }
 
-    // The render procedure of t (CodeGen::EmitRenderFn): void(stk, &len, &value).
+    // The render procedure of t: void(stk, &len, &value).
     void EmitRender(const string &name, TypeExpr *t) {
         auto ptr = tyg_type_ptr(m);
         const tyg_type *pts[3] = { ptr, ptr, ptr };
@@ -8041,8 +8038,8 @@ struct TgFn {
     }
 
     // ---- The verifier of an image's elements ----------------------------------------------------
-    // gs_tg_verify_<T>(p, n, bm) (CodeGen::VerifyFn): the element count of the image at p, or -1 if its
-    // n bytes are not one. The walks mirror CodeGen::EmitVerifyWalk over a cursor `vq`; failure goes to
+    // gs_tg_verify_<T>(p, n, bm): the element count of the image at p, or -1 if its
+    // n bytes are not one. The walks mirror the C generator's EmitVerifyWalk over a cursor `vq`; failure goes to
     // `vfail`.
     tyg_val vP = 0, vN = 0, vBM = 0, vE = 0;
     tyg_local vq = 0;
@@ -8079,7 +8076,7 @@ struct TgFn {
         if (!p) No(line, cat("tyg_proc_begin: ", tyg_error(m) ? tyg_error(m) : "?"));
     }
 
-    // A self-relative reference at q holding `off` (CodeGen::EmitVerifyLink): it must reach the start
+    // A self-relative reference at q holding `off`: it must reach the start
     // of an element, carrying the tag where typed at a variant.
     void VLink(TypeExpr *rt, tyg_val off) {
         auto offl = Local(off);
@@ -8114,7 +8111,7 @@ struct TgFn {
         else check();
     }
 
-    // The checks and cursor advance for one value of type t at q (CodeGen::EmitVerifyWalk).
+    // The checks and cursor advance for one value of type t at q.
     void VWalk(TypeExpr *t, bool links) {
         if (!cg.NeedsVerifyWalk(t)) {
             if (cg.FixedSize(t) > 0) VSkip(cg.FixedSize(t));
@@ -8215,7 +8212,7 @@ struct TgFn {
                 }
                 return;
             }
-            case TY_STRUCT: case TY_VARIANT: {   // The fields (CodeGen::EmitVerifyFields).
+            case TY_STRUCT: case TY_VARIANT: {   // The fields.
                 // A fixed one's offsets may include padding a walk would miss; bytes lay out in turn.
                 auto &fs = M.RunOfType(t);
                 auto fix = cg.IsFix(t);
@@ -8321,7 +8318,7 @@ struct TgFn {
         if (bad) No(line, cat("tinygen: ", tyg_error(m) ? tyg_error(m) : "?"));
     }
 
-    // gs_init_globals for a whole program build (CodeGen::EmitGlobalInit): the initializers in order
+    // gs_init_globals for a whole program build: the initializers in order
     // with gs_sp fixed at 0, a resizable or T[] global built on its own stack. No sp: what refers to
     // the function's own results (return, return from) is unsupported.
     void EmitInit(tyg_sym sym, Line line) {
@@ -8350,7 +8347,7 @@ struct TgFn {
                     StackInit(stk);
                     if (fo) {   // A frame object: its tail on the global's own stack.
                         GenFo(init, P { AtV(at), d->type, stk }, init->line);
-                    } else if (grow) {   // CodeGen::InitGlobalStack: an empty array, then its elements.
+                    } else if (grow) {   // the C generator's InitGlobalStack: an empty array, then its elements.
                         StartHdr(stk, AtV(at));
                         GenRz(init, stk, AtV(at), d->type, init->line);
                         if (d->reusable && !Ended()) {   // Its freelist, empty, on a stack of its own.
@@ -8379,7 +8376,7 @@ struct TgFn {
 
 // The backend: chooses the specializations it takes as CodeGen asks, then compiles those into one
 // object.
-struct TinyGenBackend : CodeGen::SpecBackend {
+struct TinyGenBackend {
     Ast &ast;
     bool checks;
     string source;
@@ -8509,29 +8506,26 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         cg.stackcalls[sp] = fn.stackcalls;
     }
 
-    vector<FnSpec *> Externs() override {
+    // The extern fns the compiled bodies call.
+    vector<FnSpec *> Externs() {
         vector<FnSpec *> r;
         if (mod)
             for (auto list : { &mod->externs, &mod->direct }) r.insert(r.end(), list->begin(), list->end());
         return r;
     }
 
-    // The specializations whose body compiles, built straight into the module; the rest are left to C.
-    // The halves call each other with gs_sp as two C functions do, so what one takes does not depend on
-    // the other.
-    set<FnSpec *> Choose(CodeGen &cg, const vector<FnSpec *> &specs) override {
-        set<FnSpec *> ours;
+    // Every live specialization, built straight into the module, then the render procedures they ask
+    // for.
+    void Choose(CodeGen &cg) {
         mod = make_unique<TgModule>(ast, cg, checks, source, coutput);
         mod->rtdecls = runtime_decls;
         mod->fixedaddrs = !UsesThreads(cg);
         if (!mod->m) throw CompileError { "tinygen backend: this target is not supported yet" };
-        for (auto sp : specs) {
+        for (auto sp : cg.livespecs) {
             Build(cg, sp);
-            ours.insert(sp);
             taken.push_back(sp);
         }
         BuildRenders();
-        return ours;
     }
 
     static bool ThreadsIn(Node *n) {
@@ -8609,7 +8603,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         }
         string s;
         // An extern of a shared library (§7.10) is called through the pointer gs_tg_dlbind fills
-        // (DylibBinding), as the C generator calls it (CodeGen::ExternProto).
+        // (DylibBinding), as the C generator calls it.
         auto dynamic = !sp->sf->dylib.empty();
         if (dynamic)
             Append(s, "static ", ret, " (*", DlSlot(sp), ")(", types.empty() ? "void" : types, ");\n",
@@ -8774,7 +8768,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
 
     // The queues (eight bytes of data with an accessor, started by main) and the worker thunks the C
     // half holds in a mixed build: a thunk takes the spawn image, opens the thread program's data
-    // stacks, unpacks the arguments and calls the worker (CodeGen::EmitThreadThunk).
+    // stacks, unpacks the arguments and calls the worker.
     void EmitThreads(CodeGen &cg) {
         auto m = mod->m;
         auto ptr = tyg_type_ptr(m);
@@ -8887,7 +8881,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         }
     }
 
-    // Whether the object can write an `export fn`'s wrapper (CodeGen::EmitExports): a plain
+    // Whether the object can write an `export fn`'s wrapper: a plain
     // specialization whose parameters and result cross by value, large fixed values among them
     // (ForwardCall). The checker admits nothing else (TypeCheck::CheckExport: one concrete top-level
     // function, no pool or builder parameter, at most one fixed-size result or a const u8 slice), and
@@ -8921,7 +8915,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
             bad(cat("returns ", mod->NameWhy(sp->rets[0]), ", which tinygen cannot hold"));
     }
 
-    // The C symbol of each `export fn` (CodeGen::EmitExports), calling it with gs_sp 0.
+    // The C symbol of each `export fn`, calling it with gs_sp 0.
     void EmitExports(CodeGen &cg) {
         auto ptr = tyg_type_ptr(mod->m);
         for (auto sf : ast.functions) {
@@ -8935,7 +8929,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
             auto sig = SigOf(!rt ? nullptr : slice ? ptr : mod->AT(rt), ps);
             auto p = tyg_proc_begin(mod->m, mod->FnSym(sf->cname), sig);
             // A library's C host calls an export only once goose_init has started the program, and
-            // takes a slice's length through a pointer it must give (CodeGen::EmitExports).
+            // takes a slice's length through a pointer it must give.
             if (initflag != TYG_NO_SYM) {
                 TgFn fn(*mod, nullptr);
                 fn.p = p;
@@ -9071,7 +9065,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     // A library's flag, set as goose_init starts it, which its exports check.
     tyg_sym initflag = TYG_NO_SYM;
 
-    // The C main of a whole program (CodeGen::EmitProgramInit, EmitMain): the runtime started with the
+    // The C main of a whole program: the runtime started with the
     // program's stack counts, the globals initialized, fn main() run. In the debugger it is at fn
     // main(). A library's is goose_init, which starts it once, runs fn main() if it has one and
     // returns to its C host.

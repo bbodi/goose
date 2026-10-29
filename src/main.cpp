@@ -28,16 +28,8 @@
 #include "bce.h"
 #include "codegen.h"
 #include "codegen_types.h"
-#include "codegen_frames.h"
-#include "codegen_values.h"
-#include "codegen_construct.h"
-#include "codegen_stmts.h"
-#include "codegen_calls.h"
-#include "codegen_builtins.h"
-#include "codegen_render.h"
-#include "codegen_emit.h"
+#include "codegen_program.h"
 #include "codegen_stacks.h"
-#include "codegen_nodes.h"
 #include "runtime_inline.h"
 #include "process.h"
 #include "jit.h"
@@ -1934,7 +1926,9 @@ int Main(int argc, char **argv) {
                                                RuntimeSections({ "runtime.h", "runtime_ext.h" }));
         tgb->coutput = tinygenc || tgjit;
         tgb->externunit = !includes.empty();
-        CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, stackcfg, tgb.get());
+        CodeGen cg(ast, norfcheck, library, stackcfg);
+        tgb->Choose(cg);
+        cg.Finish(tgb->Externs(), !includes.empty());
         if (stacks) cg.StackReport(msgs, stackcfg);
         if (nocgen) return 0;
         // A plain goose run says nothing of its backend unless asked.

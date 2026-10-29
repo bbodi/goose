@@ -25,7 +25,6 @@ struct Optimizer;
 struct Inliner;
 struct BCE;
 struct CodeGen;
-struct Dst;
 struct ExpansionClone;
 
 // A place in a source file: the 1-based line, which diagnostics name, and
@@ -885,13 +884,6 @@ struct Node {
     // kills, or bounds checks override them.
     virtual bool BceWalk(BCE &bce);
     virtual void BceMark(BCE &bce);
-    // The codegen pass (codegen.h): CgX emits the node as a C value
-    // expression, CgAny routes its value to a destination, CgStmt emits it in
-    // statement position. Implementations live together in codegen_nodes.h;
-    // most are one-line delegations into CodeGen's machinery.
-    virtual string CgX(CodeGen &cg) = 0;
-    virtual void CgAny(CodeGen &cg, const Dst &d) = 0;
-    virtual void CgStmt(CodeGen &cg) = 0;
 };
 
 // Where a diagnostic about n is: on its anchor's line, from the earliest
@@ -931,10 +923,7 @@ template<typename T> T *Is(Node *n) {
     void Children(const function<void(Node *)> &f) const override; \
     Val Check(TypeCheck &tc, TypeExpr *expected) override; \
     Node *Cp1(Inliner &inl) const override; \
-    Node *Opt(Optimizer &opt) override; \
-    string CgX(CodeGen &cg) override; \
-    void CgAny(CodeGen &cg, const Dst &d) override; \
-    void CgStmt(CodeGen &cg) override;
+    Node *Opt(Optimizer &opt) override;
 #define NODE_END };
 
 NODE(IntLit)
@@ -1446,7 +1435,6 @@ NODE(InlineBlock)
     Block *body;
     InlineBlock(Line l, SFunction *_sf, FnSpec *_spec, Block *_body)
         : Node(l, NKind), sf(_sf), spec(_spec), body(_body) {}
-    void EmitBody(CodeGen &cg, const Dst &d);   // CgAny, as the callee's own result type.
 NODE_END
 
 // ---------------------------------------------------------------------------
