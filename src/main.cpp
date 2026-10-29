@@ -892,8 +892,8 @@ the packages the program uses. Intermediates go under GOOSE_HOME.
 
 tinygen compiles the program: its C, optimized by the C compiler, or with
 --debug its machine code with debug info naming the Goose source. A program
-tinygen cannot take whole (--include or --standalone with -o x.c) builds
-through the C generator's C instead; -v says why. --backend picks a path.
+tinygen cannot take whole builds through the C generator's C instead, and
+says why. --backend picks a path.
 
 Options:
   -o exe                Where the executable goes.
@@ -916,10 +916,8 @@ R"(  --cc name|path        The C compiler: msvc, clang-cl, clang, gcc, cc or a
                         support goes through C. tinygen-c has tinygen write C
                         instead (default -O2), which the C compiler optimizes
                         unless --debug;
-                        with -o out.c it writes that C and builds nothing:
-                        tinygen's for a whole program (it links with the
-                        tinygen support object and the runtime, as -v shows),
-                        else the C generator's, which is the whole program.
+                        with -o out.c it writes that C and builds nothing, as
+                        goose -o out.c does (goose help c).
 )");
     if (topic == "check") return cat(
 R"(usage: goose check file.goose [options]
@@ -1017,10 +1015,12 @@ R"(usage: goose -o out.c file.goose [options]
        goose --emit-runtime runtime.c
        goose --<package>-link msvc|cc
 
-Writes the program's C, for a build of your own or a C host. It links with
-the runtime that --emit-runtime writes, compiled once with the C compiler
-and flags the programs use. goose build --dry-run prints the commands for
-the program at hand.
+Writes the program's C, for a build of your own or a C host: tinygen's C and
+the runtime's headers in one file. It links with the runtime that
+--emit-runtime writes, compiled once with the C compiler and flags the
+programs use, or holds the whole runtime with --standalone. --debug's checks
+are chosen here, not by the C compiler's -D. goose build --dry-run prints the
+commands for the program at hand.
 
 Options:
   -o out.c              Write the program's C rather than run it.
@@ -1687,12 +1687,28 @@ int Main(int argc, char **argv) {
     // (the optimized build), or with --debug the native tinygen backend (the fast debug build
     // with debug information). A program tinygen cannot take whole builds through the C
     // generator instead (tgdefault, tgfallback below). -o x.c asks for C, which is tinygen-c's.
-    auto tgdefault = false;
+    // The flag form `goose -o x.c` (C for a C host, with --header, --include, --standalone)
+    // writes tinygen-c's C as well (flagform).
+    auto tgdefault = false, flagform = false;
+    // tinygen counts more data stacks than the C generator for some programs, which a
+    // GS_MAX_STACKS limit then refuses (test/codegen/append_destination_storage.goose): such a
+    // program takes the C generator's C, as a goose run does (tgjit below).
+    string maxstacks;
+    for (auto &d : cdefines)
+        if (d.rfind("GS_MAX_STACKS", 0) == 0) maxstacks = d;
     #if GOOSE_HAVE_TINYGEN
-        if (verb == "build" && !backendgiven) {
-            tgdefault = true;
-            auto wantsc = outname.size() > 2 && outname.compare(outname.size() - 2, 2, ".c") == 0;
-            backendname = debug && !wantsc ? "tinygen" : "tinygen-c";
+        auto wantsc = outname.size() > 2 && outname.compare(outname.size() - 2, 2, ".c") == 0;
+        flagform = verb.empty() && !backendgiven && !forcejit && wantsc;
+        if ((verb == "build" || flagform) && !backendgiven) {
+            if (maxstacks.empty()) {
+                tgdefault = true;
+                backendname = debug && !wantsc ? "tinygen" : "tinygen-c";
+            } else {
+                flagform = false;
+                fprintf(stderr, "goose: the C generator's C for the whole program (-D%s: tinygen's "
+                                "data stack count is not checked against it yet)\n",
+                        maxstacks.c_str());
+            }
         }
     #endif
     if (backendname != "c" && backendname != "tinygen" && backendname != "tinygen-c") {
@@ -1709,7 +1725,7 @@ int Main(int argc, char **argv) {
                             "(TINYGEN_DIR, CMakeLists.txt)\n", backendname.c_str());
             return 1;
         #endif
-        if (verb != "build" && verb != "run") {
+        if (verb != "build" && verb != "run" && !flagform) {
             fprintf(stderr, "--backend=%s works with goose build and goose run\n",
                     backendname.c_str());
             return 1;
@@ -1809,16 +1825,12 @@ int Main(int argc, char **argv) {
     auto tgjit = false;
     #if GOOSE_HAVE_TINYGEN
         tgjit = jit && !backendgiven && !nocgen && !parseonly && !dump && !tokens;
-        // tinygen counts more data stacks than the C generator for some programs, which a
-        // GS_MAX_STACKS limit then refuses (test/codegen/append_destination_storage.goose).
-        for (auto &d : cdefines)
-            if (tgjit && d.rfind("GS_MAX_STACKS", 0) == 0) {
-                tgjit = false;
-                if (verbose)
-                    fprintf(stderr, "jit: the C generator's C, compiled by TinyCC, for the whole "
-                                    "program (-D%s: tinygen's data stack count is not checked "
-                                    "against it yet)\n", d.c_str());
-            }
+        if (tgjit && !maxstacks.empty()) {
+            tgjit = false;
+            fprintf(stderr, "jit: the C generator's C, compiled by TinyCC, for the whole program "
+                            "(-D%s: tinygen's data stack count is not checked against it yet)\n",
+                    maxstacks.c_str());
+        }
     #endif
     if (!headername.empty() && (jit || multitest)) {
         fprintf(stderr, "--header requires C output for a single input file\n");
@@ -2020,7 +2032,7 @@ int Main(int argc, char **argv) {
                 // that needs nothing of the C half beyond the support object,
                 // puts its main into the object and compiles no C.
                 string whynot;
-                if (!building && !tgjit) whynot = "not goose build";
+                if (!building && !tgjit && !flagform) whynot = "not goose build";
                 else if (tinygenmixed) whynot = "--tinygen-mixed";
                 // Every -D reaches the support unit (DefinesSource), the C that includes the
                 // runtime's headers; tinygen's C reads none.
@@ -2078,7 +2090,8 @@ int Main(int argc, char **argv) {
                     if (!tgwhole)
                         cgalone = make_unique<CodeGen>(ast, runtime_ext_text, includes, norfcheck,
                                                        library, stackcfg);
-                    if (verbose)
+                    // A fallback to the C generator says why, -v or not (G3.4c removes it).
+                    if (verbose || !tgwhole)
                         fprintf(msgs, tgwhole ? "jit: tinygen's C, compiled by TinyCC\n"
                                               : "jit: the C generator's C, compiled by TinyCC, "
                                                 "for the whole program (tinygen cannot take it "
@@ -2087,9 +2100,10 @@ int Main(int argc, char **argv) {
                 } else if (tgfallback) {
                     cgalone = make_unique<CodeGen>(ast, runtime_ext_text, includes, norfcheck,
                                                    library, stackcfg);
-                    if (verbose)
-                        fprintf(msgs, "build: the C generator's C, compiled by the C compiler, "
-                                      "for the whole program (tinygen cannot take it whole: %s)\n",
+                    fprintf(stderr, flagform ? "goose: the C generator's C for the whole program "
+                                               "(tinygen cannot take it whole: %s)\n"
+                                             : "build: the C generator's C, compiled by the C compiler, "
+                                               "for the whole program (tinygen cannot take it whole: %s)\n",
                                 whynot.c_str());
                 } else if (verbose)
                     fprintf(msgs, tgwhole ? "tinygen: whole program: no C compiled for it\n"
@@ -2107,8 +2121,8 @@ int Main(int argc, char **argv) {
                                              "builds both") };
                 if (!tgb->taken.empty() && !outfile.empty() && !tgfallback && !tgjit) {
                     tgobject = cat(DirOf(outfile), PathStem(outfile), ".tg.o");
-                    if (tinygenc) tgcsource = tgcout.empty() ? cat(DirOf(outfile), PathStem(outfile),
-                                                                   ".tg.c") : tgcout;
+                    if (tinygenc) tgcsource = flagform ? outfile : tgcout.empty() ?
+                                              cat(DirOf(outfile), PathStem(outfile), ".tg.c") : tgcout;
                     auto written = tinygenc ? tgcsource : tgobject;
                     string err;
                     if (tgunit) {
@@ -2116,6 +2130,7 @@ int Main(int argc, char **argv) {
                                                 tgchecks, standalone, threads, false);
                         if (!dryrun && !WriteFileMakingDirs(written, unit))
                             throw CompileError { cat("cannot write ", written) };
+                        if (stats) fprintf(msgs, "wrote %s (%d bytes)\n", written.c_str(), (int)unit.size());
                     } else if (!dryrun && !tgb->Write(written, err))
                         throw CompileError { cat("tinygen: cannot write ", written, ": ", err) };
                     // nothing is printed on success; the help says what the C links with

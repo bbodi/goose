@@ -446,6 +446,7 @@ def check_tinygen_backend(exe, base, ok, fail, say):
     check_default_inlining(exe, base, ok, fail)
     check_build_defaults(exe, base, ok, fail)
     check_c_path_flags(exe, base, ok, fail)
+    check_library(exe, base, ok, fail)
     check_debug(exe, base, ok, fail)
     check_lldb(exe, base, ok, fail, say)
     check_lldb_limited(exe, base, ok, fail)
@@ -681,7 +682,8 @@ def check_build_defaults(exe, base, ok, fail):
                 "test/threads/thread_globals.goose"):
         source = ROOT / rel
         want, aborts, markers = expected(source)
-        for verb, flags in [(["build"], []), (["build"], ["--standalone"])]:
+        for verb, flags in [(["build"], []), (["build"], ["--standalone"]), ([], []),
+                            ([], ["--standalone"])]:
             label = f"goose {' '.join(verb + flags)} -o out.c {source.name}"
             out = work / "out.c"
             out.unlink(missing_ok=True)
@@ -704,7 +706,7 @@ def check_build_defaults(exe, base, ok, fail):
                 fail(f"{label} (exit {code})", f"{err}\n--- got:\n{got}\n--- want:\n{want}")
                 return
     ok(f"goose build: tinygen-c by default and tinygen with --debug on {len(DEFAULT_BUILD_PROGRAMS)} "
-       "programs; -o out.c (build, --standalone) built by cc with the runtime "
+       "programs; -o out.c (build and the flag form, --standalone) built by cc with the runtime "
        "object or alone")
 
 
@@ -780,6 +782,70 @@ def check_c_path_flags(exe, base, ok, fail):
         return
     ok("the C path's flags on tinygen: -D, --include (a static inline extern, a -D in the header), "
        "--standalone, export fn (large fixed values too)")
+
+
+LIBRARY = """struct Pair { a: i64, b: i64 }
+var counter: i64 = 40;
+export "lib_add" fn add(x: i64, y: i64) -> i64 { counter += 1; return x + y + counter; }
+export "lib_swap" fn swap(p: Pair) -> Pair { return Pair { a: p.b, b: p.a }; }
+export "lib_name" fn name() -> const u8[:] { return "goose"; }
+"""
+LIBRARY_HOST = """#include <stdio.h>
+#include "lib.h"
+int main(int argc, char **argv) {
+    if (argc > 1) printf("%lld\\n", (long long)lib_add(1, 2));
+    goose_init(argc, argv);
+    goose_init(argc, argv);
+    printf("%lld\\n", (long long)lib_add(1, 2));
+    Pair_g p = { 3, 4 }, q = lib_swap(p);
+    printf("%lld %lld\\n", (long long)q.a_g, (long long)q.b_g);
+    gs_i64 n;
+    const uint8_t *s = lib_name(&n);
+    printf("%.*s\\n", (int)n, s);
+    return 0;
+}
+"""
+
+
+def check_library(exe, base, ok, fail):
+    """The flag form with --header (G3.4b): tinygen's C of a library, whose C host includes the
+    export header, starts it with goose_init (once, however often called) and calls its exports, a
+    struct by value and a slice among them; built with the runtime object or, --standalone, alone;
+    an export called before goose_init aborts."""
+    exe = Path(exe).resolve()
+    cc = tc.test_cc()
+    if cc is None:
+        return
+    work = base / "library"
+    work.mkdir(parents=True, exist_ok=True)
+    source, host = work / "lib.goose", work / "host.c"
+    tc.write_text(source, LIBRARY)
+    tc.write_text(host, LIBRARY_HOST)
+    runtime = tc.GooseRuntime(exe, work / "runtime")
+    for flags in ([], ["--standalone"]):
+        label = f"goose {' '.join(flags)} -o lib.c --header lib.h"
+        out = work / "lib.c"
+        code, o, e = tc.run_capture([exe, "-v", *flags, "-o", out, "--header", work / "lib.h",
+                                     source])
+        if code != 0 or "tinygen: whole program" not in o + e:
+            fail(f"{label}: tinygen's C expected", o + e)
+            return
+        prog = work / f"host{tc.EXE_SUFFIX}"
+        good, log = cc.compile([host, out], prog, opt=1, strict_decls=True,
+                               runtime=None if flags else runtime)
+        if not good:
+            fail(f"{label}: cc host.c lib.c", log)
+            return
+        code, got, err = tc.run_capture([prog])
+        if code != 0 or got.replace("\r", "") != "44\n4 3\ngoose\n":
+            fail(f"{label}: the host (exit {code})", f"{err}\n--- got:\n{got}")
+            return
+        code, got, err = tc.run_capture([prog, "early"])
+        if code == 0 or "goose_init must be called before exported functions" not in err:
+            fail(f"{label}: an export before goose_init (exit {code})", err)
+            return
+    ok("the flag form with --header: tinygen's C of a library for a C host, with the runtime object "
+       "and --standalone")
 
 
 def check_default_inlining(exe, base, ok, fail):

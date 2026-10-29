@@ -971,7 +971,16 @@ inline void CodeGen::EmitExports() {
 }
 
 inline string CodeGen::ExportHeader() {
+    // The scalar aliases the types below are written with, as runtime.h has them.
     string header = "#pragma once\n#include <stdint.h>\n"
+                    "#ifndef GS_ALIGN1\n"
+                    "#if (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__)\n"
+                    "#define GS_ALIGN1 __attribute__((aligned(1)))\n#else\n#define GS_ALIGN1\n#endif\n"
+                    "#endif\n"
+                    "typedef int16_t gs_i16 GS_ALIGN1;\ntypedef int32_t gs_i32 GS_ALIGN1;\n"
+                    "typedef int64_t gs_i64 GS_ALIGN1;\ntypedef uint16_t gs_u16 GS_ALIGN1;\n"
+                    "typedef uint32_t gs_u32 GS_ALIGN1;\ntypedef uint64_t gs_u64 GS_ALIGN1;\n"
+                    "typedef float gs_f32 GS_ALIGN1;\ntypedef double gs_f64 GS_ALIGN1;\n"
                     "typedef struct gs_stack gs_stack;\n"
                     "#pragma pack(push, 1)\n";
     header += tdecls;

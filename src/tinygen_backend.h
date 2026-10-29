@@ -8619,9 +8619,10 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         auto mainsp = mainsf && !mainsf->specs.empty() ? mainsf->specs[0] : nullptr;
         if (!mod) why = "nothing compiled";
         else if (!left.empty()) why = cat(left.size(), " function(s) left to C");
-        else if (cg.library) why = "a library";
-        else if (!mainsp || !cg.sinfo.count(mainsp) || !mainsp->params.empty() ||
-                 !cg.sinfo[mainsp].freevars.empty())
+        // A library (--header) may have no main: its C host starts it through goose_init.
+        else if ((mainsp || !cg.library) &&
+                 (!mainsp || !cg.sinfo.count(mainsp) || !mainsp->params.empty() ||
+                  !cg.sinfo[mainsp].freevars.empty()))
             why = "no plain main";
         if (!why.empty()) return false;
         for (auto sf : ast.functions)
@@ -8645,6 +8646,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                 if (d->reusable) mod->PoolAccessors(d);
             }
         EmitGlobalStorage(cg);
+        if (cg.library) initflag = DataSym("gs_tg_program_initialized", 1, 1, false);
         EmitExports(cg);
         ForwardExterns();
         EmitThreads(cg);
@@ -8831,6 +8833,23 @@ struct TinyGenBackend : CodeGen::SpecBackend {
             if (slice) ps.push_back(ptr);
             auto sig = SigOf(!rt ? nullptr : slice ? ptr : mod->AT(rt), ps);
             auto p = tyg_proc_begin(mod->m, mod->FnSym(sf->cname), sig);
+            // A library's C host calls an export only once goose_init has started the program, and
+            // takes a slice's length through a pointer it must give (CodeGen::EmitExports).
+            if (initflag != TYG_NO_SYM) {
+                TgFn fn(*mod, nullptr);
+                fn.p = p;
+                auto panic = [&](const char *msg) {
+                    auto text = mod->Bytes(string(msg, strlen(msg) + 1));
+                    fn.CallC("gs_panic", { ptr }, { fn.AddrOf(tyg_at_sym(text, 0)) }, nullptr);
+                };
+                auto set = tyg_load(p, TYG_I8, tyg_at_sym(initflag, 0), 0);
+                fn.If(tyg_cmp(p, TYG_EQ, set, tyg_iconst(p, TYG_I8, 0)), [&] {
+                    panic("goose_init must be called before exported functions");
+                });
+                if (slice)
+                    fn.If(tyg_cmp(p, TYG_EQ, tyg_param(p, (int)sp->argtypes.size()), fn.I64(0)),
+                          [&] { panic("exported slice length pointer is null"); });
+            }
             ForwardCall(p, sp, mod->Sig(sp), mod->FnSym(cg.sinfo[sp].cname), cg.sinfo[sp].needssp,
                         slice, true);
             EndProc(p, sf->cname);
@@ -8949,27 +8968,44 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         }
     }
 
+    // A library's flag, set as goose_init starts it, which its exports check.
+    tyg_sym initflag = TYG_NO_SYM;
+
     // The C main of a whole program (CodeGen::EmitProgramInit, EmitMain): the runtime started with the
     // program's stack counts, the globals initialized, fn main() run. In the debugger it is at fn
-    // main().
+    // main(). A library's is goose_init, which starts it once, runs fn main() if it has one and
+    // returns to its C host.
     void EmitMain(CodeGen &cg) {
         auto m = mod->m;
-        auto mainsp = ast.MainFunction()->specs[0];
+        auto mainsf = ast.MainFunction();
+        auto mainsp = mainsf && !mainsf->specs.empty() ? mainsf->specs[0] : nullptr;
         auto i32 = tyg_type_int(m, TYG_I32, 1), i64 = tyg_type_int(m, TYG_I64, 1);
         auto ptr = tyg_type_ptr(m);
+        auto library = initflag != TYG_NO_SYM;
         // C requires main's argv to be a char **, which a tinygen pointer prints as void *: in C
         // output the procedure is gs_tg_main, and Write adds the main that calls it.
-        auto p = tyg_proc_begin(m, mod->FnSym(coutput ? "gs_tg_main" : "main"),
-                                SigOf(i32, { i32, ptr }));
-        cmain = coutput;
-        auto line = mainsp->sf->line;
+        auto p = tyg_proc_begin(m, mod->FnSym(library ? "goose_init" : coutput ? "gs_tg_main" : "main"),
+                                SigOf(library ? nullptr : i32, { i32, ptr }));
+        cmain = coutput && !library;
+        Line line;
+        if (mainsp) line = mainsp->sf->line;
+        else
+            for (auto sf : ast.functions)
+                if (sf->isexport && line.line == 0) line = sf->line;
         auto file = mod->File(line.fileidx);
         auto dint = tyg_dt_base(m, "int", 4, TYG_DT_SIGNED);
         const tyg_dtype *pdt[] = { dint, tyg_dt_pointer(m, tyg_dt_void(m)) };
-        tyg_debug_proc(p, "main", file, line.line, tyg_dt_func(m, dint, pdt, 2, 0));
+        tyg_debug_proc(p, library ? "goose_init" : "main", file, line.line,
+                       tyg_dt_func(m, library ? nullptr : dint, pdt, 2, 0));
         tyg_loc(p, file, line.line, 0);
         TgFn fn(*mod, nullptr);
         fn.p = p;
+        if (library) {
+            auto flag = tyg_at_sym(initflag, 0);
+            fn.If(tyg_cmp(p, TYG_NE, tyg_load(p, TYG_I8, flag, 0), tyg_iconst(p, TYG_I8, 0)),
+                  [&] { tyg_ret(p, 0); });
+            tyg_store(p, TYG_I8, flag, tyg_iconst(p, TYG_I8, 1), 0);
+        }
         // The main program's stacks, or what the initializers use if more.
         auto stacks = std::max(cg.rtinit[0], initstacks);
         // The data stacks' reservation, as the C's GS_STACK_RESERVE and the others would give it.
@@ -8983,9 +9019,16 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         for (auto &[acc, q] : mod->queueacc)
             fn.CallC("gs_qinit", { ptr }, { fn.CallC(acc, {}, {}, ptr) }, nullptr);
         if (initsym != TYG_NO_SYM) CallSig(p, SigOf(nullptr, {}), initsym, {});
-        auto &mi = cg.sinfo[mainsp];
-        CallSig(p, mod->Sig(mainsp), mod->FnSym(mi.cname), mi.needssp ? vector<tyg_val> { fn.I64(0) } :
-                vector<tyg_val> {});
+        if (mainsp) {
+            auto &mi = cg.sinfo[mainsp];
+            CallSig(p, mod->Sig(mainsp), mod->FnSym(mi.cname),
+                    mi.needssp ? vector<tyg_val> { fn.I64(0) } : vector<tyg_val> {});
+        }
+        if (library) {
+            tyg_ret(p, 0);
+            EndProc(p, "goose_init");
+            return;
+        }
         fn.CallC("gs_tg_end", {}, {}, nullptr);
         tyg_ret(p, tyg_iconst(p, TYG_I32, 0));
         EndProc(p, "main");
