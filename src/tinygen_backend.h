@@ -8585,32 +8585,15 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         mod->renderq.clear();
     }
 
-    // After the C half is made: the extern fns the object calls count as used, so it declares them.
-    set<FnSpec *> declared;   // Extern fns the C half declares already.
-
+    // The extern fns the object calls count as used: a build links their packages' native parts.
     void Compile(CodeGen &cg) {
         if (!mod) return;
-        declared.insert(cg.usedexterns.begin(), cg.usedexterns.end());
+        if (mod->fixedaddrs && Threaded(cg))
+            throw CompileError { "tinygen: the program uses threads, which UsesThreads missed" };
         for (auto list : { &mod->externs, &mod->direct })
             for (auto sp : *list)
                 if (std::find(cg.usedexterns.begin(), cg.usedexterns.end(), sp) == cg.usedexterns.end())
                     cg.usedexterns.push_back(sp);
-    }
-
-    // The C the object calls into (appended to the C half): the shims, and a trampoline per extern fn.
-    string Shims(CodeGen &cg) {
-        if (!mod) return "";
-        if (mod->fixedaddrs && Threaded(cg))
-            throw CompileError { "tinygen: the program uses threads, which UsesThreads missed" };
-        string s = "\n/* ---- for the tinygen object (docs/design/tinygen_backend.md) ---- */\n";
-        for (auto &sh : mod->shims) s += sh.second;
-        for (auto sp : mod->externs) {
-            auto name = sp->sf->cname;
-            if (!declared.count(sp) && runtime_ext_text.find(cat(" ", name, "(")) == string_view::npos)
-                s += cg.ExternProto(sp);
-            s += Trampoline(cg, sp, false);
-        }
-        return s;
     }
 
     // gs_tg_x_<name>, calling the extern fn sp by its C name with the same parameters, after a
