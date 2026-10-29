@@ -8744,7 +8744,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
             why = "no plain main";
         if (!why.empty()) return false;
         for (auto sf : ast.functions)
-            if (sf->isexport && !ExportOk(cg, sf, why)) return false;
+            if (sf->isexport) CheckExport(cg, sf);
         // A shared library's externs are bound by a table in a unit of the program's own, which the
         // trampolines and the table's function (gs_tg_dlbind) go into with the --include headers'.
         if (HasDylibs()) externunit = true;
@@ -8922,23 +8922,38 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         }
     }
 
-    // Whether the object writes an `export fn`'s wrapper (CodeGen::EmitExports): a plain specialization
-    // whose parameters and result cross by value, large fixed values among them (ForwardCall). Else
-    // why not.
-    bool ExportOk(CodeGen &cg, SFunction *sf, string &why) {
-        auto fail = [&] { return Refuse(why, cat("export fn ", sf->name)); };
-        if (sf->specs.size() != 1 || !cg.sinfo.count(sf->specs[0])) return fail();
+    // Whether the object can write an `export fn`'s wrapper (CodeGen::EmitExports): a plain
+    // specialization whose parameters and result cross by value, large fixed values among them
+    // (ForwardCall). The checker admits nothing else (TypeCheck::CheckExport: one concrete top-level
+    // function, no pool or builder parameter, at most one fixed-size result or a const u8 slice), and
+    // the C generator's wrapper cannot take anything else either, so a signature that is not
+    // one is a compile error, as the C generator's is, not a program for another backend.
+    void CheckExport(CodeGen &cg, SFunction *sf) {
+        auto bad = [&](const string &what) {
+            cg.Fail(sf->line, cat("export fn ", sf->name, " ", what));
+        };
+        if (sf->specs.size() != 1 || !cg.sinfo.count(sf->specs[0]))
+            bad("has no emitted specialization");
         auto sp = sf->specs[0];
         auto &si = cg.sinfo[sp];
-        if (!si.freevars.empty() || sp->rets.size() > 1 || !mod->SigOk(sp, false, why)) return fail();
+        if (!si.freevars.empty()) bad("uses variables of an enclosing function");
+        if (sp->rets.size() > 1) bad("returns more than one value");
+        string why;
+        if (!mod->SigOk(sp, false, why)) bad(cat("has a signature tinygen cannot compile: ", why));
         for (size_t i = 0; i < sp->argtypes.size(); i++) {
             auto t = sp->argtypes[i];
-            if (cg.IsPoolParam(sp, i) || mod->RzParam(t) || !mod->TypeOk(t)) return fail();
+            if (cg.IsPoolParam(sp, i) || mod->RzParam(t))
+                bad(cat("takes parameter ", i + 1, " of type ", mod->Name(t),
+                        ", which has no C representation"));
+            if (!mod->TypeOk(t))
+                bad(cat("takes parameter ", i + 1, " of type ", mod->NameWhy(t),
+                        ", which tinygen cannot hold"));
         }
-        if (!sp->rets.empty() && ((si.cret != 0 && !cg.IsLargeFixed(sp->rets[0])) ||
-                                  !mod->TypeOk(sp->rets[0])))
-            return fail();
-        return true;
+        if (sp->rets.empty()) return;
+        if (si.cret != 0 && !cg.IsLargeFixed(sp->rets[0]))
+            bad(cat("returns ", mod->Name(sp->rets[0]), ", which is not returned by value"));
+        if (!mod->TypeOk(sp->rets[0]))
+            bad(cat("returns ", mod->NameWhy(sp->rets[0]), ", which tinygen cannot hold"));
     }
 
     // The C symbol of each `export fn` (CodeGen::EmitExports), calling it with gs_sp 0.
