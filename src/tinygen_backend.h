@@ -166,12 +166,18 @@ inline string TgSupportBody(string_view runtimeh) {
     s += "static GS_TG_TLS gs_stack *gs_tg_tstks;\n"
          "void *gs_tg_stks(void) { return gs_tg_tstks; }\n"
          // A program without threads has one block, the main thread's: gs_stks, set by gs_rt_init.
+         // A standalone unit with threads (GS_NEED_THREADS) has gs_stks thread-local, and no use
+         // for the fixed address.
+         "#if defined(GS_SEPARATE_RUNTIME) || !GS_NEED_THREADS\n"
          "void *gs_tg_stkpp = (void *)&gs_stks;\n"
+         "#endif\n"
          "void gs_tg_stack_block(int64_t n) {\n"
          "    gs_tg_tstks = (gs_stack *)calloc((size_t)(n > 0 ? n : 1), sizeof(gs_stack));\n"
          "    if (!gs_tg_tstks) gs_panic(\"out of memory allocating stack block\");\n"
          "    for (int64_t i = 0; i < n; i++) gs_stack_init(&gs_tg_tstks[i]);\n"
          "}\n"
+         // A standalone unit has the runtime's threads only with GS_NEED_THREADS.
+         "#if defined(GS_SEPARATE_RUNTIME) || GS_NEED_THREADS\n"
          "static void gs_tg_thread_run(void (*entry)(uint8_t *), uint8_t *args) {\n"
          "    entry(args);\n"
          "    gs_rt_stats();\n"
@@ -185,6 +191,7 @@ inline string TgSupportBody(string_view runtimeh) {
          "    return gs_thread_start(gs_tg_thread_run, gs_tg_thread_release, entry, args, size,\n"
          "                           contained);\n"
          "}\n"
+         "#endif\n"
          "static uint8_t gs_tg_noglobals;\n"
          "void gs_tg_start(int argc, char **argv, int64_t mainstacks, int64_t mainregions,\n"
          "                 int64_t workerregions, uint64_t reserve, uint64_t gap,\n"
@@ -259,6 +266,13 @@ struct TgModule {
             found = rtdecls.substr(bol, 7) == "GS_API ";
         }
         return rtapi[name] = found;
+    }
+
+    // Whether the module defines the C function `name` itself: an `export fn`'s wrapper.
+    bool Defines(const string &name) {
+        for (auto sf : ast.functions)
+            if (sf->isexport && sf->cname == name) return true;
+        return false;
     }
 
     // cout: the module writes C source (TYG_OUTPUT_C) for the C compiler, not an object.
@@ -5853,8 +5867,23 @@ struct TgFn {
         if (!known) list.push_back(callee);
         if (Ended()) return Dummy(callee->rets.empty() ? nullptr : callee->rets[0]);
         auto sym = M.FnSym(direct ? callee->sf->cname : cat("gs_tg_x_", callee->sf->cname));
-        return Result(callee, callee->rets.empty() ? -1 : 0, M.ExternSig(callee), tyg_direct(sym),
-                      args);
+        // In C output the callee may be one the runtime's or an --include header's text declares
+        // (TinyGenBackend::DeclareHeaderSymbols), with its own C types, which a struct of tinygen's
+        // does not convert to: such a call goes through the callee's address, as a call to a
+        // function of tinygen's signature, which the ABI makes the same call. The call is in a block
+        // of its own: tyg_call makes a call through an address taken in the same block a direct one.
+        auto aggregate = false;
+        for (auto t : callee->argtypes) aggregate = aggregate || !M.IsScalar(t);
+        for (auto t : callee->rets) aggregate = aggregate || !M.IsScalar(t);
+        auto target = tyg_direct(sym);
+        if (M.cout && aggregate && !M.Defines(callee->sf->cname)) {
+            auto addr = AddrOf(tyg_at_sym(sym, 0));
+            auto call = NewBlock();
+            tyg_jump(p, call);
+            SetBlock(call);
+            target = tyg_indirect(addr);
+        }
+        return Result(callee, callee->rets.empty() ? -1 : 0, M.ExternSig(callee), target, args);
     }
 
     static TypeExpr *PlainPointee(TypeExpr *t) {
@@ -8556,6 +8585,30 @@ struct TinyGenBackend : CodeGen::SpecBackend {
             if (!SupportHolds(sp->sf->cname)) s += Trampoline(cg, sp, true);
         return s;
     }
+
+    // The names a whole program's one C unit declares before tinygen's C (TinygenUnit in main.cpp):
+    // the runtime's exported functions (RuntimeApi, but not the C library's math, whose names tinygen
+    // keeps to itself), what the support body defines (TgSupportBody), and the extern trampolines,
+    // the support body's or, with --include, those of ExternTrampolines.
+    bool HeaderDeclares(const string &name) {
+        if (name.rfind("gs_tg_x_", 0) == 0) return externunit || SupportHolds(name.substr(8));
+        static const set<string> support = { "gs_tg_start", "gs_tg_end", "gs_tg_stack_block" };
+        if (support.count(name) || !TgFixedShim(name).empty()) return true;
+        if (name.rfind("gs_", 0) != 0) return false;
+        return mod->RuntimeApi(name);
+    }
+
+    // In that unit, every symbol the header declares is TYG_SYM_DECLARED: tinygen's C then prints no
+    // declaration of its own, which would clash with the header's C types, and calls it by name. A
+    // call whose arguments a header type would not take from tinygen's goes through the callee's
+    // address (GenExternCall).
+    void DeclareHeaderSymbols() {
+        for (auto &[name, sym] : mod->syms)
+            if (HeaderDeclares(name)) tyg_symbol_add_flags(mod->m, sym, TYG_SYM_DECLARED);
+    }
+
+    // The text of that header, which tinygen's C prints after its prelude (tyg_c_header).
+    void CHeader(const string &text) { tyg_c_header(mod->m, text.c_str()); }
 
     // Whether the object can be the whole program, with no C half: every live specialization compiled,
     // nothing asked of the C half that the support object (TgSupportBody) or the object does not hold

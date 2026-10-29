@@ -580,41 +580,33 @@ string RuntimeObjectSource() {
 
 // The C of the tinygen backend's support object (TgSupportBody): what the C
 // half of a program gives the tinygen object and does not depend on the
-// program, for a build with no C half. Compiled once per runtime and
-// configuration, `checks` (GS_DEBUG) included, as the runtime object is.
-// `jit`: the support unit of a goose run, which TinyCC compiles beside
-// tinygen's C against the runtime hosted in this compiler (jit_runtime.c),
-// as the C generator's program is (the assemble lambda in Main).
-string TinygenSupportSource(bool checks, bool jit = false) {
+// program, for a native build with no C half. Compiled once per runtime and
+// configuration, `checks` (GS_DEBUG) included, as the runtime object is. tinygen's C holds
+// the same in its one unit instead (TinygenUnitHeader).
+string TinygenSupportSource(bool checks) {
 #if !GOOSE_HAVE_TINYGEN
     (void)checks;
-    (void)jit;
     return "";
 #else
     auto rh = RuntimeSections({ "runtime.h" });
     return cat("/* The tinygen backend's support object (docs/design/tinygen_backend.md),\n"
                "   written by the Goose compiler. Do not edit. */\n\n",
-               jit ? cat("#define GS_EMBEDDED_JIT 1\n", RuntimeSections({ "jit_c.h" }),
-                         "#define GS_SEPARATE_RUNTIME 1\n")
-                   : cat("#define GS_SEPARATE_RUNTIME 1\n#define GS_RUNTIME_VERSION ",
-                         RuntimeVersion(), "\n"),
+               "#define GS_SEPARATE_RUNTIME 1\n#define GS_RUNTIME_VERSION ", RuntimeVersion(), "\n",
                checks ? "#define GS_DEBUG 1\n" : "", rh,
                "#pragma pack(push, 1)\n"
                "typedef struct { uint8_t *base; int64_t len; } gs_rhdr;\n"
                "typedef struct { gs_rhdr *hdr; gs_stack *stk; } gs_rref;\n"
                "typedef struct { uint8_t *data; int64_t len; } sl_u8;\n"
                "#pragma pack(pop)\n",
-               RuntimeSections({ "runtime_ext.h" }), TgSupportBody(rh),
-               jit ? "\nvoid gs_jit_cleanup(void) { free(gs_stks); gs_stks = NULL; gs_nstks = 0; }\n"
-                   : "");
+               RuntimeSections({ "runtime_ext.h" }), TgSupportBody(rh));
 #endif
 }
 
-// The C of a whole tinygen program's extern unit, with --include: the runtime's headers, the
-// program's C types (CodeGen::types), the headers, which are written against them, and the
+// The C of a whole native tinygen program's extern unit, with --include: the runtime's headers,
+// the program's C types (CodeGen::types), the headers, which are written against them, and the
 // trampolines through which tinygen's object calls the extern fns (ExternTrampolines). Compiled
-// with the program, beside the support object; `jit` as for TinygenSupportSource.
-string TinygenExternSource(bool checks, bool jit, const string &types,
+// with the program, beside the support object.
+string TinygenExternSource(bool checks, const string &types,
                            const vector<string> &headers, const string &trampolines) {
     string includes;
     for (auto inc : headers) {
@@ -624,28 +616,85 @@ string TinygenExternSource(bool checks, bool jit, const string &types,
     }
     return cat("/* The extern fns of a program the tinygen backend compiled, with its --include\n"
                "   headers (docs/design/tinygen_backend.md), written by the Goose compiler. */\n\n",
-               jit ? cat("#define GS_EMBEDDED_JIT 1\n", RuntimeSections({ "jit_c.h" }),
-                         "#define GS_SEPARATE_RUNTIME 1\n")
-                   : cat("#define GS_SEPARATE_RUNTIME 1\n#define GS_RUNTIME_VERSION ",
-                         RuntimeVersion(), "\n"),
+               "#define GS_SEPARATE_RUNTIME 1\n#define GS_RUNTIME_VERSION ", RuntimeVersion(), "\n",
                checks ? "#define GS_DEBUG 1\n" : "", RuntimeSections({ "runtime.h" }), types,
                RuntimeSections({ "runtime_ext.h" }), "\n/* ---- includes ---- */\n", includes,
                "\n/* ---- trampolines ---- */\n", trampolines);
 }
 
-// tinygen's C as a TinyCC unit of a goose run: the embedded JIT has no C headers of its own
-// (jit.h), so the prelude's includes give way to the declarations of jit_c.h and TinyCC's
-// va_list.
-string TinygenJitUnit(string text) {
-    for (auto h : { "stdint", "string", "stddef", "stdlib", "math", "stdarg" }) {
-        auto inc = cat("#include <", h, ".h>\n");
-        if (auto at = text.find(inc); at != string::npos) text.erase(at, inc.size());
+// A whole tinygen program as one C translation unit (docs/design/tinygen_backend.md), what goose
+// build, goose run and `-o x.c` write: the header printed after tinygen's prelude
+// (TinyGenBackend::CHeader). It holds the runtime's headers, or with `standalone` the whole runtime;
+// the program's C types (CodeGen::types), which an --include header is written against, where it has
+// headers; the support body (TgSupportBody); the headers; and the trampolines through which tinygen's
+// C calls their extern fns (ExternTrampolines). tinygen's C declares none of what it names there
+// (TinyGenBackend::DeclareHeaderSymbols).
+string TinygenUnitHeader(bool standalone, const string &types, const vector<string> &headers,
+                         const string &trampolines) {
+    string includes;
+    for (auto inc : headers) {
+        // As the C generator writes them (CodeGen): forward slashes, which every C compiler takes.
+        for (auto &c : inc) if (c == '\\') c = '/';
+        Append(includes, "#include \"", inc, "\"\n");
     }
-    return cat(RuntimeSections({ "jit_c.h" }),
+    // The support body's types, where the program's do not hold them already (EmitCoreTypes, CT).
+    string core;
+    for (auto [name, def] : { pair { "gs_rhdr", "typedef struct { uint8_t *base; int64_t len; } gs_rhdr;\n" },
+                              pair { "gs_rref", "typedef struct { gs_rhdr *hdr; gs_stack *stk; } gs_rref;\n" },
+                              pair { "sl_u8", "typedef struct { uint8_t *data; int64_t len; } sl_u8;\n" } })
+        if (types.find(cat("} ", name, ";")) == string::npos) core += def;
+#if !GOOSE_HAVE_TINYGEN
+    return "";
+#else
+    auto rh = RuntimeSections({ "runtime.h" });
+    return cat("\n/* ---- the Goose runtime's headers (goose --emit-runtime) ---- */\n",
+               standalone ? RuntimeSections({ "runtime.h", "runtime_impl.h", "runtime_threads.h" }) : rh,
+               types, core.empty() ? "" : cat("#pragma pack(push, 1)\n", core, "#pragma pack(pop)\n"),
+               standalone ? RuntimeSections({ "runtime_ext.h", "runtime_os.h" })
+                          : RuntimeSections({ "runtime_ext.h" }),
+               TgSupportBody(rh), includes.empty() ? "" : cat("\n/* ---- includes ---- */\n", includes),
+               trampolines.empty() ? "" : cat("\n/* ---- trampolines ---- */\n", trampolines),
+               "\n/* ---- the program, written by tinygen ---- */\n");
+#endif
+}
+
+// tinygen's C with that header (`text`, TinyGenBackend::CText) as the file or the TinyCC unit: before
+// it what the runtime's headers read, the -D `defines` among them; after it, in a goose run (`jit`),
+// the cleanup the embedded JIT calls. `jit` also gives the prelude's includes way to jit_c.h's
+// declarations and TinyCC's va_list: the embedded JIT has no C headers of its own (jit.h).
+// `threads`: the program's, which a standalone unit builds the runtime's threads for.
+string TinygenUnit(string text, const string &filename, const string &defines, bool checks,
+                   bool standalone, bool threads, bool jit) {
+    string pre = cat("/* Written by the Goose compiler from ", filename, " through tinygen: the program,\n"
+                     "   the runtime's ", standalone ? "source" : "headers", " and the support of the "
+                     "tinygen backend in one translation unit. Do not edit.\n",
+                     standalone ? "   It holds the runtime: compile it alone. */\n\n"
+                                : "   Link it with the runtime that `goose --emit-runtime` writes. */\n\n",
+                     // Before tinygen's prelude includes the first system header (runtime.h).
+                     "#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)\n#define _DEFAULT_SOURCE 1\n"
+                     "#endif\n");
+    // The checks of GS_DEBUG are in tinygen's code, written or not as the file was.
+    if (!checks)
+        Append(pre, "#if defined(GS_DEBUG) && GS_DEBUG\n#error this file was written without "
+                    "GS_DEBUG's checks: goose --debug or -DGS_DEBUG=1 writes them\n#endif\n");
+    if (jit) {
+        for (auto h : { "stdint", "string", "stddef", "stdlib", "math", "stdarg" }) {
+            auto inc = cat("#include <", h, ".h>\n");
+            if (auto at = text.find(inc); at != string::npos) text.erase(at, inc.size());
+        }
+        Append(pre, "#define GS_EMBEDDED_JIT 1\n", RuntimeSections({ "jit_c.h" }),
                "typedef __builtin_va_list va_list;\n#define va_start __builtin_va_start\n"
                "#define va_arg __builtin_va_arg\n#define va_copy __builtin_va_copy\n"
-               "#define va_end __builtin_va_end\n",
-               text);
+               "#define va_end __builtin_va_end\n");
+    }
+    if (!standalone)
+        Append(pre, "#define GS_SEPARATE_RUNTIME 1\n",
+               jit ? string() : cat("#define GS_RUNTIME_VERSION ", RuntimeVersion(), "\n"));
+    else if (threads)
+        pre += "#define GS_NEED_THREADS 1\n";
+    return cat(pre, defines, text,
+               jit ? "\nvoid gs_jit_cleanup(void) { free(gs_stks); gs_stks = NULL; gs_nstks = 0; }\n"
+                   : "");
 }
 
 // Locates the src/runtime/ directory (only needed by --gen-runtime-header):
@@ -1800,6 +1849,9 @@ int Main(int argc, char **argv) {
     // it is the whole program (no C half to compile), with GS_DEBUG's checks.
     string tgobject;
     bool tgwhole = false, tgchecks = false, tgfallback = false;
+    // Whether tinygen's C is the whole program's one unit (TinygenUnit): no support object, no
+    // extern unit and, with --standalone, no runtime object beside it.
+    bool tgunit = false;
     // With --backend=tinygen-c, the C tinygen wrote, which the build compiles to tgobject.
     string tgcsource;
     // With --include, a whole program's extern unit (TinygenExternSource), which the build compiles
@@ -1917,9 +1969,10 @@ int Main(int argc, char **argv) {
         // not a file from here is one the C compiler is meant to find on its
         // own include path, and is left alone. A JIT run has no file to be
         // relative to and resolves them from the working directory.
+        // goose build -o x.c writes the C there rather than to the build directory.
         if (!outfile.empty())
             for (auto &inc : includes)
-                if (FileExists(inc)) inc = RelativeTo(inc, DirOf(outfile));
+                if (FileExists(inc)) inc = RelativeTo(inc, DirOf(tgcout.empty() ? outfile : tgcout));
         // The extern-support runtime is written against the generated types,
         // so it goes in after them rather than up front.
         string_view runtime_ext_text;
@@ -1940,6 +1993,7 @@ int Main(int argc, char **argv) {
                                                   RuntimeSections({ "runtime.h", "runtime_ext.h" }));
                 tgb->skip = tinygenskip;
                 tgb->coutput = tinygenc || tgjit;
+                tgb->externunit = !includes.empty();
             }
             CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, stackcfg, tgb.get());
         #else
@@ -1967,12 +2021,6 @@ int Main(int argc, char **argv) {
                 // puts its main into the object and compiles no C.
                 string whynot;
                 if (!building && !tgjit) whynot = "not goose build";
-                // tinygen's C cannot hold the runtime in one file (it declares the runtime's
-                // functions with tinygen's signatures), so -o x.c --standalone stays the C
-                // generator's; a standalone build compiles the runtime into the build directory.
-                else if (standalone && !tgcout.empty()) whynot = "--standalone with -o x.c";
-                // tinygen's C alone does not hold the --include headers' functions.
-                else if (!includenames.empty() && !tgcout.empty()) whynot = "--include with -o x.c";
                 else if (tinygenmixed) whynot = "--tinygen-mixed";
                 // Every -D reaches the support unit (DefinesSource), the C that includes the
                 // runtime's headers; tinygen's C reads none.
@@ -1985,10 +2033,13 @@ int Main(int argc, char **argv) {
                     for (auto sp : calls)
                         if (!sp->sf->dylib.empty()) whynot = cat("extern ", sp->sf->cname, " of a shared library");
                 }
-                tgb->externunit = !includes.empty();
                 tgwhole = whynot.empty() && tgb->WholeProgram(cg, whynot);
-                if (tgwhole && tgb->externunit)
-                    tgextern = TinygenExternSource(tgb->checks, tgjit, cg.types, includes,
+                // tinygen's C of a whole program is one translation unit with the runtime's headers
+                // (TinygenUnit); the native object takes the --include headers' trampolines from an
+                // extern unit of its own.
+                tgunit = tgwhole && tgb->coutput;
+                if (tgwhole && tgb->externunit && !tgunit)
+                    tgextern = TinygenExternSource(tgb->checks, cg.types, includes,
                                                    tgb->ExternTrampolines(cg));
                 // The default build takes the C generator's C for all of a program tinygen
                 // cannot take whole, as a JIT run does; no mixed build unless asked for.
@@ -1999,18 +2050,32 @@ int Main(int argc, char **argv) {
                 // the object and ask the C half for more.
                 tgb->Compile(cg);
                 cg.result += tgb->Shims(cg);
+                // The unit's text, once tinygen has it all.
+                auto unittext = [&] {
+                    tgb->DeclareHeaderSymbols();
+                    tgb->CHeader(TinygenUnitHeader(standalone && !tgjit,
+                                                   tgb->externunit ? cg.types : string(), includes,
+                                                   tgb->externunit ? tgb->ExternTrampolines(cg)
+                                                                   : string()));
+                    string text, err;
+                    if (!tgb->CText(text, err))
+                        throw CompileError { cat("tinygen: cannot write the C: ", err) };
+                    return text;
+                };
+                auto threads = TinyGenBackend::Threaded(cg);
                 if (tgjit) {
                     // Not a mixed program in one TinyCC unit: the C generator's for all of it.
                     if (tgwhole) {
-                        string text, err;
-                        if (!tgb->CText(text, err))
-                            throw CompileError { cat("tinygen: cannot write the C: ", err) };
-                        jitunits = { TinygenSupportSource(tgchecks, true),
-                                     TinygenJitUnit(std::move(text)) };
-                        if (!tgextern.empty()) jitunits.push_back(tgextern);
+                        auto text = unittext();
+                        auto defs = DefinesSource(cdefines, true);
+                        jitunits = { TinygenUnit(text, filename, defs, tgchecks, false, false, true) };
+                        // --jit with -o writes the unit a C compiler builds as well.
+                        if (!outfile.empty() && !dryrun &&
+                            !WriteFileMakingDirs(outfile, TinygenUnit(text, filename, defs, tgchecks,
+                                                                      standalone, threads, false)))
+                            throw CompileError { cat("cannot write output file: ", outfile) };
                     }
-                    // --jit with -o writes the C generator's C as well.
-                    if (!tgwhole || !outfile.empty())
+                    if (!tgwhole)
                         cgalone = make_unique<CodeGen>(ast, runtime_ext_text, includes, norfcheck,
                                                        library, stackcfg);
                     if (verbose)
@@ -2040,13 +2105,18 @@ int Main(int argc, char **argv) {
                     throw CompileError { cat("-o ", tgcout, ": the program needs the C half too "
                                              "(mixed: ", whynot, "); goose build without -o "
                                              "builds both") };
-                if (!tgb->taken.empty() && !outfile.empty() && !tgfallback) {
+                if (!tgb->taken.empty() && !outfile.empty() && !tgfallback && !tgjit) {
                     tgobject = cat(DirOf(outfile), PathStem(outfile), ".tg.o");
                     if (tinygenc) tgcsource = tgcout.empty() ? cat(DirOf(outfile), PathStem(outfile),
                                                                    ".tg.c") : tgcout;
                     auto written = tinygenc ? tgcsource : tgobject;
                     string err;
-                    if (!dryrun && !tgb->Write(written, err))
+                    if (tgunit) {
+                        auto unit = TinygenUnit(unittext(), filename, DefinesSource(cdefines, true),
+                                                tgchecks, standalone, threads, false);
+                        if (!dryrun && !WriteFileMakingDirs(written, unit))
+                            throw CompileError { cat("cannot write ", written) };
+                    } else if (!dryrun && !tgb->Write(written, err))
                         throw CompileError { cat("tinygen: cannot write ", written, ": ", err) };
                     // nothing is printed on success; the help says what the C links with
                 }
@@ -2118,8 +2188,6 @@ int Main(int argc, char **argv) {
             // tinygen's units: the -D defines go to the support unit, which holds the
             // runtime's headers; tinygen's C reads none.
             if (!jitunits.empty()) {
-                jitunits[0].insert(0, defines);
-                if (jitunits.size() > 2) jitunits[2].insert(0, defines);
                 program = std::move(jitunits);
             } else {
                 program = { assemble(true, true) };
@@ -2170,6 +2238,7 @@ int Main(int argc, char **argv) {
         tgcsource.clear();
         tgextern.clear();
         tgwhole = false;
+        tgunit = false;
         tgfallback = false;
         astp.reset();
         nativepkgs.clear();
@@ -2224,7 +2293,7 @@ int Main(int argc, char **argv) {
                 }
                 // --standalone: the runtime compiled for this program, with the -D given, in
                 // place of the runtime object built once per C compiler (buildopts.standalone).
-                if (tgwhole && standalone) {
+                if (tgwhole && standalone && !tgunit) {
                     auto src = cat(builddir, "/goose_runtime.c");
                     auto obj = cat(builddir, "/goose_runtime.o");
                     if (!buildopts.dryrun &&
@@ -2239,7 +2308,7 @@ int Main(int argc, char **argv) {
                     tgobjects.push_back(obj);
                 }
                 pair<string, std::function<string()>> tgsupport;
-                if (tgwhole) {
+                if (tgwhole && !tgunit) {
                     // The -D given reach it, and make it a support object of their own.
                     auto src = DefinesSource(cdefines, false) + TinygenSupportSource(tgchecks);
                     tgsupport = { cat("goose_tgsupport", tgchecks ? "_checks-" : "-", Hex8(src)),
