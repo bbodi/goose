@@ -688,7 +688,8 @@ class Runner:
         if self.cc and debug_fixture(f, line):
             with self.into(res.debug):
                 res.c["debug"] = self.gendir / f"{f.stem}-debug.c"
-                res.gen["debug"] = self.goose("-O2", "-o", res.c["debug"], f)
+                # tinygen's C holds GS_DEBUG's checks or not as it is written (G3.4b).
+                res.gen["debug"] = self.goose("-O2", "-DGS_DEBUG=1", "-o", res.c["debug"], f)
         return res
 
     def fixture_runs(self, f, generated, builds):
@@ -1706,7 +1707,7 @@ def main():
     def loop_shapes():
         f = HERE / "optimizer" / "loop_shapes.goose"
         cfile = gendir / "loop_shapes-shapes.c"
-        code, out, err = r.goose("-O1", "-o", cfile, f)
+        code, out, err = r.goose("--backend=c", "-O1", "-o", cfile, f)
         if code != 0:
             r.fail(f"loop shapes {f.name}", out + err)
         elif r.check_loop_shapes(cfile.read_text()):
@@ -1717,7 +1718,7 @@ def main():
     def inline_fn_c():
         f = HERE / "optimizer" / "optimize.goose"
         cfile = gendir / "optimize-inline.c"
-        code, out, err = r.goose("-O1", "-o", cfile, f)
+        code, out, err = r.goose("--backend=c", "-O1", "-o", cfile, f)
         if code != 0:
             r.fail("inline fn C", out + err)
             return
@@ -1734,7 +1735,7 @@ def main():
     def member_params():
         f = HERE / "codegen" / "member_parameters.goose"
         cfile = gendir / "member_parameters-sig.c"
-        code, out, err = r.goose("-O1", "-o", cfile, f)
+        code, out, err = r.goose("--backend=c", "-O1", "-o", cfile, f)
         if code != 0:
             r.fail(f"member parameters {f.name}", out + err)
             return
@@ -1753,7 +1754,7 @@ def main():
     def member_stores():
         f = HERE / "codegen" / "member_stores.goose"
         cfile = gendir / "member_stores-c.c"
-        code, out, err = r.goose("-O1", "-o", cfile, f)
+        code, out, err = r.goose("--backend=c", "-O1", "-o", cfile, f)
         if code != 0:
             r.fail(f"member stores {f.name}", out + err)
             return
@@ -1770,7 +1771,7 @@ def main():
     def static_arrays():
         f = HERE / "codegen" / "const_global_folding.goose"
         cfile = gendir / "const_global_folding-static.c"
-        code, out, err = r.goose("-O1", "-o", cfile, f)
+        code, out, err = r.goose("--backend=c", "-O1", "-o", cfile, f)
         if code != 0:
             r.fail(f"static arrays {f.name}", out + err)
             return
@@ -1855,7 +1856,8 @@ def main():
         # release build.
         def clang_codegen():
             src = gendir / "cgclang.c"
-            code, out, err = r.goose("-O2", "-o", src, HERE / "codegen" / "codegen_exec.goose")
+            code, out, err = r.goose("--backend=c", "-O2", "-o", src,
+                                     HERE / "codegen" / "codegen_exec.goose")
             if code != 0:
                 r.fail("cgen-clang codegen_exec.goose", out + err)
                 return
@@ -1899,7 +1901,7 @@ def main():
 
         def clang_simd(name, path, versions):
             src = gendir / f"simdclang-{name}.c"
-            code, out, err = r.goose("-O2", "-o", src, path)
+            code, out, err = r.goose("--backend=c", "-O2", "-o", src, path)
             if code != 0:
                 r.fail(f"simd-clang {name}.goose", out + err)
                 return
@@ -1959,7 +1961,8 @@ def main():
             for gopt in ("-O2", "-O0"):
                 tag = gopt[1:].lower()
                 src = gendir / f"muladdclang-{tag}.c"
-                code, out, err = r.goose(gopt, "-o", src, HERE / "codegen" / f"{name}.goose")
+                code, out, err = r.goose("--backend=c", gopt, "-o", src,
+                                         HERE / "codegen" / f"{name}.goose")
                 if code != 0:
                     r.fail(f"mul_add-clang{gopt} {name}.goose", out + err)
                     continue
@@ -2001,7 +2004,8 @@ def main():
         def clang_vec():
             name = "vec_elemwise"
             src = gendir / "vecclang.c"
-            code, out, err = r.goose("-O2", "-o", src, HERE / "codegen" / f"{name}.goose")
+            code, out, err = r.goose("--backend=c", "-O2", "-o", src,
+                                     HERE / "codegen" / f"{name}.goose")
             if code != 0:
                 r.fail(f"vec-clang {name}.goose", out + err)
                 return
