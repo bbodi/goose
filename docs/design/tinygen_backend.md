@@ -51,8 +51,7 @@ optimization and BCE, with the analyses and type services of `CodeGen`
   what each body owns and hands its callees (`stackown`, `stackcalls`), and
   `CodeGen::Finish` turns that into the counts `main` starts the runtime
   with, checked against `GS_MAX_STACKS`.
-* **The checker's annotations**: `exprtype`, `Call::spec`, `Index::nobc`, the
-  loop shapes, and the rest.
+* **The checker's annotations**: `exprtype`, `Call::spec`, `Index::nobc`, and the rest.
 
 The driver (`main.cpp`) constructs `CodeGen` (the analyses), lets
 `TinyGenBackend::Choose` build every live specialization, calls
@@ -240,7 +239,38 @@ compile error above when one does.
   struct uses a cursor past each variable-size field.
 * **`RenderInto`** renders a value structurally.
 
+### Typed memory in the C
+
+tinygen's C prints an access as bytes (a `memcpy`), which the C compiler must
+assume may alias anything, unless the address is tagged with the C type it is
+accessed as, along the path of records and arrays it was reached through
+(`tyg_at_type`, `tyg_at_field`, `tyg_at_elem`): `((struct tyg_r0 *)p)->f1.f0`
+for `p.vel.x`. C's aliasing rules then let it reorder accesses of different
+types, and two paths alias only where one's outermost type contains the
+other's. So a place is tagged only where its bytes hold one Goose type,
+written as that type or untagged. `P::typed` marks such places, and `P::a`
+carries the path: variables (not a large value on a data stack), what a
+reference refers to, the elements of slices and resizable arrays (each a path
+of its own), and, from a typed base, fields (`FieldPlace`: field k of the
+struct's record, pads not counted) and inline array elements (`ConstElem` for
+a constant index; a variable one starts a path at the element). A global is
+reached through a record of its own (`GlobalP`, `TgModule::WrapAT`), as the
+old C generator's `GS_GL->G.x` was: a loop's stores into an array of `float3`
+structs then cannot touch a `float3` global's reads, so they leave the loop,
+while a write through a reference to the global still aliases them. `TagAt`
+tags a scalar load or store, and a whole fixed value's copy (both sides, so
+the C prints a struct assignment); the leaves of elementwise arithmetic walk
+the same path (`ElemAt`). Untagged stay: ADT payloads (another variant's
+fields hold the same bytes; payload places are made by offset, untagged, and
+a whole ADT is a record whose variants overlap, a union, which C lets alias),
+a struct literal's field stores, varint and relative-reference slots, headers
+of resizables, images, frame objects, `tyg_move` and `tyg_zero`. Untagged
+accesses may alias every type, so a typed read of bytes an untagged store
+wrote stays in order. What remains open is memory a data stack or a pool
+reuses for another type in the same function; C's own allocators share that.
+
 ## Debug info
+
 
 tinygen writes DWARF on macOS and Linux, and CodeView on Windows. Each
 function is described under its Goose name, with its C name as the linkage

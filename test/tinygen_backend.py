@@ -222,6 +222,11 @@ STACK_LIMITED = [("test/codegen/append_destination_storage.goose", "-DGS_MAX_STA
                  ("test/codegen/cycle_scratch_locals.goose", "-DGS_MAX_STACKS=4"),
                  ("test/codegen/named_init_inplace.goose", "-DGS_MAX_STACKS=1")]
 PROGRAMS += [(path, [flag]) for path, flag in STACK_LIMITED]
+# Typed memory in the C (TgFn::TagAt): at -O2 the C compiler may reorder accesses of different C
+# types, so an ADT rewritten between variants, the particles loop, nested fields, a global written
+# through a reference and reinterpreted bytes must still read back right (check_typed_c too).
+TYPED_MEMORY = "test/codegen/typed_memory.goose"
+PROGRAMS += [(TYPED_MEMORY, ["-O2"])]
 
 # The windowed samples: built whole and not run, since they loop until their
 # window closes.
@@ -321,6 +326,7 @@ def check_tinygen_backend(exe, base, ok, fail, say):
             continue
         ok(f"{label} ({done} of {total} functions, whole program)")
     check_tinygen_c(exe, base, ok, fail, say, builtin)
+    check_typed_c(exe, base, ok, fail)
     check_run(exe, base, ok, fail)
     check_jit(exe, base, ok, fail)
     check_default_inlining(exe, base, ok, fail)
@@ -430,7 +436,29 @@ def check_tinygen_c(exe, base, ok, fail, say, builtin):
     ok("goose run --backend tinygen-c, and -o out.c writing tinygen's C")
 
 
+def check_typed_c(exe, base, ok, fail):
+    """tinygen's C reads and writes typed memory as its C types: a field along its path of structs
+    (`((struct tyg_rN *)p)->f1.f0`), a global through a struct of its own (one member, a struct)
+    and a whole struct by assignment, not as bytes."""
+    cout = base / "typed_memory.tg.c"
+    code, o, e = tc.run_capture([exe, "build", "--backend=tinygen-c", "-O2", "-o", cout,
+                                 ROOT / TYPED_MEMORY])
+    text = tc.decode(cout.read_bytes()) if code == 0 and cout.exists() else ""
+    wraps = re.findall(r"struct (?:TYG_ALIGNED\(\d+\) )?tyg_r(\d+) \{\n\tstruct tyg_r\d+ f0;\n\};", text)
+    if not re.search(r"= \(float\)\(\(struct tyg_r\d+ \*\)\(.*\)\)->f\d+\.f\d+;", text) or \
+            not any(re.search(rf"\(\(struct tyg_r{w} \*\)\(.*\)\)->f0\.f\d+", text) for w in wraps) or \
+            not re.search(r"\(\*\(struct tyg_r\d+ \*\)\(v\d+\)\) = \(\*\(struct tyg_r\d+ \*\)\(v\d+\)\);",
+                          text):
+        fail("tinygen's C of typed memory: a field path, a global's own struct and a struct "
+             "assignment", o + e)
+        return
+    ok("tinygen's C of typed memory: field paths, globals through structs of their own, struct "
+       "assignments")
+
+
+
 def check_run(exe, base, ok, fail):
+
     """goose run --backend=tinygen builds the program in its build cache and
     runs it: the program's output and exit code are the run's, its
     arguments are the ones after --, its resources are its source's
