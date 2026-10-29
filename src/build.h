@@ -225,16 +225,15 @@ inline string RuntimeObject(const Builder &b) {
     return CachedObject(b, "goose_runtime", RuntimeObjectSource, "compiling the runtime", "cc.log");
 }
 
-// What `goose build` does once the compiler has written the program's C to
-// `cfile` in `builddir`: finds the runtime object for the toolchain `tc`,
-// which built the native parts whose response files are `nativersps`
-// (native.h and builtin.h, found by the caller) in link order, a package's
-// before the packages it requires and the program's own C first of all, and
-// links the executable, named by -o, the program's sidecar (`output`) or the
-// root file. A whole program the tinygen backend wrote (`cfile` "") links its
-// object with the support object `tgsupport` names (TinygenSupportSource),
-// cached as the runtime object is, so that no C of the program's is compiled.
-// The exit code.
+// What `goose build` does once tinygen has written the program: finds the
+// runtime object for the toolchain `tc`, which built the native parts whose
+// response files are `nativersps` (native.h and builtin.h, found by the
+// caller) in link order, a package's before the packages it requires and the
+// program first of all, and links the executable, named by -o, the program's
+// sidecar (`output`) or the root file. tinygen's C (`cfile`, tinygen-c) is
+// compiled by the link command; a native tinygen object (`cfile` "", in
+// `extraobjects`) links with the support object `tgsupport` names
+// (TinygenSupportSource), cached as the runtime object is. The exit code.
 inline int BuildExecutable(const string &rootfile, const string &cfile, const string &builddir,
                            const Toolchain &tc, const BuildOptions &opts, FILE *msgs,
                            const vector<string> &nativersps, const string &output,

@@ -76,7 +76,6 @@ import argparse
 import json
 import concurrent.futures
 import os
-import platform
 import re
 import shutil
 import subprocess
@@ -1071,82 +1070,6 @@ class Runner:
                 valid = False
         return valid
 
-    def check_loop_shapes(self, text):
-        # The loops codegen restates mark themselves in the C with a comment
-        # naming the shape (optimize_loops.h, BCE's lenbound). Every shape_
-        # function of the fixture must have the one it is named for, and no
-        # keep_ function any.
-        bodies = {}
-        texts = {}
-        for m in re.finditer(r"^static [^\n;]*?\b((?:shape|keep)_\w+?)_g\d*\([^\n]*\) \{\n(.*?)^\}\n",
-                             text, re.MULTILINE | re.DOTALL):
-            bodies[m[1]] = re.findall(r"/\* loop shape: ([^*]*?) \*/", m[2])
-            texts[m[1]] = m[2]
-        strip = "strip-mined by"
-        sums = "sum terms in blocks of 8"
-        bound = "trip count bounded by"
-        down = "countdown counted up"
-        shapes = {
-            "shape_strip_lanes": f"{strip} 8", "shape_strip_count": f"{strip} 4",
-            "shape_strip_range": f"{strip} 3", "shape_strip_u8": f"{strip} 16",
-            "shape_strip_return": f"{strip} 4", "shape_strip_structs": f"{strip} 2",
-            "shape_strip_fixed": f"{strip} 4", "shape_strip_div": f"{strip} 4",
-            "shape_sum_dot": sums, "shape_sum_count": sums, "shape_sum_f32": sums,
-            "shape_sum_range": sums, "shape_sum_spec": sums, "keep_sum_reads": None,
-            "shape_bound_count": f"{bound} 8", "shape_bound_any": f"{bound} 8",
-            "shape_bound_all": f"{bound} 8", "shape_bound_for": f"{bound} 6",
-            "shape_bound_grow": f"{bound} 8",
-            "shape_down": down, "shape_down_u8": down, "shape_down_i8": down,
-            "shape_down_u64": down, "shape_down_jumps": down, "keep_down_twice": None,
-        }
-        valid = True
-        for name, want in shapes.items():
-            got = bodies.get(name)
-            if got is None:
-                self.fail(f"loop shapes {name}", "no C function of its own (inlined?)")
-                valid = False
-            elif (want not in got) if want else got:
-                self.fail(f"loop shapes {name}", f"got {got}, want {want or 'none'}")
-                valid = False
-        # Both copies of a body run in blocks divide by the magic number of a
-        # divisor the loop cannot change (HoistDivisors), never by the divisor.
-        body = texts.get("shape_strip_div", "")
-        if "gs_divu32_q(" not in body or re.search(r"\bgs_(?:div|mod)_u32\(", body):
-            self.fail("loop shapes shape_strip_div", "a division not by the divisor's magic number")
-            valid = False
-        # A && or || condition is a chain of branches (CodeGen::GenBranch):
-        # neither the 0/1 flag the right operand sets inside an `if`, which
-        # a value keeps, nor the two flags combined with & or | of a loop that
-        # can be straight-line code (§6.11), nor an inlined bool call's result
-        # held for the branch (or the call left a call).
-        def forms(body):
-            got = set()
-            if re.search(r"uint8_t (t\d+) = \(uint8_t\)\([^\n]* != 0\);\n\s*if \(!?\1\) \{", body):
-                got.add("flag")
-            if re.search(r"\(uint8_t\)\(t\d+ [&|] \(uint8_t\)\(", body):
-                got.add("speculative")
-            if (re.search(r"^\s*uint8_t (t\d+);\n(?:.*\n)*?\s*if \(!?\(?\1\)?\) ", body, re.M)
-                    or re.search(r"\bclean_g\d*\(", body)):
-                got.add("call")
-            return got
-        chains = {
-            "shape_chain_while": set(), "shape_chain_skip": set(), "shape_chain_if": set(),
-            "shape_chain_guard": set(), "shape_chain_order": set(), "shape_chain_call": set(),
-            "keep_chain_value": {"flag"}, "keep_chain_spec": {"speculative"},
-            "shape_sum_spec": {"speculative"},
-        }
-        for name, want in chains.items():
-            if name not in texts:
-                self.fail(f"loop shapes {name}", "no C function of its own (inlined?)")
-                valid = False
-            elif forms(texts[name]) != want:
-                self.fail(f"loop shapes {name}",
-                          f"got {sorted(forms(texts[name])) or 'branches'}, want {sorted(want) or 'branches'}")
-                valid = False
-        return valid
-
-    # --- the Goose-written compiler ---------------------------------------
-
     def goose_in_goose(self, cc, profile, extra, jit):
         """Exercise the compiler as a large program, then execute its output.
 
@@ -1702,88 +1625,6 @@ def main():
         r"^worker `worker`: 0 data stacks \+ 0 argument and global stacks = 0 regions$",
         r"^thread cap: none, no worker holds a region$",
     ])
-    # The loops codegen restates, read in the C of their fixture, where -O1
-    # keeps each function a C function of its own.
-    def loop_shapes():
-        f = HERE / "optimizer" / "loop_shapes.goose"
-        cfile = gendir / "loop_shapes-shapes.c"
-        code, out, err = r.goose("--backend=c", "-O1", "-o", cfile, f)
-        if code != 0:
-            r.fail(f"loop shapes {f.name}", out + err)
-        elif r.check_loop_shapes(cfile.read_text()):
-            r.ok(f"loop shapes {f.name}")
-    r.show_task(loop_shapes)
-    # An inline fn returning two values stays a call in Goose and is declared
-    # GS_INLINE in the C, for the C compiler to inline (§7.13).
-    def inline_fn_c():
-        f = HERE / "optimizer" / "optimize.goose"
-        cfile = gendir / "optimize-inline.c"
-        code, out, err = r.goose("--backend=c", "-O1", "-o", cfile, f)
-        if code != 0:
-            r.fail("inline fn C", out + err)
-            return
-        text = cfile.read_text()
-        pair = re.search(r"^static GS_INLINE [^\n;]*\bil_pair_g\d*\(", text, re.MULTILINE)
-        plain = re.search(r"^static GS_INLINE [^\n;]*\bil_plain_g\d*\(", text, re.MULTILINE)
-        if not pair or plain:
-            r.fail("inline fn C", f"il_pair GS_INLINE: {bool(pair)}, il_plain GS_INLINE: {bool(plain)}")
-        else:
-            r.ok("inline fn C")
-    r.show_task(inline_fn_c)
-    # A slice and a builder parameter are two C parameters each (spec C.3),
-    # the slice's data pointer as `void *` (ParamFields).
-    def member_params():
-        f = HERE / "codegen" / "member_parameters.goose"
-        cfile = gendir / "member_parameters-sig.c"
-        code, out, err = r.goose("--backend=c", "-O1", "-o", cfile, f)
-        if code != 0:
-            r.fail(f"member parameters {f.name}", out + err)
-            return
-        sig = re.search(r"^static void walk_g\w*\(([^)]*)\) \{$", cfile.read_text(),
-                        re.MULTILINE)
-        want = (r"void \*\w+, int64_t \w+, gs_i64 \w+, gs_rhdr \*\w+, gs_stack \*\w+, "
-                r"void \*\w+, int64_t \w+")
-        if not sig or not re.fullmatch(want, sig[1]):
-            r.fail(f"member parameters {f.name}",
-                   f"walk's parameters: got {sig[1] if sig else None}")
-        else:
-            r.ok(f"member parameters {f.name}")
-    r.show_task(member_params)
-    # Fields nothing can move are member stores, not stores through a
-    # pointer taken first (StableDest).
-    def member_stores():
-        f = HERE / "codegen" / "member_stores.goose"
-        cfile = gendir / "member_stores-c.c"
-        code, out, err = r.goose("--backend=c", "-O1", "-o", cfile, f)
-        if code != 0:
-            r.fail(f"member stores {f.name}", out + err)
-            return
-        body = re.search(r"^static void store_links_g\w*\([^\n]*\) \{\n(.*?)^\}\n",
-                         cfile.read_text(), re.MULTILINE | re.DOTALL)
-        stores = body and all(re.search(rf"\)\.{fld}_g = ", body[1]) for fld in ("w", "prev"))
-        if not stores or re.search(r"gs_f64 \*t\d+ = &", body[1]):
-            r.fail(f"member stores {f.name}", body[1] if body else "no store_links in the C")
-        else:
-            r.ok(f"member stores {f.name}")
-    r.show_task(member_stores)
-    # A constant array of listed elements is static data at any length, and
-    # a long fill keeps its runtime initialization (MAXSTATICELEMS).
-    def static_arrays():
-        f = HERE / "codegen" / "const_global_folding.goose"
-        cfile = gendir / "const_global_folding-static.c"
-        code, out, err = r.goose("--backend=c", "-O1", "-o", cfile, f)
-        if code != 0:
-            r.fail(f"static arrays {f.name}", out + err)
-            return
-        text = cfile.read_text()
-        listed = re.search(r"^static const a260_i64 LONG_g\w* = ", text, re.MULTILINE)
-        filled = re.search(r"^static const \w+ FILLED_g", text, re.MULTILINE)
-        if not listed or filled:
-            r.fail(f"static arrays {f.name}",
-                   f"LONG static: {bool(listed)}, FILLED static: {bool(filled)}")
-        else:
-            r.ok(f"static arrays {f.name}")
-    r.show_task(static_arrays)
 
     # Every annotated regression, including the expected-abort cases. These
     # describe the default O1 pass; O0/O2 execution checks semantics.
@@ -1854,14 +1695,16 @@ def main():
         # generated C is actually valid: a call to a function defined only in
         # debug builds compiled silently under MSVC and broke every clang
         # release build.
+        # The C is written with GS_DEBUG's checks or without them, so the debug build asks goose
+        # for them.
         def clang_codegen():
-            src = gendir / "cgclang.c"
-            code, out, err = r.goose("--backend=c", "-O2", "-o", src,
-                                     HERE / "codegen" / "codegen_exec.goose")
-            if code != 0:
-                r.fail("cgen-clang codegen_exec.goose", out + err)
-                return
             for label in ("release", "debug"):
+                src = gendir / f"cgclang-{label}.c"
+                code, out, err = r.goose(*(["-DGS_DEBUG=1"] if label == "debug" else []), "-O2",
+                                         "-o", src, HERE / "codegen" / "codegen_exec.goose")
+                if code != 0:
+                    r.fail(f"cgen-clang-{label} codegen_exec.goose", out + err)
+                    continue
                 out_exe = gendir / f"cgclang-{label}{tc.EXE_SUFFIX}"
                 ok, log = clang.compile(src, out_exe, opt=1, warn="off", strict_decls=True,
                                         defines=["GS_DEBUG=1"] if label == "debug" else [],
@@ -1873,179 +1716,12 @@ def main():
                 out = r.run_expected([out_exe], "codegen_exec", f"clang-{label} codegen_exec.goose")
                 if out is not None and r.check_stdout("codegen_exec", f"clang-{label}", out):
                     r.ok(f"cgen-clang-{label} codegen_exec.goose")
-        # The versions of the simd functions (spec §7.12) exist only where
-        # clang builds for x86-64: each level the C may be built for runs
-        # here, at -O2 so the loops vectorize, and has to print what the
-        # baseline does. On a CPU without AVX-512 or AVX2 the higher builds
-        # run the highest version it has, which is still a version.
-        # simd_versions.goose covers the language's side; the stdlib fixtures
-        # check the library's simd functions, as clang builds them.
-        def clang_simd_versions(ctext):
-            # Every simd function keeps its versions, the single-use ones the
-            # optimizer would otherwise inline and the element-run twin too.
-            # The generic total has two specializations, numbered.
-            missing = [f for f in ("caesar_g", "checksum_g", "muladd_g", "squares_g", "minmax_g",
-                                   "biased_g", "fib_g", "sum3_g", "squares_g_er")
-                       if f"{f}_simd1(" not in ctext or f"{f}_simd2(" not in ctext]
-            if len(set(re.findall(r"\b(total_g_\d+)_simd[12]\(", ctext))) != 2:
-                missing.append("total_g")
-            return missing
-
-        def clang_simd_named(*names):
-            # A C name may carry a specialization's number after the module's.
-            def missing(ctext):
-                return [f for f in names
-                        if not re.search(rf"\b{f}_g\d+(_\d+)?_simd1\(", ctext)
-                        or not re.search(rf"\b{f}_g\d+(_\d+)?_simd2\(", ctext)]
-            return missing
-
-        def clang_simd(name, path, versions):
-            src = gendir / f"simdclang-{name}.c"
-            code, out, err = r.goose("--backend=c", "-O2", "-o", src, path)
-            if code != 0:
-                r.fail(f"simd-clang {name}.goose", out + err)
-                return
-            missing = versions(src.read_text(encoding="utf-8"))
-            if missing:
-                r.fail(f"simd-clang {name}.goose", f"no simd versions of {', '.join(missing)}")
-                return
-            for level in ("2", "1", "0"):
-                label = f"simd{level}"
-                out_exe = gendir / f"simdclang-{name}-{level}{tc.EXE_SUFFIX}"
-                ok, log = clang.compile(src, out_exe, opt=2, warn="off", strict_decls=True,
-                                        defines=[f"GS_SIMD={level}"], runtime=r.runtime,
-                                        log=gendir / f"simdclang-{name}-{level}.log")
-                if not ok:
-                    r.fail(f"{label}-clang {name}.goose", "\n".join(log.splitlines()[:8]))
-                    continue
-                out = r.run_expected([out_exe], name, f"clang-{label} {name}.goose")
-                if out is not None and r.check_stdout(name, f"clang-{label}", out):
-                    r.ok(f"{label}-clang {name}.goose")
-        # math's mul_add is the one result a simd function's versions may give
-        # differently from its baseline (spec §7.12): rounded once where the
-        # code is built for FMA. Built by clang at each level, a plain
-        # function rounds as the target does (once on arm64, twice on a plain
-        # x86-64 build) and the simd function's versions round once, which on
-        # x86-64 a CPU with AVX2 and FMA runs at levels 1 and 2. Where the CPU
-        # can't be asked, levels 1 and 2 may give either.
-        def host_fma():
-            if tc.IS_WINDOWS:
-                try:
-                    import ctypes
-                    # PF_AVX2_INSTRUCTIONS_AVAILABLE; every CPU with AVX2
-                    # this runs on has FMA.
-                    return bool(ctypes.windll.kernel32.IsProcessorFeaturePresent(40))
-                except (AttributeError, OSError):
-                    return None
-            if sys.platform.startswith("linux"):
-                try:
-                    flags = set()
-                    for line in open("/proc/cpuinfo", encoding="utf-8"):
-                        if line.startswith("flags"):
-                            flags.update(line.split(":", 1)[1].split())
-                            break
-                    return "avx2" in flags and "fma" in flags
-                except OSError:
-                    return None
-            return None
-
-        def clang_mul_add():
-            name = "simd_mul_add"
-            arm = platform.machine().lower() in ("arm64", "aarch64")
-            fma = host_fma()
-            # The program reports five calls: a plain function's, then in a
-            # simd function a direct call, an inline helper's, a plain
-            # helper's and one through a function value. At Goose -O2 the
-            # helpers are inlined (the plain one may or may not be); at -O0
-            # nothing is, and both keep the plain function's rounding.
-            for gopt in ("-O2", "-O0"):
-                tag = gopt[1:].lower()
-                src = gendir / f"muladdclang-{tag}.c"
-                code, out, err = r.goose("--backend=c", gopt, "-o", src,
-                                         HERE / "codegen" / f"{name}.goose")
-                if code != 0:
-                    r.fail(f"mul_add-clang{gopt} {name}.goose", out + err)
-                    continue
-                ctext = src.read_text(encoding="utf-8")
-                if not re.search(r"#define GS_MUL_ADD_MODE fused\nGS_SIMD_TARGET1 static [^\n]*"
-                                 r"\bdirect_g\w*_simd1\(", ctext):
-                    r.fail(f"mul_add-clang{gopt} {name}.goose", "no fused mode around the AVX2 version")
-                    continue
-                for level in ("2", "1", "0"):
-                    label = f"mul_add-simd{level}-clang{gopt} {name}.goose"
-                    out_exe = gendir / f"muladdclang-{tag}-{level}{tc.EXE_SUFFIX}"
-                    ok, log = clang.compile(src, out_exe, opt=2, warn="off", strict_decls=True,
-                                            defines=[f"GS_SIMD={level}"], runtime=r.runtime,
-                                            log=gendir / f"muladdclang-{tag}-{level}.log")
-                    if not ok:
-                        r.fail(label, "\n".join(log.splitlines()[:8]))
-                        continue
-                    out = r.check_run(name, label, *tc.run_capture([out_exe, "modes"]))
-                    if out is None:
-                        continue
-                    lines = out.splitlines()
-                    got = lines[-1].split() if lines else []
-                    plain = {"fused" if arm else "separate"}
-                    simd = ({"fused"} if arm else {"separate"} if level == "0" else
-                            {"fused", "separate"} if fma is None else {"fused" if fma else "separate"})
-                    inlined = simd if gopt == "-O2" else plain
-                    want = [plain, simd, inlined, simd | plain if gopt == "-O2" else plain, simd]
-                    if len(lines) != 2 or lines[0] != "true" or len(got) != len(want) or                             any(g not in w for g, w in zip(got, want)):
-                        r.fail(label, f"got {out!r}; want " +
-                               " ".join("|".join(sorted(w)) for w in want))
-                    else:
-                        r.ok(label)
-
-        # Elementwise float arithmetic as one vector operation (GS_VEC,
-        # runtime.h): vec_elemwise's struct and array shapes are computed
-        # through each of the six vector types where the compiler has vector
-        # extensions, and nothing else is. Built by clang with GS_VEC on and
-        # off, both print the member-by-member results.
-        def clang_vec():
-            name = "vec_elemwise"
-            src = gendir / "vecclang.c"
-            code, out, err = r.goose("--backend=c", "-O2", "-o", src,
-                                     HERE / "codegen" / f"{name}.goose")
-            if code != 0:
-                r.fail(f"vec-clang {name}.goose", out + err)
-                return
-            ctext = src.read_text(encoding="utf-8")
-            missing = [v for v in ("gs_vf64_2", "gs_vf64_4", "gs_vf64_8", "gs_vf32_4", "gs_vf32_8", "gs_vf32_16")
-                       if f"GS_VST({v}," not in ctext]
-            if missing:
-                r.fail(f"vec-clang {name}.goose", f"no vector operations on {', '.join(missing)}")
-                return
-            # The generated code's tests are indented; runtime.h's are not.
-            opens = len(re.findall(r"^\s+#if GS_VEC$", ctext, re.M))
-            elses = len(re.findall(r"^\s+#else$", ctext, re.M))
-            if opens == 0 or opens > elses:
-                r.fail(f"vec-clang {name}.goose", f"{opens} vector operations, {elses} member-by-member ones")
-                return
-            for on in ("1", "0"):
-                label = f"vec{on}"
-                out_exe = gendir / f"vecclang-{on}{tc.EXE_SUFFIX}"
-                ok, log = clang.compile(src, out_exe, opt=2, warn="off", strict_decls=True,
-                                        defines=[f"GS_VEC={on}"], runtime=r.runtime,
-                                        log=gendir / f"vecclang-{on}.log")
-                if not ok:
-                    r.fail(f"{label}-clang {name}.goose", "\n".join(log.splitlines()[:8]))
-                    continue
-                out = r.run_expected([out_exe], name, f"clang-{label} {name}.goose")
-                if out is not None and r.check_stdout(name, f"clang-{label}", out):
-                    r.ok(f"{label}-clang {name}.goose")
-
         if args.profile == "sanitize":
             pass  # The full generated-C suite already ran through Clang.
         elif not clang:
             r.show_later(r.say, "skip cgen-clang (no clang found)")
         else:
             r.show_task(clang_codegen)
-            r.show_task(clang_simd, "simd_versions", HERE / "codegen" / "simd_versions.goose",
-                        clang_simd_versions)
-            r.show_task(clang_simd, "stdlib_base64", HERE / "stdlib" / "stdlib_base64.goose",
-                        clang_simd_named("base64_encode", "base64_decode"))
-            r.show_task(clang_mul_add)
-            r.show_task(clang_vec)
 
     r.section("driver, diagnostics and language server")
 

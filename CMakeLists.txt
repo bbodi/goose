@@ -176,28 +176,25 @@ target_sources(goose PRIVATE src/jit_runtime.c src/jit_runtime.h)
 target_include_directories(goose PRIVATE "${CMAKE_BINARY_DIR}")
 set_property(TARGET goose PROPERTY C_STANDARD 11)
 
-# The tinygen backend (docs/design/tinygen_backend.md): tinygen is one C99
-# translation unit in a repository of its own, by default checked out beside
-# this one. Without it the compiler has the C backend only, and
-# `--backend=tinygen` reports that tinygen was left out.
+# The backend (docs/design/tinygen_backend.md): tinygen is one C99 translation unit in a repository
+# of its own, by default checked out beside this one. The compiler cannot be built without it.
 set(TINYGEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../tinygen" CACHE PATH
-    "A tinygen checkout, for the tinygen backend; empty or missing builds without it")
-if(TINYGEN_DIR AND EXISTS "${TINYGEN_DIR}/src/tinygen.c" AND
-   EXISTS "${TINYGEN_DIR}/include/tinygen.h")
-    add_library(goose_tinygen STATIC "${TINYGEN_DIR}/src/tinygen.c")
-    target_include_directories(goose_tinygen PUBLIC "${TINYGEN_DIR}/include")
-    set_target_properties(goose_tinygen PROPERTIES C_STANDARD 99)
-    if(MSVC)
-        target_compile_options(goose_tinygen PRIVATE /W0)
-    else()
-        target_compile_options(goose_tinygen PRIVATE -w)
-    endif()
-    target_link_libraries(goose PRIVATE goose_tinygen)
-    target_compile_definitions(goose PRIVATE GOOSE_HAVE_TINYGEN=1)
-    message(STATUS "tinygen backend: ${TINYGEN_DIR}")
-else()
-    message(STATUS "tinygen backend: left out (no tinygen at TINYGEN_DIR='${TINYGEN_DIR}')")
+    "A tinygen checkout, the compiler's backend")
+if(NOT (TINYGEN_DIR AND EXISTS "${TINYGEN_DIR}/src/tinygen.c" AND
+        EXISTS "${TINYGEN_DIR}/include/tinygen.h"))
+    message(FATAL_ERROR "no tinygen at TINYGEN_DIR='${TINYGEN_DIR}': the compiler's backend "
+                        "(check tinygen out beside this repository, or set TINYGEN_DIR)")
 endif()
+add_library(goose_tinygen STATIC "${TINYGEN_DIR}/src/tinygen.c")
+target_include_directories(goose_tinygen PUBLIC "${TINYGEN_DIR}/include")
+set_target_properties(goose_tinygen PROPERTIES C_STANDARD 99)
+if(MSVC)
+    target_compile_options(goose_tinygen PRIVATE /W0)
+else()
+    target_compile_options(goose_tinygen PRIVATE -w)
+endif()
+target_link_libraries(goose PRIVATE goose_tinygen)
+message(STATUS "tinygen: ${TINYGEN_DIR}")
 
 # The blessed packages GOOSE_BUILTIN_LIBS names (src/blessed.txt; `all`, or
 # a list of their names), compiled into the compiler (cmake/package.cmake),

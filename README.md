@@ -517,16 +517,15 @@ committed as it is used, and `--stack-reserve 16G` changes that size.
 option, including how to write the C for a build system or a C host of your
 own (`goose -o tour.c tour.goose`).
 
-`goose build` goes through [tinygen](docs/design/tinygen_backend.md) when the compiler
-has it (`--backend=tinygen-c`, or with `--debug` `--backend=tinygen`), and through
-the C generator for a program tinygen cannot take whole; `--backend=c` asks for
-that. `goose build --backend=tinygen` (experimental) makes a debug build through
-[tinygen](docs/design/tinygen_backend.md), a code generator that writes
-machine code with debug info directly. The compiler must be built with a
-tinygen checkout beside this one (`TINYGEN_DIR`). The debugger then shows
-Goose functions, `.goose` lines, and locals with their Goose names and types.
-A program that tinygen compiles whole needs no C compiler except to link. A
-function tinygen does not support goes through C, and `-v` says why.
+Every build and run goes through [tinygen](docs/design/tinygen_backend.md), a
+code generator that writes C or machine code with debug info directly; the
+compiler is built with a tinygen checkout beside this one (`TINYGEN_DIR`).
+`goose build` has tinygen write C, which the C compiler optimizes
+(`--backend=tinygen-c`); with `--debug` it makes a debug build from tinygen's
+machine code (`--backend=tinygen`). The debugger then shows Goose functions,
+`.goose` lines, and locals with their Goose names and types. Such a build
+needs no C compiler except to link. A construct tinygen does not support yet
+is a compile error that names it.
 `goose run --backend=tinygen` builds the program the same way and runs it.
 `goose debug prog.goose -- args` builds it the same way and starts lldb on it,
 with Goose's formatters loaded: arrays show as their elements, text as

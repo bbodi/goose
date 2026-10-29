@@ -11,7 +11,6 @@
 // with its defines, so GS_DEBUG means the same on both sides.
 #pragma once
 
-#if GOOSE_HAVE_TINYGEN
 #include "tinygen.h"
 
 namespace goose {
@@ -8385,12 +8384,9 @@ struct TinyGenBackend : CodeGen::SpecBackend {
     bool checks;
     string source;
     vector<FnSpec *> taken;
-    vector<pair<FnSpec *, string>> left;   // Specializations left to C, and why.
     unique_ptr<TgModule> mod;
     string_view runtime_ext_text;
     string runtime_decls;   // runtime.h and runtime_ext.h (TgModule::RuntimeApi).
-    // Left to C whatever they hold (--tinygen-skip): what tests calls across the two halves with.
-    vector<string> skip;
     // --backend=tinygen-c: Write writes tinygen's C source, which the C compiler builds into the
     // object, instead of the object.
     bool coutput = false;
@@ -8400,24 +8396,20 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         : ast(_ast), checks(_checks), source(_source), runtime_ext_text(_ext),
           runtime_decls(std::move(_decls)) {}
 
-    static string Why(const TgUnsupported &u) {
-        return u.line.line > 0 ? cat(u.why, " (line ", u.line.line, ")") : u.why;
+    // A construct the backend does not compile yet (TgFn::No): a compile error naming it and where.
+    [[noreturn]] void Unsupported(const string &why, Line l) {
+        auto where = l.line > 0 ? cat(" (", ast.sources[l.fileidx].first, ":", l.line, ")") : string();
+        throw CompileError { cat("tinygen backend: ", why, " is not supported yet", where) };
     }
-    // Runs emit() building fn's procedure: "" when it compiled, else why not. A construct not supported
-    // anywhere in the body abandons the procedure (tyg_proc_abort) and takes back what it asked of the
-    // module for the C half (shims, trampolines), so the whole body goes to C.
-    template <class F> string Attempt(TgFn &fn, F emit) {
-        auto nshims = mod->shims.size(), nexterns = mod->externs.size(), ndirect = mod->direct.size();
+    // Runs emit() building fn's procedure; a construct not supported anywhere in the body is a compile
+    // error (Unsupported).
+    template <class F> void Attempt(TgFn &fn, F emit) {
         try {
             emit();
         } catch (TgUnsupported &u) {
             if (fn.p) tyg_proc_abort(fn.p);
-            mod->shims.resize(nshims);
-            mod->externs.resize(nexterns);
-            mod->direct.resize(ndirect);
-            return Why(u);
+            Unsupported(u.why, u.line);
         }
-        return "";
     }
 
     tyg_sig *SigOf(const tyg_type *ret, const vector<const tyg_type *> &ps) {
@@ -8504,17 +8496,17 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         }
     }
 
-    // Builds sp into the module: "" when it compiled, else why not. A body that compiled tells the C
-    // half's stack accounting (codegen_stacks.h) the stacks it owns and what it hands its callees.
-    string Build(CodeGen &cg, FnSpec *sp) {
+    // Builds sp into the module, or fails the compile on what it does not support. The body tells the
+    // stack accounting (codegen_stacks.h) the stacks it owns and what it hands its callees.
+    void Build(CodeGen &cg, FnSpec *sp) {
         string why;
         // A simd function is its baseline version here (§7.12).
-        if (!mod->SigOk(sp, true, why)) return cat("interface: ", why);
+        if (!mod->SigOk(sp, true, why))
+            Unsupported(cat("the signature of ", sp->sf->name, " (", why, ")"), sp->sf->line);
         TgFn fn(*mod, sp);
-        if (auto w = Attempt(fn, [&] { fn.Emit(); }); !w.empty()) return w;
+        Attempt(fn, [&] { fn.Emit(); });
         cg.stackown[sp] = fn.maxown;
         cg.stackcalls[sp] = fn.stackcalls;
-        return "";
     }
 
     vector<FnSpec *> Externs() override {
@@ -8532,20 +8524,11 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         mod = make_unique<TgModule>(ast, cg, checks, source, coutput);
         mod->rtdecls = runtime_decls;
         mod->fixedaddrs = !UsesThreads(cg);
-        if (!mod->m) {
-            for (auto sp : specs) left.emplace_back(sp, "tinygen has no module for this target");
-            mod.reset();
-            return {};
-        }
+        if (!mod->m) throw CompileError { "tinygen backend: this target is not supported yet" };
         for (auto sp : specs) {
-            bool skipped = std::find(skip.begin(), skip.end(), sp->sf->qname) != skip.end();
-            auto w = skipped ? string("--tinygen-skip") : Build(cg, sp);
-            if (w.empty()) {
-                ours.insert(sp);
-                taken.push_back(sp);
-            } else {
-                left.emplace_back(sp, w);
-            }
+            Build(cg, sp);
+            ours.insert(sp);
+            taken.push_back(sp);
         }
         BuildRenders();
         return ours;
@@ -8736,7 +8719,6 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         auto mainsf = ast.MainFunction();
         auto mainsp = mainsf && !mainsf->specs.empty() ? mainsf->specs[0] : nullptr;
         if (!mod) why = "nothing compiled";
-        else if (!left.empty()) why = cat(left.size(), " function(s) left to C");
         // A library (--header) may have no main: its C host starts it through goose_init.
         else if ((mainsp || !cg.library) &&
                  (!mainsp || !cg.sinfo.count(mainsp) || !mainsp->params.empty() ||
@@ -9039,8 +9021,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                 line = g->line;
                 break;
             }
-        if (auto w = Attempt(fn, [&] { fn.EmitInit(sym, line); }); !w.empty())
-            return Refuse(why, cat("global initializer: ", w));
+        Attempt(fn, [&] { fn.EmitInit(sym, line); });
         int64_t need = fn.maxown;
         for (auto &c : fn.stackcalls) need = std::max(need, c.offset + cg.stackneed[c.callee]);
         // This one's temporaries may need more than the C's count; main asks the runtime for them.
@@ -9203,4 +9184,3 @@ struct TinyGenBackend : CodeGen::SpecBackend {
 };
 
 }  // namespace goose
-#endif

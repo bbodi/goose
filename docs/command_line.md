@@ -157,7 +157,7 @@ beyond those in [§5](#5-options-for-run-build-and-check):
 | `--debug` | Turn on the overflow, range and tag checks (`GS_DEBUG=1`), and build the C without optimization and with debug information (`/Od /Zi`, or `-O0 -g`), for a debugger. |
 | `--cc name\|path` | The C compiler, as above. |
 | `--standalone` | Compile the runtime into the program, rather than linking the runtime object built once per C compiler. tinygen's C then holds the whole runtime in its one file; with `--debug` (tinygen's machine code) the runtime is compiled from its source in the program's build directory and linked. |
-| `--backend name` | Without it, a compiler with tinygen builds through tinygen's C (`tinygen-c`), or with `--debug` through tinygen's machine code (`tinygen`); a program tinygen cannot take whole builds through the C generator's C (`c`), and says why. `-o x.c` writes the C, as the flag form does ([§8](#8-writing-the-c-yourself)), and builds nothing. |
+| `--backend name` | Without it, goose builds through tinygen's C (`tinygen-c`), or with `--debug` through tinygen's machine code (`tinygen`); either can be asked for. A construct tinygen does not support yet is a compile error that names it. `-o x.c` writes the C, as the flag form does ([§8](#8-writing-the-c-yourself)), and builds nothing. |
 | `-v` | Print each command the build runs, and what it prints. |
 | `--dry-run` | Print the commands the build would run, with their paths, and run none of them. A Makefile or CMake project can take them from here. |
 
@@ -310,7 +310,7 @@ On Windows the last two are `cl /O2 /c goose_runtime.c` and
 
 `-o out.c` writes the program's C and runs nothing; `--jit` also runs the
 program in-process as `goose run` would. `goose build -o out.c` writes the same
-file. With a compiler built with tinygen it is one translation unit, in this
+file. It is one translation unit, in this
 order: the `-D` defines and the configuration the runtime reads; tinygen's
 prelude of C macros; the runtime's headers (`runtime.h` and
 `runtime_ext.h`, the part of the runtime that is inlined into the program);
@@ -321,8 +321,7 @@ function per Goose function, with `#line` directives naming the `.goose`
 source, then `main`. The rest of the runtime (the OS layer, the reservation of
 data stacks, threads and printing) is the C that `--emit-runtime` writes,
 which is compiled once and linked with every program; with `--standalone` the
-file holds all of it instead and builds alone. A program tinygen cannot take
-whole gets the C generator's C instead (goose says why), with the same use.
+file holds all of it instead and builds alone.
 The checks of `--debug` (`GS_DEBUG=1`) are in tinygen's code as it is
 written: give `--debug` or `-DGS_DEBUG=1` to goose, not to the C compiler,
 which a file written without them refuses. It takes no `-D` of its own, since a program hands the runtime its

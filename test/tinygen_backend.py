@@ -1,16 +1,11 @@
-"""The tinygen backend: `goose build --backend=tinygen` against the
-expected output of the C backend.
+"""The backend: `goose build --backend=tinygen` against the blessed
+expected output.
 
 Each program in PROGRAMS is built and run; its output must be the blessed
-one the C backend is held to. Tinygen must compile at least one function of
-each program, and every function of those marked whole (the test/tinygen/
-fixtures among them). Some fixtures are also built with --tinygen-skip,
-which leaves the named functions to C, so that calls cross between the two
-halves in both directions. The WHOLE_PROGRAM programs must take the whole
-program path, which compiles no C of the program's own; with
---tinygen-mixed or --tinygen-skip they must take the mixed path. The gfx,
-ui, audio and physics fixtures run headless; the windowed samples
-(BUILD_ONLY) are only built. All of them are built and run again with
+one. Every program is built whole: every function through tinygen, main in
+tinygen's object, no C of the program compiled but tinygen's. The gfx, ui,
+audio and physics fixtures run headless; the windowed samples (BUILD_ONLY)
+are only built. All of them are built and run again with
 --backend=tinygen-c, through tinygen's C and the C compiler. Where lldb is
 installed, several fixtures run under it to check that the debugger finds
 Goose functions by name and shows their Goose source lines, and their
@@ -30,189 +25,96 @@ ROOT = HERE.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 import toolchain as tc  # noqa: E402
 
-# (source, whether every function must go through tinygen, extra build flags)
+# (source, extra build flags); every one is built whole, main and all, with no C of the program
+# compiled but tinygen's
 PROGRAMS = [
-    ("test/tinygen/tinygen_scalars.goose", True, []),
-    ("test/tinygen/tinygen_scalars.goose", True, ["--debug"]),
-    ("test/tinygen/tinygen_structs.goose", True, []),
-    ("test/tinygen/tinygen_structs.goose", False, ["--tinygen-skip=main"]),
-    ("test/tinygen/tinygen_structs.goose", False, ["--tinygen-skip=add,area,mixed_sum,swap"]),
-    ("test/tinygen/tinygen_structs.goose", False, ["--tinygen-skip=scale,dot,grow,mixed"]),
+    ("test/tinygen/tinygen_scalars.goose", []),
+    ("test/tinygen/tinygen_scalars.goose", ["--debug"]),
+    ("test/tinygen/tinygen_structs.goose", []),
     # Packed structs by value across the C calling convention, both ways: C returns to
     # tinygen, tinygen passes to C and back, C calls tinygen past the registers.
-    ("test/tinygen/tinygen_abi.goose", True, []),
-    ("test/tinygen/tinygen_abi.goose", False, ["--tinygen-skip=main"]),
-    ("test/tinygen/tinygen_abi.goose", False,
-     ["--tinygen-skip=mk_b1,mk_b3,mk_f2,mk_i8m,mk_u8f,mk_fu8,mk_if12,mk_f3,mk_df12,mk_u8i64,"
-      "mk_i64u8,mk_di,mk_id,mk_d2,mk_odd16,mk_s17,mk_s24,mk_s33,mk_arr,"
-      "mk_nest,mk_nest8,ret_i8,ret_u16"]),
-    ("test/tinygen/tinygen_abi.goose", False,
-     ["--tinygen-skip=h_b1,h_b3,h_f2,h_i8m,h_u8f,h_fu8,h_if12,h_f3,h_df12,h_u8i64,h_i64u8,"
-      "h_di,h_id,h_d2,h_odd16,h_s17,h_s24,h_s33,h_arr,h_nest,h_nest8,p_b3,"
-      "p_i8m,p_u8f,p_fu8,p_if12,p_f3,p_df12,p_u8i64,p_di,p_id,p_odd16,p_s17,"
-      "p_s33,p_nest,p_nest8,small,many_int,many_sse,many_mix,many_ret,"
-      "many_ret2"]),
-    ("test/tinygen/tinygen_extern.goose", True, []),
-    ("test/tinygen/tinygen_divzero.goose", True, []),
-    ("test/tinygen/tinygen_divzero.goose", True, ["--debug"]),
-    ("test/tinygen/tinygen_arrays.goose", True, []),
-    ("test/tinygen/tinygen_arrays.goose", True, ["--debug"]),
-    ("test/tinygen/tinygen_arrays.goose", False, ["--tinygen-skip=main"]),
-    ("test/tinygen/tinygen_arrays.goose", False,
-     ["--tinygen-skip=sum,weighted,bump,first_last,reverse,perimeter,count_bytes,at"]),
-    ("test/tinygen/tinygen_slicefail.goose", True, []),
-    ("test/tinygen/tinygen_results.goose", True, []),
-    ("test/tinygen/tinygen_results.goose", True, ["--debug"]),
-    ("test/tinygen/tinygen_results.goose", False, ["--tinygen-skip=main"]),
-    ("test/tinygen/tinygen_results.goose", False,
-     ["--tinygen-skip=divmod,minmax,split,corners,widen"]),
-    ("test/tinygen/tinygen_globals.goose", True, []),
-    ("test/tinygen/tinygen_globals.goose", True, ["--debug"]),
-    ("test/tinygen/tinygen_globals.goose", False, ["--tinygen-skip=main"]),
-    ("test/tinygen/tinygen_globals.goose", False,
-     ["--tinygen-skip=start_seed,divmod,bump,next,move_to,sum_primes"]),
-    ("test/tinygen/tinygen_strings.goose", True, []),
-    ("test/tinygen/tinygen_strings.goose", True, ["--debug"]),
-    ("test/tinygen/tinygen_strings.goose", False, ["--tinygen-skip=main"]),
-    ("test/tinygen/tinygen_strings.goose", False,
-     ["--tinygen-skip=count,first_last,total,sum_view,addto,own"]),
-    ("test/tinygen/tinygen_strings.goose", False, ["--tinygen-skip=walk,shout,far"]),
-    ("test/tinygen/tinygen_build.goose", True, []),
-    ("test/tinygen/tinygen_build.goose", True, ["--debug"]),
+    ("test/tinygen/tinygen_abi.goose", []),
+    ("test/tinygen/tinygen_extern.goose", []),
+    ("test/tinygen/tinygen_divzero.goose", []),
+    ("test/tinygen/tinygen_divzero.goose", ["--debug"]),
+    ("test/tinygen/tinygen_arrays.goose", []),
+    ("test/tinygen/tinygen_arrays.goose", ["--debug"]),
+    ("test/tinygen/tinygen_slicefail.goose", []),
+    ("test/tinygen/tinygen_results.goose", []),
+    ("test/tinygen/tinygen_results.goose", ["--debug"]),
+    ("test/tinygen/tinygen_globals.goose", []),
+    ("test/tinygen/tinygen_globals.goose", ["--debug"]),
+    ("test/tinygen/tinygen_strings.goose", []),
+    ("test/tinygen/tinygen_strings.goose", ["--debug"]),
+    ("test/tinygen/tinygen_build.goose", []),
+    ("test/tinygen/tinygen_build.goose", ["--debug"]),
     # The stack settings reach the support object at run time, so they keep a whole build.
-    ("test/tinygen/tinygen_build.goose", True, ["--stack-reserve", "64M"]),
-    ("test/tinygen/tinygen_build.goose", False, ["--tinygen-skip=main"]),
-    ("test/tinygen/tinygen_build.goose", False,
-     ["--tinygen-skip=squares,word,evens,label,split,points"]),
-    ("test/tinygen/tinygen_build.goose", False, ["--tinygen-skip=sum,own_sum,scan,nested"]),
-    ("test/tinygen/tinygen_text.goose", True, []),
-    ("test/tinygen/tinygen_text.goose", True, ["--debug"]),
-    ("test/tinygen/tinygen_text.goose", True, ["--tinygen-mixed"]),
-    ("test/tinygen/tinygen_text.goose", False, ["--tinygen-skip=main"]),
-    ("test/tinygen/tinygen_text.goose", False,
-     ["--tinygen-skip=lit,greet,first,pair,tail,wide,label"]),
-    ("test/tinygen/tinygen_text.goose", False,
-     ["--tinygen-skip=forward,named,size,same,differ,listing"]),
-    ("test/tinygen/tinygen_shrink.goose", True, []),
-    ("test/tinygen/tinygen_shrink.goose", True, ["--debug"]),
-    ("test/tinygen/tinygen_shrink.goose", False, ["--tinygen-skip=main"]),
-    ("test/tinygen/tinygen_shrink.goose", False,
-     ["--tinygen-skip=shrink,sized,points,reset,show"]),
-    ("test/tinygen/tinygen_nested.goose", True, []),
-    ("test/tinygen/tinygen_nested.goose", True, ["--debug"]),
-    ("test/tinygen/tinygen_nested.goose", False,
-     ["--tinygen-skip=counter,fields,via,words,build,more,outer,fact"]),
-    ("test/tinygen/tinygen_nested.goose", False,
-     ["--tinygen-skip=bump,grow,twice,total,add,inner,go"]),
-    ("test/tinygen/tinygen_nested.goose", False, ["--tinygen-skip=main,mid"]),
-    ("test/tinygen/tinygen_funvals.goose", True, []),
-    ("test/tinygen/tinygen_funvals.goose", True, ["--debug"]),
-    ("test/tinygen/tinygen_funvals.goose", False, ["--tinygen-skip=main"]),
-    ("test/tinygen/tinygen_funvals.goose", False,
-     ["--tinygen-skip=apply,both,pair,mapp,sum_by,fill,each,countdown"]),
-    ("test/tinygen/tinygen_gstacks.goose", True, []),
-    ("test/tinygen/tinygen_gstacks.goose", True, ["--debug"]),
-    ("test/tinygen/tinygen_gstacks.goose", False, ["--tinygen-skip=main"]),
-    ("test/tinygen/tinygen_gstacks.goose", False,
-     ["--tinygen-skip=record,sum,copied,add_point,name_len,shout,reassign"]),
-    ("test/tinygen/tinygen_retfrom.goose", True, []),
-    ("test/tinygen/tinygen_retfrom.goose", True, ["--debug"]),
-    ("test/tinygen/tinygen_retfrom.goose", False, ["--tinygen-skip=main"]),
+    ("test/tinygen/tinygen_build.goose", ["--stack-reserve", "64M"]),
+    ("test/tinygen/tinygen_text.goose", []),
+    ("test/tinygen/tinygen_text.goose", ["--debug"]),
+    ("test/tinygen/tinygen_shrink.goose", []),
+    ("test/tinygen/tinygen_shrink.goose", ["--debug"]),
+    ("test/tinygen/tinygen_nested.goose", []),
+    ("test/tinygen/tinygen_nested.goose", ["--debug"]),
+    ("test/tinygen/tinygen_funvals.goose", []),
+    ("test/tinygen/tinygen_funvals.goose", ["--debug"]),
+    ("test/tinygen/tinygen_gstacks.goose", []),
+    ("test/tinygen/tinygen_gstacks.goose", ["--debug"]),
+    ("test/tinygen/tinygen_retfrom.goose", []),
+    ("test/tinygen/tinygen_retfrom.goose", ["--debug"]),
     # Targets in C, the returns and the frames between in tinygen; then
     # the other way round; then the frames between in C.
-    ("test/tinygen/tinygen_retfrom.goose", False,
-     ["--tinygen-skip=search,check,split,fwd,inner,owner,first_over"]),
-    ("test/tinygen/tinygen_retfrom.goose", False,
-     ["--tinygen-skip=dig,bad,split_fail,forward,inner_leave,deep2,each,leave_nest"]),
-    ("test/tinygen/tinygen_retfrom.goose", False,
-     ["--tinygen-skip=deep,outer,after_owner,give,nest,point"]),
     # An --include header reads a struct its extern takes by reference, while every Goose
     # function, the extern's callers among them, is tinygen's: whole, the header in the extern unit.
-    ("samples/24_call_c.goose", True, ["--include", str(ROOT / "samples" / "call_c.h")]),
-    ("test/tinygen/tinygen_render.goose", True, []),
-    ("test/tinygen/tinygen_render.goose", True, ["--debug"]),
-    ("test/tinygen/tinygen_render.goose", False, ["--tinygen-skip=main"]),
-    ("test/tinygen/tinygen_render.goose", False, ["--tinygen-skip=show,label,points,link"]),
-    ("test/tinygen/tinygen_control.goose", True, []),
-    ("test/tinygen/tinygen_control.goose", True, ["--debug"]),
-    ("test/tinygen/tinygen_control.goose", False, ["--tinygen-skip=main"]),
-    ("test/tinygen/tinygen_control.goose", False,
-     ["--tinygen-skip=classify,small,side,valued,first_over,larger"]),
-    ("test/tinygen/tinygen_elemwise.goose", True, []),
-    ("test/tinygen/tinygen_elemwise.goose", True, ["--debug"]),
-    ("test/tinygen/tinygen_elemwise.goose", False, ["--tinygen-skip=bump,bumpa,make"]),
-    ("test/codegen/loop_invariant_divisors.goose", False, []),
-    ("test/codegen/cnames.goose", False, []),
-    ("test/codegen/wider_slot_operations.goose", False, []),
-    ("samples/21_raytrace.goose", False, []),
+    ("samples/24_call_c.goose", ["--include", str(ROOT / "samples" / "call_c.h")]),
+    ("test/tinygen/tinygen_render.goose", []),
+    ("test/tinygen/tinygen_render.goose", ["--debug"]),
+    ("test/tinygen/tinygen_control.goose", []),
+    ("test/tinygen/tinygen_control.goose", ["--debug"]),
+    ("test/tinygen/tinygen_elemwise.goose", []),
+    ("test/tinygen/tinygen_elemwise.goose", ["--debug"]),
+    ("test/codegen/loop_invariant_divisors.goose", []),
+    ("test/codegen/cnames.goose", []),
+    ("test/codegen/wider_slot_operations.goose", []),
+    ("samples/21_raytrace.goose", []),
     # Inlined code (-O2, the default; -O0 inlines nothing): a body spliced into its caller, its
     # returns leaving the block. Whole programs, so a fallback to C fails.
-    ("samples/21_raytrace.goose", True, ["-O2"]),
-    ("test/tinygen/tinygen_inline.goose", True, ["-O2"]),
-    ("test/tinygen/tinygen_inline.goose", True, ["-O1"]),
-    ("test/tinygen/tinygen_inline.goose", True, ["-O0"]),
-    ("test/tinygen/tinygen_inline.goose", True, ["-O2", "--debug"]),
-    ("test/codegen/recursive_loop_walk.goose", True, ["-O2"]),
-    ("test/codegen/exit_value_destination.goose", True, ["-O2"]),
-    ("test/codegen/exit_value_destination.goose", True, ["-O0"]),
-    ("samples/20_life.goose", True, []),
+    ("samples/21_raytrace.goose", ["-O2"]),
+    ("test/tinygen/tinygen_inline.goose", ["-O2"]),
+    ("test/tinygen/tinygen_inline.goose", ["-O1"]),
+    ("test/tinygen/tinygen_inline.goose", ["-O0"]),
+    ("test/tinygen/tinygen_inline.goose", ["-O2", "--debug"]),
+    ("test/codegen/recursive_loop_walk.goose", ["-O2"]),
+    ("test/codegen/exit_value_destination.goose", ["-O2"]),
+    ("test/codegen/exit_value_destination.goose", ["-O0"]),
+    ("samples/20_life.goose", []),
 ]
 
-# The programs tinygen builds whole with no C half: main in the object,
-# the rest from the support object, no C of the program compiled.
-WHOLE_PROGRAM = {
-    "tinygen_scalars", "tinygen_structs", "tinygen_divzero", "tinygen_arrays",
-    "tinygen_slicefail", "tinygen_results", "tinygen_build", "tinygen_text",
-    "tinygen_shrink", "tinygen_nested", "tinygen_funvals", "20_life",
-    "loop_invariant_divisors", "tinygen_globals", "tinygen_gstacks", "tinygen_retfrom",
-    "tinygen_render", "tinygen_strings", "tinygen_control", "tinygen_elemwise",
-    "tinygen_abi",
-}
 
 # ---- ADTs: fixed-mode values, variants, match and case-function dispatch,
-# whole and with the cases, the scrutinees' owners and main left to C in
-# turn; and a sample of variable-mode ADTs.
+# plain and --debug; and a sample of variable-mode ADTs.
 PROGRAMS += [
-    ("test/tinygen/tinygen_adts.goose", True, []),
-    ("test/tinygen/tinygen_adts.goose", True, ["--debug"]),
-    ("test/tinygen/tinygen_adts.goose", False, ["--tinygen-skip=main"]),
-    ("test/tinygen/tinygen_adts.goose", False,
-     ["--tinygen-skip=area,scale_area,name,tokval,widen,dirnum"]),
-    ("test/tinygen/tinygen_adts.goose", False,
-     ["--tinygen-skip=scaled,by_ref,grow,first_tok,turn,circle"]),
-    ("samples/05_shapes.goose", False, []),
+    ("test/tinygen/tinygen_adts.goose", []),
+    ("test/tinygen/tinygen_adts.goose", ["--debug"]),
+    ("samples/05_shapes.goose", []),
 ]
-WHOLE_PROGRAM |= {"tinygen_adts", "cnames", "tinygen_inline", "recursive_loop_walk"}
-WHOLE_PROGRAM |= {"wider_slot_operations", "05_shapes"}
 
 
-# Limited arrays T[..k]: the fixture whole, plain and --debug, then with
-# the functions taking, returning and growing them left to C in turn, so
-# that by-value and by-reference limited arrays (and structs holding one)
-# cross the two halves both ways.
+# Limited arrays T[..k]: by value and by reference, alone and in a struct, plain and --debug.
 PROGRAMS += [
-    ("test/tinygen/tinygen_limited.goose", True, []),
-    ("test/tinygen/tinygen_limited.goose", True, ["--debug"]),
-    ("test/tinygen/tinygen_limited.goose", False, ["--tinygen-skip=main"]),
-    ("test/tinygen/tinygen_limited.goose", False, ["--tinygen-skip=grow,halves,bag"]),
-    ("test/tinygen/tinygen_limited.goose", False,
-     ["--tinygen-skip=digits,sum,shrink,named,card"]),
+    ("test/tinygen/tinygen_limited.goose", []),
+    ("test/tinygen/tinygen_limited.goose", ["--debug"]),
     # A return nested in another return's T[] value as it is built.
-    ("test/codegen/exit_value_destination.goose", True, []),
+    ("test/codegen/exit_value_destination.goose", []),
 ]
-WHOLE_PROGRAM |= {"tinygen_limited", "exit_value_destination"}
 
 # Variable-size structs (tinygen_varsize): built in place, read behind
 # their variable-size fields, passed and returned by value and by
-# reference, crossing the halves both ways.
+# reference.
 PROGRAMS += [
-    ("test/tinygen/tinygen_varsize.goose", True, []),
-    ("test/tinygen/tinygen_varsize.goose", True, ["--debug"]),
-    ("test/tinygen/tinygen_varsize.goose", False, ["--tinygen-skip=main"]),
-    ("test/tinygen/tinygen_varsize.goose", False, ["--tinygen-skip=hire,pay,pick,with_count"]),
-    ("test/tinygen/tinygen_varsize.goose", False, ["--tinygen-skip=raise,describe,initials"]),
+    ("test/tinygen/tinygen_varsize.goose", []),
+    ("test/tinygen/tinygen_varsize.goose", ["--debug"]),
 ]
-WHOLE_PROGRAM |= {"tinygen_varsize"}
 
 
 
@@ -245,22 +147,12 @@ def check_lldb_varsize(exe, base, lldb, ok, fail):
     ok("tinygen debug info under lldb: a variable-size struct")
 
 # Optionals (T?, the address a T& would be, null where empty): every kind
-# of slot, made, tested, narrowed, rebound and printed, whole, and with
-# chosen functions left to C so that optionals cross the two halves both
-# ways (as parameters, results, fields, free variables, globals and
-# `return from` values).
+# of slot, made, tested, narrowed, rebound and printed (as parameters, results, fields, free
+# variables, globals and `return from` values).
 PROGRAMS += [
-    ("test/tinygen/tinygen_optionals.goose", True, []),
-    ("test/tinygen/tinygen_optionals.goose", True, ["--debug"]),
-    ("test/tinygen/tinygen_optionals.goose", False, ["--tinygen-skip=main"]),
-    ("test/tinygen/tinygen_optionals.goose", False,
-     ["--tinygen-skip=first_big,bump,count,shift,pick,grow,search,label,see"]),
-    ("test/tinygen/tinygen_optionals.goose", False,
-     ["--tinygen-skip=or_zero,sum,longer,same,total,walk,look,find,positive,counted"]),
+    ("test/tinygen/tinygen_optionals.goose", []),
+    ("test/tinygen/tinygen_optionals.goose", ["--debug"]),
 ]
-WHOLE_PROGRAM |= {"tinygen_optionals"}
-WHOLE_PROGRAM |= {"tinygen_extern", "21_raytrace"}   # libm and package externs called directly
-WHOLE_PROGRAM |= {"24_call_c"}   # the --include header's externs through the extern unit
 
 # The native modules' fixtures (gfx, ui, audio, physics): whole programs that
 # call into the packages' C layers. They run headless, as the suite runs
@@ -270,11 +162,10 @@ WHOLE_PROGRAM |= {"24_call_c"}   # the --include header's externs through the ex
 NATIVE_DIRS = ("gfx", "ui", "audio", "physics")
 NATIVE = sorted(p for d in NATIVE_DIRS for p in (HERE / d).glob("*.goose")
                 if "// error:" not in tc.decode(p.read_bytes()))
-PROGRAMS += [(str(p.relative_to(ROOT)), True, []) for p in NATIVE]
-WHOLE_PROGRAM |= {p.stem for p in NATIVE}
+PROGRAMS += [(str(p.relative_to(ROOT)), []) for p in NATIVE]
 
 # Programs of the main suite that sweeping found wrong or refused by the backend (G4.2, G4.3): whole
-# programs, so that the suite fails on a wrong output and on any function left to C. The G4.3 ones are
+# programs, so that the suite fails on a wrong output. The G4.3 ones are
 # a result with relative links built at its receiver, thread_wait with a message, a break in a while's
 # condition, qpoll of an image, and a dispatch on a variable-mode enum in a recursive cycle.
 # The defer ones cover every exit a defer runs at: fall-through, break, continue, return, a block's
@@ -317,35 +208,20 @@ DEBUG_REGRESSIONS = ["test/threads/thread_contained.goose", "test/storage/relati
                      "test/storage/relative_destination_results.goose",
                      "test/storage/alloc_built_in_slot.goose",
                      "test/codegen/relative_receiver_values.goose"]
-PROGRAMS += [(path, True, []) for path in REGRESSIONS]
-PROGRAMS += [(path, True, ["--debug"]) for path in DEBUG_REGRESSIONS]
-WHOLE_PROGRAM |= {Path(path).stem for path in REGRESSIONS + DEBUG_REGRESSIONS}
-# Fixed values above the C generator's 4096-byte limit lie on a data stack, as there: a local, a
+PROGRAMS += [(path, []) for path in REGRESSIONS]
+PROGRAMS += [(path, ["--debug"]) for path in DEBUG_REGRESSIONS]
+# Fixed values over 4096 bytes lie on a data stack: a local, a
 # temporary and a result slot, restored with their scope. Inlined (-O2) they used to pass the native
 # stack (a 1 MiB guard refused them), so both inlining levels are whole programs.
 LARGE_FIXED = ["test/codegen/large_fixed_values.goose", "test/codegen/large_fixed_exits.goose"]
-PROGRAMS += [(path, True, [level]) for path in LARGE_FIXED for level in ("-O0", "-O2")]
-WHOLE_PROGRAM |= {Path(path).stem for path in LARGE_FIXED}
+PROGRAMS += [(path, [level]) for path in LARGE_FIXED for level in ("-O0", "-O2")]
 # Programs under a GS_MAX_STACKS limit (their first line), as the main suite builds them: the
-# backend's data stack count is checked against it, so these stay within the C generator's count
+# backend's data stack count is checked against it, so these stay within the count the limit allows
 # (an image named result lies at its destination, a literal appended is built at the receiver).
 STACK_LIMITED = [("test/codegen/append_destination_storage.goose", "-DGS_MAX_STACKS=1"),
                  ("test/codegen/cycle_scratch_locals.goose", "-DGS_MAX_STACKS=4"),
                  ("test/codegen/named_init_inplace.goose", "-DGS_MAX_STACKS=1")]
-PROGRAMS += [(path, True, [flag]) for path, flag in STACK_LIMITED]
-WHOLE_PROGRAM |= {Path(path).stem for path, _ in STACK_LIMITED}
-# Programs the backend does not yet build whole: each leaves the named functions to the C generator
-# (the reference semantics), so the suite proves the fallback gives the blessed output today. An entry
-# moves to REGRESSIONS once its refusal is lifted, and each comment names the refusal it reaches.
-GAPS = [
-]
-PROGRAMS += [(path, False, []) for path in GAPS]
-# Results with relative links written by the callee into its caller's slot (and a return from's channel)
-# across the two halves: the callee, or the caller, left to C.
-PROGRAMS += [("test/storage/relative_destination_results.goose", False,
-              ["--tinygen-skip=distant,make"]),
-             ("test/codegen/relative_receiver_values.goose", False,
-              ["--tinygen-skip=choose,make_pair"])]
+PROGRAMS += [(path, [flag]) for path, flag in STACK_LIMITED]
 
 # The windowed samples: built whole and not run, since they loop until their
 # window closes.
@@ -386,19 +262,22 @@ def build(exe, source, out, flags, backend="tinygen"):
     return True, o + e, int(m.group(1)), int(m.group(2))
 
 
+def whole_build(label, log, done, total, fail):
+    """Whether a build's -v log shows the whole program built by tinygen, with no C of the
+    program's own compiled; fails it otherwise."""
+    if done == 0 or done != total or "tinygen: whole program" not in log:
+        fail(f"{label}: {done} of {total} functions through tinygen, whole program expected", log)
+        return False
+    return True
+
+
 def check_tinygen_backend(exe, base, ok, fail, say):
     base = (Path(base) / "tinygen").resolve()
     base.mkdir(parents=True, exist_ok=True)
-    probe = base / "probe.goose"
-    tc.write_text(probe, "fn main() { print(1); }\n")
-    code, o, e = tc.run_capture([exe, "build", "--backend=tinygen", "--dry-run", probe])
-    if "built without tinygen" in o + e:
-        say("skip tinygen backend (the compiler was built without tinygen)")
-        return
     # A gfx program asking for a window draws off screen instead.
     os.environ["GOOSE_GFX_HEADLESS"] = "1"
     builtin = tc.builtin_modules(exe)
-    for i, (rel, whole, flags) in enumerate(PROGRAMS):
+    for i, (rel, flags) in enumerate(PROGRAMS):
         source = ROOT / rel
         label = f"tinygen {source.name}{' ' + ' '.join(flags) if flags else ''}"
         modules = tc.native_imports(tc.decode(source.read_bytes()))
@@ -410,18 +289,7 @@ def check_tinygen_backend(exe, base, ok, fail, say):
         if not good:
             fail(label, log)
             continue
-        if done == 0 or (whole and done != total):
-            fail(f"{label}: {done} of {total} functions through tinygen", log)
-            continue
-        # The path the build took: whole for the WHOLE_PROGRAM fixtures
-        # (unless asked for the mixed one or told to leave functions to
-        # C), with no compile of the program's C, else mixed.
-        alone = (source.stem in WHOLE_PROGRAM and
-                 not any(f.startswith("--tinygen-") for f in flags))
-        cfile = f"{source.stem}.c"
-        compiled = [line for line in log.splitlines() if cfile in line and " -o " in line]
-        if alone != ("tinygen: whole program" in log) or (alone and compiled):
-            fail(f"{label}: expected the {'whole program' if alone else 'mixed'} path", log)
+        if not whole_build(label, log, done, total, fail):
             continue
         want, aborts, markers = expected(source)
         # The native fixtures name their data files from the repository's
@@ -440,7 +308,7 @@ def check_tinygen_backend(exe, base, ok, fail, say):
         if got.rstrip("\n") != want.rstrip("\n"):
             fail(label, f"--- got:\n{got}\n--- want:\n{want}")
             continue
-        ok(f"{label} ({done} of {total} functions{', whole program' if alone else ''})")
+        ok(f"{label} ({total} functions)")
     for rel in BUILD_ONLY:
         source = ROOT / rel
         label = f"tinygen {source.name} (built, not run)"
@@ -468,20 +336,22 @@ def check_tinygen_backend(exe, base, ok, fail, say):
 
 def tinygen_c_problem(log, debug):
     """What is wrong with the compile of tinygen's C in a tinygen-c build's
-    -v log: the first error or warning of the compiler's output (tgc.log,
-    beside the .tg.c), or the wrong flags; "" for nothing."""
-    cmd = next((line for line in log.splitlines() if ".tg.c -o " in line), None)
+    -v log: the first error or warning of the compiler's output (cc.log,
+    beside the .tg.c, which the link command compiles), or the wrong flags;
+    "" for nothing."""
+    cmd = next((line for line in log.splitlines()
+                if re.search(r"\.tg\.c\b", line) and " -o " in line), None)
     if cmd is None:
         return "tinygen's C was not compiled"
     want = ["-O0", "-g"] if debug else ["-O2"]
     if any(f not in cmd.split() for f in want):
         return f"compiled without {' '.join(want)}: {cmd}"
     tgc = next(a for a in cmd.split() if a.endswith(".tg.c"))
-    out = Path(tgc).parent / "tgc.log"
+    out = Path(tgc).parent / "cc.log"
     text = tc.decode(out.read_bytes()) if out.exists() else ""
     first = next((line.strip() for line in text.splitlines()
                   if "error:" in line or "warning:" in line), "")
-    if first or "compiling tinygen's C failed" in log:
+    if first or re.search(r"building \S+ failed", log):
         return first or "does not compile"
     return ""
 
@@ -492,7 +362,7 @@ def check_tinygen_c(exe, base, ok, fail, say, builtin):
     output and the same path; a whole program compiles only its .tg.c. A
     program whose tinygen C does not compile (or warns) fails on a line of
     its own."""
-    for i, (rel, whole, flags) in enumerate(PROGRAMS):
+    for i, (rel, flags) in enumerate(PROGRAMS):
         source = ROOT / rel
         label = f"tinygen-c {source.name}{' ' + ' '.join(flags) if flags else ''}"
         modules = tc.native_imports(tc.decode(source.read_bytes()))
@@ -508,15 +378,7 @@ def check_tinygen_c(exe, base, ok, fail, say, builtin):
         if not good:
             fail(label, log)
             continue
-        if done == 0 or (whole and done != total):
-            fail(f"{label}: {done} of {total} functions through tinygen", log)
-            continue
-        alone = (source.stem in WHOLE_PROGRAM and
-                 not any(f.startswith("--tinygen-") for f in flags))
-        cfile = f"{source.stem}.c"
-        compiled = [line for line in log.splitlines() if cfile in line and " -o " in line]
-        if alone != ("tinygen: whole program" in log) or (alone and compiled):
-            fail(f"{label}: expected the {'whole program' if alone else 'mixed'} path", log)
+        if not whole_build(label, log, done, total, fail):
             continue
         want, aborts, markers = expected(source)
         code, got, err = tc.run_capture([out], cwd=ROOT if modules else source.parent)
@@ -533,7 +395,7 @@ def check_tinygen_c(exe, base, ok, fail, say, builtin):
         if got.rstrip("\n") != want.rstrip("\n"):
             fail(label, f"--- got:\n{got}\n--- want:\n{want}")
             continue
-        ok(f"{label} ({done} of {total} functions{', whole program' if alone else ''})")
+        ok(f"{label} ({total} functions)")
     for rel in BUILD_ONLY:
         source = ROOT / rel
         label = f"tinygen-c {source.name} (built, not run)"
@@ -598,32 +460,29 @@ def check_run(exe, base, ok, fail):
     ok("goose run --backend=tinygen: output, arguments, exit code, resources, threads")
 
 
-# goose run with no --backend runs tinygen's C in TinyCC (G3.1); --backend=c the C generator's.
+# goose run with no --backend runs tinygen's C in TinyCC.
 JIT_PROGRAMS = ["samples/01_tour.goose", "test/tinygen/tinygen_text.goose",
                 "test/codegen/defer_results.goose", "test/codegen/index_type_abort.goose",
                 "test/codegen/relative_results.goose"]
 TINYGEN_JIT = "jit: tinygen's C"
-C_JIT = "jit: the C generator's C"
 
 
 def check_jit(exe, base, ok, fail):
-    """Plain goose run (tinygen's C in TinyCC) and goose run --backend=c (the
-    C generator's): the blessed output, exit status and stderr markers on
-    both, -v naming the path, and -O2 (inlined code, the default) and -O0 on tinygen's C."""
+    """Plain goose run (tinygen's C in TinyCC): the blessed output, exit status and stderr markers,
+    -v naming the path, at -O2 (inlined code, the default) and -O0."""
     exe = Path(exe).resolve()
     for rel in JIT_PROGRAMS:
         source = ROOT / rel
         want, aborts, markers = expected(source)
-        for flags, says in [([], TINYGEN_JIT), (["-O2"], TINYGEN_JIT), (["-O0"], TINYGEN_JIT),
-                            (["--backend=c"], None)]:
+        for flags in [[], ["-O2"], ["-O0"]]:
             label = f"goose run {' '.join(flags + ['-v'])} {source.name}"
             code, got, err = tc.run_capture([exe, "run", "-v", *flags, source], cwd=source.parent)
             missing = [mk for mk in markers if mk not in err]
             if (code != 0) != aborts or missing or got.rstrip("\n") != want.rstrip("\n"):
                 fail(f"{label} (exit {code})", f"{err}\n--- got:\n{got}\n--- want:\n{want}")
                 return
-            if says is None and "jit:" in err or says is not None and says not in err:
-                fail(f"{label}: -v should say {says or 'nothing of tinygen'}", err)
+            if TINYGEN_JIT not in err:
+                fail(f"{label}: -v should say {TINYGEN_JIT}", err)
                 return
     probe = base / "jit_probe.goose"
     tc.write_text(probe, "import os;\n\nfn main() {\n    let a = args();\n"
@@ -639,15 +498,13 @@ def check_jit(exe, base, ok, fail):
     if code != 0 or "tinygen" in err or "jit:" in err:
         fail("goose run without -v: quiet", err)
         return
-    ok(f"goose run on tinygen's C and with --backend=c: {len(JIT_PROGRAMS)} programs, -O2 "
+    ok(f"goose run on tinygen's C: {len(JIT_PROGRAMS)} programs, -O2 "
        "and -O0, arguments, exit code, resources")
 
 
-# goose build with no --backend (G3.2): tinygen-c, or tinygen with --debug; the C generator's C
-# for the whole program when tinygen cannot take it.
+# goose build with no --backend: tinygen-c, or tinygen with --debug.
 DEFAULT_BUILD_PROGRAMS = ["samples/01_tour.goose", "test/tinygen/tinygen_text.goose",
                           "test/codegen/defer_results.goose"]
-DEFAULT_C_PATH = "build: the C generator's C, compiled by the C compiler"
 
 
 def check_build_defaults(exe, base, ok, fail):
@@ -664,8 +521,7 @@ def check_build_defaults(exe, base, ok, fail):
         code, o, e = tc.run_capture([exe, "build", "-v", *flags, "-o", out, source],
                                     cwd=source.parent)
         log = o + e
-        if code != 0 or not out.exists() or not all(t in log for t in says) or \
-                (DEFAULT_C_PATH in log) != any(DEFAULT_C_PATH in t for t in says):
+        if code != 0 or not out.exists() or not all(t in log for t in says):
             fail(f"goose build {label} {source.name}: -v should say {says}", log)
             return None
         want, aborts, markers = expected(source)
@@ -723,7 +579,7 @@ def check_build_defaults(exe, base, ok, fail):
 
 
 def check_c_path_flags(exe, base, ok, fail):
-    """The flags that took a program to the C generator's C (G3.3) keep it on tinygen: plain goose
+    """The flags of the C a program used to need (-D, --include, --standalone, export fn): plain goose
     build, --debug and goose run, -v saying so, the program's output and stderr markers right."""
     exe = Path(exe).resolve()
     work = base / "cflags"
@@ -743,8 +599,7 @@ def check_c_path_flags(exe, base, ok, fail):
                                          *(["-o", out] if verb == "build" else []), source],
                                         cwd=work)
             if verb == "build":
-                if code != 0 or says not in o + e or DEFAULT_C_PATH in o + e or \
-                        (extra and built not in o + e):
+                if code != 0 or says not in o + e or (extra and built not in o + e):
                     fail(f"{name}: -v should say {says} {built}", o + e)
                     return False
                 code, o, e = tc.run_capture([out], cwd=work)
