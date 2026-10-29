@@ -5904,7 +5904,7 @@ struct TgFn {
         for (auto t : callee->rets) cg.CT(t);
         // One trampoline per C name (a call may have a specialization of its own of the same extern); a
         // function the runtime object exports, or an export's own wrapper, needs none.
-        auto direct = M.RuntimeApi(callee->sf->cname);
+        auto direct = callee->sf->dylib.empty() && M.RuntimeApi(callee->sf->cname);
         for (auto sf : M.ast.functions)
             direct = direct || (sf->isexport && sf->cname == callee->sf->cname);
         auto &list = direct ? M.direct : M.externs;
@@ -8642,9 +8642,49 @@ struct TinyGenBackend : CodeGen::SpecBackend {
             Append(args, i ? ", " : "", "a", i);
         }
         string s;
-        if (proto) Append(s, ret, " ", name, "(", types.empty() ? "void" : types, ");\n");
+        // An extern of a shared library (§7.10) is called through the pointer gs_tg_dlbind fills
+        // (DylibBinding), as the C generator calls it (CodeGen::ExternProto).
+        auto dynamic = !sp->sf->dylib.empty();
+        if (dynamic)
+            Append(s, "static ", ret, " (*", DlSlot(sp), ")(", types.empty() ? "void" : types, ");\n",
+                   "GS_DL_CALL ");
+        else if (proto)
+            Append(s, ret, " ", name, "(", types.empty() ? "void" : types, ");\n");
         Append(s, ret, " gs_tg_x_", name, "(", params.empty() ? "void" : params, ") { ",
-               sp->rets.empty() ? "" : "return ", name, "(", args, "); }\n");
+               sp->rets.empty() ? "" : "return ", dynamic ? DlSlot(sp) : name, "(", args, "); }\n");
+        return s;
+    }
+    static string DlSlot(FnSpec *sp) { return cat("gs_tgdl_", sp->sf->cname); }
+
+    // What binds the shared libraries the program's dynamic externs name, as the C generator's
+    // gs_program_init does (CodeGen::DlLibs): the libraries and the pointers each symbol fills, and
+    // gs_tg_dlbind, which main calls once the runtime is started, before the globals.
+    bool HasDylibs() {
+        for (auto sp : mod->externs)
+            if (!sp->sf->dylib.empty()) return true;
+        return false;
+    }
+    string DylibBinding(CodeGen &cg) {
+        vector<FnSpec *> dyn;
+        for (auto sp : mod->externs)
+            if (!sp->sf->dylib.empty()) dyn.push_back(sp);
+        if (dyn.empty()) return "";
+        auto libs = cg.DlLibs(dyn);
+        auto spelling = [&](const string &s) { return s.empty() ? string("0") : CodeGen::CStr(s); };
+        string s = "static const gs_dllib gs_tgdllibs[] = {\n";
+        for (auto &lib : libs)
+            Append(s, "    { ", CodeGen::CStr(lib.name), ", ", spelling(lib.onwindows), ", ",
+                   spelling(lib.onmacos), ", ", spelling(lib.onlinux), " },\n");
+        s += "};\nstatic const gs_dlbind gs_tgdlbinds[] = {\n";
+        for (auto sp : dyn) {
+            auto d = cg.DlSpelling(sp);
+            auto lib = std::find_if(libs.begin(), libs.end(),
+                                    [&](auto &l) { return CodeGen::SameDylib(l, d); }) - libs.begin();
+            Append(s, "    { ", lib, ", ", CodeGen::CStr(sp->sf->cname), ", (void **)&", DlSlot(sp),
+                   " },\n");
+        }
+        Append(s, "};\nvoid gs_tg_dlbind(void) { gs_dl_bind(gs_tgdllibs, ", libs.size(),
+               ", gs_tgdlbinds, ", dyn.size(), "); }\n");
         return s;
     }
 
@@ -8661,7 +8701,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         string s;
         for (auto sp : mod->externs)
             if (!SupportHolds(sp->sf->cname)) s += Trampoline(cg, sp, true);
-        return s;
+        return s + DylibBinding(cg);
     }
 
     // The names a whole program's one C unit declares before tinygen's C (TinygenUnit in main.cpp):
@@ -8705,6 +8745,9 @@ struct TinyGenBackend : CodeGen::SpecBackend {
         if (!why.empty()) return false;
         for (auto sf : ast.functions)
             if (sf->isexport && !ExportOk(cg, sf, why)) return false;
+        // A shared library's externs are bound by a table in a unit of the program's own, which the
+        // trampolines and the table's function (gs_tg_dlbind) go into with the --include headers'.
+        if (HasDylibs()) externunit = true;
         for (auto sp : mod->externs)
             if (!ExternHeld(sp)) return Refuse(why, cat("extern ", sp->sf->cname));
         if (!GlobalsOk(cg, why)) return false;
@@ -9096,6 +9139,7 @@ struct TinyGenBackend : CodeGen::SpecBackend {
                  nullptr);
         for (auto &[acc, q] : mod->queueacc)
             fn.CallC("gs_qinit", { ptr }, { fn.CallC(acc, {}, {}, ptr) }, nullptr);
+        if (HasDylibs()) fn.CallC("gs_tg_dlbind", {}, {}, nullptr);
         if (initsym != TYG_NO_SYM) CallSig(p, SigOf(nullptr, {}), initsym, {});
         if (mainsp) {
             auto &mi = cg.sinfo[mainsp];

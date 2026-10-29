@@ -146,9 +146,10 @@ struct CodeGen {
     // The libraries the used externs bind from, each spelling once, in the
     // order their first declaration comes in the program (file order, then
     // source order).
-    vector<DylibSpelling> DlLibs() {
+    vector<DylibSpelling> DlLibs() { return DlLibs(usedexterns); }
+    vector<DylibSpelling> DlLibs(const vector<FnSpec *> &externs) {
         vector<pair<Line, DylibSpelling>> firsts;
-        for (auto sp : usedexterns) {
+        for (auto sp : externs) {
             if (sp->sf->dylib.empty()) continue;
             auto l = sp->sf->line;
             auto d = DlSpelling(sp);

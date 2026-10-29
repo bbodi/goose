@@ -2017,16 +2017,6 @@ int Main(int argc, char **argv) {
                 else if (tinygenmixed) whynot = "--tinygen-mixed";
                 // Every -D reaches the support unit (DefinesSource), the C that includes the
                 // runtime's headers; tinygen's C reads none.
-                // The C generator binds an extern of a shared library through the runtime's loader
-                // as the program starts (spec §7.10); tinygen calls it by name, which only a link
-                // with the library resolves, and neither a JIT run nor a build has that link.
-                if (whynot.empty() && tgb->mod) {
-                    vector<FnSpec *> calls = cg.usedexterns;
-                    for (auto list : { &tgb->mod->externs, &tgb->mod->direct })
-                        calls.insert(calls.end(), list->begin(), list->end());
-                    for (auto sp : calls)
-                        if (!sp->sf->dylib.empty()) whynot = cat("extern ", sp->sf->cname, " of a shared library");
-                }
                 tgwhole = whynot.empty() && tgb->WholeProgram(cg, whynot);
                 // tinygen's C of a whole program is one translation unit with the runtime's headers
                 // (TinygenUnit); the native object takes the --include headers' trampolines from an

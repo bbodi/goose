@@ -330,10 +330,12 @@ statuses come from the same hosted runtime (`test/jit_runtime.py`).
 
 The run takes this path only if tinygen takes the program whole, by the
 `goose build` rules: every function compiled and a plain `main`. Every `-D`
-and every `--include` header go into the unit. Two more classes take
-the old path for now, and say so: a program calling an extern of a shared
-library (the C generator binds it through the runtime's loader, whereas
-tinygen's C calls it by name, which only a link resolves). Otherwise the whole
+and every `--include` header go into the unit. An extern of a shared library
+(§7.10) is called through a pointer in a trampoline of the program's extern unit,
+`gs_tgdl_<symbol>`, which `gs_tg_dlbind` fills with the runtime's `gs_dl_bind`
+(the libraries and spellings from `CodeGen::DlLibs`, as the C generator's
+`gs_program_init` does); main calls it once the runtime has started, before the
+globals (`DylibBinding`, `EmitMain`). Otherwise the whole
 program runs on the C generator's C, built by a second `CodeGen` without
 tinygen; a mixed program never goes into one TinyCC unit. `-v` prints
 `jit: tinygen's C` or `jit: the C generator's C ... (why)`. Inlining defaults

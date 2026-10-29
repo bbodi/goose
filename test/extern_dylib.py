@@ -169,13 +169,22 @@ def check_extern_dylib(exe, cc, base, *, jit, runtime, extra=()):
     relative = base / "relative.goose"
     tc.write_text(relative, BLOCK % "lib/dltest" + MAIN)
     expect_output(relative)
+    # tinygen takes the whole program, in the build (C compiled or the native object) and under the
+    # JIT: no fallback to the C generator, the library bound through gs_tg_dlbind.
+    for argv, said in (([exe, "build", "-v", "-o", base / "relative-tg"], "whole program: no C compiled"),
+                       ([exe, "build", "--debug", "-v", "-o", base / "relative-tgo"],
+                        "whole program: no C compiled"),
+                       ([exe, "run", "-v"], "jit: tinygen's C")):
+        code, out, err = run(argv + [relative])
+        if code != 0 or said not in out + err or "C generator" in out + err:
+            raise RuntimeError(f"relative.goose {argv[1:3]} did not stay on tinygen:\n{out}{err}")
     # The generated C is the same from one compile to the next, binds only
     # the externs a call reaches, and takes no prototype from the library.
     _, c1 = build(relative, 1)
     _, c2 = build(relative, 1)
     if c1 != c2:
         raise RuntimeError("the generated C differs between two compiles")
-    if "gs_dl_bind(gs_dllibs, 1, gs_dlbinds, 11);" not in c1 or "dlt_unused" in c1:
+    if "gs_dl_bind(gs_tgdllibs, 1, gs_tgdlbinds, 11);" not in c1 or "dlt_unused" in c1:
         raise RuntimeError(f"the generated C binds other than the 11 called members:\n{c1}")
     # A bare name is the loader's to find, by its platform spelling.
     bare = base / "bare.goose"
