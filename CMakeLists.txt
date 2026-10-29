@@ -54,7 +54,6 @@ add_executable(goose
     src/optimize.h
     src/optimize_basecase.h
     src/optimize_tre.h
-    src/optimize_loops.h
     src/optimize_reassoc.h
     src/bce.h
     src/codegen.h

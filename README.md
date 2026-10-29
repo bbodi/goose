@@ -26,11 +26,12 @@ language's type and lifetime rules make this memory model safe to use.
 
 ## Why Goose
 
-* **Faster than C++ and than safe Rust, while memory safe.** Over sixteen
-  benchmarks Goose runs at 3.3x the speed of idiomatic C++, 1.16x hand-optimized
-  C++ and 1.12x the best safe Rust, and uses 1.9x, 1.3x and 1.2x less memory
-  ([results](bench/results.md)). These gains
-  come from Goose's data layouts and memory model.
+* **Faster than idiomatic C++, memory safe, and much smaller.** Over sixteen
+  benchmarks (Apple M5, clang) Goose runs at 2.14x the speed of idiomatic C++,
+  1.06x hand-optimized C++ and 1.02x the best safe Rust, and uses 1.85x, 1.5x
+  and 1.2x less memory ([results](bench/results.md)). The Windows run on the
+  old C generator measured 3.5x, 1.24x and 1.13x; it has not been repeated.
+  The gains come from Goose's data layouts and memory model.
 * **No allocator, no GC, no reference counting, no destructors.** Memory is a
   handful of data stacks that the compiler assigns statically. Freeing a
   structure with a million elements takes a single store, no matter how
@@ -48,8 +49,8 @@ language's type and lifetime rules make this memory model safe to use.
   and one allocation in C++ takes 29 bytes and no allocations in Goose.
 * **Variable sized Enums.** Variable-mode ADTs store each value at
   the size of its own variant rather than that of the largest variant. On the
-  benchmark that exercises this, they use 4x less memory than a Rust `enum`
-  and run at 2x its speed.
+  benchmark that exercises this, they use 3.9x less memory than a Rust `enum`
+  and run at 1.4x its speed (Apple M5, clang).
 * **Links narrower than pointers.** A relative reference stores a typed, checked
   link as a 1, 2 or 4-byte offset. Structures built from them are position
   independent, so a data structure can be written to a file as is. Saving
@@ -404,9 +405,9 @@ Benchmark measurements use whole-process wall-clock time, including teardown.
 
 | Geometric mean over 16 benchmarks | vs idiomatic C++ | vs hand-optimized C++ | vs best safe Rust |
 |---|---:|---:|---:|
-| speed, MSVC backend | 3.51x | 1.24x | 1.13x |
-| speed, clang backend | 3.54x | 1.26x | 1.19x |
-| peak memory | 1.95x less | 1.32x less | 1.25x less |
+| speed, MSVC backend (Windows, measured on the old C generator, not re-measured) | 3.51x | 1.24x | 1.13x |
+| speed, clang backend (Apple M5, `build-tgc/goose`, 2026-10-29) | 2.14x | 1.06x | 1.02x |
+| peak memory (Apple M5, clang) | 1.85x less | 1.54x less | 1.23x less |
 
 The [summary](bench/summary.md) explains the gains and losses;
 [results.md](bench/results.md) has every measurement, and

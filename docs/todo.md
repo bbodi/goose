@@ -4,10 +4,10 @@
 
 Commit df40ba0 ("Pass slices and fat references as their members in
 tinygen") changed how the tinygen backend passes a slice and a fat
-reference. Each is now two parameters, as the C half passes it
+reference. Each is now two parameters, as the old C generator passed it
 (`CodeGen::ParamFields`), instead of one 16-byte record. That fixed the
-mixed builds on Windows x64, which passes such a record by reference to a
-copy.
+builds that mixed tinygen's functions with the C generator's on Windows x64,
+which passes such a record by reference to a copy.
 
 It was tested on Windows only. Under SysV and on arm64, the two parameters
 go in the same two registers the record did, so nothing should change. But

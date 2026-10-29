@@ -1,4 +1,4 @@
-// runtime-debug: a `while v > 0 { v--; ... }` countdown run as a counted loop (optimize_loops.h) aborts at the same value of its counter as the loop as written.
+// runtime-debug: a `while v > 0 { v--; ... }` countdown run as a counted loop aborts at the same value of its counter as the loop as written.
 
 fn walk(xs: i64[:], n: i64) -> i64 {
     var i = n;

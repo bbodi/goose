@@ -1,4 +1,4 @@
-// runtime-debug: a strip-mined loop (optimize_loops.h) whose body aborts partway through a block of iterations prints and aborts exactly where the loop as written does.
+// runtime-debug: a strip-mined loop whose body aborts partway through a block of iterations prints and aborts exactly where the loop as written does.
 
 fn lanes(data: u8[:], out: i64[:]) -> i64 {
     var acc: i64[4] = [0; 4];

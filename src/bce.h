@@ -2924,11 +2924,12 @@ struct BCE {
 
     // Which of the reference variables a loop indexes keep the same array,
     // base and length throughout: an array behind a reference has both halves
-    // of its view in memory the C backend must reload after every byte store
+    // of its view in memory that generated C must reload after every byte store
     // (§6.5 also makes growth during iteration legal), and only a grow, a
     // shrink, a whole-value write or a call that can reach the array changes
-    // them -- exactly what the kill summary reports. Codegen reads the view of
-    // each variable named here once, before the loop. The same holds for the
+    // them -- exactly what the kill summary reports. The backend does not use
+    // the result yet (it reads the view at every access); it would read the view
+    // of each variable named here once, before the loop. The same holds for the
     // arrays it indexes in fields (`fout`), whose header sits in the struct.
     void LoopViewRefs(Node *body, Node *cond, vector<VarDef *> &out, vector<FieldPath> &fout) {
         out.clear();
@@ -3978,25 +3979,13 @@ inline bool ForLoop::BceWalk(BCE &b) {
             }
     }
     b.loopdepth++;
-    // Codegen reads the views ahead of the whole loop, the iteration
+    // The views would be read ahead of the whole loop, the iteration
     // expression included, so what that expression changes counts too.
     b.LoopViewRefs(body, iter, hoistrefs, hoistfields);
     b.StripKills(body);
     if (iterkind == IK_ARRAY || iterkind == IK_SLICE) {
         lot = BCE::Term { true, BCE::Zero(), 0 };
         hit = b.LenTermOf(iter);
-        // With the body's kills stripped, what bounds the length now bounds
-        // it wherever an iteration tests it.
-        if (b.mode == BCE::M_JUDGE) {
-            lenbound = -1;
-            lenexact = false;
-            auto up = hit.ok ? b.Dist(hit.b, BCE::Zero()) : BCE::INF;
-            auto ub = up == BCE::INF ? BCE::INF : BCE::SatAdd(up, hit.off);
-            if (ub >= 0 && ub < BCE::LENMAX) {
-                lenbound = ub;
-                lenexact = b.Query(BCE::Zero(), hit.b, BCE::SatSub(hit.off, ub));
-            }
-        }
     }
     auto exitf = b.flow;
     if (iv) {

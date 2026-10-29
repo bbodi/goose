@@ -1,4 +1,4 @@
-// runtime-debug: an in-order float sum whose terms are computed a block at a time (optimize_loops.h) aborts at the term the loop as written aborts at, partway through a block.
+// runtime-debug: an in-order float sum whose terms are computed a block at a time aborts at the term the loop as written aborts at, partway through a block.
 
 fn total(w: f64[:], n: i64) -> f64 {
     var s = 0.0;

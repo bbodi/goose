@@ -65,8 +65,8 @@ single translation unit, included in the order the driver lists them.
 | Parse | `lexer.h`, `parser.h`, `ParseProgram` in `main.cpp` | source files, following `import` | the `Ast`: nodes, type expressions, symbols per namespace, globals in initialization order |
 | Resolve | `resolve.h` (`ResolveTypeNames`) | type names as written | struct/enum/generic kinds, aliases substituted away |
 | Typecheck | `typecheck*.h` (`TypeCheckProgram`) | the `Ast` | one `FnSpec` per specialization with a cloned, annotated body; `StructInst`/`EnumInst`; `VarDef`s; the store record; every diagnostic of §3--§11; the shader blobs `embed_shader` compiles (`gfx.h`, `shaderc.c`) |
-| Optimize | `optimize.h`, `optimize_basecase.h`, `optimize_tre.h`, `optimize_loops.h`, `optimize_reassoc.h` (`Optimizer`) | live specializations | bodies rewritten in place (inlined, folded, loops), liveness and use counts, loop shapes (`ForLoop::stripk`, `sumred`, `While::countdown`) |
-| BCE | `bce.h` (`BCE::RunAll`) | live specializations | `Index::nobc`, `SliceExpr::nobc`, `ForLoop::fixedlen` and `lenbound`, per-loop `hoistrefs` and `hoistfields` |
+| Optimize | `optimize.h`, `optimize_basecase.h`, `optimize_tre.h`, `optimize_reassoc.h` (`Optimizer`) | live specializations | bodies rewritten in place (inlined, folded, loops), liveness and use counts, loop shapes (`ForLoop::stripk`, `sumred`, `While::countdown`) |
+| BCE | `bce.h` (`BCE::RunAll`) | live specializations | `Index::nobc`, `SliceExpr::nobc`, `ForLoop::fixedlen`, per-loop `hoistrefs` and `hoistfields` |
 | Analyses | `codegen.h`, `codegen_types.h`, `codegen_program.h`, `codegen_stacks.h` (`CodeGen`) | live specializations, globals | the call interface of each specialization (C name, `gs_sp`, free variables, `return from` ids), layouts, the globals' names and static initializers, the C spelling of types |
 | Backend | `tinygen_backend.h` (`TinyGenBackend`, `TgModule`, `TgFn`) | live specializations, with the analyses' call interfaces and layouts | each function lowered to tinygen's IR (`docs/design/tinygen_backend.md`), written as a native object with debug info (`--backend=tinygen`, `goose build --debug`) or as C (`--backend=tinygen-c`, the `goose build` default, `goose run`, `goose -o x.c`), with `src/runtime/` (or the part of it that a program's unit holds) around it |
 | JIT | `jit.h` | tinygen's C | the program run in-process through libtcc, when no `-o` was given |
@@ -4029,8 +4029,7 @@ After that, in order, come:
   `TailRecurse`, `Scan`);
 * globals again (now able to inline);
 * a final reachability pass, so that specializations whose every call was
-  inlined go dead and the backend skips them;
-* loop shaping over the live bodies.
+  inlined go dead and the backend skips them.
 
 **Constant propagation** (`OptStmt`, `Ident::Opt`): a single-name declaration
 of a scalar with a literal initializer, never written and never
@@ -4290,40 +4289,6 @@ last, reusing the chain's own calls. Integer min and max are associative
 and commutative, so the value is the same; a wrong guess about which
 operand carries the dependence has no effect beyond the regrouping itself.
 
-**Loop shaping** (`LoopShaper`, `optimize_loops.h`, every level). Some
-loops compile to code that a C compiler cannot make fast, although it can
-make an equivalent restatement of the same loop fast. Once the final bodies
-are known, this pass marks such loops. It rewrites no tree. The backend
-reads none of the marks (§6.12), so the marks are facts only. Each records a
-fact about the loop as written that makes the restatement compute the same
-values and abort at the same point:
-
-* `ForLoop::stripk` and `lanemods`: the counter starts at 0 and steps by 1
-  (an array's `i64` index, a count's variable, or a range's counter from a
-  literal 0 at the range's own type), and the body takes it `% K` for a
-  constant `K` from 2 to 16 (the `lanemods` are those with the first `K`
-  found). In a block of `K` iterations starting at a multiple of `K`,
-  `i % K` is the position in the block (§6.2's `%` is Euclidean and the
-  counter is never negative), and the `%` could not abort. The loop
-  variable must not be captured.
-* `ForLoop::sumred`: the body is the single statement `s += e`. Here `s` is
-  a float local that is not global, not captured and never the operand of
-  `&` (the facts `Analyze` collects: a reference to a scalar takes an
-  explicit one). `e` reads no `s` and has no effect but a possible abort:
-  it is made of literals, variables, operators, casts, index and field
-  reads, `if`, and inlined bodies of `let`s of scalars whose returns leave
-  only them. Floating-point addition is not associative, so clang keeps
-  such a loop scalar. Computing the terms of a block of iterations first,
-  and then adding them to `s` one at a time in order, changes no bit of any
-  result. A term that aborts does so at the same iteration, and what it
-  leaves unadded is a local nothing reads afterwards.
-* `While::countdown`: `while v > 0 { v--; ... }` (or `0 < v`, or `v -= 1`
-  first), where `v` is a `var` integer like `s` above that no other
-  statement of the body assigns or steps. The trip count is `v`'s value at
-  entry, and the decrement can neither wrap nor overflow.
-
-A body over 300 nodes is not marked.
-
 ---
 
 ## 5. Bounds-check elimination
@@ -4332,7 +4297,7 @@ A body over 300 nodes is not marked.
 marks the `Index` and `SliceExpr` nodes whose runtime check cannot fire, and
 the backend then omits those checks. The pass is required only to be sound: a
 program's meaning never depends on it (§10.5). The pass also records
-facts that are not about checks: `ForLoop::fixedlen` and `lenbound`, and the
+facts that are not about checks: `ForLoop::fixedlen` and the
 per-loop `hoistrefs` and `hoistfields` (§5.10); the backend reads only the
 check marks (`nobc`).
 
@@ -4763,11 +4728,6 @@ a select (the merge step
   view once. Otherwise it re-reads the length, and the slices and
   references on the way to it, every iteration; section 3.15 makes growth
   during iteration legal, so the re-read is the default.
-* `ForLoop::lenbound` and `lenexact`: for an array or slice loop, the
-  smallest constant that the facts bound the length by once the body's
-  kills are stripped (so the bound holds wherever an iteration tests the
-  length), and whether the facts prove the length equal to it. A loop may be
-  bounded by that constant (§6.12).
 * `hoistrefs` on every loop: the reference variables that the loop indexes
   and whose array cannot be grown, shrunk, rewritten whole or reached
   through a call by the body, or by a `while` condition or a `for` loop's
@@ -5564,7 +5524,7 @@ the newline itself.)
 
 The backend reads an array's base and length through its reference at every
 access, and a stack's top and count from memory at every push; it hoists no
-views and caches no tops. `ForLoop::fixedlen`, `lenbound` and the per-loop
+views and caches no tops. `ForLoop::fixedlen` and the per-loop
 `hoistrefs` and `hoistfields` (§5.10) are computed, and the backend reads
 none of them: a loop is built as written. A division by a divisor that is fixed for a loop is an ordinary
 division, not a multiplication by a magic number.
@@ -5587,12 +5547,10 @@ short-circuit style, setting the local. The right operand is never evaluated
 unconditionally: the short circuit of the specification (§6.1) is the only
 form.
 
-### 6.12 Restated loops
+### 6.12 Loop shapes
 
-The optimizer marks loops that a restatement would speed up (`stripk`,
-`sumred`, `countdown`, §4's loop shaping and §5.10's `lenbound`). The backend
-reads none of these marks and builds every loop as written, one iteration at
-a time.
+The backend builds every loop as written, one iteration at a time. The
+optimizer does not restate loops for the C compiler.
 
 ### 6.13 `simd` functions
 
@@ -6216,10 +6174,9 @@ outside the loop.
 
 ### 9.10 Loop shapes
 
-The optimizer marks loops that a restatement would speed up (lanes picked by
-the counter, an in-order float sum, a small bounded loop, a countdown; §4),
-but the backend builds every loop as written (§6.12). A loop that wants one
-of these shapes is written in it by hand: a block loop with constant lane
+The compiler does not restate loops: the backend builds every loop as
+written (§6.12). A loop that wants a
+faster shape is written in it by hand: a block loop with constant lane
 indices for state in a few lanes, a block of partial terms added in order for
 a float sum, and `for i in n { ... }` counting up instead of `while i > 0 {
 i--; ... }`.

@@ -1,3 +1,29 @@
+## October 29, 2026 re-measurement (Apple M5, clang)
+
+Re-run on a different machine and a different backend, so it is not
+comparable with the October 16 Windows tables below. The machine is an Apple
+M5 (arm64) with Apple clang 21 and rustc; the compiler is `build-tgc/goose`
+built from `90da5c6a` on `feature/tinygen-backend` against tinygen `a53bd5e`,
+so the C is tinygen's, with pointer-typed values and typed memory paths (see
+docs/design/tinygen_backend.md). MSVC and clang-cl are not available here, so
+there is no MSVC column.
+
+```
+python3 bench/run_bench.py --exe build-tgc/goose --toolchains clang --sizes large
+```
+
+Only the `large` size was run (all sixteen benchmarks, about 22 minutes),
+because every suite figure is taken at `large`; a three-size run exceeded ten
+minutes and was stopped. `results.md` therefore shows `large` only. Suite
+geometric means at `large`: 2.14x idiomatic C++, 1.06x expert C++, 1.02x best
+safe Rust; peak memory 1.85x, 1.54x, 1.23x less. An A/B on the same machine
+against the old C generator (upstream master `0940627d`) has blur and
+particles at parity, and nine rows 1.1x to 1.5x behind it: the two hash
+tables (short copies and compares through libc rather than the runtime's
+inline helpers) and the pool rows (the pool header's fields written back on
+every push, and range checks the old generator compiled out under a 2^31
+stack reserve); both are being fixed in the backend.
+
 ## October 16, 2026 refresh
 
 The main tables are a fresh run of all sixteen benchmarks, at all three

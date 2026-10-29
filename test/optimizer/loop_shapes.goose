@@ -1,13 +1,9 @@
-// Loops codegen restates for the C compiler (optimize_loops.h, and BCE's
-// lenbound): strip-mined loops that take their counter modulo a constant,
-// in-order float sums whose terms are computed a block at a time, loops over
-// limited arrays bounded by the capacity, and `while v > 0 { v--; ... }`
-// countdowns run as counted loops. Each shape_ function is checked against
-// a reference written so that none of them applies, over lengths around
-// every block size, with breaks, continues and returns inside. The runner
-// also checks that the shape_ functions' C has the restated loops, and that
-// the keep_ functions', whose loops look alike but must not be restated,
-// has none (run_tests.py, check_loop_shapes).
+// Loops of the shapes the optimizer once marked for restating (strip-mined
+// loops that take their counter modulo a constant, in-order float sums, loops
+// over limited arrays, and `while v > 0 { v--; ... }` countdowns). The
+// backend builds them as written; each shape_ function is still checked
+// against a reference written so that none of them applies, over lengths
+// around every block size, with breaks, continues and returns inside.
 
 import std;
 

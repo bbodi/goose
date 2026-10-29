@@ -1262,11 +1262,6 @@ NODE(While)
     vector<VarDef *> hoistrefs;
     // Likewise for the arrays it indexes in fields (FieldPath).
     vector<FieldPath> hoistfields;
-    // Set by the optimizer's loop shaping (optimize_loops.h): the loop is
-    // `while v > 0 { v--; ... }` over a local integer nothing else in the
-    // body can write, so its trip count is v's value at entry and codegen
-    // runs it as a counted loop.
-    bool countdown = false;
     Node *cond;
     Block *body;
     While(Line l, Node *_cond, Block *_body) : Node(l, NKind), cond(_cond), body(_body) {}
@@ -1290,22 +1285,6 @@ NODE(ForLoop)
     bool fixedlen = false;
     vector<VarDef *> hoistrefs;   // See While.
     vector<FieldPath> hoistfields;
-    // Set by BCE for array/slice iteration: a constant the length never
-    // exceeds where an iteration tests it (-1: none known), and whether it
-    // always equals it.
-    int64_t lenbound = -1;
-    bool lenexact = false;
-    // Set by the optimizer's loop shaping (optimize_loops.h); codegen uses
-    // them where the iteration count is fixed at entry and the body can be
-    // emitted twice (CodeGen::Dupable). `stripk`: the counter starts at 0
-    // and the body takes it modulo stripk (the `lanemods`), which in a block
-    // of stripk iterations starting at a multiple of it is the position in
-    // the block. `sumred`: the body is `s += e` on a float local that e
-    // neither reads nor writes, so the terms of a block of iterations may be
-    // computed before they are added to s, in order.
-    int stripk = 0;
-    vector<Binary *> lanemods;
-    bool sumred = false;
     BCE_MARK
     bool byref;                 // for &x in ...
     string_view var;
