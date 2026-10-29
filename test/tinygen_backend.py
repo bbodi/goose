@@ -227,6 +227,10 @@ PROGRAMS += [(path, [flag]) for path, flag in STACK_LIMITED]
 # through a reference and reinterpreted bytes must still read back right (check_typed_c too).
 TYPED_MEMORY = "test/codegen/typed_memory.goose"
 PROGRAMS += [(TYPED_MEMORY, ["-O2"])]
+# Byte copies next to or inside their own source (TgFn::CopyDisjoint, tyg_move_dyn) and compares of
+# every short length (gs_memeq), whose C check_copy_c reads.
+OVERLAPPING_COPIES = "test/codegen/overlapping_copies.goose"
+PROGRAMS += [(OVERLAPPING_COPIES, ["-O2"]), (OVERLAPPING_COPIES, [])]
 
 # The windowed samples: built whole and not run, since they loop until their
 # window closes.
@@ -327,6 +331,7 @@ def check_tinygen_backend(exe, base, ok, fail, say):
         ok(f"{label} ({done} of {total} functions, whole program)")
     check_tinygen_c(exe, base, ok, fail, say, builtin)
     check_typed_c(exe, base, ok, fail)
+    check_copy_c(exe, base, ok, fail)
     check_run(exe, base, ok, fail)
     check_jit(exe, base, ok, fail)
     check_default_inlining(exe, base, ok, fail)
@@ -457,6 +462,24 @@ def check_typed_c(exe, base, ok, fail):
 
 
 
+def check_copy_c(exe, base, ok, fail):
+    """tinygen's C copies runs that cannot overlap through gs_tg_memcpy and compares bytes through
+    gs_tg_memeq, the runtime's inline gs_memcpy and gs_memeq, never memcmp; a run moved within its
+    own array (a limited array set to its own tail) stays a memmove of a run-time length."""
+    cout = base / "overlapping_copies.tg.c"
+    code, o, e = tc.run_capture([exe, "build", "--backend=tinygen-c", "-O2", "-o", cout,
+                                 ROOT / OVERLAPPING_COPIES])
+    text = tc.decode(cout.read_bytes()) if code == 0 and cout.exists() else ""
+    prog = text.partition("/* ---- the program, written by tinygen ---- */")[2]
+    if not re.search(r"\bgs_tg_memcpy\(", prog) or not re.search(r"\bgs_tg_memeq\(", prog) or \
+            "memcmp" in prog or not re.search(r"\bmemmove\([^;]*\(size_t\)v\d+\);", prog):
+        fail("tinygen's C of byte copies: gs_tg_memcpy, gs_tg_memeq, memmove where runs overlap",
+             o + e)
+        return
+    ok("tinygen's C of byte copies: gs_tg_memcpy and gs_tg_memeq, memmove where runs overlap")
+
+
+
 def check_run(exe, base, ok, fail):
 
     """goose run --backend=tinygen builds the program in its build cache and
@@ -491,7 +514,7 @@ def check_run(exe, base, ok, fail):
 # goose run with no --backend runs tinygen's C in TinyCC.
 JIT_PROGRAMS = ["samples/01_tour.goose", "test/tinygen/tinygen_text.goose",
                 "test/codegen/defer_results.goose", "test/codegen/index_type_abort.goose",
-                "test/codegen/relative_results.goose"]
+                "test/codegen/relative_results.goose", OVERLAPPING_COPIES]
 TINYGEN_JIT = "jit: tinygen's C"
 
 

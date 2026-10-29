@@ -66,6 +66,12 @@ inline string TgFixedShim(const string &name) {
                          "return GS_RANGE(v, lo, hi, t, f, l); }\n" },
         { "gs_tg_slicefail",
           "void gs_tg_slicefail(const char *f, int l) { gs_abort(GS_E_SLICE, f, l); }\n" },
+        // runtime.h's copy of runs that do not overlap and its compare, inline where tinygen's C is
+        // the unit: short ones without the C library's call.
+        { "gs_tg_memcpy", "void gs_tg_memcpy(void *d, const void *s, int64_t n) "
+                          "{ gs_memcpy(d, s, (size_t)n); }\n" },
+        { "gs_tg_memeq", "int32_t gs_tg_memeq(const void *a, const void *b, int64_t n) "
+                         "{ return gs_memeq(a, b, (size_t)n); }\n" },
     };
     if (auto it = fixed.find(name); it != fixed.end()) return it->second;
     if (name.rfind("gs_tg_abort_", 0) == 0)
@@ -139,7 +145,7 @@ inline string TgSupportBody(string_view runtimeh) {
         }
     for (auto n : { "gs_tg_stack_init", "gs_tg_rf", "gs_tg_rfpanic", "gs_tg_f2iwrap", "gs_tg_f2u",
                     "gs_tg_f2i",
-                    "gs_tg_range_u", "gs_tg_range", "gs_tg_slicefail" })
+                    "gs_tg_range_u", "gs_tg_range", "gs_tg_slicefail", "gs_tg_memcpy", "gs_tg_memeq" })
         s += TgFixedShim(n);
     // The codes of the runtime's error enum, one per line: "    GS_E_POP,".
     set<string> codes;
@@ -2039,11 +2045,11 @@ struct TgFn {
         return Add(SpVal(l), I64(live));
     }
 
-    // Moves n bytes from src (maybe on stk itself) to the top of stk, which grows by them; where they
-    // land.
+    // Copies n bytes from src (maybe on stk itself, but below its top: live bytes) to the top of stk,
+    // which grows by them; where they land.
     tyg_val PushBytes(tyg_val stk, tyg_val src, tyg_val n) {
         auto top = Top(stk);
-        tyg_move_dyn(p, top, src, n);
+        CopyDisjoint(top, src, n);
         SetTop(stk, Add(top, n));
         return top;
     }
@@ -2337,7 +2343,7 @@ struct TgFn {
                        auto elems = Add(pre, I64(1));
                        auto top = Top(stk);
                        tyg_move_dyn(p, Add(elems, Sub(msv(), I64(1))), elems, Sub(top, elems));
-                       tyg_copy_dyn(p, pre, AddrOf(AtL(tmp)), msv());
+                       CopyDisjoint(pre, AddrOf(AtL(tmp)), msv());
                        SetTop(stk, Add(top, Sub(msv(), I64(1))));
                    });
             return;
@@ -2458,11 +2464,12 @@ struct TgFn {
     void ToBytesIntoLim(const P &out, Node *a, Line l) {
         ToBytesVia(a, l, [&](tyg_val from, tyg_val n) { AppendToLim(out, from, n, l); });
     }
-    // n bytes at `from` appended to the limited u8 array out, under its capacity.
+    // n bytes at `from` appended to the limited u8 array out, under its capacity: past its length,
+    // where no live bytes, out's own included, lie.
     void AppendToLim(const P &out, tyg_val from, tyg_val n, Line l) {
         auto ol = Local(LimLen(out));
         AbortUnless(Cmp(TYG_SLE, Add(LdL(ol), n), LimCapOf(out)), "CAPACITY", l);
-        tyg_move_dyn(p, ElemAddr(LimView(out), LdL(ol)), from, n);
+        CopyDisjoint(ElemAddr(LimView(out), LdL(ol)), from, n);
         LimSetLen(out, Add(LdL(ol), n));
     }
 
@@ -2497,9 +2504,17 @@ struct TgFn {
     // A two-word header (a, then b) on a temporary.
     V PairV(TypeExpr *t, tyg_val a, tyg_val b) { return MemV(t, AtL(PairLocal(a, b))); }
     tyg_val BytesEq(tyg_val a, tyg_val b, tyg_val n) {
-        auto d = CallC("memcmp", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64, false) }, { a, b, n },
+        M.NeedShim("gs_tg_memeq");
+        auto d = CallC("gs_tg_memeq", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64) }, { a, b, n },
                        IT(TYG_I32));
-        return Cmp(TYG_EQ, d, I32(0));
+        return Cmp(TYG_NE, d, I32(0));
+    }
+    // n bytes from src to dst, runs that do not overlap (gs_memcpy); a run that may overlap moves
+    // with tyg_move_dyn.
+    void CopyDisjoint(tyg_val dst, tyg_val src, tyg_val n) {
+        M.NeedShim("gs_tg_memcpy");
+        CallC("gs_tg_memcpy", { tyg_type_ptr(m), tyg_type_ptr(m), IT(TYG_I64) }, { dst, src, n },
+              nullptr);
     }
     // arm(vi), in a block entered when the tag in `tag` is variant vi, for each of n variants.
     template <class F> void TagSwitch(tyg_local tag, size_t n, F arm) {
@@ -4074,14 +4089,14 @@ struct TgFn {
         return ValV(i64, I64(LimCap(ot)));
     }
     // v's elements appended to pl (CopyIntoLimited, EmitAppend): count and capacity check first, then
-    // the elements (moved as memmove moves them) and the length.
+    // the elements, past pl's length, so apart from v's even where v is pl, and the length.
     void LimAppendView(const P &pl, const View &v, Line l) {
         auto et = pl.t->arr->sub;
         if (cg.Mangle(v.elem) != cg.Mangle(et)) Unreachable(l, "array of another element type");
         auto nl = Local(v.len), ol = Local(LimLen(pl));
         auto total = [&] { return Add(LdL(ol), LdL(nl)); };
         AbortUnless(Cmp(TYG_SLE, total(), LimCapOf(pl)), "CAPACITY", l);
-        tyg_move_dyn(p, LimElemAddr(pl, LdL(ol)), v.elems, Mul(LdL(nl), I64(cg.FixedSize(et))));
+        CopyDisjoint(LimElemAddr(pl, LdL(ol)), v.elems, Mul(LdL(nl), I64(cg.FixedSize(et))));
         LimSetLen(pl, total());
     }
     V LimFrom(const V &x, TypeExpr *want, Line l) {
@@ -5480,7 +5495,7 @@ struct TgFn {
             auto n = Ld(blen);
             AbortUnless(Cmp(TYG_SLE, Add(LimLen(pl), n), LimCapOf(pl)), "CAPACITY", c->line);
             auto v = LimView(pl);
-            tyg_copy_dyn(p, Add(v.elems, LimLen(pl)), Ld(b.a), n);
+            CopyDisjoint(Add(v.elems, LimLen(pl)), Ld(b.a), n);
             LimSetLen(pl, Add(LimLen(pl), n));
             return V {};
         }
@@ -5525,7 +5540,7 @@ struct TgFn {
             }
             auto at = Local(LimLen(pl));
             AbortUnless(Cmp(TYG_SLE, Add(LdL(at), n), LimCapOf(pl)), "CAPACITY", a->line);
-            tyg_copy_dyn(p, Add(LimView(pl).elems, LdL(at)), src, n);
+            CopyDisjoint(Add(LimView(pl).elems, LdL(at)), src, n);
             LimSetLen(pl, Add(LdL(at), n));
         }
     }
