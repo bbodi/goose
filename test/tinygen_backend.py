@@ -231,6 +231,11 @@ PROGRAMS += [(TYPED_MEMORY, ["-O2"])]
 # every short length (gs_memeq), whose C check_copy_c reads.
 OVERLAPPING_COPIES = "test/codegen/overlapping_copies.goose"
 PROGRAMS += [(OVERLAPPING_COPIES, ["-O2"]), (OVERLAPPING_COPIES, [])]
+# Pushes counted in locals (TgFn::PoolCache) around calls that read or push the same array, relative
+# links null and not; and the range checks a 2 GB reservation still needs, of u16 links (check_rel_c).
+POOL_PUSHES = "test/storage/pool_push_locals.goose"
+PROGRAMS += [(POOL_PUSHES, ["-O2"]), (POOL_PUSHES, []),
+             ("test/storage/reloff_u16.goose", ["-O2"]), ("test/storage/inpool_u16.goose", ["-O2"])]
 
 # The windowed samples: built whole and not run, since they loop until their
 # window closes.
@@ -332,6 +337,7 @@ def check_tinygen_backend(exe, base, ok, fail, say):
     check_tinygen_c(exe, base, ok, fail, say, builtin)
     check_typed_c(exe, base, ok, fail)
     check_copy_c(exe, base, ok, fail)
+    check_rel_c(exe, base, ok, fail)
     check_run(exe, base, ok, fail)
     check_jit(exe, base, ok, fail)
     check_default_inlining(exe, base, ok, fail)
@@ -478,6 +484,26 @@ def check_copy_c(exe, base, ok, fail):
         return
     ok("tinygen's C of byte copies: gs_tg_memcpy and gs_tg_memeq, memmove where runs overlap")
 
+
+def check_rel_c(exe, base, ok, fail):
+    """A relative store's range check (gs_tg_abort_RELOFF) is in tinygen's C only where a root can
+    span more than the width holds (TgFn::RelSpan): not for u32 links under the default 2 GB
+    reservation, where both ends lie in one, but for them under a 4 GB one, and for u16 links."""
+    def checks(source, flags):
+        cout = base / f"{Path(source).stem}-rel.tg.c"
+        code, o, e = tc.run_capture([exe, "build", "--backend=tinygen-c", "-O2", *flags, "-o", cout,
+                                     ROOT / source])
+        text = tc.decode(cout.read_bytes()) if code == 0 and cout.exists() else ""
+        prog = text.partition("/* ---- the program, written by tinygen ---- */")[2]
+        return (len(re.findall(r"\bgs_tg_abort_RELOFF\(", prog)) if prog else -1), o + e
+    n32, log32 = checks(POOL_PUSHES, [])
+    n32wide, logwide = checks(POOL_PUSHES, ["-DGS_STACK_RESERVE=4294967296"])
+    n16, log16 = checks("test/storage/reloff_u16.goose", [])
+    if n32 != 0 or n32wide < 3 or n16 < 1:
+        fail(f"tinygen's C of relative range checks: {n32} under 2 GB, {n32wide} under 4 GB, "
+             f"{n16} of u16", log32 + logwide + log16)
+        return
+    ok("tinygen's C of relative range checks: none for u32 under 2 GB, kept under 4 GB and for u16")
 
 
 def check_run(exe, base, ok, fail):
