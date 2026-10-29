@@ -331,11 +331,9 @@ statuses come from the same hosted runtime (`test/jit_runtime.py`).
 The run takes this path only if tinygen takes the program whole, by the
 `goose build` rules: every function compiled and a plain `main`. Every `-D`
 and every `--include` header go into the unit. Two more classes take
-the old path for now, and say so. The first is a program calling an extern of a shared
-library: the C generator binds it through the runtime's loader, whereas
-tinygen's C calls it by name, which only a link resolves. The second is a
-run with `-DGS_MAX_STACKS`, because tinygen counts more data stacks than the
-C generator for some programs (`append_destination_storage`). Otherwise the whole
+the old path for now, and say so: a program calling an extern of a shared
+library (the C generator binds it through the runtime's loader, whereas
+tinygen's C calls it by name, which only a link resolves). Otherwise the whole
 program runs on the C generator's C, built by a second `CodeGen` without
 tinygen; a mixed program never goes into one TinyCC unit. `-v` prints
 `jit: tinygen's C` or `jit: the C generator's C ... (why)`. Inlining defaults
@@ -379,6 +377,18 @@ Two things of tinygen's C output are worked around here:
   `typedef _Bool _Bool;`. In C output the `bool` base type is named `bool`,
   which tinygen leaves to the C type.
 
+## Data stack counts and named results
+
+`-DGS_MAX_STACKS` is checked against tinygen's own count (`stackown`, `stackcalls`: the
+indices each body allocates), which has to stay within the C generator's. Two shapes
+made it higher, and both are built as the C generator builds them: an array appended
+from a call or construct yielding a `T[..]` is built on the receiver's stack and
+compacted there (`AppendSrc`, `EmitAppend`), and a `T[]` or `T[..]` local that the returns
+hand back (guaranteed NRVO, spec 7.3) is declared on the destination stack (`nrvo`,
+`NrvoBind`), in a function and in its inlined form, with another returned value built
+behind it and slid down. A resizable or frame object named result still has a stack of
+its own and is copied out at the return, one stack more than the C generator needs.
+
 ## Defaults of `goose build`
 
 With a compiler built with tinygen, `goose build` without `--backend` means
@@ -386,7 +396,7 @@ With a compiler built with tinygen, `goose build` without `--backend` means
 `--backend=tinygen` (the fast debug build, GS_DEBUG checks as before). `-o x.c`
 selects tinygen-c, also with `--debug`. A program that tinygen cannot take
 whole builds through the C generator's C, all of it, as the JIT of `goose run`
-does: `-DGS_MAX_STACKS` (tinygen's data stack count is not checked against it), an `export fn` that
+does: an `export fn` that
 `ExportOk` rejects (no program is known to reach one: large fixed values by value
 cross through `ForwardCall`), or any function left to C. A `-D` keeps the program on tinygen: it goes into the support
 object's source (`DefinesSource`), which a define other than GS_DEBUG and the ones

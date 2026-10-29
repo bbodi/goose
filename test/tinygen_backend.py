@@ -307,7 +307,9 @@ REGRESSIONS = ["test/codegen/forward_adaptation.goose", "test/codegen/bytes_valu
                "test/codegen/relative_declarations.goose",
                "test/codegen/frame_pool_references.goose",
                # G3.4c1: `self` in a self-relative field of a literal built in a temporary.
-               "test/storage/relative_copy_forms.goose"]
+               "test/storage/relative_copy_forms.goose",
+               # An image local the returns hand back lies at its destination from its declaration.
+               "test/codegen/named_image_results.goose"]
 # Programs whose header asks for the debug checks (a runtime-debug or GS_DEBUG=1 line), built with
 # --debug: thread_contained answers only in a debug build, and the others, also listed above, have
 # links the checks verify.
@@ -324,6 +326,14 @@ WHOLE_PROGRAM |= {Path(path).stem for path in REGRESSIONS + DEBUG_REGRESSIONS}
 LARGE_FIXED = ["test/codegen/large_fixed_values.goose", "test/codegen/large_fixed_exits.goose"]
 PROGRAMS += [(path, True, [level]) for path in LARGE_FIXED for level in ("-O0", "-O2")]
 WHOLE_PROGRAM |= {Path(path).stem for path in LARGE_FIXED}
+# Programs under a GS_MAX_STACKS limit (their first line), as the main suite builds them: the
+# backend's data stack count is checked against it, so these stay within the C generator's count
+# (an image named result lies at its destination, a literal appended is built at the receiver).
+STACK_LIMITED = [("test/codegen/append_destination_storage.goose", "-DGS_MAX_STACKS=1"),
+                 ("test/codegen/cycle_scratch_locals.goose", "-DGS_MAX_STACKS=4"),
+                 ("test/codegen/named_init_inplace.goose", "-DGS_MAX_STACKS=1")]
+PROGRAMS += [(path, True, [flag]) for path, flag in STACK_LIMITED]
+WHOLE_PROGRAM |= {Path(path).stem for path, _ in STACK_LIMITED}
 # Programs the backend does not yet build whole: each leaves the named functions to the C generator
 # (the reference semantics), so the suite proves the fallback gives the blessed output today. An entry
 # moves to REGRESSIONS once its refusal is lifted, and each comment names the refusal it reaches.

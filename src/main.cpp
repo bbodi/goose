@@ -1690,25 +1690,12 @@ int Main(int argc, char **argv) {
     // The flag form `goose -o x.c` (C for a C host, with --header, --include, --standalone)
     // writes tinygen-c's C as well (flagform).
     auto tgdefault = false, flagform = false;
-    // tinygen counts more data stacks than the C generator for some programs, which a
-    // GS_MAX_STACKS limit then refuses (test/codegen/append_destination_storage.goose): such a
-    // program takes the C generator's C, as a goose run does (tgjit below).
-    string maxstacks;
-    for (auto &d : cdefines)
-        if (d.rfind("GS_MAX_STACKS", 0) == 0) maxstacks = d;
     #if GOOSE_HAVE_TINYGEN
         auto wantsc = outname.size() > 2 && outname.compare(outname.size() - 2, 2, ".c") == 0;
         flagform = verb.empty() && !backendgiven && !forcejit && !outname.empty();
         if ((verb == "build" || flagform) && !backendgiven) {
-            if (maxstacks.empty()) {
-                tgdefault = true;
-                backendname = debug && !wantsc && !flagform ? "tinygen" : "tinygen-c";
-            } else {
-                flagform = false;
-                fprintf(stderr, "goose: the C generator's C for the whole program (-D%s: tinygen's "
-                                "data stack count is not checked against it yet)\n",
-                        maxstacks.c_str());
-            }
+            tgdefault = true;
+            backendname = debug && !wantsc && !flagform ? "tinygen" : "tinygen-c";
         }
     #endif
     if (backendname != "c" && backendname != "tinygen" && backendname != "tinygen-c") {
@@ -1825,12 +1812,6 @@ int Main(int argc, char **argv) {
     auto tgjit = false;
     #if GOOSE_HAVE_TINYGEN
         tgjit = jit && !backendgiven && !nocgen && !parseonly && !dump && !tokens;
-        if (tgjit && !maxstacks.empty()) {
-            tgjit = false;
-            fprintf(stderr, "jit: the C generator's C, compiled by TinyCC, for the whole program "
-                            "(-D%s: tinygen's data stack count is not checked against it yet)\n",
-                    maxstacks.c_str());
-        }
     #endif
     if (!headername.empty() && (jit || multitest)) {
         fprintf(stderr, "--header requires C output for a single input file\n");

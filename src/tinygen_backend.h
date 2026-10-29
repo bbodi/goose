@@ -1645,6 +1645,30 @@ struct TgFn {
         tyg_local top0 = 0;   // A destination's top on entry (DstTop0).
     };
     vector<Chan> chans;
+    // A named result built where the value ends up (§7.3; CodeGen::DetectNrvo, OpenIbNrvo): a T[] image
+    // local the returns hand back is declared on its destination stack, at the top it has on entry, so
+    // it needs no stack of its own and `return it` moves nothing. Another value returned meanwhile is
+    // built behind it and slid down over it. Only images; a resizable or frame object local still has
+    // a stack of its own and is copied out at the return.
+    struct NrvoBind {
+        tyg_local stk, top0;
+        bool open = false;   // Declared: its elements lie at the destination.
+    };
+    map<const VarDef *, NrvoBind> nrvo;
+    map<size_t, const VarDef *> nrvoret;   // A function's result positions bound to a local.
+    NrvoBind *NrvoOf(Node *val) {
+        auto id = Is<Ident>(val);
+        auto it = id && id->vdef ? nrvo.find(id->vdef) : nrvo.end();
+        return it != nrvo.end() && it->second.open ? &it->second : nullptr;
+    }
+    // The value built at start on stk moved down to top0.
+    void SlideDown(tyg_val stk, tyg_val start, tyg_val top0) {
+        If(Cmp(TYG_NE, start, top0), [&] {
+            auto n = Sub(Top(stk), start);
+            tyg_move_dyn(p, top0, start, n);
+            SetTop(stk, Add(top0, n));
+        });
+    }
     // Data stacks (§6.2) as the C backend uses them: gs_sp in a local, the thread's stack block
     // (gs_stks) read once per invocation (gblk). The body's stacks are GS(gs_sp + k), k counted up as
     // locals and temporaries take one (AllocStk); a callee is handed gs_sp + the indices in use. Every
@@ -3669,12 +3693,17 @@ struct TgFn {
             No(sl->line, "literal of this type");
         auto x = MemTemp(t, true);
         if (t->kind == TY_ENUM) StoreTag(x.a, t, M.EI(t)->en->VariantIndex(sl->variant));
+        // `self` in a self-relative field is minus the field's own offset, wherever the value lies
+        // (CodeGen::EmitRelSelfAt), so it survives the copy out of the temporary.
+        SelfScope scope(selfbase, AddrOf(x.a));
         EachLitInit(sl, [&](Node *init, TypeExpr *ft, int64_t off) {
             // Any other self-relative link measures from the slot it lies in, which a literal built
             // here and copied out of is not.
             if (!adt && TgModule::IsRel(ft) && !ft->ref->pool && !Is<NullLit>(init) &&
                 !Is<SelfRef>(init))
                 No(sl->line, "self-relative link in a literal");
+            if (!adt && TgModule::IsRel(ft) && ft->ref->pool && Is<SelfRef>(init))
+                No(sl->line, "self in a pool link of a literal built in a temporary");
             Into(P { AddrPlus(x.a, off), ft }, init);
         });
         return x;
@@ -3694,16 +3723,11 @@ struct TgFn {
         if ((pl.t->kind == TY_SLICE && M.TypeOk(pl.t)) || (IsGrow(pl.t) && M.RzOk(pl.t))) {
             // { data, len }, and gs_rhdr { base, len } alike.
             auto elem = pl.t->kind == TY_SLICE ? pl.t->sub : pl.t->arr->sub;
-        // `self` in a self-relative field is minus the field's own offset, wherever the value lies
-        // (CodeGen::EmitRelSelfAt), so it survives the copy out of the temporary.
-        SelfScope scope(selfbase, AddrOf(x.a));
             return { BaseOf(pl), needlen ? Ld(AddrPlus(pl.a, 8)) : 0, elem, -1 };
         }
         if (TgModule::IsLim(pl.t) && M.LimHeld(pl.t)) return LimView(pl);
         // Elements of variable size: walked from the first (StepElem).
         if (IsGrow(pl.t) && M.VeOk(pl.t))
-            if (!adt && TgModule::IsRel(ft) && ft->ref->pool && Is<SelfRef>(init))
-                No(sl->line, "self in a pool link of a literal built in a temporary");
             return { BaseOf(pl), needlen ? Ld(AddrPlus(pl.a, 8)) : 0, pl.t->arr->sub, -1 };
         if (IsArrayKind(pl.t, A_VAR) && (M.RzOk(pl.t) || M.VarImgOk(pl.t))) return VarArrView(pl);
         No(l, "array of this kind");
@@ -4854,6 +4878,22 @@ struct TgFn {
             if (Ended()) return;
             SetTop(pl.stk, Add(LdL(base), I64(k * cg.FixedSize(et))));
             St(len, Add(Ld(len), I64(k)));
+            return;
+        }
+        auto st = src->exprtype;
+        auto sc = Is<Call>(src);
+        if (st && M.RcOk(st) && ((sc && sc->builtin < 0) || cg.IsCtl(src))) {
+            // A T[..] a call or a construct yields: built on the receiving stack itself, its
+            // capacity/length header then slid out and its unused capacity dropped, so no stack of
+            // its own is claimed (CodeGen::EmitAppend).
+            auto base = Local(Top(pl.stk));
+            GenImg(src, pl.stk, st, l);
+            if (Ended()) return;
+            auto cnt = Local(LimLen(P { AtV(LdL(base)), st }));
+            auto bytes = Mul(LdL(cnt), I64(cg.FixedSize(et)));
+            tyg_move_dyn(p, LdL(base), Add(LdL(base), I64(8)), bytes);
+            SetTop(pl.stk, Add(LdL(base), bytes));
+            St(len, Add(Ld(len), LdL(cnt)));
             return;
         }
         auto th = NewHdr();
@@ -6288,6 +6328,14 @@ struct TgFn {
         auto done = NewBlock();
         auto lt = CtlTarget(k, done, done, true, ip);
         lt.ibsf = ib->sf;
+        auto bound = false;
+        if (ip && ip->mode == 1 && ib->spec && ib->spec->rets.size() == 1 && IsImg(ip->t)) {
+            auto vd = cg.NamedResult(ib->body, ib->sf, 1, 0);
+            if (vd && !nrvo.count(vd) && !vd->reusable && IsImg(vd->type) && cg.TEq(vd->type, ip->t)) {
+                nrvo[vd] = { Local(ip->stk), lt.top0 };
+                bound = true;
+            }
+        }
         loops.push_back(lt);
         InScope([&] {
             for (auto i = first; i < body->stmts.size(); i++) Stmt(body->stmts[i]);
@@ -6297,7 +6345,11 @@ struct TgFn {
             // The tail is a return of its value: delivered as a `return` does (a reference stays
             // the reference the callee gives, not a copy of its target).
             auto tail = body->tail;
-            if (k.valued && !ip && tail->exprtype && tail->exprtype->kind != TY_VOID) {
+            if (bound) {
+                OpenScope(true);
+                BreakValue(tail, tail->line, lt);
+                CloseScope();
+            } else if (k.valued && !ip && tail->exprtype && tail->exprtype->kind != TY_VOID) {
                 OpenScope(true);
                 BreakValue(tail, tail->line, lt);
                 CloseScope();
@@ -6665,6 +6717,7 @@ struct TgFn {
     }
     // A break's value, delivered as its target wants it (CodeGen::GenExitValue, LandValue).
     void BreakValue(Node *val, Line line, const LoopTargets &t) {
+        if (auto nb = t.ip.mode == 1 ? NrvoOf(val) : nullptr; nb && nb->top0 == t.top0) return;
         if (t.pref) {
             PrefInto(AtL(t.res), val);
         } else if (t.ip.mode == 5) {
@@ -6863,10 +6916,16 @@ struct TgFn {
         for (size_t i = 0; i < rets.size(); i++) {
             if (IsImg(rets[i]) || M.Resz(rets[i])) {
                 auto dst = LdL(chans[i].a);
-                SetTop(dst, LdL(chans[i].top0));
+                auto nb = nrvoret.count(i) ? &nrvo[nrvoret[i]] : nullptr;
+                if (nb && !nb->open) nb = nullptr;
+                if (nb && xs.empty() && NrvoOf(vals[i]) == nb) continue;   // Built in place already.
+                // Over an open named result the value is built behind it, then slid down.
+                if (!nb) SetTop(dst, LdL(chans[i].top0));
+                auto start = Local(Top(dst));
                 auto rl = M.Resz(rets[i]) ? AtV(LdL(chans[i].b)) : tyg_addr {};
                 BuildAt(xs.empty() ? vals[i] : nullptr, xs.empty() ? nullptr : &xs[i], dst, rets[i],
                         rl, l);
+                if (nb && !Ended()) SlideDown(dst, LdL(start), LdL(chans[i].top0));
             } else if (xs.empty() && selfrel(vals[i], rets[i])) {
                 Into(dest(i), vals[i]);
             } else if (!xs.empty() && cg.NeedsResultLocation(rets[i])) {
@@ -7039,8 +7098,10 @@ struct TgFn {
                     M.VvOk(t) ||
                     M.RcOk(t) || M.VrOk(t));
         if ((hdr || img || M.FoOk(t)) && !cg.PrefVar(d)) {
-            auto stk = Stk(AllocStk(true, l), l);
+            auto nb = img && nrvo.count(d) ? &nrvo[d] : nullptr;
+            auto stk = nb ? LdL(nb->stk) : Stk(AllocStk(true, l), l);
             auto sl = Local(stk);
+            if (nb) nb->open = true;
             tyg_local loc;
             if (img) {
                 loc = Local(Top(stk));
@@ -7923,6 +7984,17 @@ struct TgFn {
             if (!NonFixedRet(sp->rets[i])) continue;
             chans[i].top0 = Local(Top(LdL(chans[i].a)));
         }
+        // An image local the returns hand back is built at its destination (nrvo).
+        if (!cg.fromids.count(sp))
+            for (size_t i = 0; i < sp->rets.size(); i++) {
+                if (!IsImg(sp->rets[i])) continue;
+                auto cand = cg.NamedResult(sp->body, sp->sf, sp->rets.size(), i);
+                if (!cand || nrvo.count(cand) || cand->reusable || !IsImg(cand->type) ||
+                    !cg.TEq(cand->type, sp->rets[i]))
+                    continue;
+                nrvo[cand] = { chans[i].a, chans[i].top0 };
+                nrvoret[i] = cand;
+            }
         NewProcBody();
         if (cg.fromids.count(sp)) {
             // A `return from` target: values in flight to it are built on its destinations (EmitSpec).
