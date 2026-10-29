@@ -305,7 +305,9 @@ REGRESSIONS = ["test/codegen/forward_adaptation.goose", "test/codegen/bytes_valu
                "test/codegen/index_type_abort.goose", "test/codegen/bound_type_abort.goose",
                "test/typing/index_types.goose", "test/codegen/relative_results.goose",
                "test/codegen/relative_declarations.goose",
-               "test/codegen/frame_pool_references.goose"]
+               "test/codegen/frame_pool_references.goose",
+               # G3.4c1: `self` in a self-relative field of a literal built in a temporary.
+               "test/storage/relative_copy_forms.goose"]
 # Programs whose header asks for the debug checks (a runtime-debug or GS_DEBUG=1 line), built with
 # --debug: thread_contained answers only in a debug build, and the others, also listed above, have
 # links the checks verify.

@@ -3670,9 +3670,10 @@ struct TgFn {
         auto x = MemTemp(t, true);
         if (t->kind == TY_ENUM) StoreTag(x.a, t, M.EI(t)->en->VariantIndex(sl->variant));
         EachLitInit(sl, [&](Node *init, TypeExpr *ft, int64_t off) {
-            // A self-relative link measures from the slot it lies in, which a literal built here and
-            // copied out of is not.
-            if (!adt && TgModule::IsRel(ft) && !ft->ref->pool && !Is<NullLit>(init))
+            // Any other self-relative link measures from the slot it lies in, which a literal built
+            // here and copied out of is not.
+            if (!adt && TgModule::IsRel(ft) && !ft->ref->pool && !Is<NullLit>(init) &&
+                !Is<SelfRef>(init))
                 No(sl->line, "self-relative link in a literal");
             Into(P { AddrPlus(x.a, off), ft }, init);
         });
@@ -3693,11 +3694,16 @@ struct TgFn {
         if ((pl.t->kind == TY_SLICE && M.TypeOk(pl.t)) || (IsGrow(pl.t) && M.RzOk(pl.t))) {
             // { data, len }, and gs_rhdr { base, len } alike.
             auto elem = pl.t->kind == TY_SLICE ? pl.t->sub : pl.t->arr->sub;
+        // `self` in a self-relative field is minus the field's own offset, wherever the value lies
+        // (CodeGen::EmitRelSelfAt), so it survives the copy out of the temporary.
+        SelfScope scope(selfbase, AddrOf(x.a));
             return { BaseOf(pl), needlen ? Ld(AddrPlus(pl.a, 8)) : 0, elem, -1 };
         }
         if (TgModule::IsLim(pl.t) && M.LimHeld(pl.t)) return LimView(pl);
         // Elements of variable size: walked from the first (StepElem).
         if (IsGrow(pl.t) && M.VeOk(pl.t))
+            if (!adt && TgModule::IsRel(ft) && ft->ref->pool && Is<SelfRef>(init))
+                No(sl->line, "self in a pool link of a literal built in a temporary");
             return { BaseOf(pl), needlen ? Ld(AddrPlus(pl.a, 8)) : 0, pl.t->arr->sub, -1 };
         if (IsArrayKind(pl.t, A_VAR) && (M.RzOk(pl.t) || M.VarImgOk(pl.t))) return VarArrView(pl);
         No(l, "array of this kind");
