@@ -156,8 +156,8 @@ beyond those in [§5](#5-options-for-run-build-and-check):
 | `-o exe` | Where the executable goes. Its directory is made if needed. |
 | `--debug` | Turn on the overflow, range and tag checks (`GS_DEBUG=1`), and build the C without optimization and with debug information (`/Od /Zi`, or `-O0 -g`), for a debugger. |
 | `--cc name\|path` | The C compiler, as above. |
-| `--standalone` | Compile the runtime into the program, rather than linking the runtime object built once per C compiler. With tinygen the runtime is compiled from its source in the program's build directory and linked; with `-o x.c` the C generator writes one file holding the runtime and the program. |
-| `--backend name` | Without it, a compiler with tinygen builds through tinygen's C (`tinygen-c`), or with `--debug` through tinygen's machine code (`tinygen`); a program tinygen cannot take whole (`--include` or `--standalone` with `-o x.c`) builds through the C generator's C (`c`), and `-v` says why. `-o x.c` writes that C and builds nothing. |
+| `--standalone` | Compile the runtime into the program, rather than linking the runtime object built once per C compiler. tinygen's C then holds the whole runtime in its one file; with `--debug` (tinygen's machine code) the runtime is compiled from its source in the program's build directory and linked. |
+| `--backend name` | Without it, a compiler with tinygen builds through tinygen's C (`tinygen-c`), or with `--debug` through tinygen's machine code (`tinygen`); a program tinygen cannot take whole builds through the C generator's C (`c`), and says why. `-o x.c` writes the C, as the flag form does ([§8](#8-writing-the-c-yourself)), and builds nothing. |
 | `-v` | Print each command the build runs, and what it prints. |
 | `--dry-run` | Print the commands the build would run, with their paths, and run none of them. A Makefile or CMake project can take them from here. |
 
@@ -191,7 +191,7 @@ These options have the same meaning for `goose run`, `goose build`,
 |---|---|
 | `-O0`, `-O1`, `-O2` | How much the Goose compiler inlines: nothing, a little, or the most (the default). Constant folding and propagation run at every level, and a build's C compiler optimizes at every level. |
 | `--debug` | Turn on the overflow checks, the range checks of `as` casts and the tag checks (`GS_DEBUG=1`). Each failure names its source line, and an overflow or a cast names the values involved. A build also gets debug information ([§3](#3-building-an-executable)). |
-| `-D NAME[=VALUE]` | Define a C macro in the generated program, as `-DNAME[=VALUE]` does too. The define is written into the C itself, so a run and a build see the same source. The value is 1 when none is given. With tinygen it goes into the support unit, the C that includes the runtime's headers (and any `--include` header); tinygen's C reads no macro. |
+| `-D NAME[=VALUE]` | Define a C macro in the generated program, as `-DNAME[=VALUE]` does too. The define is written into the C itself, so a run and a build see the same source. The value is 1 when none is given. It reaches the runtime's headers and any `--include` header; tinygen's code of the program reads no macro. |
 | `--stack-reserve size` | The address space reserved for each data stack, from 64K up to 256T with a `K`, `M`, `G` or `T` suffix. The default is 2G. The address space is committed as it is used, so a large reservation costs nothing until it is used. |
 | `--stacks` | Report how many data stacks the program and each of its workers use, what that adds up to, and the cap it puts on `hardware_threads()`. |
 | `--bce-lines` | Report, for each source line, how many bounds checks the compiler removed and how many it kept. |
@@ -309,11 +309,23 @@ On Windows the last two are `cl /O2 /c goose_runtime.c` and
 `cl /O2 tour.c goose_runtime.obj`. On Linux, add `-ldl` before glibc 2.34.
 
 `-o out.c` writes the program's C and runs nothing; `--jit` also runs the
-program in-process as `goose run` would. The C holds the program and the part
-of the runtime that is inlined into it. The rest of the runtime (the OS
-layer, the reservation of data stacks, threads and printing) is the C that
-`--emit-runtime` writes, which is compiled once and linked with every
-program. It takes no `-D` of its own, since a program hands the runtime its
+program in-process as `goose run` would. `goose build -o out.c` writes the same
+file. With a compiler built with tinygen it is one translation unit, in this
+order: the `-D` defines and the configuration the runtime reads; tinygen's
+prelude of C macros; the runtime's headers (`runtime.h` and
+`runtime_ext.h`, the part of the runtime that is inlined into the program);
+with `--include`, the program's C types and the headers, then the calls into
+their extern fns; the support of the tinygen backend (its checks, aborts and
+the program's start); and the program itself as tinygen writes it, one C
+function per Goose function, with `#line` directives naming the `.goose`
+source, then `main`. The rest of the runtime (the OS layer, the reservation of
+data stacks, threads and printing) is the C that `--emit-runtime` writes,
+which is compiled once and linked with every program; with `--standalone` the
+file holds all of it instead and builds alone. A program tinygen cannot take
+whole gets the C generator's C instead (goose says why), with the same use.
+The checks of `--debug` (`GS_DEBUG=1`) are in tinygen's code as it is
+written: give `--debug` or `-DGS_DEBUG=1` to goose, not to the C compiler,
+which a file written without them refuses. It takes no `-D` of its own, since a program hands the runtime its
 configuration as it starts. Build it with the same C compiler and flags as
 the programs. A program from another version of the compiler fails to link
 against it (`goose version` prints the runtime's hash, which must match).
@@ -322,8 +334,8 @@ against it (`goose version` prints the runtime's hash, which must match).
 |---|---|
 | `-o out.c` | Write the program's C, and do not run it. |
 | `--standalone` | Write C that holds the whole runtime, and builds on its own: `cc -O2 tour.c -o tour -lm -pthread`. |
-| `--header out.h` | Also write a header for a C host, declaring the program's `export fn`s, of which there must be one at least. The C then has no `main`: the host calls `goose_init(argc, argv)` once, which runs the program's `main`, and then calls the exported functions. |
-| `--include header.h` | Have the generated C include this header, for small shims written against the generated types (spec §7.10). May be repeated. `goose build` and `goose run` take it too: with tinygen the header goes into a unit of the program's own, with the program's C types and the calls to its extern fns, so a static or inline function of the header can implement one. |
+| `--header out.h` | Also write a header for a C host, declaring the program's `export fn`s, of which there must be one at least, with the C types they take. The C then has no `main`: the host calls `goose_init(argc, argv)`, which starts the program once and runs its `main` if it has one, and then calls the exported functions; one called before `goose_init` aborts. Link the C with the host and the runtime object, or write it `--standalone`. |
+| `--include header.h` | Have the generated C include this header, for small shims written against the generated types (spec §7.10), after the program's C types and before the program. May be repeated. `goose build` and `goose run` take it too, so a static or inline function of the header can implement an extern fn. |
 | `--jit` | Also run the program in this process. |
 | `--emit-runtime out.c` | Write the runtime's C. |
 | `--<package>-link msvc\|cc` | Print the path of the response file that links the native part of a package compiled into `goose`, for the `msvc` or `cc` style of command line. |

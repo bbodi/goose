@@ -72,25 +72,52 @@ The support object depends only on the runtime (`TgSupportBody`,
 version and configuration, and caches it beside the runtime object. It comes
 in two variants: plain, and with `GS_DEBUG` for `--debug`.
 
-**Extern unit.** With `--include`, a whole program also has an extern unit
-(`TinygenExternSource`), which the build writes to `<stem>.tgx.c` in the
-build directory and compiles with the program, and which a `goose run`
-compiles as a third TinyCC unit. It holds the runtime's headers, the
+**Extern unit.** With `--include`, a whole native program also has an extern
+unit (`TinygenExternSource`), which the build writes to `<stem>.tgx.c` in the
+build directory and compiles with the program. (tinygen's C holds the same in
+its one unit, below.) It holds the runtime's headers, the
 program's C types as the C generator declares them (`CodeGen::types`), the
 headers, which are written against those types, and a `gs_tg_x_` trampoline
 for each extern fn the support object does not hold (`ExternTrampolines`).
 The object then forwards no extern itself (`ForwardExterns`), so a header's
 static or inline function is callable. The `-D` given go into the unit as
-into the support object. `goose build -o x.c` with `--include` still writes
-the C generator's C, since tinygen's C alone lacks the header's functions.
+into the support object.
 
-**`--standalone`.** A whole program built with `--standalone` links a runtime
-object compiled from `RuntimeObjectSource` in its build directory, with the
-`-D` given, instead of the one cached per C compiler. `goose build -o x.c
---standalone` still writes the C generator's single file: tinygen's C
-declares the runtime's functions with tinygen's signatures (`void *` for the
-runtime's typed pointers), which conflict with the runtime's own in one
-translation unit, the reason `goose run` uses two TinyCC units.
+**`--standalone`.** A whole native program built with `--standalone` links a
+runtime object compiled from `RuntimeObjectSource` in its build directory,
+with the `-D` given, instead of the one cached per C compiler.
+
+**One C unit.** tinygen's C of a whole program (tinygen-c, `goose run`, and
+every `-o x.c`) is one translation unit instead of the three objects. goose
+hands tinygen the header text through `tyg_c_header`, which tinygen prints
+after its prelude (`TinygenUnitHeader`), and writes defines before and the
+JIT's cleanup after it (`TinygenUnit`):
+
+| Part | Holds |
+|---|---|
+| goose's prefix | `_DEFAULT_SOURCE`, the `-D` defines, `GS_SEPARATE_RUNTIME` and `GS_RUNTIME_VERSION` (or, `--standalone`, `GS_NEED_THREADS` for a program with threads), in a run `jit_c.h` and TinyCC's `va_list`, and an `#error` for a `GS_DEBUG` the file was not written for |
+| tinygen's prelude | its macros and C headers (a run drops the `#include`s) |
+| the header | `runtime.h` (with `--standalone` all of the runtime), with `--include` the program's C types (`CodeGen::types`), `runtime_ext.h`, `TgSupportBody`, the `--include` headers and `ExternTrampolines` |
+| tinygen's C | the program's types, data and procedures, with `#line` naming the Goose source, then `main` (`kCMain`) or a library's `goose_init` |
+
+Every symbol the header declares that tinygen's C names is
+`TYG_SYM_DECLARED` (`DeclareHeaderSymbols`, after `WholeProgram` decided
+the unit): the runtime's `GS_API` functions, the support body's shims and
+`gs_tg_start`, and the `gs_tg_x_` trampolines. tinygen then prints no
+prototype of its own, which would clash with the header's typed pointers, and
+calls them by name with `void *` arguments, which C converts. The C library's
+math names stay tinygen's: it reserves them. An extern call with a struct
+argument or result (`sl_u8`, `gs_rref`, a program's struct) cannot pass
+tinygen's struct to the header's, so `GenExternCall` calls such a callee
+through its address in a block of its own (`tyg_call` turns a call through an
+address taken in the same block into a direct one); the ABI makes it the same
+call. The support body builds the runtime's threads in a standalone unit only
+with `GS_NEED_THREADS`, and its fixed `gs_tg_stkpp` only without it.
+
+A library (`--header`, the flag form) is whole too: no `main` is needed,
+`EmitMain` writes `goose_init`, which starts the program once and runs `main`
+if there is one, and each `export fn` wrapper aborts when called before it.
+The header stays `CodeGen::ExportHeader`'s.
 
 **Mixed.** The C backend writes its C as usual, and the C compiler compiles it
 at `-O0 -g`. That C holds `main`, the globals, any function tinygen did not
@@ -98,9 +125,7 @@ take, and the shims the object calls. `CodeGen` gives every function external
 linkage, so the two objects resolve each other's calls.
 
 A build takes the mixed path when a function or a global initializer falls
-back to C. It also takes it for a library (`--header`, which only the C
-generator's flag form `goose -o x.c` takes) or an `export fn` that `ExportOk`
-rejects, and for `--include` or `--standalone` with `-o x.c`. A `-D` goes into
+back to C, or for an `export fn` that `ExportOk` rejects. A `-D` goes into
 the support object's source, and `GS_DEBUG` picks its variant. The stack
 settings (`GS_STACK_RESERVE`, `GS_STACK_GAP`, `GS_STACK_BUDGET` and
 `GS_MAX_STACKS`, so `--stack-reserve` too) keep a whole build: `main` passes
@@ -293,29 +318,20 @@ to C (the C backend keeps those on a data stack).
 Plain `goose run` (and `goose file.goose`) runs tinygen's C in TinyCC
 (`docs/design/jit_backend.md`). The module is created with `TYG_OUTPUT_C`, as
 for tinygen-c, and `CText` returns its text in memory with the appended
-`main`. TinyCC compiles two translation units into one in-memory program:
-
-* the support unit, `TinygenSupportSource(checks, true)`: the `-D` defines,
-  `jit_c.h`, `runtime.h`, the packed prelude, `runtime_ext.h`, `TgSupportBody`
-  (shims, trampolines, `gs_tg_start`) and `gs_jit_cleanup`. It names
-  `gs_rt_start` without the runtime version, since the runtime is the one
-  built into Goose. `GS_TG_TLS` is empty there because the JIT runs no
-  threads;
-* tinygen's C (`TinygenJitUnit`). Its prelude's `#include`s of the C headers
-  give way to `jit_c.h` and TinyCC's `va_list`, because the JIT has no C
-  headers. tinygen's prelude has TinyCC fallbacks of its own for traps, byte
-  swaps, atomics and `asm` labels.
-
-They are two units because tinygen's C declares the runtime's functions with
-its own signatures, which conflict with `runtime.h`'s. Both bind the
-runtime's `gs_*` functions through the `GS_JIT_SYMBOL` table, as the C
-generator's program does. Exit status, arguments, resource root and abort
+`main`. TinyCC compiles the one unit (`TinygenUnit` with `jit`, above): the
+prelude's `#include`s of the C headers give way to `jit_c.h` and TinyCC's
+`va_list`, because the JIT has no C headers; the unit names `gs_rt_start`
+without the runtime version, since the runtime is the one built into Goose;
+`GS_TG_TLS` is empty because the JIT runs no threads; and `gs_jit_cleanup`
+follows the program. tinygen's prelude has TinyCC fallbacks of its own for
+traps, byte swaps, atomics and `asm` labels. The runtime's `gs_*` functions
+bind through the `GS_JIT_SYMBOL` table, as the C generator's program does. Exit status, arguments, resource root and abort
 statuses come from the same hosted runtime (`test/jit_runtime.py`).
 
 The run takes this path only if tinygen takes the program whole, by the
 `goose build` rules: every function compiled and a plain `main`. Every `-D`
-goes into the support unit, and an `--include` header into the extern unit. Two more classes take
-the old path for now. The first is a program calling an extern of a shared
+and every `--include` header go into the unit. Two more classes take
+the old path for now, and say so. The first is a program calling an extern of a shared
 library: the C generator binds it through the runtime's loader, whereas
 tinygen's C calls it by name, which only a link resolves. The second is a
 run with `-DGS_MAX_STACKS`, because tinygen counts more data stacks than the
@@ -324,8 +340,8 @@ program runs on the C generator's C, built by a second `CodeGen` without
 tinygen; a mixed program never goes into one TinyCC unit. `-v` prints
 `jit: tinygen's C` or `jit: the C generator's C ... (why)`. Inlining defaults
 to `-O2`, as for the C backend, and `-O0` is selectable. `--backend=c`
-asks for the C generator's path. With `--jit -o out.c`, the C generator's C still goes to
-`out.c` and tinygen's C runs. Threads are refused on both paths.
+asks for the C generator's path. With `--jit -o out.c`, the unit for a C compiler goes to
+`out.c` and the TinyCC one runs. Threads are refused on both paths.
 
 tinygen's C is about 5 to 15 times slower than the C generator's under
 TinyCC (samples 07, 09, 10, 21, 22). It reads and writes memory through
@@ -345,13 +361,14 @@ with threads.
 ## Optimized builds: `--backend=tinygen-c`
 
 `--backend=tinygen-c` builds as `--backend=tinygen` does, whole or mixed by
-the same rules, but the module is created with `TYG_OUTPUT_C`. `Write` then
-writes `<stem>.tg.c`, tinygen's C for the whole object, and the C compiler
-builds it into `<stem>.tg.o` with the c backend's flags: `-O2`, or `-O0 -g`
-with `--debug`. The link is the tinygen one. A mixed build's C half is
+the same rules, but the module is created with `TYG_OUTPUT_C`. A whole program's
+`<stem>.tg.c` is the one unit, which the C compiler builds into `<stem>.tg.o`
+with the c backend's flags (`-O2`, or `-O0 -g` with `--debug`) and the link
+takes with the runtime object alone (`--standalone`: nothing else). A mixed
+build's `Write` writes tinygen's C alone, linked as the native object is. A mixed build's C half is
 compiled with the same flags. Goose's own inlining is at `-O2` by default, as
 for the C backend. `goose build --backend=tinygen-c -o out.c`
-writes tinygen's C and builds nothing; a mixed program refuses it.
+writes the unit and builds nothing; a mixed program refuses it.
 
 Two things of tinygen's C output are worked around here:
 
@@ -369,15 +386,17 @@ With a compiler built with tinygen, `goose build` without `--backend` means
 `--backend=tinygen` (the fast debug build, GS_DEBUG checks as before). `-o x.c`
 selects tinygen-c, also with `--debug`. A program that tinygen cannot take
 whole builds through the C generator's C, all of it, as the JIT of `goose run`
-does: `--include` or `--standalone` with `-o x.c`, an `export fn` that
+does: `-DGS_MAX_STACKS` (tinygen's data stack count is not checked against it), an `export fn` that
 `ExportOk` rejects (no program is known to reach one: large fixed values by value
 cross through `ForwardCall`), or any function left to C. A `-D` keeps the program on tinygen: it goes into the support
 object's source (`DefinesSource`), which a define other than GS_DEBUG and the ones
 main hands the runtime as it starts (GS_STACK_*, GS_MAX_STACKS) makes an object of
 its own in the cache.
-`-v` prints `build: backend tinygen-c (the default)` and, for a fallback,
+`-v` prints `build: backend tinygen-c (the default)`. A fallback prints
 `build: the C generator's C, compiled by the C compiler, for the whole program
-(tinygen cannot take it whole: why)`. There is no mixed build unless
+(tinygen cannot take it whole: why)` on stderr, `-v` or not. The flag form
+`goose -o x.c` (C for a C host, with `--header`, `--include`,
+`--standalone`) takes the same default and fallback. There is no mixed build unless
 `--tinygen-mixed` or an explicit `--backend` asks for one. `-o x.c` of a
 fallback program writes the C generator's C to `x.c`. `--backend=c` is the old
 path; a compiler without tinygen only has it.
