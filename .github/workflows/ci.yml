@@ -36,6 +36,13 @@ jobs:
       # by the configure below (GOOSE_BUILTIN_LIBS), submodules and all.
       - uses: actions/checkout@v4
 
+      # tinygen, the compiler's backend, from its own repository, beside
+      # the sources as CMake looks for it (TINYGEN_DIR).
+      - uses: actions/checkout@v4
+        with:
+          repository: bbodi/tinygen
+          path: tinygen
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
@@ -59,7 +66,7 @@ jobs:
       # is what the Visual Studio generator reads; passing both builds Debug
       # (asserts on) everywhere.
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DGOOSE_BUILTIN_LIBS=all
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DGOOSE_BUILTIN_LIBS=all -DTINYGEN_DIR=${{ github.workspace }}/tinygen
 
       - name: Build
         run: cmake --build build --config Debug
@@ -102,6 +109,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # tinygen, the compiler's backend, from its own repository, beside
+      # the sources as CMake looks for it (TINYGEN_DIR).
+      - uses: actions/checkout@v4
+        with:
+          repository: bbodi/tinygen
+          path: tinygen
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
@@ -116,7 +130,7 @@ jobs:
       # useful sanitizer stacks and compiler build time modest.
       - name: Configure instrumented compiler
         run: >-
-          cmake -S . -B build-sanitize -DCMAKE_BUILD_TYPE=Debug
+          cmake -S . -B build-sanitize -DCMAKE_BUILD_TYPE=Debug -DTINYGEN_DIR=${{ github.workspace }}/tinygen
           -DCMAKE_CXX_FLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all"
 
       - name: Build instrumented compiler
