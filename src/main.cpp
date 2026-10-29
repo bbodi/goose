@@ -1698,11 +1698,11 @@ int Main(int argc, char **argv) {
         if (d.rfind("GS_MAX_STACKS", 0) == 0) maxstacks = d;
     #if GOOSE_HAVE_TINYGEN
         auto wantsc = outname.size() > 2 && outname.compare(outname.size() - 2, 2, ".c") == 0;
-        flagform = verb.empty() && !backendgiven && !forcejit && wantsc;
+        flagform = verb.empty() && !backendgiven && !forcejit && !outname.empty();
         if ((verb == "build" || flagform) && !backendgiven) {
             if (maxstacks.empty()) {
                 tgdefault = true;
-                backendname = debug && !wantsc ? "tinygen" : "tinygen-c";
+                backendname = debug && !wantsc && !flagform ? "tinygen" : "tinygen-c";
             } else {
                 flagform = false;
                 fprintf(stderr, "goose: the C generator's C for the whole program (-D%s: tinygen's "
