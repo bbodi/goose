@@ -247,6 +247,11 @@ PROGRAMS += [(POOL_BASES, ["-O2"]), (POOL_BASES, [])]
 ARRAY_CACHES = "test/storage/array_caches.goose"
 PROGRAMS += [(ARRAY_CACHES, ["-O2"]), (ARRAY_CACHES, [])]
 
+# Resizable locals returned as T[]s, built at the destination behind the count the return writes
+# (TgFn::NrvoBind), also into a field of another count width (check_named_result_c).
+GROW_RESULTS = "test/storage/grow_named_results.goose"
+PROGRAMS += [(GROW_RESULTS, ["-O2"]), (GROW_RESULTS, [])]
+
 # The windowed samples: built whole and not run, since they loop until their
 # window closes.
 BUILD_ONLY = ["samples/27_gfx_cube.goose", "samples/28_physics_boxes.goose", "samples/29_ui_todo.goose",
@@ -350,6 +355,7 @@ def check_tinygen_backend(exe, base, ok, fail, say):
     check_rel_c(exe, base, ok, fail)
     check_pool_base_c(exe, base, ok, fail)
     check_array_cache_c(exe, base, ok, fail)
+    check_named_result_c(exe, base, ok, fail)
     check_run(exe, base, ok, fail)
     check_jit(exe, base, ok, fail)
     check_default_inlining(exe, base, ok, fail)
@@ -568,6 +574,21 @@ def check_array_cache_c(exe, base, ok, fail):
              f"threads said: {nothreads}, const accessors: {consts}", log + tlog)
         return
     ok("tinygen's C of cached arrays: pushes counted in the copy, nodes built whole and untested")
+
+
+def check_named_result_c(exe, base, ok, fail):
+    """A resizable local that every return hands back as a T[] is built at the destination
+    (TgFn::NrvoBind): the out-of-line letters_rec copies nothing out at its return."""
+    cout = base / "grow_named_results.tg.c"
+    code, o, e = tc.run_capture([exe, "build", "--backend=tinygen-c", "-O2", "-o", cout,
+                                 ROOT / GROW_RESULTS])
+    text = tc.decode(cout.read_bytes()) if code == 0 and cout.exists() else ""
+    prog = text.partition("/* ---- the program, written by tinygen ---- */")[2]
+    body = re.search(r"\bstatic [^\n]*\bletters_rec_g\([^)]*\) \{\n(.*?)\n\}\n", prog, re.S)
+    if not body or "gs_tg_memcpy(" in body.group(1) or "memmove(" in body.group(1):
+        fail("tinygen's C of a resizable named result: built at its destination, no copy", o + e)
+        return
+    ok("tinygen's C of a resizable named result: built at its destination, no copy")
 
 
 def check_run(exe, base, ok, fail):

@@ -1687,12 +1687,55 @@ struct TgFn {
     // A named result built where the value ends up (§7.3; as the old C generator's DetectNrvo, OpenIbNrvo did): a T[] image
     // local the returns hand back is declared on its destination stack, at the top it has on entry, so
     // it needs no stack of its own and `return it` moves nothing. Another value returned meanwhile is
-    // built behind it and slid down over it. Only images; a resizable or frame object local still has
-    // a stack of its own and is copied out at the return.
+    // built behind it and slid down over it. A resizable local returned as a T[] (img) is declared
+    // there too, behind the image's count, which `return it` writes (pfx; the old generator's
+    // resizable named result); a frame object local still has a stack of its own and is copied out.
     struct NrvoBind {
         tyg_local stk, top0;
         bool open = false;   // Declared: its elements lie at the destination.
+        TypeExpr *img = nullptr;
+        tyg_local pfx {};
     };
+    // Whether the local vd, returned as type rt, can be a named result: an image of that type, or a
+    // resizable of its elements.
+    bool NrvoOk(const VarDef *vd, TypeExpr *rt) {
+        if (!vd || vd->reusable || !rt || !IsImg(rt)) return false;
+        if (IsImg(vd->type)) return cg.TEq(vd->type, rt);
+        return IsGrowNrvo(vd->type, rt);
+    }
+    bool IsGrowNrvo(TypeExpr *t, TypeExpr *rt) {
+        return t && IsGrow(t) && !TgModule::IsLim(t) && (M.RzOk(t) || M.VeOk(t)) && IsVarArr(rt) &&
+               !M.IsRc(rt) && cg.TEq(t->arr->sub, rt->arr->sub);
+    }
+    NrvoBind Nrvo(tyg_local stk, tyg_local top0, const VarDef *vd, TypeExpr *rt) {
+        NrvoBind b { stk, top0 };
+        if (!IsImg(vd->type)) b.img = rt;
+        return b;
+    }
+    // Before another value is built behind an open resizable named result: its count and top
+    // written back from its cache (PoolCache), which stays set aside on this path, a return's, which
+    // ends here.
+    void NrvoAside(const VarDef *vd) {
+        auto it = poolof.find(vd);
+        if (it == poolof.end()) return;
+        auto &pc = pools[it->second];
+        if (!pc.alive || pc.off) return;
+        if (!Ended()) PoolStore(pc);
+        pc.off = true;
+        asides.push_back(it->second);
+    }
+    vector<size_t> asides;
+    // After the return: the caches set aside in use again on the paths that go on (no code: the
+    // return's path has ended).
+    void NrvoAsideEnd(size_t mark) {
+        for (auto i = mark; i < asides.size(); i++) pools[asides[i]].off = false;
+        asides.resize(mark);
+    }
+    // At `return it` of a resizable named result: the count written before its elements.
+    void NrvoClose(NrvoBind *nb, const VarDef *vd, tyg_val stk) {
+        if (!nb->img || Ended()) return;
+        PatchPrefix(LdL(nb->pfx), nb->img, Ld(CountAt(AtL(locals[vd]))), stk);
+    }
     map<const VarDef *, NrvoBind> nrvo;
     map<size_t, const VarDef *> nrvoret;   // A function's result positions bound to a local.
     NrvoBind *NrvoOf(Node *val) {
@@ -1876,7 +1919,18 @@ struct TgFn {
     // Whether an inlined call is built at d by its arms: it gives the callee's own result type.
     bool InlineBuildable(InlineBlock *ib, const InPlace &d) {
         auto rt = InlineAs(ib);
-        return rt && cg.TEq(rt, d.t) && (d.mode <= 3 || d.mode == 5);
+        return rt && (cg.TEq(rt, d.t) || CountOnly(ib, d)) && (d.mode <= 3 || d.mode == 5);
+    }
+    // An inlined call returning a T[] built as an image of the same elements with another count
+    // (T[varint] for T[]): when every return gives one resizable local, a named result built behind
+    // the destination's own count (NrvoClose), whatever count the callee's type has.
+    bool CountOnly(InlineBlock *ib, const InPlace &d) {
+        auto rt = InlineAs(ib);
+        if (d.mode != 1 || !rt || !IsVarArr(rt) || !IsVarArr(d.t) || !cg.TEq(rt->arr->sub, d.t->arr->sub) ||
+            !ib->spec || ib->spec->rets.size() != 1)
+            return false;
+        auto vd = cg.NamedResult(ib->body, ib->sf, 1, 0);
+        return vd && !nrvo.count(vd) && !IsImg(vd->type) && NrvoOk(vd, d.t);
     }
     // If, block, match, early block, loop or function value n built at d, each arm's value by
     // BuildInto. A match, early block or loop only for a destination they deliver to. False for any
@@ -6881,7 +6935,8 @@ struct TgFn {
         auto as = InlineAs(ib);
         hasinline = true;
         CheckFrame();
-        if (ip && as && !cg.TEq(ip->t, as)) Unreachable(ib->line, "inlined call built as another type");
+        if (ip && as && !cg.TEq(ip->t, as) && !CountOnly(ib, *ip))
+            Unreachable(ib->line, "inlined call built as another type");
         // A frame object or resizable struct is built in a temporary of its own, as a call's result is.
         if (!ip && !discard && !prefctl && as && (M.FoOk(as) || M.RsOk(as)))
             return BuildTemp(ib, as, ib->line);
@@ -6903,8 +6958,8 @@ struct TgFn {
         auto bound = false;
         if (ip && ip->mode == 1 && ib->spec && ib->spec->rets.size() == 1 && IsImg(ip->t)) {
             auto vd = cg.NamedResult(ib->body, ib->sf, 1, 0);
-            if (vd && !nrvo.count(vd) && !vd->reusable && IsImg(vd->type) && cg.TEq(vd->type, ip->t)) {
-                nrvo[vd] = { Local(ip->stk), lt.top0 };
+            if (vd && !nrvo.count(vd) && NrvoOk(vd, ip->t)) {
+                nrvo[vd] = Nrvo(Local(ip->stk), lt.top0, vd, ip->t);
                 bound = true;
             }
         }
@@ -7295,14 +7350,22 @@ struct TgFn {
     }
     // A break's value, delivered as its target wants it.
     void BreakValue(Node *val, Line line, const LoopTargets &t) {
-        if (auto nb = t.ip.mode == 1 ? NrvoOf(val) : nullptr; nb && nb->top0 == t.top0) return;
+        if (auto nb = t.ip.mode == 1 ? NrvoOf(val) : nullptr; nb && nb->top0 == t.top0) {
+            NrvoClose(nb, Is<Ident>(val)->vdef, t.ip.stk);
+            return;
+        }
         if (t.pref) {
             PrefInto(AtL(t.res), val);
         } else if (t.ip.mode == 5) {
             BuildInto(val, t.ip, line);   // Built where it lies: nothing to move.
         } else if (t.ip.mode) {
             // Built at the top, which something under construction may have moved up: the value then
-            // moves down to where the exit's value starts.
+            // moves down to where the exit's value starts. An open resizable named result's top
+            // written back first.
+            auto mark = asides.size();
+            for (auto &[vd, nb] : nrvo)
+                if (nb.open && nb.img && nb.top0 == t.top0) NrvoAside(vd);
+            struct End { TgFn *f; size_t m; ~End() { f->NrvoAsideEnd(m); } } end { this, mark };
             auto st = Local(Top(t.ip.stk));
             BuildInto(val, t.ip, line);
             if (Ended()) return;
@@ -7452,6 +7515,11 @@ struct TgFn {
     // built at its destination stack, its count written through its out-parameter. Then every scope's
     // stacks are restored, and the C return value returned.
     void DoReturn(const vector<Node *> &vals, Line l) {
+        auto mark = asides.size();
+        DoReturn1(vals, l);
+        NrvoAsideEnd(mark);
+    }
+    void DoReturn1(const vector<Node *> &vals, Line l) {
         auto &rets = sp->rets;
         auto cret = cg.sinfo[sp].cret;
         if (rets.empty()) {
@@ -7499,8 +7567,12 @@ struct TgFn {
                 auto dst = LdL(chans[i].a);
                 auto nb = nrvoret.count(i) ? &nrvo[nrvoret[i]] : nullptr;
                 if (nb && !nb->open) nb = nullptr;
-                if (nb && xs.empty() && NrvoOf(vals[i]) == nb) continue;   // Built in place already.
+                if (nb && xs.empty() && NrvoOf(vals[i]) == nb) {   // Built in place already.
+                    NrvoClose(nb, nrvoret[i], dst);
+                    continue;
+                }
                 // Over an open named result the value is built behind it, then slid down.
+                if (nb && nb->img) NrvoAside(nrvoret[i]);
                 if (!nb) SetTop(dst, LdL(chans[i].top0));
                 auto start = Local(Top(dst));
                 auto rl = M.Resz(rets[i]) ? AtV(LdL(chans[i].b)) : tyg_addr {};
@@ -7679,10 +7751,15 @@ struct TgFn {
                     M.VvOk(t) ||
                     M.RcOk(t) || M.VrOk(t));
         if ((hdr || img || M.FoOk(t)) && !cg.PrefVar(d)) {
-            auto nb = img && nrvo.count(d) ? &nrvo[d] : nullptr;
+            auto nb = (img || hdr) && nrvo.count(d) ? &nrvo[d] : nullptr;
+            if (nb && hdr && !nb->img) nb = nullptr;
             auto stk = nb ? LdL(nb->stk) : Stk(AllocStk(true, l), l);
             auto sl = Local(stk);
             if (nb) nb->open = true;
+            if (nb && hdr) {   // Its count's bytes reserved, its elements behind them.
+                nb->pfx = Local(Top(stk));
+                SetTop(stk, Add(LdL(nb->pfx), I64(TgModule::PrefixBytes(nb->img))));
+            }
             tyg_local loc;
             if (img) {
                 loc = Local(Top(stk));
@@ -8601,10 +8678,8 @@ struct TgFn {
             for (size_t i = 0; i < sp->rets.size(); i++) {
                 if (!IsImg(sp->rets[i])) continue;
                 auto cand = cg.NamedResult(sp->body, sp->sf, sp->rets.size(), i);
-                if (!cand || nrvo.count(cand) || cand->reusable || !IsImg(cand->type) ||
-                    !cg.TEq(cand->type, sp->rets[i]))
-                    continue;
-                nrvo[cand] = { chans[i].a, chans[i].top0 };
+                if (!cand || nrvo.count(cand) || !NrvoOk(cand, sp->rets[i])) continue;
+                nrvo[cand] = Nrvo(chans[i].a, chans[i].top0, cand, sp->rets[i]);
                 nrvoret[i] = cand;
             }
         NewProcBody();
