@@ -748,7 +748,8 @@ struct TgModule {
     // A type typed memory is accessed as (TgFn::TagAt): a scalar or a fixed value, not a relative
     // reference or a varint, whose bytes are offsets or encoded.
     bool Taggable(TypeExpr *t) {
-        return t && !IsRel(t) && !IsVarint(t) && (IsScalar(t) || (TypeOk(t) && cg.IsFix(t)));
+        // A fixed-width relative link is its offset's integer (AT).
+        return t && !IsVr(t) && !IsVarint(t) && (IsRel(t) || IsScalar(t) || (TypeOk(t) && cg.IsFix(t)));
     }
 
 
@@ -2846,7 +2847,7 @@ struct TgFn {
             auto at = AddrOf(pl.a);
             off = pl.t->ref->pool ? UlebRead(at) : ZigRead(at);
         } else {
-            off = tyg_load(p, s, pl.a, 0);
+            off = tyg_load(p, s, TagAt(pl), 0);
             if (s != TYG_I64) off = tyg_convert(p, pl.t->ref->pool ? TYG_ZEXT : TYG_SEXT, TYG_I64, off);
         }
         auto at = Add(RelOrigin(pl, l), off);
@@ -2927,7 +2928,7 @@ struct TgFn {
             AbortUnless(Bin(TYG_AND, lo, Cmp(TYG_SLT, off, I64((int64_t)(1ull << (bits - 1))))),
                         "RELOFF", l);
         }
-        tyg_store(p, s, pl.a, s == TYG_I64 ? off : tyg_convert(p, TYG_TRUNC, s, off), 0);
+        tyg_store(p, s, TagAt(pl), s == TYG_I64 ? off : tyg_convert(p, TYG_TRUNC, s, off), 0);
     }
     // What a reference value refers to.
     P RefTarget(const V &x) {
