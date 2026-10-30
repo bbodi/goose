@@ -1568,18 +1568,17 @@ struct TgFn {
     // body() while cond() holds; on after. tinygen's structured builders: a for (;;) whose first
     // statement breaks out unless cond() holds, in tinygen's C.
     template <class C, class F> void WhileDo(C cond, F body) {
-        tyg_loop(p);
+        SLoop();
         BreakUnless(cond());
         body();
-        tyg_endloop(p);
+        SEndLoop();
     }
     // if (!c) break; out of the innermost tyg_loop.
     void BreakUnless(tyg_val c) {
-        tyg_if(p, Not(c));
+        tyg_if_not(p, c);
         tyg_break(p, 0);
         tyg_endif(p);
     }
-    tyg_val Not(tyg_val c) { return tyg_cmp(p, TYG_EQ, c, tyg_iconst(p, TYG_I8, 0)); }
     // body(i) for i from `from` up to n (n read once); on after the last.
     template <class F> void Loop(tyg_val from, tyg_val n, F body) {
         auto il = Local(from), nl = Local(n);
@@ -1638,8 +1637,37 @@ struct TgFn {
         tyg_local top0 = 0;
         bool pref = false;        // Its value is a pool reference (GenPref).
         SFunction *ibsf = nullptr;   // An inlined body: the function whose returns exit here.
+        // A loop built with tinygen's structured builders (tyg_loop): its index among them (sloops),
+        // whose exit a break reaches with tyg_break; and whether continue is tyg_continue (its
+        // start) rather than a jump to cnt (a for's step).
+        int sloop = -1;
+        bool scont = false;
     };
     vector<LoopTargets> loops;
+    int sloops = 0;   // The tyg_loops open.
+    void SLoop() {
+        tyg_loop(p);
+        sloops++;
+    }
+    void SEndLoop() {
+        tyg_endloop(p);
+        sloops--;
+    }
+    // Out of (or, cont, round again in) the loop or block t: tinygen's break or continue for a
+    // structured loop, else a jump to its block.
+    void JumpOut(const LoopTargets &t, bool cont) {
+        if (t.sloop >= 0 && !cont) tyg_break(p, sloops - 1 - t.sloop);
+        else if (t.sloop >= 0 && t.scont) tyg_continue(p, sloops - 1 - t.sloop);
+        else tyg_jump(p, cont ? t.cnt : t.brk);
+    }
+    // A structured loop's targets: no exit block of its own (tyg_break reaches it), cnt for
+    // continue unless 0 (tyg_continue).
+    LoopTargets SLoopTargets(tyg_block cnt) {
+        LoopTargets lt { 0, cnt, sscopes.size() };
+        lt.sloop = sloops - 1;
+        lt.scont = cnt == 0;
+        return lt;
+    }
     // The value at src copied to d as d.t is: a frame object, an image (a variant or fixed ADT adapted
     // to a variable-mode one), a resizable ADT, resizable struct or array (its elements).
     void CopyFrom(const P &src, const InPlace &d, Line l) {
@@ -6679,9 +6707,9 @@ struct TgFn {
     // ---- Varints in bytes values (§3.6: ULEB128, values zigzag) ---------------------------------
 
     template <class F> void DoWhile(F body) {
-        tyg_loop(p);
+        SLoop();
         BreakUnless(body());
-        tyg_endloop(p);
+        SEndLoop();
     }
     // A one-byte varint, the common case, is read straight; a longer one by the loop (the old C
     // generator's GS_ULEB_READ and GS_ULEB_SIZE).
@@ -7022,14 +7050,14 @@ struct TgFn {
         Ctl k;
         auto brkval = BreakGivesValue(lp->body);
         if (CtlBegin(k, lp, discard, ip, brkval)) return k.w;
-        auto body = NewBlock(), done = NewBlock();
-        tyg_jump(p, body);
-        SetBlock(body);
-        loops.push_back(CtlTarget(k, done, body, false, ip));
+        SLoop();
+        auto lt = CtlTarget(k, 0, 0, false, ip);
+        lt.sloop = sloops - 1;
+        lt.scont = true;
+        loops.push_back(lt);
         GenBlock(lp->body, true);
         loops.pop_back();
-        Jump(body);
-        SetBlock(done);
+        SEndLoop();
         return CtlValue(k, lp->line);
     }
 
@@ -7427,27 +7455,27 @@ struct TgFn {
                 return;
             }
             case NK_While: {
+                // A tyg_loop that breaks out where the condition fails; the condition is inside
+                // it: a break in it leaves, a continue tests again.
                 auto w = static_cast<While *>(n);
-                auto head = NewBlock(), body = NewBlock(), done = NewBlock();
-                tyg_jump(p, head);
-                SetBlock(head);
+                SLoop();
                 Loc(w->cond->line);
-                // The condition is inside the loop: a break in it leaves, a continue tests again
-                //.
-                loops.push_back({ done, head, sscopes.size() });
+                loops.push_back(SLoopTargets(0));
                 if (IsShortCircuit(w->cond)) {
-                    CondBranch(w->cond, body, done, true);
+                    auto body = NewBlock(), out = NewBlock();
+                    CondBranch(w->cond, body, out, true);
+                    SetBlock(out);
+                    tyg_break(p, 0);
+                    SetBlock(body);
                 } else {
                     OpenScope(true);
                     auto c = Truth(w->cond);
                     CloseScope();
-                    if (!Ended()) Branch(c, body, done);
+                    if (!Ended()) BreakUnless(c);
                 }
-                SetBlock(body);
                 GenBlock(w->body, true);
                 loops.pop_back();
-                Jump(head);
-                SetBlock(done);
+                SEndLoop();
                 return;
             }
             case NK_LoopExpr:
@@ -7495,7 +7523,7 @@ struct TgFn {
                 }
                 RestoreFrom(t.depth);
                 PoolsBack();
-                tyg_jump(p, t.brk);
+                JumpOut(t, false);
                 return;
             }
             case NK_Continue: {
@@ -7504,7 +7532,7 @@ struct TgFn {
                 if (i == 0) No(n->line, "continue target");
                 RestoreFrom(loops[i - 1].depth);
                 PoolsBack();
-                tyg_jump(p, loops[i - 1].cnt);
+                JumpOut(loops[i - 1], true);
                 return;
             }
             case NK_FnDecl: case NK_StructDecl: case NK_EnumDecl: case NK_AliasDecl: return;
@@ -8033,8 +8061,9 @@ struct TgFn {
         tyg_store(p, M.Scal(d->type), AtL(locals[d]), Conv(v, from, d->type, l), 0);
     }
     // A loop's body, then on at its step block.
-    void LoopBody(ForLoop *f, tyg_block done, tyg_block step) {
-        loops.push_back({ done, step, sscopes.size() });
+    // The body of a structured for loop, a continue a jump to its step.
+    void LoopBody(ForLoop *f, tyg_block step) {
+        loops.push_back(SLoopTargets(step));
         GenBlock(f->body, true);
         loops.pop_back();
         Jump(step);
@@ -8062,21 +8091,17 @@ struct TgFn {
         if (f->idxdef) ix = Local(I64(0));
         if (f->vdef) Declare(f->vdef, f->line);
         if (f->idxdef) Declare(f->idxdef, f->line);
-        auto head = NewBlock(), body = NewBlock(), step = NewBlock(), done = NewBlock();
-        tyg_jump(p, head);
-        SetBlock(head);
+        auto step = NewBlock();
+        SLoop();
         Loc(f->line);
         auto cv = tyg_load(p, s, AtL(ctr), 0);
-        Branch(Cmp(TgModule::IsSigned(ct) ? TYG_SLT : TYG_ULT, cv, tyg_load(p, s, AtL(hiv), 0)), body,
-               done);
-        SetBlock(body);
+        BreakUnless(Cmp(TgModule::IsSigned(ct) ? TYG_SLT : TYG_ULT, cv, tyg_load(p, s, AtL(hiv), 0)));
         if (f->vdef) StoreConv(f->vdef, cv, ct, f->line);
         if (f->idxdef) StoreConv(f->idxdef, LdL(ix), M.ast.inttypes[IS_I64], f->line);
-        LoopBody(f, done, step);
+        LoopBody(f, step);
         tyg_store(p, s, AtL(ctr), Add(tyg_load(p, s, AtL(ctr), 0), tyg_iconst(p, s, 1)), 0);
         if (f->idxdef) StL(ix, Add(LdL(ix), I64(1)));
-        tyg_jump(p, head);
-        SetBlock(done);
+        SEndLoop();
         tyg_scope_end(p);
     }
 
@@ -8110,7 +8135,7 @@ struct TgFn {
             Declare(f->vdef, f->line);
         }
         if (f->idxdef) Declare(f->idxdef, f->line);
-        auto head = NewBlock(), body = NewBlock(), step = NewBlock(), done = NewBlock();
+        auto step = NewBlock();
         tyg_local wb = 0;
         if (walk) {
             cl = Slot();
@@ -8119,8 +8144,7 @@ struct TgFn {
             StL(cl, e0);
             StL(wb, e0);
         }
-        tyg_jump(p, head);
-        SetBlock(head);
+        SLoop();
         Loc(f->line);
         auto v = ViewOf(at(), f->line);
         if (walk && path) {
@@ -8136,8 +8160,7 @@ struct TgFn {
             v = ViewOf(at(), f->line);
         }
         auto i = LdL(gi);
-        Branch(Cmp(TYG_SLT, i, v.len), body, done);
-        SetBlock(body);
+        BreakUnless(Cmp(TYG_SLT, i, v.len));
         auto ea = walk ? LdL(cl) : ElemAddr(v, i);
         if (f->vdef && bindptr) {
             StL(locals[f->vdef], ea);
@@ -8152,14 +8175,13 @@ struct TgFn {
             }
         }
         if (f->idxdef) StoreConv(f->idxdef, i, M.ast.inttypes[IS_I64], f->line);
-        LoopBody(f, done, step);
+        LoopBody(f, step);
         StL(gi, Add(LdL(gi), I64(1)));
         if (walk) {
             auto c0 = LdL(cl);
             StL(cl, Add(c0, ImgSize(ielem, c0)));
         }
-        tyg_jump(p, head);
-        SetBlock(done);
+        SEndLoop();
         tyg_scope_end(p);
     }
 
