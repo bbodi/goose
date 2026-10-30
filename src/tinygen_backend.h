@@ -2584,19 +2584,26 @@ struct TgFn {
               nullptr);
     }
     // arm(vi), in a block entered when the tag in `tag` is variant vi, for each of n variants.
-    // One test after another, each arm leaving the chain, so the C compiler sees a switch on the
-    // tag, which a second dispatch on the same tag can be threaded through.
+    // One tyg_switch, a C switch in tinygen's C, which the C compiler lowers as the old generator's
+    // switch and threads a second dispatch on the same tag through.
     template <class F> void TagSwitch(tyg_local tag, size_t n, F arm) {
         auto done = NewBlock();
+        if (Ended() || n == 0) {
+            SetBlock(done);
+            return;
+        }
+        vector<tyg_block> targets;
+        vector<int64_t> tags;
         for (size_t vi = 0; vi < n; vi++) {
-            auto t = NewBlock(), next = NewBlock();
-            Branch(Cmp(TYG_EQ, LdL(tag), I64((int64_t)vi)), t, next);
-            SetBlock(t);
+            targets.push_back(NewBlock());
+            tags.push_back((int64_t)vi);
+        }
+        tyg_switch(p, LdL(tag), (int)n, tags.data(), targets.data(), done);
+        for (size_t vi = 0; vi < n; vi++) {
+            SetBlock(targets[vi]);
             arm(vi);
             if (!Ended()) tyg_jump(p, done);
-            SetBlock(next);
         }
-        tyg_jump(p, done);
         SetBlock(done);
     }
     // The i64 that arm(vi) gives for the variant of the ADT that tag says (init for a corrupt tag).
@@ -7132,32 +7139,47 @@ struct TgFn {
         else tyg_zero(p, to, 1);
     }
 
+    // The arms reached by one switch on the tag (a C switch in tinygen's C), a wildcard's or a corrupt
+    // tag's the default; then each arm.
     V GenAdtMatch(MatchExpr *me, TypeExpr *adt, const Ctl &k, const InPlace *ip) {
         auto s = AdtScrutinee(me->scrutinee, adt);
         auto done = NewBlock();
-        auto wild = false;
+        vector<tyg_block> hits, targets;
+        vector<int64_t> tags;
+        tyg_block wild = 0;
+        size_t narms = 0;
         for (auto &a : me->arms) {
             auto hit = NewBlock();
+            hits.push_back(hit);
+            narms++;
             if (a.pat.kind == P_WILDCARD) {
-                wild = true;
-                tyg_jump(p, hit);
-            } else {
-                for (auto v : a.variants) TagIs(s, adt->enu->en->VariantIndex(v), hit);
+                wild = hit;
+                break;
             }
-            auto next = NewBlock();
-            if (!wild) tyg_jump(p, next);
-            SetBlock(hit);
+            for (auto v : a.variants) {
+                tags.push_back(adt->enu->en->VariantIndex(v));
+                targets.push_back(hit);
+            }
+        }
+        auto bad = wild ? wild : NewBlock();
+        if (!Ended()) {
+            if (tags.empty()) tyg_jump(p, bad);
+            else tyg_switch(p, LdL(s.tag), (int)tags.size(), tags.data(), targets.data(), bad);
+        }
+        for (size_t i = 0; i < narms; i++) {
+            auto &a = me->arms[i];
+            SetBlock(hits[i]);
             InScope([&] {
                 if (a.binder) BindAdtArm(me, adt, s, a);
                 Loc(a.body->line);   // A breakpoint on the arm's line stops here, bound.
                 CtlArm(k, ip, a.body, me->line);
             });
             Jump(done);
-            SetBlock(next);
-            if (wild) break;
         }
-        if (!wild) BadTag(me->line);
-        else tyg_unreachable(p);
+        if (!wild) {
+            SetBlock(bad);
+            BadTag(me->line);
+        }
         SetBlock(done);
         return CtlValue(k, me->line);
     }

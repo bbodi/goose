@@ -549,7 +549,8 @@ def check_array_cache_c(exe, base, ok, fail):
     back once, after it (TgFn::PoolCache); a node pushed with every field given takes no zero bytes
     first and its links to references that cannot be null no null test (TgFn::SelfRelInto); and the
     unit of a program without threads says so, for its gs_rf to be a plain static
-    (TgSupportBody); a global's accessor is const (TinyGenBackend::DefAccessor)."""
+    (TgSupportBody); a global's accessor is const (TinyGenBackend::DefAccessor); a match is a C
+    switch (TgFn::GenAdtMatch, tyg_switch)."""
     def unit(source, name):
         cout = base / f"{name}.tg.c"
         code, o, e = tc.run_capture([exe, "build", "--backend=tinygen-c", "-O2", "-o", cout,
@@ -560,7 +561,9 @@ def check_array_cache_c(exe, base, ok, fail):
     def body(name):
         m = re.search(r"\bstatic [^\n]*\b" + name + r"\([^)]*\) \{\n(.*?)\n\}\n", prog, re.S)
         return m.group(1) if m else ""
-    squares, tree = body("squares_g"), body("tree_g")
+    squares, tree, scan = body("squares_g"), body("tree_g"), body("scan_g")
+    # A match dispatches through one C switch on the tag (tyg_switch).
+    switched = "\tswitch (" in scan
     hdr = len(re.findall(r"TYG_ST64\(\(v\d+ \+ 8\), ", squares))
     copy = len(re.findall(r"TYG_ST64\(\(\(char \*\)l\d+ \+ 8\), ", squares))
     threads, tlog = unit("test/threads/codegen_threads.goose", "codegen_threads")
@@ -568,10 +571,11 @@ def check_array_cache_c(exe, base, ok, fail):
     # A global's accessor is const data the C compiler folds into the global's address.
     consts = re.search(r"\bconst struct tyg_d\d+ gs_tg_g\d+ = \{", prog) is not None
     if (not squares or hdr != 1 or copy < 1 or not tree or "RELNULL" in tree or "memset" in tree
-            or not nothreads or not consts):
+            or not nothreads or not consts or not switched):
         fail(f"tinygen's C of cached arrays: {hdr} header count stores, {copy} copy stores, "
              f"tree tested or zeroed: {'RELNULL' in tree or 'memset' in tree}, "
-             f"threads said: {nothreads}, const accessors: {consts}", log + tlog)
+             f"threads said: {nothreads}, const accessors: {consts}, match as switch: {switched}",
+             log + tlog)
         return
     ok("tinygen's C of cached arrays: pushes counted in the copy, nodes built whole and untested")
 
