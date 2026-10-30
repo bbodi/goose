@@ -72,6 +72,11 @@ inline string TgFixedShim(const string &name) {
                           "{ gs_memcpy(d, s, (size_t)n); }\n" },
         { "gs_tg_memeq", "int32_t gs_tg_memeq(const void *a, const void *b, int64_t n) "
                          "{ return gs_memeq(a, b, (size_t)n); }\n" },
+        // A varint longer than a byte: GS_ULEB_READ's and GS_ULEB_SIZE's slow path.
+        { "gs_tg_uleb_read", "int64_t gs_tg_uleb_read(const void *p) "
+                             "{ return gs_uleb_read((const uint8_t *)p); }\n" },
+        { "gs_tg_uleb_size", "int64_t gs_tg_uleb_size(const void *p) "
+                             "{ return gs_uleb_size((const uint8_t *)p); }\n" },
     };
     if (auto it = fixed.find(name); it != fixed.end()) return it->second;
     if (name.rfind("gs_tg_abort_", 0) == 0)
@@ -149,7 +154,8 @@ inline string TgSupportBody(string_view runtimeh) {
         }
     for (auto n : { "gs_tg_stack_init", "gs_tg_rf", "gs_tg_rfpanic", "gs_tg_f2iwrap", "gs_tg_f2u",
                     "gs_tg_f2i",
-                    "gs_tg_range_u", "gs_tg_range", "gs_tg_slicefail", "gs_tg_memcpy", "gs_tg_memeq" })
+                    "gs_tg_range_u", "gs_tg_range", "gs_tg_slicefail", "gs_tg_memcpy", "gs_tg_memeq",
+                    "gs_tg_uleb_read", "gs_tg_uleb_size" })
         s += TgFixedShim(n);
     // The codes of the runtime's error enum, one per line: "    GS_E_POP,".
     set<string> codes;
@@ -1269,6 +1275,13 @@ struct TgModule {
         auto name = cat("gs_tg_render_", k);
         renderfns[k] = name;
         renderq.emplace_back(name, t);
+        return name;
+    }
+    // The size procedure of a variable-mode ADT's image: int64(at), its bytes (the old C generator's
+    // gs_size_<T>_vm), so a walk over its array calls it instead of repeating the tag dispatch.
+    string SizeFn(TypeExpr *t) {
+        auto name = cat("gs_tg_size_", cg.Mangle(t));
+        if (renderfns.emplace(name, name).second) renderq.emplace_back(name, t);
         return name;
     }
     // The verifier procedure of an image's element type: int64(payload, n, bitmap).
@@ -6744,22 +6757,14 @@ struct TgFn {
         BreakUnless(body());
         SEndLoop();
     }
-    // A one-byte varint, the common case, is read straight; a longer one by the loop (the old C
-    // generator's GS_ULEB_READ and GS_ULEB_SIZE).
+    // A one-byte varint, the common case, is read straight; a longer one by the runtime
+    // (GS_ULEB_READ: gs_uleb_read).
     tyg_val UlebRead(tyg_val at) {
         auto b0 = LoadN(at, 1, false);
         auto v = Local(b0);
         If(Cmp(TYG_NE, AndK(b0, 0x80), I64(0)), [&] {
-            auto sh = Local(I64(0)), q = Local(at);
-            StL(v, I64(0));
-            DoWhile([&] {
-                auto qa = LdL(q);
-                auto b = LoadN(qa, 1, false);
-                StL(v, Bin(TYG_OR, LdL(v), Bin(TYG_SHL, AndK(b, 0x7f), LdL(sh))));
-                StL(q, Add(qa, I64(1)));
-                StL(sh, Add(LdL(sh), I64(7)));
-                return Cmp(TYG_NE, AndK(b, 0x80), I64(0));
-            });
+            M.NeedShim("gs_tg_uleb_read");
+            StL(v, CallC("gs_tg_uleb_read", { tyg_type_ptr(m) }, { at }, IT(TYG_I64)));
         });
         return LdL(v);
     }
@@ -6768,17 +6773,12 @@ struct TgFn {
         auto u = UlebRead(at);
         return Bin(TYG_XOR, Bin(TYG_LSHR, u, I64(1)), tyg_un(p, TYG_NEG, AndK(u, 1)));
     }
-    // The bytes of the ULEB128 at `at` (gs_uleb_size).
+    // The bytes of the ULEB128 at `at`: 1, or the runtime's count (GS_ULEB_SIZE: gs_uleb_size).
     tyg_val UlebSize(tyg_val at) {
         auto n = Local(I64(1));
         If(Cmp(TYG_NE, AndK(LoadN(at, 1, false), 0x80), I64(0)), [&] {
-            auto q = Local(at);
-            DoWhile([&] {
-                auto qa = LdL(q);
-                StL(q, Add(qa, I64(1)));
-                return Cmp(TYG_NE, AndK(LoadN(qa, 1, false), 0x80), I64(0));
-            });
-            StL(n, Sub(LdL(q), at));
+            M.NeedShim("gs_tg_uleb_size");
+            StL(n, CallC("gs_tg_uleb_size", { tyg_type_ptr(m) }, { at }, IT(TYG_I64)));
         });
         return LdL(n);
     }
@@ -8138,7 +8138,16 @@ struct TgFn {
         SLoop();
         Loc(f->line);
         auto v = ViewOf(at(), f->line);
-        if (walk && path) {
+        // Only a slice, or a path through a reference, can be re-pointed by the body (§6.5); an
+        // array's or a resizable's elements stay where they are (the old C generator's `moves`).
+        auto viaref = false;
+        for (auto n = f->iter; n;) {
+            if (n->exprtype && n->exprtype->kind == TY_REF) viaref = true;
+            auto d = Is<Dot>(n);
+            n = d ? d->obj : nullptr;
+        }
+        auto moves = path && ((itt && itt->kind == TY_SLICE) || viaref);
+        if (walk && moves) {
             // The path re-pointed: the cursor walks to the same index from the new start.
             If(Cmp(TYG_NE, v.elems, LdL(wb)), [&] {
                 StL(wb, v.elems);
@@ -8374,6 +8383,8 @@ struct TgFn {
         // Zigzag has ULEB128's shape.
         if (TgModule::IsVarint(t) || TgModule::IsVr(t)) return UlebSize(at);
         if (M.IsVm(t)) {
+            if (t != sizeinline)
+                return CallC(M.SizeFn(t), { tyg_type_ptr(m) }, { at }, IT(TYG_I64));
             // The tag, and its variant's payload: a variable one walked, only on its own tag's path.
             auto ts = M.TagSize(t);
             return ByTag(t, LoadTag(AtV(at), t), [&](int vi) {
@@ -8995,6 +9006,16 @@ struct TgFn {
         }
     }
 
+    // SizeFn's procedure: the bytes of t's image at the parameter, t's dispatch inline here only.
+    TypeExpr *sizeinline = nullptr;
+    void EmitSize(const string &name, TypeExpr *t) {
+        auto ptr = tyg_type_ptr(m);
+        NewProcBegin(M.FnSym(name), tyg_sig_new(m, IT(TYG_I64), &ptr, 1, 0), {});
+        NewProcBody();
+        sizeinline = t;
+        tyg_ret(p, ImgSize(t, tyg_param(p, 0)));
+        Finish(Line {});
+    }
     void EmitVerify(const string &name, TypeExpr *elem) {
         auto i64t = IT(TYG_I64);
         const tyg_type *pts[3] = { i64t, i64t, i64t };
@@ -9315,6 +9336,7 @@ struct TinyGenBackend {
             TgFn fn(*mod, nullptr);
             try {
                 if (name.rfind("gs_tg_verify_", 0) == 0) fn.EmitVerify(name, t);
+                else if (name.rfind("gs_tg_size_", 0) == 0) fn.EmitSize(name, t);
                 else fn.EmitRender(name, t);
             } catch (TgUnsupported &u) {
                 if (fn.p) tyg_proc_abort(fn.p);
