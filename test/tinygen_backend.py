@@ -576,7 +576,8 @@ def check_array_cache_c(exe, base, ok, fail):
     switched = "\tswitch (" in scan
     # The header's count through the pointer a local holds; the copy's, a local's own bytes.
     hdr = len(re.findall(r"TYG_STORE64\(\(\(\(char \*\)\(uintptr_t\)l\d+\) \+ 8\), ", squares))
-    copy = len(re.findall(r"TYG_STORE64\(\(\(char \*\)l\d+ \+ 8\), ", squares))
+    # The copy is a typed header local (gs_hdr): its count written as lN.len.
+    copy = len(re.findall(r"\bl\d+\.len = ", squares))
     threads, tlog = unit("test/threads/codegen_threads.goose", "codegen_threads")
     nothreads = "#define GS_TG_NO_THREADS 1" in text and "#define GS_TG_NO_THREADS 1" not in threads
     # A global's accessor is const data the C compiler folds into the global's address.

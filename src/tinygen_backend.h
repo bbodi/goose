@@ -741,7 +741,10 @@ struct TgModule {
         if (cache) return cache;
         tyg_field fs[2] = { { tyg_type_ptr(m), 0 },
                             { lenSecond ? tyg_type_int(m, TYG_I64, 1) : tyg_type_ptr(m), 8 } };
-        return cache = tyg_type_record(m, 16, 1, fs, 2);
+        cache = tyg_type_record(m, 16, 1, fs, 2);
+        // gs_rhdr's shape; the runtime's typedef has that name already, so gs_hdr
+        if (lenSecond) Named(cache, "gs_hdr", { "base", "len" });
+        return cache;
     }
     const tyg_type *sliceat = nullptr, *pairat = nullptr;
     const tyg_type *SliceAT() { return PtrPairAT(sliceat, true); }
@@ -1546,14 +1549,22 @@ struct TgFn {
     tyg_val I64(int64_t v) { return tyg_iconst(p, TYG_I64, v); }
     // A large fixed value's "local" is a pointer slot (Temp): its place is what the slot holds.
     set<tyg_local> viaptr;
+    // Header locals (HdrLocal), typed gs_hdr: their address carries the type, for l.base, l.len.
+    set<tyg_local> hdrlocals;
     tyg_addr AtL(tyg_local l, int64_t off = 0) {
         if (!viaptr.empty() && viaptr.count(l))
             return tyg_at_val(tyg_load(p, TYG_I64, tyg_at_local(l, 0), 0), off);
+        if ((off == 0 || off == 8) && !hdrlocals.empty() && hdrlocals.count(l)) {
+            auto a = tyg_at_type(tyg_at_local(l, 0), M.SliceAT());
+            return off ? tyg_at_field(a, M.SliceAT(), 1) : a;
+        }
         return tyg_at_local(l, off);
     }
     tyg_addr AtV(tyg_val v, int64_t off = 0) { return tyg_at_val(v, off); }
-    tyg_val Ld(tyg_addr a) { return tyg_load(p, TYG_I64, a, 0); }
-    void St(tyg_addr a, tyg_val v) { tyg_store(p, TYG_I64, a, v, 0); }
+    // A header's own address (typed gs_hdr, NewHdr or a field's path) reads and writes its base.
+    tyg_addr HdrField(tyg_addr a, int k) { return a.type && a.type == M.SliceAT() ? tyg_at_field(a, a.type, k) : a; }
+    tyg_val Ld(tyg_addr a) { return tyg_load(p, TYG_I64, HdrField(a, 0), 0); }
+    void St(tyg_addr a, tyg_val v) { tyg_store(p, TYG_I64, HdrField(a, 0), v, 0); }
     tyg_val LdL(tyg_local l, int64_t off = 0) { return Ld(AtL(l, off)); }
     void StL(tyg_local l, tyg_val v, int64_t off = 0) { St(AtL(l, off), v); }
     tyg_val Bin(tyg_binop op, tyg_val a, tyg_val b) { return tyg_bin(p, op, a, b); }
@@ -1931,6 +1942,8 @@ struct TgFn {
             viaptr.insert(at);
             return at;
         }
+        // A resizable's or a slice's header: gs_hdr.
+        if (sz == 16 && M.AT(t) == M.SliceAT()) return HdrLocal();
         // A scalar or a fixed record of the native frame: a local of its type, its C type in
         // tinygen's C.
         if (M.Taggable(t)) {
@@ -1966,7 +1979,15 @@ struct TgFn {
     // ---- Building values in place ---------------------------------------------------------------
 
     // A resizable's header is (base, count); a build dispatches on the node.
-    tyg_addr NewHdr() { return AtL(Slot16()); }
+    // A header local, typed gs_hdr: the C reads its fields as l.base, l.len.
+    tyg_local HdrLocal() {
+        framebytes += 16;
+        CheckFrame();
+        auto l = tyg_local_typed_align(p, M.SliceAT(), 8);   // gs_hdr is packed: aligned to 1
+        hdrlocals.insert(l);
+        return l;
+    }
+    tyg_addr NewHdr() { return AtL(HdrLocal()); }
     static Node *StripCopy(Node *n) {
         auto c = Is<Call>(n);
         return c && c->builtin == B_COPY && c->ArgNodes().size() == 1 ? c->ArgNodes()[0] : n;
@@ -4763,12 +4784,13 @@ struct TgFn {
     static tyg_arg ArgOfVal(tyg_val v) { return tyg_arg { v, {} }; }
     static tyg_arg ArgOfMem(tyg_addr m) { return tyg_arg { 0, m }; }
     // Untagged: a tag (TagAt) is for one access, not for the bytes around it.
-    static tyg_addr AddrPlus(tyg_addr a, int64_t off) {
+    tyg_addr AddrPlus(tyg_addr a, int64_t off) {
+        if (off == 8 && a.type && a.type == M.SliceAT()) return HdrField(a, 1);   // a header's len
         a.offset += off;
         return Untag(a);
     }
     // The count of the resizable whose header is at hdr.
-    static tyg_addr CountAt(tyg_addr hdr) { return AddrPlus(hdr, 8); }
+    tyg_addr CountAt(tyg_addr hdr) { return AddrPlus(hdr, 8); }
     P Spill(const V &x) {
         P pl { AtL(Temp(x.t)), x.t };
         Store(pl, x);
@@ -5279,7 +5301,7 @@ struct TgFn {
         pc.arr = pl.t;
         pc.hdr = Local(AddrOf(Untag(pl.a)));
         pc.stk = Local(pl.stk);
-        pc.fhdr = Slot16();
+        pc.fhdr = HdrLocal();
         pc.ftop = Slot();
         poolof[vd] = pools.size();
         pools.push_back(pc);
@@ -7791,7 +7813,7 @@ struct TgFn {
                 indirect.insert(d);
             } else {
                 // The tail's elements go on the stack, the tail empty.
-                loc = Frame(hdr ? 16 : M.Size(t), 8);
+                loc = hdr ? HdrLocal() : Frame(M.Size(t), 8);
                 if (!hdr) tyg_zero(p, AtL(loc), M.Size(t));
                 StL(loc, Top(stk), hdr ? 0 : M.FoHdrOff(t));
                 if (hdr) StL(loc, I64(0), 8);
@@ -7802,7 +7824,7 @@ struct TgFn {
             if (hdr && d->reusable) {
                 // Its freelist: free slot indices on a stack of their own.
                 auto flstk = Stk(AllocStk(true, l), l);
-                auto fl = Slot16();
+                auto fl = HdrLocal();
                 auto fsl = Local(flstk);
                 StL(fl, Top(flstk));
                 StL(fl, I64(0), 8);
@@ -8052,8 +8074,7 @@ struct TgFn {
         auto s = M.Scal(ct);
         auto lo = r ? GenAs(r->lo, ct).v : tyg_iconst(p, s, 0);
         auto hi = GenAs(r ? r->hi : f->iter, ct).v;
-        auto ctr = tyg_local_new(p, TgModule::ScalSize(s), TgModule::ScalSize(s));
-        auto hiv = tyg_local_new(p, TgModule::ScalSize(s), TgModule::ScalSize(s));
+        auto ctr = tyg_local_typed(p, M.AT(ct)), hiv = tyg_local_typed(p, M.AT(ct));
         tyg_store(p, s, AtL(ctr), lo, 0);
         tyg_store(p, s, AtL(hiv), hi, 0);
         tyg_local ix = 0;
