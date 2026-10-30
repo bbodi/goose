@@ -535,8 +535,9 @@ def check_pool_base_c(exe, base, ok, fail):
     text = tc.decode(cout.read_bytes()) if code == 0 and cout.exists() else ""
     prog = text.partition("/* ---- the program, written by tinygen ---- */")[2]
     body = re.search(r"\bstatic int64_t sum_g\(int64_t dir[^)]*\) \{\n(.*?)\n\}\n", prog, re.S)
-    # The entry block (B1, last) reads the base through the global's address into a local.
-    entry = body.group(1).partition("\nB1:;")[2] if body else ""
+    # The entry block reads the base through the global's address into a local: tinygen prints it
+    # first, before the body's first if or loop.
+    entry = re.split(r"\n\t(?:if \(|for \()", body.group(1))[0] if body else ""
     # The global's header address loaded (TYG_LOAD64, tinygen's expression form), its base read
     # through it into a local.
     based = re.search(r"(v\d+) = \(char \*\)\(uintptr_t\)TYG_LOAD64\(\(\(char \*\)&gs_tg_g\d+\)\);.*"
