@@ -1578,8 +1578,19 @@ struct TgFn {
     tyg_addr HdrField(tyg_addr a, int k) { return a.type && a.type == M.SliceAT() ? tyg_at_field(a, a.type, k) : a; }
     tyg_val Ld(tyg_addr a) { return tyg_load(p, TYG_I64, HdrField(a, 0), 0); }
     void St(tyg_addr a, tyg_val v) { tyg_store(p, TYG_I64, HdrField(a, 0), v, 0); }
-    tyg_val LdL(tyg_local l, int64_t off = 0) { return Ld(AtL(l, off)); }
-    void StL(tyg_local l, tyg_val v, int64_t off = 0) { St(AtL(l, off), v); }
+    // Locals made by Local from a top handle, never stored again (a store drops one for good).
+    map<tyg_local, tyg_local> stklocals;
+    set<tyg_local> stkpoisoned;
+    tyg_val LdL(tyg_local l, int64_t off = 0) {
+        auto v = Ld(AtL(l, off));
+        if (off == 0 && !stklocals.empty())
+            if (auto it = stklocals.find(l); it != stklocals.end() && !stkpoisoned.count(l)) topslots[v] = it->second;
+        return v;
+    }
+    void StL(tyg_local l, tyg_val v, int64_t off = 0) {
+        if (!stklocals.empty() && stklocals.count(l)) stkpoisoned.insert(l);
+        St(AtL(l, off), v);
+    }
     tyg_val Bin(tyg_binop op, tyg_val a, tyg_val b) { return tyg_bin(p, op, a, b); }
     tyg_val Add(tyg_val a, tyg_val b) { return Bin(TYG_ADD, a, b); }
     tyg_val Sub(tyg_val a, tyg_val b) { return Bin(TYG_SUB, a, b); }
@@ -1646,6 +1657,9 @@ struct TgFn {
     tyg_local Local(tyg_val v) {
         auto l = Slot();
         StL(l, v);
+        // A local holding a pool cache's top handle (topslots): a read of it is that handle too.
+        if (!topslots.empty())
+            if (auto it = topslots.find(v); it != topslots.end()) stklocals[l] = it->second;
         return l;
     }
     TgModule &M;
@@ -2127,8 +2141,17 @@ struct TgFn {
         }
         return Add(LdL(stksl), Mul(Add(sp0, I64(k)), I64(8)));
     }
-    tyg_val Top(tyg_val stk) { return Ld(AtV(stk)); }
-    void SetTop(tyg_val stk, tyg_val top) { St(AtV(stk), top); }
+    // A stack handle that is the address of a pool cache's top (PoolPlace): its top is that local,
+    // read and written as a variable (the old C generator's cursor) rather than through its address.
+    map<tyg_val, tyg_local> topslots;
+    tyg_val Top(tyg_val stk) {
+        if (auto it = topslots.find(stk); it != topslots.end()) return LdL(it->second);
+        return Ld(AtV(stk));
+    }
+    void SetTop(tyg_val stk, tyg_val top) {
+        if (auto it = topslots.find(stk); it != topslots.end()) return StL(it->second, top);
+        St(AtV(stk), top);
+    }
 
     // The next free index, for a local (innermost non-statement scope) or a temporary (the
     // statement's), its top saved to restore (AllocStk(forlocal) in the old C generator).
@@ -5465,6 +5488,7 @@ struct TgFn {
         if (auto pc = PoolOf(n)) {
             pl.a = AtL(pc->fhdr);
             pl.stk = AddrOf(AtL(pc->ftop));
+            topslots[pl.stk] = pc->ftop;
         }
         return pl;
     }
@@ -8556,7 +8580,14 @@ struct TgFn {
         auto base = at();
         auto size = M.TagSize(t) + (fixed ? cg.FixedSize(vt) : 0);
         SetTop(stk, Add(base, I64(size)));
-        if (fixed) tyg_zero(p, AtV(base), size);
+        // A literal giving every field of a payload with no padding writes all its bytes: no zero
+        // bytes first, as the old C generator's push of a variant.
+        auto whole = fixed && sl;
+        if (whole) {
+            auto &fs = M.RunOfType(vt);
+            for (size_t i = 0; i < fs.f.size(); i++) whole = whole && !fs.f[i].ispad && sl->InitFor((int)i);
+        }
+        if (fixed && !whole) tyg_zero(p, AtV(base), size);
         StoreTag(AtV(base), t, vi);
         if (!sl) return at();
         SelfScope scope(selfbase, base);
