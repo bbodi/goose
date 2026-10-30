@@ -5868,11 +5868,9 @@ struct TgFn {
     }
     // An abort unless `cond`, then on.
     void AbortUnless(tyg_val cond, const string &what, Line l) {
-        auto ok = NewBlock(), bad = NewBlock();
-        Branch(cond, ok, bad);
-        SetBlock(bad);
+        tyg_if_not(p, cond);
         Abort(what, l);
-        SetBlock(ok);
+        tyg_endif(p);
     }
 
     // pop, pop_n, resize and clear of a resizable: the elements end at the stack's
@@ -7038,26 +7036,28 @@ struct TgFn {
         auto x0 = Conv(GenAs(me->scrutinee, ot).v, ot, M.ast.inttypes[IS_I64], me->line);
         if (Ended()) return k.valued ? Dummy(k.et) : V {};
         auto xl = Local(x0);
-        auto done = NewBlock();
-        auto wild = false;
+        // An if per arm, the next in its else (tinygen's ifs): the arm's ranges, each lo <= x <= hi
+        // (lo <= hi at the type's order) as one unsigned compare, or'ed; a wildcard's arm the last
+        // else.
+        size_t open = 0;
         for (auto &a : me->arms) {
             if (a.binder) No(me->line, "match arm with a binding");
-            auto hit = NewBlock(), next = NewBlock();
-            wild = a.pat.kind == P_WILDCARD;
-            if (wild) tyg_jump(p, hit);
-            // lo <= x <= hi (lo <= hi at the type's order) as one unsigned compare.
-            for (auto &r : a.ranges)
-                HitElse(Cmp(TYG_ULE, Sub(LdL(xl), I64(r.lo)),
-                            I64((int64_t)((uint64_t)r.hi - (uint64_t)r.lo))), hit);
-            if (!wild) tyg_jump(p, next);
-            SetBlock(hit);
+            if (a.pat.kind == P_WILDCARD) {
+                CtlArm(k, ip, a.body, me->line);
+                break;
+            }
+            tyg_val hit = I8(0);
+            for (size_t i = 0; i < a.ranges.size(); i++) {
+                auto &r = a.ranges[i];
+                auto in = Cmp(TYG_ULE, Sub(LdL(xl), I64(r.lo)), I64((int64_t)((uint64_t)r.hi - (uint64_t)r.lo)));
+                hit = i == 0 ? in : Bin(TYG_OR, hit, in);
+            }
+            tyg_if(p, hit);
             CtlArm(k, ip, a.body, me->line);
-            Jump(done);
-            SetBlock(next);
-            if (wild) break;
+            tyg_else(p);
+            open++;
         }
-        Jump(done);   // Past the last arm, or the wildcard's never-entered fall-through.
-        SetBlock(done);
+        while (open-- > 0) tyg_endif(p);
         return CtlValue(k, me->line);
     }
 
@@ -7122,9 +7122,6 @@ struct TgFn {
         if (!M.TypeOk(adt)) No(n->line, cat("match over type ", M.NameWhy(adt)));
         auto x = GenAs(n, adt);
         return ScrutAt(adt, x.a);
-    }
-    void TagIs(const Scrut &s, int vi, tyg_block hit) {
-        HitElse(Cmp(TYG_EQ, LdL(s.tag), I64(vi)), hit);
     }
     void CopyPayload(const Scrut &s, int vi, tyg_addr to) {
         auto sz = cg.FixedSize(cg.VariantType(s.adt, vi));
@@ -7302,16 +7299,18 @@ struct TgFn {
         }
         vector<tyg_arg> chanargs;
         auto rets = RetChans(sp0, cg.sinfo[sp0], idst, dst, rdst, chanargs, c->line);
-        auto done = NewBlock();
+        // One switch on the tag, a case per variant calling its case function (a C switch in
+        // tinygen's C), a corrupt tag the default.
         auto nvar = adt->enu->en->variants.size();
-        vector<tyg_block> arms;
+        vector<int64_t> tags;
+        vector<int> cases;
         for (size_t vi = 0; vi < nvar; vi++) {
-            arms.push_back(NewBlock());
-            TagIs(s, (int)vi, arms.back());
+            tags.push_back((int64_t)vi);
+            cases.push_back((int)vi);
         }
-        BadTag(c->line);
+        tyg_switch_begin(p, LdL(s.tag), (int)nvar, tags.data(), cases.data(), (int)nvar);
         for (size_t vi = 0; vi < nvar; vi++) {
-            SetBlock(arms[vi]);
+            tyg_case(p, (int)vi);
             auto sp = c->dispatch[vi];
             auto &ci = cg.sinfo[sp];
             vector<tyg_arg> args;
@@ -7339,9 +7338,10 @@ struct TgFn {
             auto x = Result(sp, ci.cret, M.Sig(sp), tyg_direct(sym), args);
             if (rt) Store(P { AtL(res), rt }, x);
             RfCheck(sp);
-            Jump(done);
         }
-        SetBlock(done);
+        tyg_default(p);
+        BadTag(c->line);
+        tyg_endswitch(p);
         for (size_t i = 0; i < rets.size(); i++) {
             if ((int)i == cret) lastrets.push_back(Load(P { AtL(res), rt }, c->line));
             else if (M.IsScalar(rets[i].t))
