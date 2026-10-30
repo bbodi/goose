@@ -3448,7 +3448,7 @@ struct TgFn {
     V GenBinary(Binary *b) {
         auto op = b->op;
         if (op == T_ANDAND || op == T_OROR) {
-            auto t = tyg_local_new(p, 1, 1);
+            auto t = tyg_local_typed(p, tyg_type_int(m, TYG_I8, 0));
             auto lb = Cmp(TYG_NE, Truth(b->left), I8(0));
             tyg_store(p, TYG_I8, AtL(t), lb, 0);
             If(op == T_ANDAND ? lb : Cmp(TYG_EQ, lb, I8(0)), [&] {
@@ -6904,47 +6904,12 @@ struct TgFn {
         Ctl k;
         if (CtlBegin(k, i, discard, nullptr, i->elseb != nullptr)) return k.w;
         auto arm = [&](Node *n) { CtlArm(k, nullptr, n, i->line); };
-        if (IsShortCircuit(i->cond)) {
-            auto t = NewBlock(), e = NewBlock(), done = i->elseb ? NewBlock() : e;
-            CondBranch(i->cond, t, e, false);
-            SetBlock(t);
-            arm(i->thenb);
-            if (!Ended()) tyg_jump(p, done);
-            if (i->elseb) {
-                SetBlock(e);
-                arm(i->elseb);
-                if (!Ended()) tyg_jump(p, done);
-            }
-            SetBlock(done);
-            return CtlValue(k, i->line);
-        }
+        // `&&` and `||` too: their value in a bool local (GenBinary), the right operand tested in an
+        // if of its own, so the if is tinygen's and its C an if.
         auto c = Truth(i->cond);
         if (i->elseb) IfElse(c, [&] { arm(i->thenb); }, [&] { arm(i->elseb); });
         else If(c, [&] { arm(i->thenb); });
         return CtlValue(k, i->line);
-    }
-
-    bool IsShortCircuit(Node *n) {
-        auto b = Is<Binary>(n);
-        return b && (b->op == T_ANDAND || b->op == T_OROR);
-    }
-    // To t where the condition n holds, else to f. `&&` and `||` test each operand with a branch of
-    // its own, where GenBinary keeps their value in a bool local; the right operand's temporaries
-    // exist only when it runs, as there. With `scoped`, the left one's too.
-    void CondBranch(Node *n, tyg_block t, tyg_block f, bool scoped) {
-        if (IsShortCircuit(n)) {
-            auto b = static_cast<Binary *>(n);
-            auto mid = NewBlock();
-            if (b->op == T_ANDAND) CondBranch(b->left, mid, f, scoped);
-            else CondBranch(b->left, t, mid, scoped);
-            SetBlock(mid);
-            CondBranch(b->right, t, f, true);
-            return;
-        }
-        if (scoped) OpenScope(true);
-        auto c = Truth(n);
-        if (scoped) CloseScope();
-        if (!Ended()) Branch(c, t, f);
     }
 
     // `block { ... }`: its tail's value, or a break's.
@@ -7461,18 +7426,10 @@ struct TgFn {
                 SLoop();
                 Loc(w->cond->line);
                 loops.push_back(SLoopTargets(0));
-                if (IsShortCircuit(w->cond)) {
-                    auto body = NewBlock(), out = NewBlock();
-                    CondBranch(w->cond, body, out, true);
-                    SetBlock(out);
-                    tyg_break(p, 0);
-                    SetBlock(body);
-                } else {
-                    OpenScope(true);
-                    auto c = Truth(w->cond);
-                    CloseScope();
-                    if (!Ended()) BreakUnless(c);
-                }
+                OpenScope(true);
+                auto c = Truth(w->cond);
+                CloseScope();
+                if (!Ended()) BreakUnless(c);
                 GenBlock(w->body, true);
                 loops.pop_back();
                 SEndLoop();
