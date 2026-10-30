@@ -2624,24 +2624,19 @@ struct TgFn {
     // One tyg_switch, a C switch in tinygen's C, which the C compiler lowers as the old generator's
     // switch and threads a second dispatch on the same tag through.
     template <class F> void TagSwitch(tyg_local tag, size_t n, F arm) {
-        auto done = NewBlock();
-        if (Ended() || n == 0) {
-            SetBlock(done);
-            return;
-        }
-        vector<tyg_block> targets;
+        if (n == 0) return;
         vector<int64_t> tags;
+        vector<int> cases;
         for (size_t vi = 0; vi < n; vi++) {
-            targets.push_back(NewBlock());
             tags.push_back((int64_t)vi);
+            cases.push_back((int)vi);
         }
-        tyg_switch(p, LdL(tag), (int)n, tags.data(), targets.data(), done);
+        tyg_switch_begin(p, LdL(tag), (int)n, tags.data(), cases.data(), (int)n);
         for (size_t vi = 0; vi < n; vi++) {
-            SetBlock(targets[vi]);
+            tyg_case(p, (int)vi);
             arm(vi);
-            if (!Ended()) tyg_jump(p, done);
         }
-        SetBlock(done);
+        tyg_endswitch(p);   // A corrupt tag: none of them.
     }
     // The i64 that arm(vi) gives for the variant of the ADT that tag says (init for a corrupt tag).
     template <class F> tyg_val ByTag(TypeExpr *adt, tyg_val tag, F arm, int64_t init = 0) {
@@ -7137,48 +7132,48 @@ struct TgFn {
         else tyg_zero(p, to, 1);
     }
 
-    // The arms reached by one switch on the tag (a C switch in tinygen's C), a wildcard's or a corrupt
-    // tag's the default; then each arm.
+    // One switch on the tag with the arms inside (tinygen's tyg_switch_begin, a C switch with its
+    // cases in tinygen's C), a wildcard's or a corrupt tag's arm the default.
     V GenAdtMatch(MatchExpr *me, TypeExpr *adt, const Ctl &k, const InPlace *ip) {
         auto s = AdtScrutinee(me->scrutinee, adt);
-        auto done = NewBlock();
-        vector<tyg_block> hits, targets;
         vector<int64_t> tags;
-        tyg_block wild = 0;
-        size_t narms = 0;
-        for (auto &a : me->arms) {
-            auto hit = NewBlock();
-            hits.push_back(hit);
-            narms++;
+        vector<int> cases;
+        vector<size_t> armof;   // Each case's arm.
+        int wild = -1;
+        for (size_t i = 0; i < me->arms.size(); i++) {
+            auto &a = me->arms[i];
             if (a.pat.kind == P_WILDCARD) {
-                wild = hit;
+                wild = (int)i;
                 break;
             }
             for (auto v : a.variants) {
                 tags.push_back(adt->enu->en->VariantIndex(v));
-                targets.push_back(hit);
+                cases.push_back((int)armof.size());
             }
+            armof.push_back(i);
         }
-        auto bad = wild ? wild : NewBlock();
-        if (!Ended()) {
-            if (tags.empty()) tyg_jump(p, bad);
-            else tyg_switch(p, LdL(s.tag), (int)tags.size(), tags.data(), targets.data(), bad);
-        }
-        for (size_t i = 0; i < narms; i++) {
+        auto body = [&](size_t i) {
             auto &a = me->arms[i];
-            SetBlock(hits[i]);
             InScope([&] {
                 if (a.binder) BindAdtArm(me, adt, s, a);
                 Loc(a.body->line);   // A breakpoint on the arm's line stops here, bound.
                 CtlArm(k, ip, a.body, me->line);
             });
-            Jump(done);
+        };
+        if (armof.empty()) {   // A wildcard alone.
+            if (wild >= 0) body((size_t)wild);
+            else BadTag(me->line);
+            return CtlValue(k, me->line);
         }
-        if (!wild) {
-            SetBlock(bad);
-            BadTag(me->line);
+        tyg_switch_begin(p, LdL(s.tag), (int)tags.size(), tags.data(), cases.data(), (int)armof.size());
+        for (size_t c = 0; c < armof.size(); c++) {
+            tyg_case(p, (int)c);
+            body(armof[c]);
         }
-        SetBlock(done);
+        tyg_default(p);
+        if (wild >= 0) body((size_t)wild);
+        else BadTag(me->line);
+        tyg_endswitch(p);
         return CtlValue(k, me->line);
     }
     // An arm's binder: a payload by reference (variable mode only) or by value (§8.1).
