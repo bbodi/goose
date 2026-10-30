@@ -540,10 +540,11 @@ def check_pool_base_c(exe, base, ok, fail):
     # The entry block reads the base through the global's address into a local: tinygen prints it
     # first, before the body's first if or loop.
     entry = re.split(r"\n\t(?:if \(|for \()", body.group(1))[0] if body else ""
-    # The global's header address loaded (TYG_LOAD64, tinygen's expression form), its base read
-    # through it into a local.
-    based = re.search(r"(v\d+) = \(char \*\)\(uintptr_t\)TYG_LOAD64\(\(\(char \*\)&gs_tg_g\d+\)\);.*"
-                      r"l\d+ = \(int64_t\)\(\(uint64_t\)\(TYG_LOAD64\(\1\)\)\);", entry, re.S)
+    # The global's header address loaded (TYG_LOAD64, tinygen's expression form) into a value or a
+    # local (tinygen's C reads a value as the local it was stored to), its base read through it
+    # into a local.
+    based = re.search(r"\b([vl]\d+) = [^;\n]*TYG_LOAD64\(\(\(char \*\)&gs_tg_g\d+\)\)\)?;.*"
+                      r"l\d+ = \(int64_t\)\(\(uint64_t\)\(TYG_LOAD64\([^;\n]*\b\1\b", entry, re.S)
     if not based:
         fail("tinygen's C of a pool's base: static functions, the base read in the entry block", o + e)
         return
