@@ -474,9 +474,10 @@ def check_typed_c(exe, base, ok, fail):
                                  ROOT / TYPED_MEMORY])
     text = tc.decode(cout.read_bytes()) if code == 0 and cout.exists() else ""
     wraps = re.findall(r"struct (?:TYG_ALIGNED\(\d+\) )?tyg_r(\d+) \{\n\tstruct tyg_r\d+ f0;\n\};", text)
-    if not re.search(r"= \(float\)\(\(struct tyg_r\d+ \*\)\(.*\)\)->f\d+\.f\d+;", text) or \
+    # The operands may be folded expressions (tinygen's tg_c_fold).
+    if not re.search(r"\(float\)\(\(struct tyg_r\d+ \*\)\(.*\)\)->f\d+\.f\d+", text) or \
             not any(re.search(rf"\(\(struct tyg_r{w} \*\)\(.*\)\)->f0\.f\d+", text) for w in wraps) or \
-            not re.search(r"\(\*\(struct tyg_r\d+ \*\)\(v\d+\)\) = \(\*\(struct tyg_r\d+ \*\)\(v\d+\)\);",
+            not re.search(r"\(\*\(struct tyg_r\d+ \*\)\(.*\)\) = \(\*\(struct tyg_r\d+ \*\)\(.*\)\);",
                           text):
         fail("tinygen's C of typed memory: a field path, a global's own struct and a struct "
              "assignment", o + e)
