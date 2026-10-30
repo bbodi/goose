@@ -131,8 +131,12 @@ inline const vector<TgSupportExtern> &TgSupportExterns() {
 // thread-locals kept here (gs_stks, gs_gl).
 inline string TgSupportBody(string_view runtimeh) {
     string s = "\n/* ---- tinygen support (docs/design/tinygen_backend.md) ---- */\n"
-               // The embedded JIT runs no threads (TinyCC places no thread-locals in memory).
-               "#if defined(GS_EMBEDDED_JIT)\n#define GS_TG_TLS\n"
+               // The embedded JIT runs no threads (TinyCC places no thread-locals in memory), nor
+               // does the unit of a program without them (TinygenUnit), whose gs_rf, a plain static
+               // as the old C generator's GS_TLS made it, the C compiler reads at its address. The
+               // support object serves programs with threads too.
+               "#if defined(GS_EMBEDDED_JIT) || defined(GS_TG_NO_THREADS)\n"
+               "#define GS_TG_TLS\n"
                "#elif defined(_MSC_VER)\n#define GS_TG_TLS __declspec(thread)\n#else\n"
                "#define GS_TG_TLS __thread\n#endif\n"
                "static GS_TG_TLS int32_t gs_rf;\n";
@@ -2526,8 +2530,20 @@ struct TgFn {
               nullptr);
     }
     // arm(vi), in a block entered when the tag in `tag` is variant vi, for each of n variants.
+    // One test after another, each arm leaving the chain, so the C compiler sees a switch on the
+    // tag, which a second dispatch on the same tag can be threaded through.
     template <class F> void TagSwitch(tyg_local tag, size_t n, F arm) {
-        for (size_t vi = 0; vi < n; vi++) If(Cmp(TYG_EQ, LdL(tag), I64((int64_t)vi)), [&] { arm(vi); });
+        auto done = NewBlock();
+        for (size_t vi = 0; vi < n; vi++) {
+            auto t = NewBlock(), next = NewBlock();
+            Branch(Cmp(TYG_EQ, LdL(tag), I64((int64_t)vi)), t, next);
+            SetBlock(t);
+            arm(vi);
+            if (!Ended()) tyg_jump(p, done);
+            SetBlock(next);
+        }
+        tyg_jump(p, done);
+        SetBlock(done);
     }
     // The i64 that arm(vi) gives for the variant of the ADT that tag says (init for a corrupt tag).
     template <class F> tyg_val ByTag(TypeExpr *adt, tyg_val tag, F arm, int64_t init = 0) {
@@ -2768,11 +2784,12 @@ struct TgFn {
     // of the address leaves it a second one (origin + offset may be 0 for all it knows).
     map<const VarDef *, pair<tyg_local, const VarDef *>> reloffs;   // With the pool, if any.
     // The offset the slot at pl holds for the address v, zero for a null.
+    bool relnonnull = false;   // v is not null, nor the slot's own address (SelfRelInto).
     tyg_val RelOffset(const P &pl, tyg_val v, Line l) {
         if (auto it = offof.find(v); it != offof.end() && pl.t->ref->pool && it->second.first == pl.t->ref->pool)
             return it->second.second;
         auto off = Sub(v, RelOrigin(pl, l));
-        if (pl.t->ref->optional) {
+        if (pl.t->ref->optional && !relnonnull) {
             auto isnull = Cmp(TYG_EQ, v, I64(0));
             off = tyg_select(p, isnull, I64(0), off);
             // A link to its own slot would read back as null (RelOffset).
@@ -2948,10 +2965,26 @@ struct TgFn {
     }
     // The start of the literal being built in place, which `self` in its fields is (§3.9), or 0.
     tyg_val selfbase = 0;
-    // Such a literal built at pl: zero bytes, then its fields where they lie.
-    void SelfRelInto(const P &pl, Node *lit) {
+    // Whether n mentions `self`, which is the slot being built.
+    static bool NamesSelf(Node *n) {
+        if (!n || Is<SelfRef>(n)) return n != nullptr;
+        auto f = false;
+        n->Children([&](Node *ch) { f = f || NamesSelf(ch); });
+        return f;
+    }
+    // Such a literal built at pl: zero bytes, then its fields where they lie. In a slot a push just
+    // claimed (fresh), which nothing reads or links to yet, a struct whose every field is given
+    // takes no zero bytes first, and a link to a reference that cannot be null cannot be one to its
+    // own slot either, so it is stored untested (relnonnull).
+    void SelfRelInto(const P &pl, Node *lit, bool fresh = false) {
         auto t = lit->exprtype;
-        tyg_zero(p, pl.a, M.Size(t));
+        auto sl = Is<StructLit>(lit);
+        auto whole = fresh && sl && t->kind == TY_STRUCT;
+        if (whole) {
+            auto &fs = M.StFields(t);
+            for (size_t i = 0; i < fs.f.size(); i++) whole = whole && !fs.f[i].ispad && sl->InitFor((int)i);
+        }
+        if (!whole) tyg_zero(p, pl.a, M.Size(t));
         if (auto al = Is<ArrayLit>(lit)) {
             auto et = t->arr->sub;
             auto esz = cg.FixedSize(et);
@@ -2964,11 +2997,26 @@ struct TgFn {
                 Into(P { AddrPlus(pl.a, (int64_t)i * esz), et }, al->elems[i]);
             return;
         }
-        auto sl = Is<StructLit>(lit);
         SelfScope scope(selfbase, AddrOf(pl.a));
         if (t->kind == TY_ENUM) StoreTag(pl.a, t, M.EI(t)->en->VariantIndex(sl->variant));
         EachLitInit(sl, [&](Node *init, TypeExpr *ft, int64_t off) {
-            Into(P { AddrPlus(pl.a, off), ft }, init);
+            if (Is<NullLit>(init) && TgModule::IsRel(ft)) {   // Null: the zero offset.
+                auto rs = M.RelScal(ft);
+                return tyg_store(p, rs, AddrPlus(pl.a, off), tyg_iconst(p, rs, 0), 0);
+            }
+            // The checker gives the field's optional type to its value: a variable's or a callee's
+            // own says what it holds.
+            auto it = init->exprtype;
+            if (auto id = Is<Ident>(init); id && id->vdef && id->vdef->type) it = id->vdef->type;
+            else if (auto c = Is<Call>(init); c && c->spec && c->builtin < 0 && c->spec->rets.size() == 1)
+                it = c->spec->rets[0];
+            if (!fresh || !TgModule::IsRel(ft) || !it || it->kind != TY_REF || it->ref->optional ||
+                NamesSelf(init))
+                return Into(P { AddrPlus(pl.a, off), ft }, init);
+            auto x = GenAs(init, ft);
+            relnonnull = true;
+            Store(P { AddrPlus(pl.a, off), ft }, x);
+            relnonnull = false;
         });
     }
     // A fill [v; k] of a value linking to itself: v's leaves evaluated once, then
@@ -4698,8 +4746,8 @@ struct TgFn {
         auto line = c->line;
         if (b == B_PRINT) return GenPrint(c);
         if (b == B_LEN && nargs == 1) return GenLen(an[0], c);
-        if (b == B_PUSH && nargs == 2) return GenPush(c);
-        if (b == B_APPEND && nargs == 2) return GenAppend(c);
+        if (b == B_PUSH && nargs == 2) return PoolCall(c, [&] { return GenPush(c); });
+        if (b == B_APPEND && nargs == 2) return PoolCall(c, [&] { return GenAppend(c); });
         if (b == B_STR) return GenStr(c);
         if (b == B_POP || b == B_POP_N || b == B_RESIZE || b == B_CLEAR) return GenShrink(c);
         if (b == B_ASSERT && nargs == 1) {
@@ -5008,13 +5056,19 @@ struct TgFn {
     std::optional<P> pushed;
     bool discardpush = false;   // A push in statement position: its value unwanted.
 
-    // A growable array a reference parameter names, whose top and count the function keeps in locals
-    // (the old C generator's pool locals): read on entry, written back before every call and exit and
-    // read again after a call. Only where every use of the parameter, or of a local bound to it
-    // (an inlined call's argument), pushes into it or passes it to a call (PoolUses), so no other
-    // code reads the array's header while the locals are ahead of it.
+    // A growable array whose count and stack top the function keeps in locals of its own (the old C
+    // generator's pool locals): a reference parameter's or a global's from entry, a local's from its
+    // declaration to its block's end. Pushes and appends build through the copy (PoolPlace), which
+    // is written back before every call and exit and read again after a call. A statement that uses
+    // the array any other way, or names another array of its type that could be the same one
+    // (PoolUses), runs with the copy written back and set aside (off), read again after it and before
+    // a jump out of it. The copy's address taken by nothing else, the C compiler keeps it in
+    // registers, where the header in memory would be read again after every element byte stored.
     struct PoolCache {
-        tyg_local hdr, stk, top, len;
+        TypeExpr *arr;
+        tyg_local hdr, stk;     // The header's and the stack's addresses.
+        tyg_local fhdr, ftop;   // The copy: the header (base, count) and the top.
+        bool off = false, alive = true;
     };
     vector<PoolCache> pools;
     map<const VarDef *, size_t> poolof;
@@ -5036,9 +5090,9 @@ struct TgFn {
         return holds(t);
     }
     // Whether the uses in n of the variables in `defs` (each bound to its pool, of type arr) are
-    // pushes and call arguments, and nothing else in n may reach an array of that type, which could
-    // be the same one (another reference, a global, a field); a local bound to one of them joins it.
-    // `pushes`: some push is one.
+    // pushes, appends and call arguments by reference, and nothing else in n may reach an array of
+    // that type, which could be the same one (another reference, a global, a field); a reference
+    // bound to one of them joins it. `pushes`: some push is one.
     bool PoolUses(Node *n, TypeExpr *arr, map<const VarDef *, size_t> &defs, set<const Node *> &ok,
                   bool &pushes) {
         if (!n) return true;
@@ -5051,14 +5105,21 @@ struct TgFn {
         if (auto id = Is<Ident>(n); id && id->vdef && defs.count(id->vdef)) return false;
         if (auto d = Is<Dot>(n); d && ok.count(d->obj)) return true;   // A push's callee.
         if (Holds(n->exprtype, arr)) return false;
+        // A value of an index type of the array (`u32 in a`, `upto a`, §3.11), which a conversion
+        // checks against its length.
+        if (auto t = n->exprtype; t && t->ix && t->ix->arr && defs.count(t->ix->arr)) return false;
         if (auto c = Is<Call>(n)) {
             auto an = c->ArgNodes();
-            if (c->builtin == B_PUSH && an.size() == 2 && pooled(an[0]) && Is<Dot>(c->callee)) {
+            if ((c->builtin == B_PUSH || c->builtin == B_APPEND) && an.size() == 2 && pooled(an[0]) &&
+                Is<Dot>(c->callee)) {
                 ok.insert(an[0]);
                 pushes = true;
             } else if (c->builtin < 0 && c->spec && !c->fvbody) {
-                for (auto a : c->args)
-                    if (pooled(a)) ok.insert(a);
+                // Handed by reference, its header read by the callee, after the copy is written back.
+                auto va = c->ValueArgNodes();
+                for (size_t i = 0; i < va.size() && va.size() == c->spec->argtypes.size(); i++)
+                    if (pooled(va[i]) && c->spec->argtypes[i] && c->spec->argtypes[i]->kind == TY_REF)
+                        ok.insert(va[i]);
             }
             // Compiled with the call, though no child of it: a function value's body, a default.
             if (!PoolUses(c->fvbody, arr, defs, ok, pushes) || !PoolUses(c->defaultinit, arr, defs, ok, pushes))
@@ -5066,7 +5127,7 @@ struct TgFn {
         }
         if (auto vd = Is<VarDecl>(n); vd && vd->defs.size() == 1 && vd->inits.size() == 1 &&
                                          pooled(vd->inits[0]) && vd->defs[0] && vd->defs[0]->type &&
-                                         cg.TEq(vd->defs[0]->type, vd->inits[0]->exprtype)) {
+                                         BindsArr(vd->defs[0]->type, vd->inits[0]->exprtype)) {
             defs[vd->defs[0]] = defs[Is<Ident>(vd->inits[0])->vdef];
             ok.insert(vd->inits[0]);
         }
@@ -5074,51 +5135,192 @@ struct TgFn {
         n->Children([&](Node *ch) { good = good && PoolUses(ch, arr, defs, ok, pushes); });
         return good;
     }
+    // A local of type d bound to a value of type t naming an array names it too: a reference, bound
+    // to the reference or to the array.
+    bool BindsArr(TypeExpr *d, TypeExpr *t) {
+        return t && d->kind == TY_REF && (cg.TEq(d, t) || (t->kind != TY_REF && cg.TEq(d->ref->sub, t)));
+    }
+    // Whether n pushes or appends to an array the variables in defs name, a local bound to one of
+    // them joining them.
+    bool PushesTo(Node *n, set<const VarDef *> &defs) {
+        if (!n) return false;
+        if (auto c = Is<Call>(n); c && (c->builtin == B_PUSH || c->builtin == B_APPEND)) {
+            auto an = c->ArgNodes();
+            auto id = an.size() == 2 ? Is<Ident>(an[0]) : nullptr;
+            if (id && id->vdef && defs.count(id->vdef)) return true;
+        }
+        if (auto vd = Is<VarDecl>(n); vd && vd->defs.size() == 1 && vd->inits.size() == 1 && vd->defs[0]) {
+            auto id = Is<Ident>(vd->inits[0]);
+            if (id && id->vdef && defs.count(id->vdef)) defs.insert(vd->defs[0]);
+        }
+        auto f = false;
+        n->Children([&](Node *ch) { f = f || PushesTo(ch, defs); });
+        if (auto c = Is<Call>(n)) f = f || PushesTo(c->fvbody, defs);
+        return f;
+    }
+    // Whether an array of type t can have the cache: one a push builds at its stack's top.
+    bool PoolType(TypeExpr *t) {
+        return t && IsGrow(t) && !TgModule::IsLim(t) && (M.RzOk(t) || M.VeOk(t));
+    }
+    // The cache of vd's array at pl, its copy read.
+    void StartPool(const VarDef *vd, const P &pl) {
+        PoolCache pc;
+        pc.arr = pl.t;
+        pc.hdr = Local(AddrOf(Untag(pl.a)));
+        pc.stk = Local(pl.stk);
+        pc.fhdr = Slot16();
+        pc.ftop = Slot();
+        poolof[vd] = pools.size();
+        pools.push_back(pc);
+        PoolLoad(pools.back());
+    }
+    // The copy read from the header and the stack, and written back (the base no push changes).
+    void PoolLoad(PoolCache &pc) {
+        auto h = LdL(pc.hdr);
+        StL(pc.fhdr, Ld(AtV(h)));
+        StL(pc.fhdr, Ld(AtV(h, 8)), 8);
+        StL(pc.ftop, Top(LdL(pc.stk)));
+    }
+    void PoolStore(PoolCache &pc) {
+        St(AtV(LdL(pc.hdr), 8), LdL(pc.fhdr, 8));
+        SetTop(LdL(pc.stk), LdL(pc.ftop));
+    }
+    // The caches of the function's reference parameters and globals a push reaches, but of two of
+    // one type, which can be one array, neither.
     // Not under GS_DEBUG (--debug), where a debugger reads the header as the program goes.
     void StartPoolCaches() {
         if (M.checks) return;
+        vector<VarDef *> cands;
         for (size_t i = 0; i < sp->params.size(); i++) {
             auto vd = sp->params[i];
             auto t = sp->argtypes[i];
-            if (!vd || !t || t->kind != TY_REF || cg.IsPoolParam(sp, i) || vd->reusable) continue;
-            auto pt = t->ref->sub;
-            if (!pt || !IsGrow(pt) || TgModule::IsLim(pt) || !M.RzOk(pt) || M.VeOk(pt) ||
-                !cg.IsFix(pt->arr->sub))
+            // Not an optional one, which may be null where the copy is read on entry.
+            if (!vd || !t || t->kind != TY_REF || t->ref->optional || cg.IsPoolParam(sp, i) ||
+                vd->reusable || !PoolType(t->ref->sub))
                 continue;
-            map<const VarDef *, size_t> defs { { vd, pools.size() } };
-            set<const Node *> ok;
-            bool pushes = false;
-            if (!PoolUses(sp->body, pt, defs, ok, pushes) || !pushes) continue;
-            auto pl = Deref(VarPlace(vd, sp->sf->line));
-            if (!pl.stk || !IsGrow(pl.t)) continue;
-            PoolCache pc;
-            pc.hdr = Local(AddrOf(Untag(pl.a)));
-            pc.stk = Local(pl.stk);
-            pc.top = Local(Top(LdL(pc.stk)));
-            pc.len = Local(Ld(AtV(LdL(pc.hdr), 8)));
-            pools.push_back(pc);
-            for (auto &[d, k] : defs) poolof[d] = k;
+            set<const VarDef *> defs { vd };
+            if (PushesTo(sp->body, defs)) cands.push_back(vd);
         }
+        set<VarDef *> globals;
+        function<void(Node *)> find = [&](Node *n) {
+            if (!n) return;
+            if (auto c = Is<Call>(n); c && (c->builtin == B_PUSH || c->builtin == B_APPEND)) {
+                auto an = c->ArgNodes();
+                auto id = an.size() == 2 ? Is<Ident>(an[0]) : nullptr;
+                if (id && id->vdef && id->vdef->isglobal && !id->vdef->reusable && PoolType(id->vdef->type) &&
+                    cg.gstks.count(id->vdef))
+                    globals.insert(id->vdef);
+            }
+            n->Children(find);
+            if (auto c = Is<Call>(n)) find(c->fvbody);
+        };
+        find(sp->body);
+        cands.insert(cands.end(), globals.begin(), globals.end());
+        auto arr = [](VarDef *d) { return d->type->kind == TY_REF ? d->type->ref->sub : d->type; };
+        for (auto d : cands) {
+            auto shared = false;
+            for (auto e : cands) shared = shared || (e != d && cg.TEq(arr(e), arr(d)));
+            if (shared) continue;
+            auto pl = Deref(VarPlace(d, sp->sf->line));
+            if (pl.stk && IsGrow(pl.t)) StartPool(d, pl);
+        }
+    }
+    // After b's statement i: a growable local it declares cached to the block's end when a later
+    // statement pushes to it.
+    void StartLocalPool(Block *b, size_t i) {
+        auto vd = Is<VarDecl>(b->stmts[i]);
+        if (M.checks || Ended() || !vd || vd->defs.size() != 1 || !vd->defs[0]) return;
+        auto d = vd->defs[0];
+        if (d->isglobal || d->reusable || !PoolType(d->type)) return;
+        set<const VarDef *> defs { d };
+        auto later = PushesTo(b->tail, defs);
+        for (auto j = i + 1; j < b->stmts.size() && !later; j++) later = PushesTo(b->stmts[j], defs);
+        if (!later) return;
+        auto pl = Deref(VarPlace(d, vd->line));
+        if (pl.stk && IsGrow(pl.t)) StartPool(d, pl);
+    }
+    void EndPools(size_t mark) {
+        for (auto k = mark; k < pools.size(); k++) pools[k].alive = false;
+    }
+    // Sets aside for n the caches n does not keep to (PoolUses), written back first; those set aside,
+    // for PoolsOn after n.
+    vector<size_t> PoolsOff(Node *n) {
+        vector<size_t> r;
+        for (size_t k = 0; k < pools.size(); k++) {
+            auto &pc = pools[k];
+            if (!pc.alive || pc.off) continue;
+            map<const VarDef *, size_t> defs;
+            for (auto &[d, i] : poolof)
+                if (i == k) defs[d] = k;
+            set<const Node *> ok;
+            auto pushes = false;
+            if (PoolUses(n, pc.arr, defs, ok, pushes)) {
+                for (auto &[d, i] : defs) poolof[d] = i;   // The locals n binds to it join it.
+                continue;
+            }
+            if (!Ended()) PoolStore(pc);
+            pc.off = true;
+            r.push_back(k);
+        }
+        return r;
+    }
+    void PoolsOn(const vector<size_t> &ks) {
+        for (auto k : ks) {
+            pools[k].off = false;
+            if (!Ended()) PoolLoad(pools[k]);
+        }
+    }
+    // Before a jump out of a statement that set caches aside, to where they are in use.
+    void PoolsBack() {
+        for (auto &pc : pools)
+            if (pc.alive && pc.off) PoolLoad(pc);
     }
     void PoolFlush() {
         if (Ended()) return;
-        for (auto &pc : pools) {
-            SetTop(LdL(pc.stk), LdL(pc.top));
-            St(AtV(LdL(pc.hdr), 8), LdL(pc.len));
-        }
+        for (auto &pc : pools)
+            if (pc.alive && !pc.off) PoolStore(pc);
     }
     void PoolReload() {
         if (Ended()) return;
-        for (auto &pc : pools) {
-            StL(pc.top, Top(LdL(pc.stk)));
-            StL(pc.len, Ld(AtV(LdL(pc.hdr), 8)));
-        }
+        for (auto &pc : pools)
+            if (pc.alive && !pc.off) PoolLoad(pc);
     }
-    // The cache of the pool an[0] names, if it has one.
+    // The cache of the array n names, if it has one in use.
     PoolCache *PoolOf(Node *n) {
         auto id = Is<Ident>(n);
         auto it = id && id->vdef ? poolof.find(id->vdef) : poolof.end();
-        return it == poolof.end() ? nullptr : &pools[it->second];
+        if (it == poolof.end() || !pools[it->second].alive || pools[it->second].off) return nullptr;
+        return &pools[it->second];
+    }
+    // Whether building n calls a function, which may be handed the stack it is built on.
+    static bool Calls(Node *n) {
+        if (!n) return false;
+        if (auto c = Is<Call>(n); c && (c->builtin < 0 || Calls(c->fvbody))) return true;
+        auto f = false;
+        n->Children([&](Node *ch) { f = f || Calls(ch); });
+        return f;
+    }
+    // A push or append whose value a call builds at the receiver's top, which the call reaches
+    // through the stack it is handed: made with the receiver's cache written back and set aside.
+    template <class F> V PoolCall(Call *c, F gen) {
+        auto an = c->ArgNodes();
+        auto pc = an.size() == 2 && Calls(an[1]) ? PoolOf(an[0]) : nullptr;
+        if (!pc) return gen();
+        auto k = (size_t)(pc - pools.data());
+        if (!Ended()) PoolStore(*pc);
+        pc->off = true;
+        auto r = gen();
+        PoolsOn({ k });
+        return r;
+    }
+    // The array n names, through its cache's copy where it has one.
+    P PoolPlace(Node *n) {
+        auto pl = Deref(Place(n));
+        if (auto pc = PoolOf(n)) {
+            pl.a = AtL(pc->fhdr);
+            pl.stk = AddrOf(AtL(pc->ftop));
+        }
+        return pl;
     }
     // v.push(x) (EmitPush): the receiver, then the element, which may grow the array itself, then its
     // slot claimed at the stack's top and the count raised. Its value is the element's address.
@@ -5126,7 +5328,7 @@ struct TgFn {
         auto dp = discardpush;
         discardpush = false;
         auto an = c->ArgNodes();
-        auto pl = Deref(Place(an[0]));
+        auto pl = PoolPlace(an[0]);
         if (TgModule::IsLim(pl.t)) {
             discardpush = dp;
             return LimPush(c, pl);
@@ -5151,22 +5353,12 @@ struct TgFn {
         auto et = pl.t->arr->sub;
         auto selfrel = SelfRelLit(an[1]) || (cg.HasRelRef(et) && SelfRelLitOk(an[1])) ||
                        Delivers(an[1], et);
-        auto pc = PoolOf(an[0]);
-        if (selfrel && cg.TEq(an[1]->exprtype, et) && pc) {
-            // Built in its slot at the cached top, then counted there.
-            auto sv = Local(LdL(pc->top));
-            IntoSlot(P { AtV(LdL(sv)), et }, an[1]);
-            if (Ended()) return Dummy(c->exprtype);
-            auto at = LdL(sv);
-            StL(pc->top, Add(at, I64(cg.FixedSize(et))));
-            StL(pc->len, Add(LdL(pc->len), I64(1)));
-            return counted(at);
-        }
         if (selfrel && cg.TEq(an[1]->exprtype, et)) {
             // Built in its slot at the top, then counted.
             auto slot = Top(pl.stk);
             auto sv = Local(slot);
-            IntoSlot(P { AtV(slot), et }, an[1]);
+            if (SelfRelLitOk(an[1])) SelfRelInto(P { AtV(slot), et }, an[1], true);
+            else Into(P { AtV(slot), et }, an[1]);
             if (Ended()) return Dummy(c->exprtype);
             auto at = LdL(sv);
             SetTop(pl.stk, Add(at, I64(cg.FixedSize(et))));
@@ -5177,17 +5369,9 @@ struct TgFn {
         if (Ended()) return Dummy(c->exprtype);
         if (!M.IsScalar(et) && !x.mem) No(c->line, "aggregate value");
         if (!cg.IsFix(et)) No(Line {}, "an element of variable size");
-        tyg_val top;
-        if (pc) {
-            top = LdL(pc->top);
-            Store(P { AtV(top), et }, x);
-            StL(pc->top, Add(top, I64(cg.FixedSize(et))));
-            StL(pc->len, Add(LdL(pc->len), I64(1)));
-        } else {
-            top = Top(pl.stk);
-            PushVal(pl.stk, et, x);
-            St(la, Add(Ld(la), I64(1)));
-        }
+        auto top = Top(pl.stk);
+        PushVal(pl.stk, et, x);
+        St(la, Add(Ld(la), I64(1)));
         V r;
         if (c->exprtype && c->exprtype->kind == TY_REF) r = NewElemResult(top, et, c->exprtype, c->line);
         // The element itself, as a value, where one is wanted.
@@ -5199,7 +5383,7 @@ struct TgFn {
     // v.append(x) (EmitAppend): x's elements built at v's top, their count added.
     V GenAppend(Call *c) {
         auto an = c->ArgNodes();
-        auto pl = Deref(Place(an[0]));
+        auto pl = PoolPlace(an[0]);
         if (TgModule::IsLim(pl.t)) return LimAppend(c, pl);
         if (!IsGrow(pl.t) || !(M.RzOk(pl.t) || M.VeOk(pl.t)) || !pl.stk)
             No(c->line, "append to an array of this kind");
@@ -6393,18 +6577,33 @@ struct TgFn {
         auto want = armwant;
         armwant = nullptr;
         V x;
+        auto mark = pools.size();
         InScope([&] {
-            for (auto s : b->stmts) Stmt(s);
+            Stmts(b, 0);
             if (!b->tail) return;
             if (discard && !tailret) return Stmt(b->tail);
             Open();
             Loc(b->tail->line);
-            if (tailret) return DoReturn({ b->tail }, b->tail->line);
-            x = want ? GenSliceAs(b->tail, want) : Gen(b->tail);
-            if (x.t && (IsGrow(x.t) || (IsImg(x.t) && !TgModule::IsVr(x.t))))
-                No(b->tail->line, "array value of a block");
+            auto off = PoolsOff(b->tail);
+            if (tailret) {
+                DoReturn({ b->tail }, b->tail->line);
+            } else {
+                x = want ? GenSliceAs(b->tail, want) : Gen(b->tail);
+                if (x.t && (IsGrow(x.t) || (IsImg(x.t) && !TgModule::IsVr(x.t))))
+                    No(b->tail->line, "array value of a block");
+            }
+            PoolsOn(off);
         });
+        EndPools(mark);
         return x;
+    }
+
+    // b's statements from `first`, a growable local among them cached from its declaration on.
+    void Stmts(Block *b, size_t first) {
+        for (auto i = first; i < b->stmts.size(); i++) {
+            Stmt(b->stmts[i]);
+            StartLocalPool(b, i);
+        }
     }
 
     // ---- Varints in bytes values (§3.6: ULEB128, values zigzag) ---------------------------------
@@ -6710,11 +6909,13 @@ struct TgFn {
             }
         }
         loops.push_back(lt);
+        auto mark = pools.size();
         InScope([&] {
-            for (auto i = first; i < body->stmts.size(); i++) Stmt(body->stmts[i]);
+            Stmts(body, first);
             if (Ended() || !body->tail) return;
             Open();
             Loc(body->tail->line);
+            auto off = PoolsOff(body->tail);
             // The tail is a return of its value: delivered as a `return` does (a reference stays
             // the reference the callee gives, not a copy of its target).
             auto tail = body->tail;
@@ -6729,7 +6930,9 @@ struct TgFn {
             } else {
                 CtlArm(k, ip, tail, ib->line);
             }
+            PoolsOn(off);
         });
+        EndPools(mark);
         loops.pop_back();
         Jump(done);
         SetBlock(done);
@@ -7084,9 +7287,11 @@ struct TgFn {
     void Stmt(Node *n) {
         Open();
         Loc(n->line);
+        auto off = PoolsOff(n);
         OpenScope(true);
         Stmt1(n);
         CloseScope();
+        PoolsOn(off);
     }
     // A break's value, delivered as its target wants it.
     void BreakValue(Node *val, Line line, const LoopTargets &t) {
@@ -7180,6 +7385,7 @@ struct TgFn {
                         if (Ended()) return;
                     }
                     RestoreFrom(t.depth);
+                    PoolsBack();
                     tyg_jump(p, t.brk);
                     return;
                 }
@@ -7198,6 +7404,7 @@ struct TgFn {
                     if (Ended()) return;
                 }
                 RestoreFrom(t.depth);
+                PoolsBack();
                 tyg_jump(p, t.brk);
                 return;
             }
@@ -7206,6 +7413,7 @@ struct TgFn {
                 while (i > 0 && loops[i - 1].block) i--;
                 if (i == 0) No(n->line, "continue target");
                 RestoreFrom(loops[i - 1].depth);
+                PoolsBack();
                 tyg_jump(p, loops[i - 1].cnt);
                 return;
             }

@@ -241,6 +241,12 @@ PROGRAMS += [(POOL_PUSHES, ["-O2"]), (POOL_PUSHES, []),
 POOL_BASES = "test/storage/pool_base_locals.goose"
 PROGRAMS += [(POOL_BASES, ["-O2"]), (POOL_BASES, [])]
 
+# Growable arrays counted in a copy of their own (TgFn::PoolCache): locals, globals and reference
+# parameters, statements that read them otherwise, a call building a pushed element, aliased
+# references; nodes pushed with every field given (check_array_cache_c).
+ARRAY_CACHES = "test/storage/array_caches.goose"
+PROGRAMS += [(ARRAY_CACHES, ["-O2"]), (ARRAY_CACHES, [])]
+
 # The windowed samples: built whole and not run, since they loop until their
 # window closes.
 BUILD_ONLY = ["samples/27_gfx_cube.goose", "samples/28_physics_boxes.goose", "samples/29_ui_todo.goose",
@@ -343,6 +349,7 @@ def check_tinygen_backend(exe, base, ok, fail, say):
     check_copy_c(exe, base, ok, fail)
     check_rel_c(exe, base, ok, fail)
     check_pool_base_c(exe, base, ok, fail)
+    check_array_cache_c(exe, base, ok, fail)
     check_run(exe, base, ok, fail)
     check_jit(exe, base, ok, fail)
     check_default_inlining(exe, base, ok, fail)
@@ -529,6 +536,36 @@ def check_pool_base_c(exe, base, ok, fail):
         fail("tinygen's C of a pool's base: static functions, the base read in the entry block", o + e)
         return
     ok("tinygen's C of a pool's base: static functions, the base read in the entry block")
+
+
+def check_array_cache_c(exe, base, ok, fail):
+    """In tinygen's C a loop pushing into a local counts in the array's copy and writes the header
+    back once, after it (TgFn::PoolCache); a node pushed with every field given takes no zero bytes
+    first and its links to references that cannot be null no null test (TgFn::SelfRelInto); and the
+    unit of a program without threads says so, for its gs_rf to be a plain static
+    (TgSupportBody)."""
+    def unit(source, name):
+        cout = base / f"{name}.tg.c"
+        code, o, e = tc.run_capture([exe, "build", "--backend=tinygen-c", "-O2", "-o", cout,
+                                     ROOT / source])
+        return (tc.decode(cout.read_bytes()) if code == 0 and cout.exists() else ""), o + e
+    text, log = unit(ARRAY_CACHES, "array_caches")
+    prog = text.partition("/* ---- the program, written by tinygen ---- */")[2]
+    def body(name):
+        m = re.search(r"\bstatic [^\n]*\b" + name + r"\([^)]*\) \{\n(.*?)\n\}\n", prog, re.S)
+        return m.group(1) if m else ""
+    squares, tree = body("squares_g"), body("tree_g")
+    hdr = len(re.findall(r"TYG_ST64\(\(v\d+ \+ 8\), ", squares))
+    copy = len(re.findall(r"TYG_ST64\(\(\(char \*\)l\d+ \+ 8\), ", squares))
+    threads, tlog = unit("test/threads/codegen_threads.goose", "codegen_threads")
+    nothreads = "#define GS_TG_NO_THREADS 1" in text and "#define GS_TG_NO_THREADS 1" not in threads
+    if (not squares or hdr != 1 or copy < 1 or not tree or "RELNULL" in tree or "memset" in tree
+            or not nothreads):
+        fail(f"tinygen's C of cached arrays: {hdr} header count stores, {copy} copy stores, "
+             f"tree tested or zeroed: {'RELNULL' in tree or 'memset' in tree}, "
+             f"threads said: {nothreads}", log + tlog)
+        return
+    ok("tinygen's C of cached arrays: pushes counted in the copy, nodes built whole and untested")
 
 
 def check_run(exe, base, ok, fail):

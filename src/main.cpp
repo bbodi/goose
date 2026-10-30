@@ -674,6 +674,8 @@ string TinygenUnit(string text, const string &filename, const string &defines, b
                jit ? string() : cat("#define GS_RUNTIME_VERSION ", RuntimeVersion(), "\n"));
     else if (threads)
         pre += "#define GS_NEED_THREADS 1\n";
+    // A program without threads: the support body's gs_rf a plain static (TgSupportBody).
+    if (!threads && !jit) pre += "#define GS_TG_NO_THREADS 1\n";
     return cat(pre, defines, text,
                jit ? "\nvoid gs_jit_cleanup(void) { free(gs_stks); gs_stks = NULL; gs_nstks = 0; }\n"
                    : "");
