@@ -1548,8 +1548,9 @@ struct TgFn {
     tyg_val AddrOf(tyg_addr a) { return tyg_addr_of(p, a); }
     // The address of the read-only bytes b (a string literal's, or a file name's).
     tyg_val BytesAddr(const string &b) { return AddrOf(tyg_at_sym(M.Bytes(b), 0)); }
-    // An uninitialised 8-byte (i64), 16-byte (header) or 32-byte (pool reference) local.
-    tyg_local Slot() { return tyg_local_new(p, 8, 8); }
+    // An uninitialised 8-byte (i64), 16-byte (header) or 32-byte (pool reference) local; the first
+    // an int64_t in tinygen's C.
+    tyg_local Slot() { return tyg_local_typed(p, tyg_type_int(m, TYG_I64, 1)); }
     tyg_local Slot16() { return tyg_local_new(p, 16, 8); }
     tyg_local Slot32() { return tyg_local_new(p, 32, 8); }
     // The size-byte integer at `at`, widened to i64 (signed or not); the low byte of v stored at `at`.
@@ -1887,6 +1888,12 @@ struct TgFn {
             viaptr.insert(at);
             return at;
         }
+        // A scalar or a fixed record of the native frame: a local of its type, its C type in
+        // tinygen's C.
+        if (M.Taggable(t)) {
+            auto at = M.AT(t);
+            if (tyg_type_size(at) == sz) return FrameTyped(at);
+        }
         int64_t align = 1;
         while (align < 8 && align * 2 <= sz) align *= 2;
         return Frame(sz, align);
@@ -1901,6 +1908,11 @@ struct TgFn {
     bool hasinline = false;
     void CheckFrame() {
         if (hasinline && framebytes > MAX_FRAME) No(here, "native frame over 1 MiB after inlining");
+    }
+    tyg_local FrameTyped(const tyg_type *t) {
+        framebytes += tyg_type_size(t);
+        CheckFrame();
+        return tyg_local_typed(p, t);
     }
     tyg_local Frame(int64_t size, int64_t align) {
         framebytes += size;

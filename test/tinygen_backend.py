@@ -537,7 +537,8 @@ def check_pool_base_c(exe, base, ok, fail):
     # The entry block (B1, last) reads the base through the global's address into a local.
     entry = body.group(1).partition("\nB1:;")[2] if body else ""
     based = re.search(r"TYG_LD64\(&(v\d+), \(\(char \*\)&gs_tg_g\d+\)\);.*"
-                      r"TYG_LD64\(&(v\d+), \1\);\s*TYG_ST64\(\(\(char \*\)l\d+\), &\2\);", entry, re.S)
+                      r"TYG_LD64\(&(v\d+), \1\);\s*(?:TYG_ST64\(\(\(char \*\)l\d+\), &\2\);|"
+                      r"l\d+ = \(int64_t\)\2;)", entry, re.S)
     if not based:
         fail("tinygen's C of a pool's base: static functions, the base read in the entry block", o + e)
         return
