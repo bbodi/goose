@@ -1565,17 +1565,21 @@ struct TgFn {
     void Branch(tyg_val c, tyg_block a, tyg_block b) { tyg_branch(p, c, a, b); }
     tyg_block NewBlock() { return tyg_block_new(p); }
     void SetBlock(tyg_block b) { tyg_block_set(p, b); }
-    // body() while cond() holds, each in a block of its own; on after.
+    // body() while cond() holds; on after. tinygen's structured builders: a for (;;) whose first
+    // statement breaks out unless cond() holds, in tinygen's C.
     template <class C, class F> void WhileDo(C cond, F body) {
-        auto head = NewBlock(), b = NewBlock(), done = NewBlock();
-        tyg_jump(p, head);
-        SetBlock(head);
-        Branch(cond(), b, done);
-        SetBlock(b);
+        tyg_loop(p);
+        BreakUnless(cond());
         body();
-        Jump(head);
-        SetBlock(done);
+        tyg_endloop(p);
     }
+    // if (!c) break; out of the innermost tyg_loop.
+    void BreakUnless(tyg_val c) {
+        tyg_if(p, Not(c));
+        tyg_break(p, 0);
+        tyg_endif(p);
+    }
+    tyg_val Not(tyg_val c) { return tyg_cmp(p, TYG_EQ, c, tyg_iconst(p, TYG_I8, 0)); }
     // body(i) for i from `from` up to n (n read once); on after the last.
     template <class F> void Loop(tyg_val from, tyg_val n, F body) {
         auto il = Local(from), nl = Local(n);
@@ -1584,25 +1588,18 @@ struct TgFn {
             if (!Ended()) StL(il, Add(LdL(il), I64(1)));
         });
     }
-    // then() where c holds; on after it either way.
+    // then() where c holds; on after it either way (tinygen's if, an if in its C).
     template <class F> void If(tyg_val c, F then) {
-        auto t = NewBlock(), done = NewBlock();
-        Branch(c, t, done);
-        SetBlock(t);
+        tyg_if(p, c);
         then();
-        if (!Ended()) tyg_jump(p, done);
-        SetBlock(done);
+        tyg_endif(p);
     }
     template <class F, class G> void IfElse(tyg_val c, F then, G other) {
-        auto t = NewBlock(), e = NewBlock(), done = NewBlock();
-        Branch(c, t, e);
-        SetBlock(t);
+        tyg_if(p, c);
         then();
-        if (!Ended()) tyg_jump(p, done);
-        SetBlock(e);
+        tyg_else(p);
         other();
-        if (!Ended()) tyg_jump(p, done);
-        SetBlock(done);
+        tyg_endif(p);
     }
     // An i64 local holding v.
     tyg_local Local(tyg_val v) {
@@ -6682,13 +6679,9 @@ struct TgFn {
     // ---- Varints in bytes values (§3.6: ULEB128, values zigzag) ---------------------------------
 
     template <class F> void DoWhile(F body) {
-        auto head = NewBlock(), again = NewBlock(), done = NewBlock();
-        tyg_jump(p, head);
-        SetBlock(head);
-        Branch(body(), again, done);
-        SetBlock(again);
-        tyg_jump(p, head);
-        SetBlock(done);
+        tyg_loop(p);
+        BreakUnless(body());
+        tyg_endloop(p);
     }
     // A one-byte varint, the common case, is read straight; a longer one by the loop (the old C
     // generator's GS_ULEB_READ and GS_ULEB_SIZE).
