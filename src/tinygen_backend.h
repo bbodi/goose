@@ -9063,7 +9063,9 @@ struct TinyGenBackend {
         if (mod->DirectAcc(name)) {
             static const uint8_t zero[8] = {};
             auto sym = mod->Sym(name, TYG_SYM_GLOBAL);
-            tyg_data(mod->m, sym, TYG_SECTION_DATA, zero, 8, 8);
+            // Read-only in tinygen's C, where it is a const the C compiler folds into the target's
+            // address, instead of a pointer it loads again after every store.
+            tyg_data(mod->m, sym, coutput ? TYG_SECTION_RODATA : TYG_SECTION_DATA, zero, 8, 8);
             tyg_data_reloc(mod->m, sym, 0, 8, target, 0);
             return;
         }

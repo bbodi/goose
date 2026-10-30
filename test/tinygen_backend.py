@@ -543,7 +543,7 @@ def check_array_cache_c(exe, base, ok, fail):
     back once, after it (TgFn::PoolCache); a node pushed with every field given takes no zero bytes
     first and its links to references that cannot be null no null test (TgFn::SelfRelInto); and the
     unit of a program without threads says so, for its gs_rf to be a plain static
-    (TgSupportBody)."""
+    (TgSupportBody); a global's accessor is const (TinyGenBackend::DefAccessor)."""
     def unit(source, name):
         cout = base / f"{name}.tg.c"
         code, o, e = tc.run_capture([exe, "build", "--backend=tinygen-c", "-O2", "-o", cout,
@@ -559,11 +559,13 @@ def check_array_cache_c(exe, base, ok, fail):
     copy = len(re.findall(r"TYG_ST64\(\(\(char \*\)l\d+ \+ 8\), ", squares))
     threads, tlog = unit("test/threads/codegen_threads.goose", "codegen_threads")
     nothreads = "#define GS_TG_NO_THREADS 1" in text and "#define GS_TG_NO_THREADS 1" not in threads
+    # A global's accessor is const data the C compiler folds into the global's address.
+    consts = re.search(r"\bconst struct tyg_d\d+ gs_tg_g\d+ = \{", prog) is not None
     if (not squares or hdr != 1 or copy < 1 or not tree or "RELNULL" in tree or "memset" in tree
-            or not nothreads):
+            or not nothreads or not consts):
         fail(f"tinygen's C of cached arrays: {hdr} header count stores, {copy} copy stores, "
              f"tree tested or zeroed: {'RELNULL' in tree or 'memset' in tree}, "
-             f"threads said: {nothreads}", log + tlog)
+             f"threads said: {nothreads}, const accessors: {consts}", log + tlog)
         return
     ok("tinygen's C of cached arrays: pushes counted in the copy, nodes built whole and untested")
 
