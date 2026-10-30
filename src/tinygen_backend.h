@@ -228,6 +228,7 @@ struct TgModule {
     // instead of calling an accessor on entry. TinyGenBackend::Choose sets it.
     bool fixedaddrs = false;
     bool cout = false;     // C source (TYG_OUTPUT_C) rather than an object.
+    bool externunit = false;  // TinyGenBackend::externunit: the unit has the --include headers.
     tyg_module *m = nullptr;
     map<int, tyg_file> files;
     map<int, tyg_sym> filenames;
@@ -695,10 +696,13 @@ struct TgModule {
         if (t->kind == TY_ENUM) {   // The tag, the payload records behind it.
             auto ei = cg.EIOf(t);
             vector<tyg_field> fs { { tyg_type_int(m, TagScal(t), 0), 0 } };
+            vector<string> names { "tag" };
             for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
-                if (cg.VariantLayout(ei, (int)vi).size)
+                if (cg.VariantLayout(ei, (int)vi).size) {
                     fs.push_back({ AT(cg.VariantType(t, (int)vi)), TagSize(t) });
-            return atypes[key] = tyg_type_record(m, cg.FixedSize(t), 1, fs.data(), (int)fs.size());
+                    names.push_back(cg.Sanitize(ei->en->variants[vi].name));
+                }
+            return atypes[key] = Named(tyg_type_record(m, cg.FixedSize(t), 1, fs.data(), (int)fs.size()), key, names);
         }
         if (t->kind == TY_VARIANT && !cg.FixedSize(t)) {   // struct { uint8_t gs_empty; }
             tyg_field f { tyg_type_int(m, TYG_I8, 0), 0 };
@@ -711,8 +715,21 @@ struct TgModule {
             return atypes[key] = tyg_type_record(m, Size(t), 1, &f, 1);
         }
         vector<tyg_field> fs;
-        for (auto &f : Fields(t)) fs.push_back({ AT(f.t), f.off });
-        return atypes[key] = tyg_type_record(m, Size(t), 1, fs.data(), (int)fs.size());
+        vector<string> names;
+        for (auto &f : Fields(t)) {
+            fs.push_back({ AT(f.t), f.off });
+            names.push_back(cg.Sanitize(f.name));
+        }
+        return atypes[key] = Named(tyg_type_record(m, Size(t), 1, fs.data(), (int)fs.size()), key, names);
+    }
+    // A record named as the old C generator names the type and its fields (Node_g, val_g), for
+    // tinygen's C. A unit with the --include headers carries the old generator's own types under
+    // those names, so its records keep tinygen's names.
+    const tyg_type *Named(const tyg_type *rec, const string &name, const vector<string> &fields) {
+        vector<const char *> fs;
+        for (auto &f : fields) fs.push_back(f.c_str());
+        if (rec && !externunit) tyg_type_name(m, rec, name.c_str(), fs.data());
+        return rec;
     }
     // A resizable value: a T[>..]'s header, or a frame object, with a stack.
     bool Resz(TypeExpr *t) {
@@ -9223,6 +9240,7 @@ struct TinyGenBackend {
         mod = make_unique<TgModule>(ast, cg, checks, source, coutput);
         mod->rtdecls = runtime_decls;
         mod->fixedaddrs = !UsesThreads(cg);
+        mod->externunit = externunit;
         if (!mod->m) throw CompileError { "tinygen backend: this target is not supported yet" };
         if (coutput)
             for (auto sp : cg.livespecs)
@@ -9412,7 +9430,7 @@ struct TinyGenBackend {
             if (sf->isexport) CheckExport(cg, sf);
         // A shared library's externs are bound by a table in a unit of the program's own, which the
         // trampolines and the table's function (gs_tg_dlbind) go into with the --include headers'.
-        if (HasDylibs()) externunit = true;
+        if (HasDylibs()) externunit = mod->externunit = true;
         for (auto sp : mod->externs)
             if (!ExternHeld(sp)) return Refuse(why, cat("extern ", sp->sf->cname));
         if (!GlobalsOk(cg, why)) return false;

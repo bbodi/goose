@@ -467,17 +467,19 @@ def check_tinygen_c(exe, base, ok, fail, say, builtin):
 
 def check_typed_c(exe, base, ok, fail):
     """tinygen's C reads and writes typed memory as its C types: a field along its path of structs
-    (`((struct tyg_rN *)p)->f1.f0`), a global through a struct of its own (one member, a struct)
+    (`((struct Part_g *)p)->vel_g.x_g`), a global through a struct of its own (one member, a struct)
     and a whole struct by assignment, not as bytes."""
     cout = base / "typed_memory.tg.c"
     code, o, e = tc.run_capture([exe, "build", "--backend=tinygen-c", "-O2", "-o", cout,
                                  ROOT / TYPED_MEMORY])
     text = tc.decode(cout.read_bytes()) if code == 0 and cout.exists() else ""
-    wraps = re.findall(r"struct (?:TYG_ALIGNED\(\d+\) )?tyg_r(\d+) \{\n\tstruct tyg_r\d+ f0;\n\};", text)
+    # Records are named as the old C generator names them (Part_g, vel_g); a global's own struct
+    # stays tinygen's (tyg_rN, member f0).
+    wraps = re.findall(r"struct (?:TYG_ALIGNED\(\d+\) )?(tyg_r\d+) \{\n\tstruct \w+ f0;\n\};", text)
     # The operands may be folded expressions (tinygen's tg_c_fold).
-    if not re.search(r"\(float\)\(\(struct tyg_r\d+ \*\)\(.*\)\)->f\d+\.f\d+", text) or \
-            not any(re.search(rf"\(\(struct tyg_r{w} \*\)\(.*\)\)->f0\.f\d+", text) for w in wraps) or \
-            not re.search(r"\(\*\(struct tyg_r\d+ \*\)\(.*\)\) = \(\*\(struct tyg_r\d+ \*\)\(.*\)\);",
+    if not re.search(r"\(float\)\(\(struct \w+ \*\)\(.*\)\)->\w+\.\w+", text) or \
+            not any(re.search(rf"\(\(struct {w} \*\)\(.*\)\)->f0\.\w+", text) for w in wraps) or \
+            not re.search(r"\(\*\(struct \w+ \*\)\(.*\)\) = \(\*\(struct \w+ \*\)\(.*\)\);",
                           text):
         fail("tinygen's C of typed memory: a field path, a global's own struct and a struct "
              "assignment", o + e)
