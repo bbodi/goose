@@ -537,9 +537,10 @@ def check_pool_base_c(exe, base, ok, fail):
     body = re.search(r"\bstatic int64_t sum_g\(int64_t dir[^)]*\) \{\n(.*?)\n\}\n", prog, re.S)
     # The entry block (B1, last) reads the base through the global's address into a local.
     entry = body.group(1).partition("\nB1:;")[2] if body else ""
-    based = re.search(r"TYG_LD64\(&(v\d+), \(\(char \*\)&gs_tg_g\d+\)\);.*"
-                      r"TYG_LD64\(&(v\d+), \1\);\s*(?:TYG_ST64\(\(\(char \*\)l\d+\), &\2\);|"
-                      r"l\d+ = \(int64_t\)\2;)", entry, re.S)
+    # The global's header address loaded (TYG_LOAD64, tinygen's expression form), its base read
+    # through it into a local.
+    based = re.search(r"(v\d+) = \(char \*\)\(uintptr_t\)TYG_LOAD64\(\(\(char \*\)&gs_tg_g\d+\)\);.*"
+                      r"l\d+ = \(int64_t\)\(\(uint64_t\)\(TYG_LOAD64\(\1\)\)\);", entry, re.S)
     if not based:
         fail("tinygen's C of a pool's base: static functions, the base read in the entry block", o + e)
         return
@@ -566,8 +567,9 @@ def check_array_cache_c(exe, base, ok, fail):
     squares, tree, scan = body("squares_g"), body("tree_g"), body("scan_g")
     # A match dispatches through one C switch on the tag (tyg_switch).
     switched = "\tswitch (" in scan
-    hdr = len(re.findall(r"TYG_ST64\(\(v\d+ \+ 8\), ", squares))
-    copy = len(re.findall(r"TYG_ST64\(\(\(char \*\)l\d+ \+ 8\), ", squares))
+    # The header's count through the pointer a local holds; the copy's, a local's own bytes.
+    hdr = len(re.findall(r"TYG_STORE64\(\(\(\(char \*\)\(uintptr_t\)l\d+\) \+ 8\), ", squares))
+    copy = len(re.findall(r"TYG_STORE64\(\(\(char \*\)l\d+ \+ 8\), ", squares))
     threads, tlog = unit("test/threads/codegen_threads.goose", "codegen_threads")
     nothreads = "#define GS_TG_NO_THREADS 1" in text and "#define GS_TG_NO_THREADS 1" not in threads
     # A global's accessor is const data the C compiler folds into the global's address.
