@@ -367,8 +367,11 @@ struct CodeGen {
     // `let` globals of a const type with a compile-time initializer, which are static data
     // (§9.5), with that initializer, which a later one naming it is spelled out from.
     map<const VarDef *, Node *> gstatic;
+    // Constant globals of flat fixed type whose initializer has no static spelling: one object
+    // gs_init_globals fills once, read in place by every instance (§11.2), not copied to a worker.
+    set<const VarDef *> gshared;
     // Spelling out more elements of a fill or a string than this would trade startup work for
-    // size; such a value keeps its runtime initialization.
+    // size; such a value keeps its runtime initialization, as a shared one (gshared).
     static constexpr int64_t MAXSTATICELEMS = 256;
     bool StaticInitX(Node *n, TypeExpr *t, string &out);
     static string IntStr(int64_t v);
@@ -389,6 +392,7 @@ struct CodeGen {
     // A fixed type holding relative references at any depth, whose values are built where they
     // end up (§3.9).
     bool HasRelRef(TypeExpr *t);
+    // Flat (§1.1) and fixed: one object of it serves every program instance in place.
     bool IsFlatFixed(TypeExpr *t);
     bool NeedsResultLocation(TypeExpr *t) { return IsFix(t) && t->kind != TY_REF && HasRelRef(t); }
     TypeExpr *AdtFrom(Node *n);

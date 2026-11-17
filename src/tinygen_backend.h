@@ -1446,12 +1446,23 @@ struct TgModule {
     map<string, int64_t> channels;
 
     // The static copy of a global the C makes static data, with its debug entry under its Goose name;
-    // TYG_NO_SYM for any other global, or one whose initializer this backend does not lay out.
+    // TYG_NO_SYM for any other global, or one whose initializer this backend does not lay out. A
+    // shared constant (CodeGen::gshared) is one zero-filled symbol of the image, never thread-local,
+    // which gs_init_globals fills.
     map<const VarDef *, tyg_sym> gdata;
     tyg_sym StaticGlobal(VarDef *d) {
         if (auto it = gdata.find(d); it != gdata.end()) return it->second;
         auto init = cg.gstatic.find(d);
         vector<uint8_t> bytes((size_t)max<int64_t>(Size(d->type), 1), 0);
+        if (cg.gshared.count(d)) {
+            auto sym = tyg_symbol(m, cat("gs_g_", cg.gnames[d].substr(7)).c_str(), 0);   // "GS_GL->name"
+            int64_t align = 1;
+            while (align < 8 && align * 2 <= (int64_t)bytes.size()) align *= 2;
+            tyg_data(m, sym, TYG_SECTION_BSS, nullptr, (int64_t)bytes.size(), align);
+            tyg_debug_global(m, string(d->name).c_str(), DT(d->type), sym, File(d->line.fileidx),
+                             d->line.line);
+            return gdata[d] = sym;
+        }
         if (init == cg.gstatic.end() || !StaticBytes(init->second, d->type, bytes, 0))
             return gdata[d] = TYG_NO_SYM;
         auto sym = tyg_symbol(m, cat("gs_tg_d", gdata.size()).c_str(), 0);
@@ -10264,7 +10275,7 @@ struct TinyGenBackend {
             return sym;
         };
         function<void(VarDef *)> store = [&](VarDef *d) {
-            if (cg.gstatic.count(d)) return;
+            if (cg.gstatic.count(d) || cg.gshared.count(d)) return;   // TgModule::StaticGlobal's.
             auto name = cg.gnames[d].substr(7);   // "GS_GL->name"
             if (TgModule::IsGrow(d->type) || mod->IsRs(d->type)) {
                 gsyms[d] = def(name, 16, 8, d, mod->DT(d->type));

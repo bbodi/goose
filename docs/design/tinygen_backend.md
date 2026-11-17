@@ -43,7 +43,8 @@ optimization and BCE, with the analyses and type services of `CodeGen`
 * **The layouts** (`FixedSize`, `FieldRuns`, `LayoutFields`, `TagStore`):
   Goose's fixed types are packed, so tinygen gets records aligned to 1.
 * **The globals' names and static initializers** (`NameGlobals`,
-  `StaticInitX`), and the globals a thread program copies (`ThreadGlobals`).
+  `StaticInitX`), the constants every instance shares (`gstatic`, `gshared`)
+  and the globals a thread program copies (`ThreadGlobals`).
 * **The C spelling of the types** (`CT`, `Mangle`), which the extern unit, an
   `--include` header and the export header (`ExportHeader`) are written
   against.
@@ -208,6 +209,11 @@ addresses of its globals once, on entry. How it reads them depends on threads:
   The function loads it from a data pointer (`gs_tg_stkpp`, `gs_tg_g<i>`).
 * *With threads*, each thread has its own instance. The function calls an
   accessor (`gs_tg_stks`, `gs_tg_g<i>`) that reads the thread-local.
+
+A constant every instance shares is named by its symbol either way
+(`TgModule::StaticGlobal`): read-only data with a compile-time initializer
+(`gstatic`), else a zero-filled symbol that `gs_init_globals` fills once
+before any worker exists (`gshared`), which a spawn does not copy.
 
 `UsesThreads` scans for thread and queue builtins before any body is built;
 `Compile` stops the build if that scan missed a thread use.
