@@ -301,7 +301,7 @@ inline string CodeGen::FltStr(double v, bool f32) {
 
 // Each global's name, by which the backend names its storage and accessors (GS_GL->name, or the
 // static data of a constant one), its dedicated data stack and a reusable pool's freelist, and the
-// constant `let` globals the backend writes as static data (gstatic).
+// constant `let` globals the backend writes as static data (gstatic) or shares (gshared).
 inline void CodeGen::NameGlobals() {
     for (auto g : ast.globals) {
         for (size_t di = 0; di < g->defs.size(); di++) {
@@ -331,10 +331,14 @@ inline void CodeGen::NameGlobals() {
                 // A `let` global of a const type with a compile-time initializer is never written
                 // (§9.5): static data every instance shares.
                 string init;
-                if (!d->isvar && d->type->cq && !PrefVar(d) &&
-                    StaticInitX(g->inits[di], d->type, init)) {
-                    gstatic[d] = g->inits[di];
-                    gnames[d] = cat("(*(", VarCT(d), " *)&", name, ")");
+                if (!d->isvar && d->type->cq && !PrefVar(d)) {
+                    if (StaticInitX(g->inits[di], d->type, init)) {
+                        gstatic[d] = g->inits[di];
+                        gnames[d] = cat("(*(", VarCT(d), " *)&", name, ")");
+                    } else if (IsFlatFixed(d->type)) {
+                        // Written once by gs_init_globals, before any worker exists.
+                        gshared.insert(d);
+                    }
                 }
             }
         }
@@ -416,6 +420,19 @@ inline bool CodeGen::HasRelRef(TypeExpr *t) {
     }
 }
 
+// No reference, slice or relative reference at any depth.
+inline bool CodeGen::IsFlatFixed(TypeExpr *t) {
+    if (!IsFix(t)) return false;
+    switch (t->kind) {
+        case TY_REF: case TY_SLICE: return false;
+        case TY_STRUCT: return SI(t)->flat;
+        case TY_ENUM: return EIOf(t)->flat;
+        case TY_VARIANT: return !AnyField(t, [&](TypeExpr *ft) { return !IsFlatFixed(ft); });
+        case TY_ARRAY: return IsFlatFixed(t->arr->sub);
+        default: return true;
+    }
+}
+
 // The type a call or an inlined call body delivers its value as, where the
 // checker adapted that value to an ADT it does not arrive as (FitsAt: a
 // variant to its ADT, or the ADT to its other mode, §3.5); null elsewhere.
@@ -465,8 +482,8 @@ inline string CodeGen::QueueFor(TypeExpr *t) {
 }
 
 // The globals a thread program can name (CheckThreadGlobals admits flat
-// ones only), in declaration order: read-only static data is not among
-// them, since every instance shares it as it is.
+// ones only), in declaration order: read-only static data, spelled out or
+// shared, is not among them, since every instance reads it in place.
 inline vector<VarDef *> &CodeGen::ThreadGlobals(FnSpec *entry) {
     auto it = threadglobals.find(entry);
     if (it != threadglobals.end()) return it->second;
@@ -493,7 +510,7 @@ inline vector<VarDef *> &CodeGen::ThreadGlobals(FnSpec *entry) {
     auto &out = threadglobals[entry];
     for (auto g : ast.globals)
         for (auto d : g->defs)
-            if (named.count(d) && !gstatic.count(d)) out.push_back(d);
+            if (named.count(d) && !gstatic.count(d) && !gshared.count(d)) out.push_back(d);
     return out;
 }
 

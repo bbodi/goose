@@ -5166,7 +5166,7 @@ however long it is.
 
 ### 6.3 Globals and program instances
 
-Every global that is not read-only static data is a member of one
+Every global that is not a static (below) is a member of one
 globals record per program instance, which also holds the dedicated
 stacks of the resizable globals. Main's record is a static; a worker's is
 allocated by its entry thunk and filled from the spawn image (§6.8). Each
@@ -5181,10 +5181,16 @@ A `let` (or `const`) global of a `const` flat fixed type with a compile-time
 initializer (`StaticInitX`, up to 256 array elements) is read-only static
 data shared by every instance. The initializer may name earlier globals of
 that kind, anywhere a literal could stand; the named global's own
-initializer is written out in its place (`gstatic` keeps them). A `var` of
-such a type can be assigned as a whole and is a member like any other.
-Everything but the statics is initialized by `gs_init_globals` in
-declaration order.
+initializer is written out in its place (`gstatic` keeps them). One whose
+initializer has no static spelling, a fill or a string past 256 elements
+(`MAXSTATICELEMS`) or a name the static form cannot spell, is one object of
+the image all the same (`gshared`, a zero-filled symbol that is never
+thread-local): `gs_init_globals` fills it once, before any worker exists,
+and every instance reads it in place, so a worker never copies it
+(`ThreadGlobals` leaves both kinds out). A `var` of such a type can be
+assigned as a whole and is a member like any other. Everything but the
+read-only static data is initialized by `gs_init_globals` in declaration
+order.
 
 ### 6.4 The calling convention (C.3)
 

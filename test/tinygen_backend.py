@@ -231,6 +231,8 @@ PROGRAMS += [(TYPED_MEMORY, ["-O2"])]
 # every short length (gs_memeq), whose C check_copy_c reads.
 OVERLAPPING_COPIES = "test/codegen/overlapping_copies.goose"
 PROGRAMS += [(OVERLAPPING_COPIES, ["-O2"]), (OVERLAPPING_COPIES, [])]
+# Constant globals too long for a static initializer, which workers read (check_shared_fills).
+SHARED_FILLS = "test/threads/thread_shared_fills.goose"
 # Pushes counted in locals (TgFn::PoolCache) around calls that read or push the same array, relative
 # links null and not; and the range checks a 2 GB reservation still needs, of u16 links (check_rel_c).
 POOL_PUSHES = "test/storage/pool_push_locals.goose"
@@ -352,6 +354,7 @@ def check_tinygen_backend(exe, base, ok, fail, say):
     check_tinygen_c(exe, base, ok, fail, say, builtin)
     check_typed_c(exe, base, ok, fail)
     check_copy_c(exe, base, ok, fail)
+    check_shared_fills(exe, base, ok, fail)
     check_rel_c(exe, base, ok, fail)
     check_pool_base_c(exe, base, ok, fail)
     check_array_cache_c(exe, base, ok, fail)
@@ -487,6 +490,49 @@ def check_typed_c(exe, base, ok, fail):
     ok("tinygen's C of typed memory: field paths, globals through structs of their own, struct "
        "assignments")
 
+
+
+def check_shared_fills(exe, base, ok, fail):
+    """A constant fill or string past MAXSTATICELEMS is one object of the image, read in place by
+    every worker rather than copied at spawn (§11.2): in tinygen's C a definition that is not
+    thread-local, in the native object a data symbol that is not a TLS one. Nothing else in the
+    fixture is a global, so no thread-local global is left at all."""
+    source = ROOT / SHARED_FILLS
+    names = ("TABLE", "ZEROS", "TEXT")
+    cout = base / "thread_shared_fills.tg.c"
+    code, o, e = tc.run_capture([exe, "build", "--backend=tinygen-c", "-O1", "-o", cout, source])
+    text = tc.decode(cout.read_bytes()) if code == 0 and cout.exists() else ""
+    prog = text.partition("/* ---- the program, written by tinygen ---- */")[2]
+    defs = {n: re.findall(rf"^.*\bgs_g_{n}_g\w*\[\d+\].*;$", prog, re.MULTILINE) for n in names}
+    bad = [n for n in names if not defs[n] or any("TYG_THREAD" in d for d in defs[n])]
+    if bad or re.search(r"TYG_THREAD.*\bgs_g_", prog):
+        fail("tinygen's C of shared constant fills: copied or not one object: " +
+             (", ".join(bad) or "another global"), o + e)
+    else:
+        ok("tinygen's C of shared constant fills: one object each, not thread-local")
+    want = expected(source)[0]
+    for backend in ("tinygen", "tinygen-c"):
+        out = base / f"thread_shared_fills-{backend}{tc.EXE_SUFFIX}"
+        label = f"{backend} shared constant fills"
+        code, o, e = tc.run_capture([exe, "build", f"--backend={backend}", "-O1", "-o", out, source])
+        if code != 0:
+            fail(label, o + e)
+            continue
+        code, got, err = tc.run_capture([out])
+        if code != 0 or got.rstrip("\n") != want.rstrip("\n"):
+            fail(f"{label} (exit {code})", f"--- got:\n{got}\n--- want:\n{want}\n{err}")
+            continue
+        # The linked image's symbols, where readelf reads it (ELF).
+        readelf = shutil.which("readelf") if sys.platform.startswith("linux") else None
+        if backend == "tinygen" and readelf:
+            code, syms, err = tc.run_capture([readelf, "-sW", out])
+            kinds = {n: re.findall(rf"^\s*\d+:\s+\S+\s+\d+\s+(\w+)\s.*\sgs_g_{n}_g\w*$", syms,
+                                   re.MULTILINE) for n in names}
+            bad = [n for n in names if kinds[n] != ["OBJECT"]]
+            if code != 0 or bad:
+                fail(f"{label}: not one data symbol: {', '.join(bad)}", syms if code == 0 else err)
+                continue
+        ok(label)
 
 
 def check_copy_c(exe, base, ok, fail):
