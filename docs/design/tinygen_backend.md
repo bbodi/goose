@@ -75,7 +75,7 @@ program is compiled. The link takes three objects:
 | Object | Holds |
 |---|---|
 | `<stem>.tg.o`, written by tinygen | every function, `main`, `gs_init_globals`, the globals, the `return from` channels, queues and worker thunks |
-| the support object (`goose_tgsupport[_checks]-<hash>.o`) | the program-independent shims, the trampolines of `runtime_ext.h`'s static externs, the thread-locals `gs_stks`, `gs_gl` and `gs_rf`, and `gs_tg_start`/`gs_tg_end` |
+| the support object (`goose_tgsupport[_checks]-<hash>.o`) | the program-independent shims, the trampolines of `runtime_ext.h`'s static externs, the thread-locals `gs_stks`, `gs_gl` and `gs_rf`, and `gs_tg_start`/`gs_tg_end`/`gs_tg_exit` |
 | the runtime object (`goose_runtime.o`) | as in any build |
 
 The support object depends only on the runtime (`TgSupportBody`,
@@ -116,9 +116,14 @@ with the header's typed pointers, and calls them by name with `void *`
 arguments, which C converts. The C library's math names stay tinygen's: it
 reserves them. An extern call with a struct argument or result (`sl_u8`,
 `gs_rref`, a program's struct) cannot pass tinygen's struct to the header's,
-so `GenExternCall` calls such a callee through its address in a block of its
-own (`tyg_call` turns a call through an address taken in the same block into
-a direct one); the ABI makes it the same call. The support body builds the
+and a call through the callee's address cast to tinygen's signature is one
+through an incompatible type, which gcc does not keep for a function it can
+see. `GenExternCall` calls `gs_tg_mx_<name>` instead, a static function the
+header ends with (`MemTrampolines`): each struct crosses by its address, a
+result's first, and the trampoline copies it into the header's type and makes
+the call. The unit starts with `#pragma GCC optimize("no-strict-aliasing")`
+under gcc: the runtime's and the headers' functions reach, under their own C
+types, memory tinygen's C declares under tinygen's. The support body builds the
 runtime's threads in a standalone unit only with `GS_NEED_THREADS`, and its
 fixed `gs_tg_stkpp` only without it.
 
@@ -131,8 +136,13 @@ or alone with `--standalone`.
 
 A library (`--header`, the flag form) needs no `main`: `EmitMain` writes
 `goose_init`, which starts the program once and runs `main` if there is one,
-and each `export fn` wrapper aborts when called before it. The header is
-`CodeGen::ExportHeader`'s. An `export fn` whose signature the wrapper cannot
+and each `export fn` wrapper aborts when called before it, and `goose_exit`
+(`EmitExit`), which ends it through the support's `gs_tg_exit` and frees the
+queues, so that `goose_init` can start a program again. The header is
+`CodeGen::ExportHeader`'s. `goose build --shared` links the library, the
+unit holding the runtime, or with `--debug` the tinygen object beside a
+runtime and a support object compiled `-fPIC`; the host's entry points are
+`TYG_SYM_EXPORT`, and on Linux the link is `-Bsymbolic`. An `export fn` whose signature the wrapper cannot
 cross is a compile error (`CheckExport`).
 
 Every `-D` goes into the unit or the support object's source
