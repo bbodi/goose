@@ -4986,6 +4986,68 @@ struct TgFn {
             auto ix = Bin(TYG_SDIV, Sub(r.v, v.elems), esz);
             return ValV(c->exprtype, Conv(ix, M.ast.inttypes[IS_I64], c->exprtype, line));
         }
+        if (b == B_MOVE_FROM && nargs == 2) {
+            // The slice's elements over the receiver's, which they may overlap; the lengths must match.
+            auto v = ViewOf(Place(an[0]), line);
+            auto base = Local(v.elems), count = Local(v.len);
+            auto src = GenAs(an[1], M.ast.SliceOf(v.elem, an[1]->line));
+            if (Ended()) return V {};
+            auto data = Ld(src.a), n = Ld(AddrPlus(src.a, 8));
+            FailUnless(Cmp(TYG_EQ, LdL(count), n), "move_from lengths differ", line);
+            if (auto size = cg.FixedSize(v.elem))
+                tyg_move_dyn(p, LdL(base), data, Mul(LdL(count), I64(size)));
+            return V {};
+        }
+        if (b == B_CHECK_LENGTH && nargs >= 2) {
+            // A count of elements a data stack could hold (CodeGen's SliceLen), else an abort.
+            auto v = ViewOf(Place(an[0]), line, false);
+            auto nl = Local(Index64(an[1]));
+            if (Ended()) return Dummy(c->exprtype);
+            auto esz = cg.FixedSize(v.elem);
+            auto ok = esz ? Cmp(TYG_ULE, LdL(nl), I64((int64_t)(cg.stackcfg.reserve / (uint64_t)esz)))
+                          : Cmp(TYG_SGE, LdL(nl), I64(0));
+            FailUnless(ok, "ARRAYLEN", nargs > 2 ? an[2] : nullptr, line);
+            return ValV(c->exprtype, Conv(LdL(nl), M.ast.inttypes[IS_I64], c->exprtype, line));
+        }
+        if (b == B_RANGE_INDEX && nargs >= 2) {
+            // The index of a slice's first element in the receiver: 0 for an empty one; else, where
+            // the checker cannot root it here, checked to lie wholly inside.
+            auto v = ViewOf(Place(an[0]), line);
+            auto elems = Local(v.elems), len = Local(v.len);
+            auto sv = GenAs(an[1], M.ast.SliceOf(v.elem, an[1]->line));
+            if (Ended()) return Dummy(c->exprtype);
+            auto data = Local(Ld(sv.a)), n = Local(Ld(AddrPlus(sv.a, 8)));
+            auto msg = nargs > 2 ? an[2] : nullptr;
+            auto esz = cg.FixedSize(v.elem);
+            auto il = Local(I64(0));
+            if (!esz) {
+                FailUnless(Cmp(TYG_ULE, LdL(n), LdL(len)), "ARRAYSLICE", msg, line);
+            } else {
+                If(Cmp(TYG_NE, LdL(n), I64(0)), [&] {
+                    auto off = Sub(LdL(data), LdL(elems));
+                    if (c->poolcheck) {
+                        auto k = Bin(TYG_UDIV, off, I64(esz));
+                        auto bad = Bin(TYG_OR, Cmp(TYG_NE, Bin(TYG_UREM, off, I64(esz)), I64(0)),
+                                       Bin(TYG_OR, Cmp(TYG_UGE, k, LdL(len)),
+                                           Cmp(TYG_UGT, LdL(n), Sub(LdL(len), k))));
+                        FailUnless(Cmp(TYG_EQ, bad, I8(0)), "ARRAYSLICE", msg, line);
+                        StL(il, k);
+                    } else {
+                        StL(il, Bin(TYG_SDIV, off, I64(esz)));
+                    }
+                });
+            }
+            return ValV(c->exprtype, Conv(LdL(il), M.ast.inttypes[IS_I64], c->exprtype, line));
+        }
+        if (b == B_FILE) {
+            // The last path segment, not the path the aborts name: no directory in a log line.
+            auto path = M.SourceName(line.fileidx);
+            auto slash = path.find_last_of("/\\");
+            auto name = slash == string::npos ? path : path.substr(slash + 1);
+            return PairV(c->rettypes[0], BytesAddr(name), I64((int64_t)name.size()));
+        }
+        if (b == B_LINE)
+            return ValV(c->exprtype, Conv(I64(line.line), M.ast.inttypes[IS_I64], c->exprtype, line));
         if ((b == B_ALLOC_INDEX || b == B_ALLOC_REF || b == B_FREE) && nargs == 2) return GenPool(c);
         if (b == B_ALLOC_SLICE || b == B_REALLOC_SLICE || b == B_FREE_SLICE) return GenSlicePool(c);
         if (b == B_COPY && nargs == 1 && (!cg.IsFix(c->rettypes[0]) || M.TypeOk(c->rettypes[0]))) {
@@ -5988,6 +6050,21 @@ struct TgFn {
         tyg_if_not(p, cond);
         Abort(what, l);
         tyg_endif(p);
+    }
+
+    // An abort with `text` as its message unless `cond`.
+    void FailUnless(tyg_val cond, const string &text, Line l) {
+        tyg_if_not(p, cond);
+        CallC("gs_abort_msg", { tyg_type_ptr(m), IT(TYG_I64), tyg_type_ptr(m), IT(TYG_I32) },
+              { BytesAddr(text), I64((int64_t)text.size()), FileArg(l), LineArg(l) }, nullptr);
+        tyg_unreachable(p);
+        tyg_endif(p);
+    }
+    // The runtime's message for GS_E_<what>, or the string literal a range_index or check_length
+    // was given in its place (CodeGen's FailCall).
+    void FailUnless(tyg_val cond, const string &what, Node *msg, Line l) {
+        if (auto s = msg ? Is<StrLit>(msg) : nullptr) FailUnless(cond, s->val, l);
+        else AbortUnless(cond, what, l);
     }
 
     // pop, pop_n, resize and clear of a resizable: the elements end at the stack's
