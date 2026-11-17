@@ -105,12 +105,24 @@ inline const vector<TgSupportExtern> &TgSupportExterns() {
             { "gs_ctz", "int64_t", "uint64_t a0", "a0" },
             { "gs_mul_add", "double", "double a0, double a1, double a2", "a0, a1, a2" },
             { "gs_mul_addf", "float", "float a0, float a1, float a2", "a0, a1, a2" },
+            { "gs_f32_from_bits", "float", "uint32_t a0", "a0" },
+            { "gs_f64_from_bits", "double", "uint64_t a0", "a0" },
+            { "gs_f32_to_bits", "uint32_t", "float a0", "a0" },
+            { "gs_f64_to_bits", "uint64_t", "double a0", "a0" },
+            { "gs_rotl32", "uint32_t", "uint32_t a0, int64_t a1", "a0, a1" },
+            { "gs_rotl64", "uint64_t", "uint64_t a0, int64_t a1", "a0, a1" },
+            { "gs_rotr32", "uint32_t", "uint32_t a0, int64_t a1", "a0, a1" },
+            { "gs_rotr64", "uint64_t", "uint64_t a0, int64_t a1", "a0, a1" },
+            { "gs_byte_swap16", "uint16_t", "uint16_t a0", "a0" },
+            { "gs_byte_swap32", "uint32_t", "uint32_t a0", "a0" },
+            { "gs_byte_swap64", "uint64_t", "uint64_t a0", "a0" },
         };
         static const char *unary[] = { "sqrt", "sin", "cos", "tan", "asin", "acos", "atan",
-                                       "exp", "log", "log2", "log10" };
-        static const char *binary[] = { "atan2", "pow" };
+                                       "exp", "log", "log2", "log10", "cbrt", "cosh", "sinh", "tanh",
+                                       "exp2", "expm1", "log1p" };
+        static const char *binary[] = { "atan2", "pow", "hypot" };
         static vector<string> names;   // Stable storage for the generated names.
-        names.reserve(64);
+        names.reserve(128);
         for (auto f : { false, true }) {
             auto ty = f ? "float" : "double";
             for (auto u : unary) {

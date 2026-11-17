@@ -696,7 +696,7 @@ string TinygenUnit(string text, const string &filename, const string &defines, b
     // The checks of GS_DEBUG are in tinygen's code, written or not as the file was.
     if (!checks)
         Append(pre, "#if defined(GS_DEBUG) && GS_DEBUG\n#error this file was written without "
-                    "GS_DEBUG's checks: goose --debug or -DGS_DEBUG=1 writes them\n#endif\n");
+                    "the GS_DEBUG checks: goose --debug or -DGS_DEBUG=1 writes them\n#endif\n");
     if (jit) {
         for (auto h : { "stdint", "string", "stddef", "stdlib", "math", "stdarg" }) {
             auto inc = cat("#include <", h, ".h>\n");
