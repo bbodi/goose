@@ -49,11 +49,15 @@ inline void CodeGen::CollectSpecs() {
         auto &si = sinfo[sp];
         auto &calls = callees[sp];
         set<const VarDef *> seen;
+        set<TypeExpr *> namedtypes;
         set<pair<FnSpec *, const Call *>> seencalls;
         for (auto pt : sp->argtypes) si.needssp |= NeedsStack(pt);
         for (auto rt : sp->rets) si.needssp |= NeedsStack(rt);
         function<void(Node *)> walk = [&](Node *n) {
             if (!n) return;
+            NodeNamedArrays(n, namedtypes, [&](VarDef *a, bool length) {
+                if (length) si.globals.insert(a);
+            });
             if (auto id = Is<Ident>(n)) {
                 auto v = id->vdef;
                 // A global initializer's locals have no ownerspec: every spec
@@ -301,7 +305,15 @@ inline void CodeGen::NameGlobals() {
             auto d = g->defs[di];
             auto name = Unique(Sanitize(g->ns, d->name));
             gnames[d] = cat("GS_GL->", name);
-            if (IsResz(d->type)) {
+            if (IsRoot(d->type)) {
+                // A root owner: its descriptor, and each field a global of its own.
+                for (auto c : d->components) {
+                    if (!c) continue;
+                    auto cn = Unique(cat("gs_component_", name, "_", c->componentfield));
+                    gnames[c] = cat("GS_GL->", cn);
+                    if (IsBytesT(c->type)) gstks[c] = cat("(&GS_GL->", Unique(cat("gs_gstk_", cn)), ")");
+                }
+            } else if (IsResz(d->type)) {
                 auto stk = Unique(cat("gs_gstk_", name));
                 gstks[d] = cat("(&GS_GL->", stk, ")");
                 if (d->reusable) {
@@ -337,6 +349,8 @@ inline void CodeGen::GlobalStacks() {
             if (gstatic.count(d)) continue;
             noglobalinit = false;
             if (IsResz(d->type) || IsBytesT(d->type)) globalregions += 1 + (d->reusable ? 1 : 0);
+            for (auto c : d->components)
+                if (c && IsRoot(d->type) && IsBytesT(c->type)) globalregions++;
         }
     }
 }
@@ -455,12 +469,14 @@ inline vector<VarDef *> &CodeGen::ThreadGlobals(FnSpec *entry) {
     if (it != threadglobals.end()) return it->second;
     set<FnSpec *> seen;
     set<VarDef *> named;
+    set<TypeExpr *> namedtypes;
     function<void(FnSpec *)> rec = [&](FnSpec *sp) {
         if (!sp || !sp->body || !seen.insert(sp).second) return;
         function<void(Node *)> walk = [&](Node *n) {
             if (!n) return;
+            NodeNamedArrays(n, namedtypes, [&](VarDef *a, bool) { named.insert(a); });
             if (auto id = Is<Ident>(n))
-                if (auto v = id->vdef; v && v->isglobal && !gstatic.count(v)) named.insert(v);
+                if (auto v = id->vdef; v && v->isglobal) named.insert(v);
             if (auto c = Is<Call>(n)) {
                 rec(c->spec);
                 for (auto d : c->dispatch) rec(d);
@@ -473,7 +489,8 @@ inline vector<VarDef *> &CodeGen::ThreadGlobals(FnSpec *entry) {
     rec(entry);
     auto &out = threadglobals[entry];
     for (auto g : ast.globals)
-        for (auto d : g->defs) if (named.count(d)) out.push_back(d);
+        for (auto d : g->defs)
+            if (named.count(d) && !gstatic.count(d)) out.push_back(d);
     return out;
 }
 

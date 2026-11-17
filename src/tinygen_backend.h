@@ -486,6 +486,43 @@ struct TgModule {
         return f();
     }
 
+    // A root struct (§3.4): each field is a variable of its own (VarDef::components). The owner's
+    // value is a descriptor, one reference per field in field order, which a reference to the owner
+    // points at (as the old C generator's struct of references).
+    bool IsRootT(TypeExpr *t) { return t && t->kind == TY_STRUCT && cg.IsRoot(t); }
+    struct RootDesc {
+        vector<TypeExpr *> ref;   // The reference to field i, null for a field without storage.
+        vector<int64_t> off;
+        int64_t size = 0;
+    };
+    map<string, RootDesc> rootdescs;
+    const RootDesc &RootOf(TypeExpr *t) {
+        auto [it, fresh] = rootdescs.try_emplace(cg.Mangle(t));
+        auto &rd = it->second;
+        if (!fresh) return rd;
+        auto si = cg.SI(t);
+        for (auto ft : si->ftypes) {
+            auto rt = ft ? ast.RefTo(ft, t->line) : nullptr;
+            rd.ref.push_back(rt);
+            rd.off.push_back(rd.size);
+            if (rt) rd.size += cg.IsFatRef(rt) ? 16 : 8;
+        }
+        return rd;
+    }
+    // A root owner's varint field: its variable holds the zigzag ULEB128 bytes (16 for the ten), as a
+    // varint& expects to find them.
+    bool EncVar(const VarDef *d) {
+        return d && d->componentowner && IsVarint(d->type) && IsRootT(d->componentowner->type);
+    }
+    bool RootOk(TypeExpr *t, int depth = 0) {
+        if (!IsRootT(t) || depth > kTypeDepthMax) return false;
+        return Within(t, true, [&] {
+            for (auto rt : RootOf(t).ref)
+                if (rt && !TypeOk(rt, depth + 1)) return false;
+            return true;
+        });
+    }
+
     // A type this backend holds: a machine integer, a float, a bool, a plain reference to a fixed value
     // it holds, or a fixed struct of those.
     bool TypeOk(TypeExpr *t, int depth = 0) {
@@ -503,7 +540,7 @@ struct TgModule {
                 if (!IsPlainRef(t) && !OptRef(t)) return false;
                 auto s = t->ref->sub;
                 return (cg.IsFix(s) && TypeOk(s, d)) || IsVarint(s) || ImgOk(s, d) || ZeroOk(s, d) ||
-                       FoOk(s, d) || RsOk(s, d) || (IsPlainRef(t) && VeOk(s, d));
+                       FoOk(s, d) || RsOk(s, d) || (IsPlainRef(t) && VeOk(s, d)) || RootOk(s, d);
             }
             case TY_ARRAY:   // T[k], packed; a static-capacity T[..k] has a length beside the elements.
                 if (ZeroArr(t)) return depth == 0 && ZeroOk(t, depth);
@@ -558,6 +595,12 @@ struct TgModule {
                     "variable-size value";
             }
             case TY_STRUCT: {
+                if (IsRootT(t)) {
+                    if (RootOk(t, depth)) return "";
+                    for (auto rt : RootOf(t).ref)
+                        if (rt && !TypeOk(rt, d)) return cat("root struct with ", Blocker(rt, d));
+                    return "root struct";
+                }
                 auto nm = Name(t);
                 if (nm.rfind("dictionary", 0) == 0) return "dictionary";
                 if (nm.rfind("vec", 0) == 0) return "SIMD vector";
@@ -677,6 +720,7 @@ struct TgModule {
     int64_t Size(TypeExpr *t) {
         if (IsVr(t)) return 16;   // A temporary for the value: up to ten bytes of varint.
         if (IsRb(t)) return 16;   // Its header.
+        if (IsRootT(t)) return std::max<int64_t>(RootOf(t).size, 8);   // Its descriptor.
         if (IsScalar(t)) return ScalSize(Scal(t));
         // A payload-less variant: the gs_empty byte.
         if (t->kind == TY_VARIANT && !cg.FixedSize(t)) return 1;
@@ -871,6 +915,14 @@ struct TgModule {
             // tinygen has no array whose count is a member
             case TY_SLICE: return DHdr(name, "data", t->sub);
             case TY_STRUCT: {
+                if (IsRootT(t)) {   // The descriptor: a reference per field.
+                    auto si = cg.SI(t);
+                    auto &rd = RootOf(t);
+                    auto rec = DRec(name, si->st->line);
+                    for (size_t i = 0; i < rd.ref.size(); i++)
+                        if (rd.ref[i]) DMem(rec, si->st->fields[i].name, DT(rd.ref[i]), rd.off[i]);
+                    return DEnd(rec, Size(t));
+                }
                 if (IsRb(t)) return DHdr(name, "base", nullptr);
                 if (IsVs(t)) return ImgDT(t, name);
                 if (IsRs(t)) return DHdr(name, "base", nullptr, cg.SI(t)->st->line);
@@ -1320,6 +1372,11 @@ struct TgModule {
     // own stack (CodeGen::gstks), which a second accessor gives (StackAccessor).
     bool GlobalOk(VarDef *d) {
         if (!d->isglobal || !cg.gnames.count(d)) return false;
+        if (IsRootT(d->type)) {   // The descriptor, and each component a global of its own.
+            for (auto c : d->components)
+                if (c && !GlobalOk(c)) return false;
+            return RootOk(d->type);
+        }
         if (cg.PrefVar(d)) return cg.IsFatRef(d->type) && TypeOk(d->type);   // A gs_pref.
         if (d->reusable)
             return IsGrow(d->type) && RzOk(d->type) && cg.gstks.count(d) && cg.gpools.count(d);
@@ -1489,7 +1546,7 @@ struct TgModule {
         if (!fv->type) return false;
         if (cg.PrefVar(fv)) return cg.IsFatRef(fv->type) && TypeOk(fv->type);
         if (fv->reusable) return IsGrow(fv->type) && RzOk(fv->type);
-        return Held(fv->type);
+        return Held(fv->type) || RootOk(fv->type);   // A root owner by its descriptor's address.
     }
 
     // Whether parameter i of sp is a slice or a fat reference, which the C passes as its two members
@@ -1913,6 +1970,7 @@ struct TgFn {
         TypeExpr *t;
         tyg_val stk = 0;
         bool enc = false;   // A varint in a bytes value: zigzag ULEB128 (ZigRead).
+        bool encbuf = false;   // Such bytes with room for any value: a root owner's varint field.
         // The tail of a resizable struct (FieldPlace): its elements start here, not where the header's
         // base says, and the header is the owner's, whose count it is.
         tyg_val rbase = 0;
@@ -2131,6 +2189,14 @@ struct TgFn {
     }
     // x built as a value of type ft and pushed; false if the build ended.
     bool BuildField(tyg_val stk, TypeExpr *ft, Node *x) {
+        if (SelfRelLit(x) && x->exprtype && cg.TEq(x->exprtype, ft)) {
+            // A literal linking to itself: built in the slot, which its links measure from.
+            auto top = Local(Top(stk));
+            SelfRelInto(P { AtV(LdL(top)), ft }, x);
+            if (Ended()) return false;
+            SetTop(stk, Add(LdL(top), I64(cg.FixedSize(ft))));
+            return true;
+        }
         auto v = GenAs(x, ft);
         if (Ended()) return false;
         if (!M.IsScalar(ft) && !v.mem) No(x->line, "aggregate value");
@@ -2850,7 +2916,11 @@ struct TgFn {
     }
     void Store(const P &pl, const V &x) {
         if (Ended()) return;
-        if (pl.enc) No(Line {}, "a store into a varint in a bytes value");
+        if (pl.enc) {
+            if (!pl.encbuf) No(Line {}, "a store into a varint in a bytes value");
+            if (x.v) ZigWrite(AddrOf(pl.a), x.v);
+            return;
+        }
         // Only a temporary carrying a value across blocks (TgModule::Size) holds a Vr: the language
         // never assigns one.
         if (TgModule::IsVr(pl.t)) RelOffsetInto(pl, x.v, here);
@@ -3029,8 +3099,12 @@ struct TgFn {
             if (!id->vdef) Unreachable(n->line, "function as a value");
             return VarPlace(id->vdef, n->line);
         }
-        if (auto d = Is<Dot>(n); d && d->IsField())
-            return FieldPlace(Deref(Place(d->obj)), d->fieldidx, n->line);
+        if (auto d = Is<Dot>(n); d && d->IsField()) {
+            if (auto c = RootComponent(d)) return VarPlace(c, n->line);
+            auto obj = Deref(Place(d->obj));
+            if (M.IsRootT(obj.t)) return RootField(obj, d->fieldidx, n->line);
+            return FieldPlace(obj, d->fieldidx, n->line);
+        }
         if (auto ix = Is<Index>(n)) return IndexPlace(ix);
         if (auto se = Is<SliceExpr>(n)) {
             // A view, whatever array the checker typed it as.
@@ -3042,6 +3116,37 @@ struct TgFn {
         if (x.mem) return P { x.a, x.t, x.stk };
         if (!x.t || x.t->kind == TY_VOID) No(n->line, "place of no value");
         return Spill(x);
+    }
+
+    // A field of a root owner named outright, where this frame holds the owner or it is a global: the
+    // field's own variable. Null for a field reached through a reference to the owner.
+    VarDef *RootComponent(Dot *d) {
+        auto id = Is<Ident>(d->obj);
+        auto vd = id ? id->vdef : nullptr;
+        if (!vd || !vd->type || !M.IsRootT(vd->type) || d->fieldidx < 0 ||
+            (size_t)d->fieldidx >= vd->components.size())
+            return nullptr;
+        auto c = vd->components[(size_t)d->fieldidx];
+        if (!c) return nullptr;
+        if (locals.count(vd)) return locals.count(c) ? c : nullptr;
+        return vd->isglobal && cg.gnames.count(c) ? c : nullptr;
+    }
+    // Field i of the root owner whose descriptor is at pl: what the descriptor's reference refers to.
+    P RootField(const P &pl, int i, Line l) {
+        auto &rd = M.RootOf(pl.t);
+        if (i < 0 || (size_t)i >= rd.ref.size() || !rd.ref[(size_t)i] || !M.TypeOk(rd.ref[(size_t)i]))
+            No(l, cat("field of ", M.NameWhy(pl.t)));
+        auto r = Step(P { AddrPlus(pl.a, rd.off[(size_t)i]), rd.ref[(size_t)i] });
+        r.encbuf = r.enc;
+        return r;
+    }
+    // The reference to the variable c of a root owner, of type rt, into the owner's descriptor at `at`.
+    void RootRef(tyg_addr at, VarDef *c, TypeExpr *rt, Line l) {
+        auto pl = VarPlace(c, l);
+        St(at, AddrOf(pl.a));
+        if (!cg.IsFatRef(rt)) return;
+        if (!pl.stk) No(l, "root field of this kind");
+        St(AddrPlus(at, 8), pl.stk);
     }
 
     // A variable: a local or parameter of this frame, one it was handed (a free variable, read through
@@ -3057,6 +3162,7 @@ struct TgFn {
         // A captured resizable: its header's address, its stack.
         if (auto s = rzstk.find(vd); s != rzstk.end() && (!ind || M.Resz(vd->type)))
             pl.stk = LdL(s->second);
+        if (M.EncVar(vd)) pl.enc = pl.encbuf = true;
         return pl;
     }
 
@@ -3071,6 +3177,7 @@ struct TgFn {
         auto pl = GlobalP(AtV(at), d);
         if (HasHdrStk(d->type))
             pl.stk = LdL(AccessorLocal(M.StackAccessor(d)));
+        if (M.EncVar(d)) pl.enc = pl.encbuf = true;
         return pl;
     }
     // A global, reached through a record of its own (TgModule::WrapAT): its bytes are always that
@@ -3352,6 +3459,11 @@ struct TgFn {
             if (Ended()) return Dummy(t);
             if (!pl.stk || pl.tmphdr) No(n->line, "reference to an array of this kind");
             return PairV(t, AddrOf(pl.a), pl.stk);
+        }
+        if (t && IsAddrRef(t) && n->exprtype && M.IsRootT(n->exprtype)) {
+            // A root owner where a reference to it is wanted: its descriptor's address.
+            auto pl = Deref(Place(n));
+            return ValV(t, Ended() ? I64(0) : AddrOf(pl.a));
         }
         if (t && IsAddrRef(t) && n->exprtype && IsImg(n->exprtype) && M.ImgOk(t->ref->sub)) {
             // A T[] (or variable-size struct) where a reference is wanted: its image's address.
@@ -5903,6 +6015,20 @@ struct TgFn {
                 FmtScalar(stk, len, t, Load(pl, l).v);
                 return;
             case TY_STRUCT:
+                if (M.IsRootT(t)) {   // A root owner: each field where its descriptor says it is.
+                    if (!M.RootOk(t)) break;
+                    auto &rd = M.RootOf(t);
+                    TextLit(stk, len, cat(TextName(t), " { "));
+                    auto first = true;
+                    for (size_t i = 0; i < rd.ref.size(); i++) {
+                        if (!rd.ref[i]) continue;
+                        if (!first) TextLit(stk, len, ", ");
+                        first = false;
+                        RenderInto(stk, len, RootField(pl, (int)i, l), true, l, depth + 1);
+                    }
+                    TextLit(stk, len, " }");
+                    return;
+                }
                 if (!rb && !M.VsOk(t) && !M.RsOk(t) && !M.FoOk(t) && !M.TypeOk(t)) break;
                 RenderRun(stk, len, TextName(t), pl, l, depth);
                 return;
@@ -7828,6 +7954,16 @@ struct TgFn {
     // object's struct, or a T[] local's image address (built by StmtVarDecl).
     void Declare(VarDef *d, Line l) {
         auto t = d->type;
+        if (M.IsRootT(t)) {
+            // A root owner: its descriptor, and each field a local of its own.
+            if (!M.RootOk(t)) No(l, cat("variable type of ", d->name, ": ", M.NameWhy(t)));
+            auto loc = Frame(M.Size(t), 8);
+            locals[d] = loc;
+            DebugVar(tyg_debug_var, d, M.DT(t), loc);
+            for (auto c : d->components)
+                if (c) Declare(c, l);
+            return;
+        }
         auto hdr = (IsGrow(t) && (M.RzOk(t) || M.VeOk(t))) || M.RsOk(t) || M.RbOk(t);
         auto img = !hdr && !M.FoOk(t) &&
                    ((IsVarArr(t) && (M.RzOk(t) || M.VarImgOk(t))) || M.VsOk(t) || M.VmOk(t) ||
@@ -7870,7 +8006,7 @@ struct TgFn {
         }
         if (!M.TypeOk(t)) No(l, cat("variable type of ", d->name, ": ", M.NameWhy(t)));
         // A pool reference is a gs_pref: the fat reference and the pool's freelist (CodeGen::VarCT).
-        auto loc = cg.PrefVar(d) ? Slot32() : Temp(t, true);
+        auto loc = cg.PrefVar(d) ? Slot32() : M.EncVar(d) ? Frame(16, 8) : Temp(t, true);
         locals[d] = loc;
         DebugVar(tyg_debug_var, d, M.DT(t), loc);
     }
@@ -7936,6 +8072,18 @@ struct TgFn {
     // A declared local's first value: init's, or zero bytes (an empty array) where there is none.
     void Init(VarDef *d, Node *init, Line l) {
         auto t = d->type;
+        if (M.IsRootT(t)) {
+            auto sl = Is<StructLit>(init);
+            if (!sl) No(l, "root owner without a literal");
+            auto &rd = M.RootOf(t);
+            for (size_t i = 0; i < d->components.size() && !Ended(); i++) {
+                auto c = d->components[i];
+                if (!c) continue;
+                Init(c, sl->InitFor((int)i), l);
+                if (!Ended()) RootRef(AtL(locals[d], rd.off[i]), c, rd.ref[i], l);
+            }
+            return;
+        }
         auto a = AtL(locals[d]);
         auto stk = [&] { return LdL(rzstk[d]); };
         if (IsImg(t)) {
@@ -7948,6 +8096,9 @@ struct TgFn {
         } else if (cg.PrefVar(d)) {
             if (!init) tyg_zero(p, a, 32);
             else PrefInto(a, init);
+        } else if (M.EncVar(d)) {
+            tyg_zero(p, a, 16);
+            if (init) Store(VarPlace(d, l), GenAs(init, t));
         } else if (!init) {
             tyg_zero(p, a, M.Size(t));
         } else {
@@ -9121,6 +9272,55 @@ struct TgFn {
         if (bad) No(line, cat("tinygen: ", tyg_error(m) ? tyg_error(m) : "?"));
     }
 
+    // One global's first value, as gs_init_globals builds it.
+    void InitGlobal(VarDef *d, Node *init) {
+        if (M.IsRootT(d->type)) {
+            // A root owner: each field's global, then the descriptor's reference to it.
+            auto sl = Is<StructLit>(init);
+            if (!sl) No(init->line, "root owner without a literal");
+            auto &rd = M.RootOf(d->type);
+            for (size_t i = 0; i < d->components.size() && !Ended(); i++) {
+                auto c = d->components[i];
+                if (!c) continue;
+                auto ci = sl->InitFor((int)i);
+                if (!ci) No(init->line, "root field without a value");
+                InitGlobal(c, ci);
+                if (Ended()) return;
+                RootRef(AddrPlus(GlobalPlace(d, init->line).a, rd.off[i]), c, rd.ref[i], init->line);
+            }
+            return;
+        }
+        Loc(init->line);
+        auto fo = M.FoOk(d->type);
+        auto grow = IsGrow(d->type) || M.IsRs(d->type) || M.IsRb(d->type);
+        if (fo || grow || IsImg(d->type)) {
+            auto at = LdL(AccessorLocal(M.Accessor(d)));
+            auto stk = LdL(AccessorLocal(M.StackAccessor(d)));
+            StackInit(stk);
+            if (fo) {   // A frame object: its tail on the global's own stack.
+                GenFo(init, P { AtV(at), d->type, stk }, init->line);
+            } else if (grow) {   // as the old C generator's InitGlobalStack did: an empty array, then its elements.
+                StartHdr(stk, AtV(at));
+                GenRz(init, stk, AtV(at), d->type, init->line);
+                if (d->reusable && !Ended()) {   // Its freelist, empty, on a stack of its own.
+                    auto [h, st] = M.PoolAccessors(d);
+                    auto flstk = LdL(AccessorLocal(st));
+                    StackInit(flstk);
+                    StartHdr(flstk, AtV(LdL(AccessorLocal(h))));
+                }
+            } else {
+                auto img = GenImg(init, stk, d->type, init->line);
+                if (!Ended()) St(AtV(at), img);
+            }
+        } else if (cg.PrefVar(d)) {
+            PrefInto(GlobalPlace(d, init->line).a, init);
+        } else if (M.EncVar(d)) {
+            Store(GlobalPlace(d, init->line), GenAs(init, d->type));
+        } else {
+            Into(GlobalPlace(d, init->line), init);
+        }
+    }
+
     // gs_init_globals for a whole program build: the initializers in order
     // with gs_sp fixed at 0, a resizable or T[] global built on its own stack. No sp: what refers to
     // the function's own results (return, return from) is unsupported.
@@ -9139,35 +9339,8 @@ struct TgFn {
             OpenScope(true);
             for (size_t i = 0; i < g->defs.size() && !Ended(); i++) {
                 auto d = g->defs[i];
-                auto init = g->inits[i];
                 if (cg.gstatic.count(d)) continue;   // Static data.
-                Loc(init->line);
-                auto fo = M.FoOk(d->type);
-                auto grow = IsGrow(d->type) || M.IsRs(d->type) || M.IsRb(d->type);
-                if (fo || grow || IsImg(d->type)) {
-                    auto at = LdL(AccessorLocal(M.Accessor(d)));
-                    auto stk = LdL(AccessorLocal(M.StackAccessor(d)));
-                    StackInit(stk);
-                    if (fo) {   // A frame object: its tail on the global's own stack.
-                        GenFo(init, P { AtV(at), d->type, stk }, init->line);
-                    } else if (grow) {   // as the old C generator's InitGlobalStack did: an empty array, then its elements.
-                        StartHdr(stk, AtV(at));
-                        GenRz(init, stk, AtV(at), d->type, init->line);
-                        if (d->reusable && !Ended()) {   // Its freelist, empty, on a stack of its own.
-                            auto [h, st] = M.PoolAccessors(d);
-                            auto flstk = LdL(AccessorLocal(st));
-                            StackInit(flstk);
-                            StartHdr(flstk, AtV(LdL(AccessorLocal(h))));
-                        }
-                    } else {
-                        auto img = GenImg(init, stk, d->type, init->line);
-                        if (!Ended()) St(AtV(at), img);
-                    }
-                } else if (cg.PrefVar(d)) {
-                    PrefInto(GlobalPlace(d, init->line).a, init);
-                } else {
-                    Into(GlobalPlace(d, init->line), init);
-                }
+                InitGlobal(d, g->inits[i]);
             }
             CloseScope();
         }
@@ -9837,25 +10010,30 @@ struct TinyGenBackend {
                                  d->line.line);
             return sym;
         };
-        for (auto g : ast.globals)
-            for (auto d : g->defs) {
-                if (cg.gstatic.count(d)) continue;
-                auto name = cg.gnames[d].substr(7);   // "GS_GL->name"
-                if (TgModule::IsGrow(d->type) || mod->IsRs(d->type)) {
-                    gsyms[d] = def(name, 16, 8, d, mod->DT(d->type));
-                } else if (mod->IsImg(d->type)) {
-                    gsyms[d] = def(name, 8, 8, d, tyg_dt_pointer(m, mod->DT(d->type)));
-                } else {
-                    auto sz = cg.PrefVar(d) ? 32 : mod->Size(d->type);
-                    int64_t align = 1;
-                    while (align < 8 && align * 2 <= sz) align *= 2;
-                    gsyms[d] = def(name, sz, align, d, mod->DT(d->type));
-                }
-                if (cg.gstks.count(d)) ssyms[d] = def(cat("gs_gstk_", name), 8, 8, d, nullptr);
-                if (cg.gpools.count(d))
-                    flsyms[d] = { def(cat(name, "_fl"), 16, 8, d, nullptr),
-                                  def(cat("gs_gstk_", name, "_fl"), 8, 8, d, nullptr) };
+        function<void(VarDef *)> store = [&](VarDef *d) {
+            if (cg.gstatic.count(d)) return;
+            auto name = cg.gnames[d].substr(7);   // "GS_GL->name"
+            if (TgModule::IsGrow(d->type) || mod->IsRs(d->type)) {
+                gsyms[d] = def(name, 16, 8, d, mod->DT(d->type));
+            } else if (mod->IsImg(d->type)) {
+                gsyms[d] = def(name, 8, 8, d, tyg_dt_pointer(m, mod->DT(d->type)));
+            } else {
+                auto sz = cg.PrefVar(d) ? 32 : mod->EncVar(d) ? 16 : mod->Size(d->type);
+                int64_t align = 1;
+                while (align < 8 && align * 2 <= sz) align *= 2;
+                gsyms[d] = def(name, sz, align, d, mod->DT(d->type));
             }
+            if (cg.gstks.count(d)) ssyms[d] = def(cat("gs_gstk_", name), 8, 8, d, nullptr);
+            if (cg.gpools.count(d))
+                flsyms[d] = { def(cat(name, "_fl"), 16, 8, d, nullptr),
+                              def(cat("gs_gstk_", name, "_fl"), 8, 8, d, nullptr) };
+            // A root owner's fields, each a global of its own.
+            if (mod->IsRootT(d->type))
+                for (auto c : d->components)
+                    if (c) store(c);
+        };
+        for (auto g : ast.globals)
+            for (auto d : g->defs) store(d);
         for (auto &[d, n] : mod->accessors) DefAccessor(n, gsyms.at(d));
         for (auto &[d, n] : mod->stkaccessors) DefAccessor(n, ssyms.at(d));
         for (auto &[d, n] : mod->flaccessors) {
