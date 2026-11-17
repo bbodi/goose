@@ -1459,8 +1459,8 @@ struct TgModule {
             int64_t align = 1;
             while (align < 8 && align * 2 <= (int64_t)bytes.size()) align *= 2;
             tyg_data(m, sym, TYG_SECTION_BSS, nullptr, (int64_t)bytes.size(), align);
-            tyg_debug_global(m, string(d->name).c_str(), DT(d->type), sym, File(d->line.fileidx),
-                             d->line.line);
+            auto file = File(d->line.fileidx);
+            tyg_debug_global(m, string(d->name).c_str(), DT(d->type), sym, file, d->line.line);
             return gdata[d] = sym;
         }
         if (init == cg.gstatic.end() || !StaticBytes(init->second, d->type, bytes, 0))
