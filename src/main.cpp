@@ -1997,6 +1997,7 @@ int Main(int argc, char **argv) {
         tgb->coutput = tinygenc || tgjit;
         tgb->externunit = !includes.empty();
         CodeGen cg(ast, norfcheck, library, stackcfg);
+        cg.sharedlibrary = shared;
         tgb->Choose(cg);
         cg.Finish(tgb->Externs(), !includes.empty());
         if (stacks) cg.StackReport(msgs, stackcfg);
