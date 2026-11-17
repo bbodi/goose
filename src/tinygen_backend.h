@@ -182,8 +182,12 @@ inline string TgSupportBody(string_view runtimeh) {
             codes.insert(code).second)
             s += TgFixedShim(cat("gs_tg_abort_", code));
     }
+    // In a program's one C unit (TinygenUnit) the trampolines are the unit's own: one nothing calls
+    // is left out, and the C compiler sees through the others to the callee (libm's sin, pow).
+    s += "#if !defined(GS_TG_UNIT)\n#define GS_TG_X\n#elif defined(_MSC_VER)\n"
+         "#define GS_TG_X static __inline\n#else\n#define GS_TG_X static inline\n#endif\n";
     for (auto &x : TgSupportExterns())
-        Append(s, x.ret, " gs_tg_x_", x.name, "(", x.params, ") { ",
+        Append(s, "GS_TG_X ", x.ret, " gs_tg_x_", x.name, "(", x.params, ") { ",
                string(x.ret) == "void" ? "" : "return ", x.name, "(", x.args, "); }\n");
     // gs_stks is thread-local only in a program built with GS_NEED_THREADS, which this object is not,
     // so a thread-local of its own holds the block the procedures reach; a worker's thunk opens one and
@@ -3339,6 +3343,15 @@ struct TgFn {
     // ---- Expressions ----------------------------------------------------------------------------
 
     InlineBlock *adapting = nullptr;
+    // How deep n's operators nest: 0 for what is none.
+    unordered_map<const Node *, int> nestings;
+    int Nesting(Node *n) {
+        if (!n || !(Is<Binary>(n) || Is<Unary>(n) || Is<AsCast>(n))) return 0;
+        if (auto it = nestings.find(n); it != nestings.end()) return it->second;
+        int h = 0;
+        n->Children([&](Node *ch) { h = std::max(h, Nesting(ch)); });
+        return nestings[n] = h + 1;
+    }
     V Gen(Node *n) {
         // An inlined call the checker typed as an image or resizable other than its callee's result
         // (a return's type): built as that, from the result where it lies (LimCallResult).
@@ -3353,6 +3366,14 @@ struct TgFn {
             if (built) return w;
         }
         auto x = Gen1(n);
+        // An expression nested deeper than C compilers take (TinyCC's value stack, clang's
+        // brackets): tinygen's C folds single-use values into one, so its operands go through locals.
+        if (!Ended() && x.v && !x.mem && Is<Binary>(n) && Nesting(n) % 64 == 0) {
+            auto sc = tyg_val_type(p, x.v);
+            auto at = tyg_at_local(tyg_local_new(p, 8, 8), 0);
+            tyg_store(p, sc, at, x.v, 0);
+            x.v = tyg_load(p, sc, at, 0);
+        }
         // After a return or break the code using this value is still built: it needs a value.
         if (Ended() && !x.v && !x.mem && n->exprtype && M.IsScalar(n->exprtype))
             return Dummy(n->exprtype);
