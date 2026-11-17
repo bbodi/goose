@@ -226,7 +226,15 @@ inline string TgSupportBody(string_view runtimeh) {
          "    gs_tg_tstks = gs_stks;\n"
          "    gs_gl = &gs_tg_noglobals;\n"
          "}\n"
-         "void gs_tg_end(void) { gs_rt_stats(); }\n";
+         "void gs_tg_end(void) { gs_rt_stats(); }\n"
+         // A library's goose_exit: what gs_tg_start took, given back (the queues are the program's).
+         "void gs_tg_exit(void) {\n"
+         "    gs_rt_stop();\n"
+         "    free(gs_stks);\n"
+         "    gs_stks = NULL;\n"
+         "    gs_nstks = 0;\n"
+         "    gs_tg_tstks = NULL;\n"
+         "}\n";
     return s;
 }
 
@@ -9480,7 +9488,8 @@ struct TinyGenBackend {
     // the support body's or, with --include, those of ExternTrampolines.
     bool HeaderDeclares(const string &name) {
         if (name.rfind("gs_tg_x_", 0) == 0) return externunit || SupportHolds(name.substr(8));
-        static const set<string> support = { "gs_tg_start", "gs_tg_end", "gs_tg_stack_block" };
+        static const set<string> support = { "gs_tg_start", "gs_tg_end", "gs_tg_exit",
+                                             "gs_tg_stack_block" };
         if (support.count(name) || !TgFixedShim(name).empty()) return true;
         if (name.rfind("gs_", 0) != 0) return false;
         return mod->RuntimeApi(name);
@@ -9536,6 +9545,7 @@ struct TinyGenBackend {
                 if (d->reusable) mod->PoolAccessors(d);
             }
         EmitGlobalStorage(cg);
+        sharedlibrary = cg.sharedlibrary;
         if (cg.library) initflag = DataSym("gs_tg_program_initialized", 1, 1, false);
         EmitExports(cg);
         ForwardExterns();
@@ -9736,7 +9746,7 @@ struct TinyGenBackend {
             for (auto t : sp->argtypes) ps.push_back(mod->AT(t));
             if (slice) ps.push_back(ptr);
             auto sig = SigOf(!rt ? nullptr : slice ? ptr : mod->AT(rt), ps);
-            auto p = tyg_proc_begin(mod->m, mod->FnSym(sf->cname), sig);
+            auto p = tyg_proc_begin(mod->m, HostSym(sf->cname), sig);
             // A library's C host calls an export only once goose_init has started the program, and
             // takes a slice's length through a pointer it must give.
             if (initflag != TYG_NO_SYM) {
@@ -9887,7 +9897,8 @@ struct TinyGenBackend {
         auto library = initflag != TYG_NO_SYM;
         // C requires main's argv to be a char **, which a tinygen pointer prints as void *: in C
         // output the procedure is gs_tg_main, and Write adds the main that calls it.
-        auto p = tyg_proc_begin(m, mod->FnSym(library ? "goose_init" : coutput ? "gs_tg_main" : "main"),
+        auto p = tyg_proc_begin(m, library ? HostSym("goose_init")
+                                           : mod->FnSym(coutput ? "gs_tg_main" : "main"),
                                 SigOf(library ? nullptr : i32, { i32, ptr }));
         cmain = coutput && !library;
         Line line;
@@ -9931,11 +9942,39 @@ struct TinyGenBackend {
         if (library) {
             tyg_ret(p, 0);
             EndProc(p, "goose_init");
+            EmitExit();
             return;
         }
         fn.CallC("gs_tg_end", {}, {}, nullptr);
         tyg_ret(p, tyg_iconst(p, TYG_I32, 0));
         EndProc(p, "main");
+    }
+
+    // A library's goose_exit, the inverse of goose_init: ends a started program, its stack block,
+    // regions and queues released, so that goose_init can start one in the process again.
+    void EmitExit() {
+        auto m = mod->m;
+        auto ptr = tyg_type_ptr(m);
+        auto p = tyg_proc_begin(m, HostSym("goose_exit"), SigOf(nullptr, {}));
+        TgFn fn(*mod, nullptr);
+        fn.p = p;
+        auto flag = tyg_at_sym(initflag, 0);
+        fn.If(tyg_cmp(p, TYG_EQ, tyg_load(p, TYG_I8, flag, 0), tyg_iconst(p, TYG_I8, 0)),
+              [&] { tyg_ret(p, 0); });
+        fn.CallC("gs_tg_exit", {}, {}, nullptr);
+        for (auto &[acc, q] : mod->queueacc)
+            fn.CallC("gs_qfree", { ptr }, { fn.CallC(acc, {}, {}, ptr) }, nullptr);
+        tyg_store(p, TYG_I8, flag, tyg_iconst(p, TYG_I8, 0), 0);
+        tyg_ret(p, 0);
+        EndProc(p, "goose_exit");
+    }
+
+    // A symbol a library's C host calls: exported from a shared library (--shared).
+    bool sharedlibrary = false;
+    tyg_sym HostSym(const string &name) {
+        auto sym = mod->FnSym(name);
+        if (sharedlibrary) tyg_symbol_add_flags(mod->m, sym, TYG_SYM_EXPORT);
+        return sym;
     }
 
     // The C main of C output, which calls the gs_tg_main EmitMain made.
