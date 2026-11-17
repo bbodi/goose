@@ -380,7 +380,8 @@ struct TgModule {
         uint8_t bytes[16] = {};
         memcpy(bytes + 8, &l.line, 4);
         auto s = tyg_symbol(m, cat("gs_tg_loc", locsyms.size()).c_str(), 0);
-        tyg_data(m, s, TYG_SECTION_RODATA, bytes, 16, 8);
+        // Writable in an object: an address in read-only data makes the linker patch text pages.
+        tyg_data(m, s, cout ? TYG_SECTION_RODATA : TYG_SECTION_DATA, bytes, 16, 8);
         tyg_data_reloc(m, s, 0, 8, FileName(l.fileidx), 0);
         return locsyms[key] = s;
     }

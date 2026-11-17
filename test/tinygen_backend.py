@@ -233,6 +233,8 @@ OVERLAPPING_COPIES = "test/codegen/overlapping_copies.goose"
 PROGRAMS += [(OVERLAPPING_COPIES, ["-O2"]), (OVERLAPPING_COPIES, [])]
 # Constant globals too long for a static initializer, which workers read (check_shared_fills).
 SHARED_FILLS = "test/threads/thread_shared_fills.goose"
+# A program whose calls hand their callee the caller's location (check_no_text_relocs).
+LOCATED = "test/codegen/defer_return_from.goose"
 # Pushes counted in locals (TgFn::PoolCache) around calls that read or push the same array, relative
 # links null and not; and the range checks a 2 GB reservation still needs, of u16 links (check_rel_c).
 POOL_PUSHES = "test/storage/pool_push_locals.goose"
@@ -355,6 +357,7 @@ def check_tinygen_backend(exe, base, ok, fail, say):
     check_typed_c(exe, base, ok, fail)
     check_copy_c(exe, base, ok, fail)
     check_shared_fills(exe, base, ok, fail)
+    check_no_text_relocs(exe, base, ok, fail)
     check_rel_c(exe, base, ok, fail)
     check_pool_base_c(exe, base, ok, fail)
     check_array_cache_c(exe, base, ok, fail)
@@ -532,6 +535,28 @@ def check_shared_fills(exe, base, ok, fail):
             if code != 0 or bad:
                 fail(f"{label}: not one data symbol: {', '.join(bad)}", syms if code == 0 else err)
                 continue
+        ok(label)
+
+
+def check_no_text_relocs(exe, base, ok, fail):
+    """A caller-location record holds its file name's address, so in the native object it is
+    writable data: in read-only data the linker would patch the image's text pages (DT_TEXTREL)."""
+    readelf = shutil.which("readelf") if sys.platform.startswith("linux") else None
+    if not readelf:
+        return
+    out = base / f"located-tinygen{tc.EXE_SUFFIX}"
+    label = "tinygen caller locations: no text relocations"
+    code, o, e = tc.run_capture([exe, "build", "--backend=tinygen", "--debug", "-o", out, ROOT / LOCATED])
+    if code != 0:
+        fail(label, o + e)
+        return
+    code, syms, err = tc.run_capture([readelf, "-sW", out])
+    code2, dyn, err2 = tc.run_capture([readelf, "-dW", out])
+    if code != 0 or code2 != 0 or "gs_tg_loc" not in syms:
+        fail(f"{label}: the fixture has no location record", syms if code == 0 else err + err2)
+    elif "TEXTREL" in dyn:
+        fail(label, dyn)
+    else:
         ok(label)
 
 
