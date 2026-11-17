@@ -216,7 +216,7 @@ rustc time for the Rust ones; memory is the peak working set at the largest size
 | cpp variant + buffer | -- | 431.4 | 752.0 |
 | rust enum + String | -- | 449.7 | 553.5 |
 
-The variable enum stores each record at the size of its own variant, including inline text. The fixed-enum Goose row controls for that representation choice. C++ variant and Rust enum reserve space for the largest payload in every element; their owned strings may also allocate separately.
+The variable enum stores each record at the size of its own variant, including inline text. C++ variant and Rust enum reserve space for the largest payload in every element; their owned strings may also allocate separately.
 
 ## tree
 
@@ -662,8 +662,7 @@ three words where `std::string` is four, and the enum tag is stored in the
 pointer's niche rather than needing its own word. But it is still a *fixed*
 enum, so every one of the 16M elements is sized for `Say` whether it is a
 `Say` or not, and the text needs a second allocation as well. This is a
-property of Rust's enum layout. `records_fixed.goose` provides a control
-with a fixed-size representation.
+property of Rust's enum layout.
 
 Three Goose layouts differ substantially from the corresponding C++ and Rust
 implementations:

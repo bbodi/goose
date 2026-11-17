@@ -16,8 +16,9 @@ fn clamp<T>(x: T, lo: T, hi: T) -> T {
 }
 
 fn abs<T>(x: T) -> T { if x < 0 { return -x; } return x; }
-fn abs(x: f32) -> f32 { if x < 0.0 { return -x; } return x; }
-fn abs(x: f64) -> f64 { if x < 0.0 { return -x; } return x; }
+// libm's, which clear the sign bit: abs(-0.0) is 0.0, as IEEE 754 has it.
+extern fn abs(x: f32) -> f32 = "fabsf";
+extern fn abs(x: f64) -> f64 = "fabs";
 
 // Truncating remainder pairs with `/`. The product stays between a and
 // zero; divisor -1 has remainder zero even when its quotient cannot fit.
@@ -57,11 +58,13 @@ fn sign(x: f64) -> f64 {
 fn lerp(a: f32, b: f32, t: f32) -> f32 { a + (b - a) * t }
 fn lerp(a: f64, b: f64, t: f64) -> f64 { a + (b - a) * t }
 
-// The smallest power of two that is at least max(x, 1).
+// The smallest power of two that is at least max(x, 1), aborting past 2^62.
 fn next_pow2(x: i64) -> i64 {
-    var p = 1;
-    while p < x { p = p * 2; }
-    return p;
+    if x <= 1 { return 1; }
+    assert(x <= 1 << 62);
+    var v = (x - 1) as! u64;
+    v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16; v |= v >> 32;
+    return (v + 1) as! i64;
 }
 
 // The bits set, and the leading / trailing zero bits, 64 for zero: the
@@ -69,6 +72,84 @@ fn next_pow2(x: i64) -> i64 {
 extern fn popcount(x: u64) -> i64 = "gs_popcount";
 extern fn clz(x: u64) -> i64 = "gs_clz";
 extern fn ctz(x: u64) -> i64 = "gs_ctz";
+
+// x's bits rotated by n, an integer of any type taken modulo the width: a
+// negative n turns the other way. Masking n first makes its conversion to
+// i64 exact at every count type. These and byte_swap are the runtime's, so
+// that each is one instruction where the C compiler has one.
+extern fn bits_detail::rotl32(x: u32, n: i64) -> u32 = "gs_rotl32";
+extern fn bits_detail::rotl64(x: u64, n: i64) -> u64 = "gs_rotl64";
+extern fn bits_detail::rotr32(x: u32, n: i64) -> u32 = "gs_rotr32";
+extern fn bits_detail::rotr64(x: u64, n: i64) -> u64 = "gs_rotr64";
+fn rotl<N>(x: u32, n: N) -> u32 { bits_detail::rotl32(x, (n & 31) as i64) }
+fn rotl<N>(x: u64, n: N) -> u64 { bits_detail::rotl64(x, (n & 63) as i64) }
+fn rotr<N>(x: u32, n: N) -> u32 { bits_detail::rotr32(x, (n & 31) as i64) }
+fn rotr<N>(x: u64, n: N) -> u64 { bits_detail::rotr64(x, (n & 63) as i64) }
+
+// x with its bytes in the opposite order.
+extern fn bits_detail::byte_swap16(x: u16) -> u16 = "gs_byte_swap16";
+extern fn bits_detail::byte_swap32(x: u32) -> u32 = "gs_byte_swap32";
+extern fn bits_detail::byte_swap64(x: u64) -> u64 = "gs_byte_swap64";
+fn byte_swap(x: u16) -> u16 { bits_detail::byte_swap16(x) }
+fn byte_swap(x: u32) -> u32 { bits_detail::byte_swap32(x) }
+fn byte_swap(x: u64) -> u64 { bits_detail::byte_swap64(x) }
+
+// Integers of any type. ilog2 is floor(log2(x)), -1 where there is none
+// (x <= 0); isqrt is floor(sqrt(x)) and aborts on a negative x.
+fn is_pow2<T>(x: T) -> bool { x > 0 && (x & (x - 1)) == 0 }
+fn ilog2<T>(x: T) -> i64 {
+    if x <= 0 { return -1; }
+    return 63 - clz(x as! u64);
+}
+fn isqrt<T>(x: T) -> T {
+    assert(x >= 0);
+    let v = x as! u64;
+    if v < 2 { return x; }
+    // Newton's steps from a power of two above the root fall to its floor.
+    var r: u64 = 1 << ((63 - clz(v)) / 2 + 1);
+    loop {
+        let next = (r + v / r) >> 1;
+        if next >= r { return r as! T; }
+        r = next;
+    }
+}
+
+// The greatest common divisor and least common multiple, never negative:
+// gcd(0, 0) == 0 and lcm(x, 0) == 0. They work on the magnitudes as u64,
+// so MIN is no special case, and assert that the result fits in T
+// (gcd(MIN, 0) and an lcm past MAX do not), as no wrapped value is either
+// one.
+fn gcd<T>(a: T, b: T) -> T { gcd_fit<T>(gcd_u64(gcd_magnitude(a), gcd_magnitude(b))) }
+fn lcm<T>(a: T, b: T) -> T {
+    let x = gcd_magnitude(a);
+    let y = gcd_magnitude(b);
+    if x == 0 || y == 0 { return 0; }
+    let q = x / gcd_u64(x, y);
+    assert(q <= 0xFFFFFFFFFFFFFFFF / y);
+    return gcd_fit<T>(q * y);
+}
+fn gcd_magnitude<T>(x: T) -> u64 {
+    if x < 0 { return 0 - (x as! u64); }
+    return x as! u64;
+}
+fn gcd_fit<T>(r: u64) -> T {
+    let t = r as! T;
+    assert(t >= 0 && t as! u64 == r);
+    return t;
+}
+// Stein's binary algorithm: shifts and subtractions in place of division.
+fn gcd_u64(a: u64, b: u64) -> u64 {
+    if a == 0 || b == 0 { return a | b; }
+    let shift = ctz(a | b);
+    var x = a >> ctz(a);
+    var y = b;
+    loop {
+        y = y >> ctz(y);
+        if x > y { swap(x, y); }
+        y -= x;
+        if y == 0 { return x << shift; }
+    }
+}
 
 // The values a and b refer to. `T&` of a reference type is that reference
 // (spec §3.8), so for two elements of an array of references this swaps
@@ -141,7 +222,7 @@ fn hash(s: u8[:]) -> u64 {
         var i = 0;
         while i < n - 8 {
             h = (h ^ hash_le64(s, i)) * 11400714819323198485;
-            h = (h << 29) | (h >> 35);
+            h = rotl(h, 29);
             i += 8;
         }
         w = hash_le64(s, n - 8);
@@ -166,15 +247,15 @@ fn hash_lanes(s: u8[:]) -> u64 {
     var i = 0;
     while i < n - 24 {
         h = (h ^ hash_le64(s, i)) * 11400714819323198485;
-        h = (h << 29) | (h >> 35);
+        h = rotl(h, 29);
         g = (g ^ hash_le64(s, i + 8)) * 11400714819323198485;
-        g = (g << 29) | (g >> 35);
+        g = rotl(g, 29);
         i += 16;
     }
-    h = h ^ ((g << 31) | (g >> 33));
+    h = h ^ rotl(g, 31);
     while i < n - 8 {
         h = (h ^ hash_le64(s, i)) * 11400714819323198485;
-        h = (h << 29) | (h >> 35);
+        h = rotl(h, 29);
         i += 8;
     }
     h = (h ^ hash_le64(s, n - 8)) * 11400714819323198485;
@@ -214,8 +295,40 @@ fn rand_int(r: rng&, n: i64) -> i64 {
     return (x % m) as i64;
 }
 
-// Uniform in [0, 1).
+// Uniform in [0, size), or [lo, lo + size), size > 0; the range has to fit
+// in i64. A size, not an end, so a range is never empty by an off-by-one.
+fn rand_range(r: rng&, size: i64) -> i64 { rand_int(r, size) }
+fn rand_range(r: rng&, lo: i64, size: i64) -> i64 {
+    assert(size > 0);
+    return lo + rand_int(r, size);
+}
+
+// Uniform in [0, 1): the top 53 (24) bits, scaled by 2^-53 (2^-24), so every
+// result is a multiple of that step and each is equally likely.
 fn rand_flt(r: rng&) -> f64 { (rand_u64(r) >> 11) * (1.0 / 9007199254740992.0) }
+fn rand_f32(r: rng&) -> f32 { (rand_u64(r) >> 40) * (1.0 / 16777216.0) }
+
+// std imports nothing, so it names the two libm functions rand_gaussian needs
+// itself, in a namespace of their own, apart from math's sqrt and log.
+extern fn rand_detail::sqrt(x: f64) -> f64 = "gs_sqrt";
+extern fn rand_detail::log(x: f64) -> f64 = "gs_log";
+
+// Gaussian: the standard normal distribution (mean 0, variance 1), by
+// Marsaglia's polar method. A point
+// drawn uniformly in the square is kept once it lands inside the unit circle
+// (about 79% of tries), and gives two independent draws. rng holds only
+// its seed, so the second is dropped, and a seed always gives the same
+// draws. Those are the same everywhere that libm's log agrees.
+fn rand_gaussian(r: rng&) -> f64 {
+    loop {
+        let u = 2.0 * rand_flt(r) - 1.0;
+        let v = 2.0 * rand_flt(r) - 1.0;
+        let s = u * u + v * v;
+        if s > 0.0 && s < 1.0 {
+            return u * rand_detail::sqrt(-2.0 * rand_detail::log(s) / s);
+        }
+    }
+}
 
 // Fisher-Yates.
 // The functions that move elements around store whole elements with `.=`,
@@ -252,6 +365,7 @@ fn each_rev<T, F>(xs: T[:]) {
 
 // F(chunk, i) over consecutive slices of n elements; the last may be short.
 fn each_chunk<T, F>(xs: T[:], n: i64) {
+    assert(n > 0);
     var i = 0;
     var k = 0;
     while i < xs.len {
@@ -361,15 +475,19 @@ fn lower_bound<T, F>(xs: T[:]) -> i64 {
     return lo;
 }
 
-// xs sorted by <: the position of v (or where it would go), and whether it is there.
+// xs sorted by < (or by F(a, b), "a goes before b"): the position of v (or
+// where it would go), and whether it is there.
 fn binary_search<T>(xs: T[:], v: T) -> i64, bool {
+    return binary_search(xs, v) { a, b => a < b };
+}
+fn binary_search<T, F>(xs: T[:], v: T) -> i64, bool {
     var lo = 0;
     var hi = xs.len;
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        if xs[mid] < v { lo = mid + 1; } else { hi = mid; }
+        if F(xs[mid], v) { lo = mid + 1; } else { hi = mid; }
     }
-    return lo, lo < xs.len && xs[lo] == v;
+    return lo, lo < xs.len && !F(v, xs[lo]);
 }
 
 // The first / last occurrence of a subsequence, -1 if none.
@@ -409,11 +527,11 @@ fn ends_with<T>(xs: T[:], p: T[:]) -> bool { p.len <= xs.len && xs[xs.len - p.le
 // 16 + j, which are all a set of kind 5 is tested by.
 struct ByteSet {
     members: bool[256],
-    kind: u8,
-    invert: bool,
-    bytes: u8[3],
-    lo: u8[16],
-    hi: u8[16],
+    kind:    u8,
+    invert:  bool,
+    bytes:   u8[3],
+    lo:      u8[16],
+    hi:      u8[16],
 }
 
 fn byte_set(members: bool[256]) -> ByteSet {
@@ -530,8 +648,18 @@ fn reverse<T>(xs: T[:]) {
 }
 
 // ASCII, in place.
-fn to_lower(s: u8[:]) { for &c in s { if c >= 'A' && c <= 'Z' { c += 32; } } }
-fn to_upper(s: u8[:]) { for &c in s { if c >= 'a' && c <= 'z' { c -= 32; } } }
+fn to_lower(s: u8[:]) {
+    for &c in s {
+        let mask: u8 = if c >= 'A' && c <= 'Z' { 32 } else { 0 };
+        c |= mask;
+    }
+}
+fn to_upper(s: u8[:]) {
+    for &c in s {
+        let mask: u8 = if c >= 'a' && c <= 'z' { 32 } else { 0 };
+        c ^= mask;
+    }
+}
 
 // ---- arrays: sorting -----------------------------------------------------------
 // The sort_ helpers take the comparator as F, "a goes before b", and are
@@ -988,8 +1116,9 @@ fn make_heap<A, F>(xs: A&) {
 // appended to `out`, any u8 array that grows (u8[>..], or a limited u8[..k]).
 // Base ten is the builtin text of the integer, the runtime's digit loop
 // writing straight into `out`; other bases divide by the `base` parameter,
-// a real division per digit.
+// a real division per digit. A base outside 2..36 is a contract violation.
 fn format_uint<B>(out: B&, v: u64, base: i64, width: i64, padc: u8) {
+    if base < 2 || base > 36 { abort("format_uint: base out of range"); }
     if base == 10 {
         if width > 1 {
             var n = 1;
@@ -1027,8 +1156,10 @@ fn format_uint<B>(out: B&, v: u64, base: i64, width: i64, padc: u8) {
 }
 
 // The sign goes in front of any padding: -0042. The magnitude is taken in
-// unsigned arithmetic, which holds i64.min's.
+// unsigned arithmetic, which holds i64.min's. A base outside 2..36 is a
+// contract violation.
 fn format_int<B>(out: B&, v: i64, base: i64, width: i64, padc: u8) {
+    if base < 2 || base > 36 { abort("format_int: base out of range"); }
     if v < 0 {
         out.push('-');
         format_uint(out, 0 - v as! u64, base, width - 1, padc);
@@ -1068,33 +1199,154 @@ fn parse_uleb(s: u8[:]) -> i64, i64 {
     return 0, 0;
 }
 
-// v with a fixed number of decimals, rounded half up; infinities and NaN
-// in their text form (§3.7).
+// v with a fixed number of decimals, its exact value rounded half up;
+// infinities and NaN in their text form (§3.7).
 fn format_flt(out: u8[>..]&, v: f64, decimals: i64) {
     if v != v || v - v != 0.0 {
         format(out, v);
         return;
     }
     var x = v;
-    if x < 0.0 {
+    // The sign bit rather than x < 0.0: -0.0 writes its sign, as printf does.
+    if (float_text::bits_of(x) >> 63) != 0 {
         out.push('-');
         x = -x;
     }
-    var scale = 1.0;
-    for i in decimals { scale *= 10.0; }
-    // x is not negative, so truncation is floor and adding 0.5 first rounds
-    // half up: `as!`, since dropping the fraction is the point.
-    let scaled = (x * scale + 0.5) as! i64;
-    let iscale = scale as i64;
-    format_uint(out, (scaled / iscale) as u64, 10, 0, ' ');
-    if decimals > 0 {
+    let d = max(decimals, 0);
+    // x * 10^d, below 2^52, is x's scaled value rounded once, by at most
+    // y * 2^-53, and its fraction is exact. Only a fraction that close to
+    // a half can round the other way than the exact value would, and then
+    // the digits are worked out exactly. `as!`: the floor drops the
+    // fraction on purpose.
+    if d <= 18 {
+        let y = x * float_text::POW10[d];
+        if y < 4503599627370496.0 {
+            let n = y as! i64;
+            let frac = y - n;
+            if abs(frac - 0.5) > y * 2.3e-16 {
+                let scaled = if frac >= 0.5 { n + 1 } else { n };
+                let iscale = float_text::POW10_U64[d] as i64;
+                format_uint(out, (scaled / iscale) as u64, 10, 0, ' ');
+                if d > 0 {
+                    out.push('.');
+                    format_uint(out, (scaled % iscale) as u64, 10, d, '0');
+                }
+                return;
+            }
+        }
+    }
+    format_flt_exact(out, x, d);
+}
+
+// The decimal digits of x, finite and not negative, rounded half up at d
+// places. x is m * 2^e, which is the integer m * 2^e for e >= 0 and
+// m * 5^-e / 10^-e otherwise, so the product, worked out in limbs of nine
+// digits, holds every digit of x: up to 309 before the point and 767
+// significant ones after it.
+fn format_flt_exact(out: u8[>..]&, x: f64, d: i64) {
+    let b = float_text::bits_of(x);
+    let be = ((b >> 52) & 0x7FF) as i64;
+    var m = b & 0xFFFFFFFFFFFFF;
+    var e = -1074;
+    if be > 0 {
+        m |= 0x10000000000000;
+        e = be - 1075;
+    }
+    var limbs: u64[>..] = [m % 1000000000, (m / 1000000000) % 1000000000, m / 1000000000000000000];
+    var point = 0;
+    if e >= 0 {
+        while e > 0 {
+            let s = min(e, 29);
+            format_flt_mul(limbs, (1 as u64) << s);
+            e -= s;
+        }
+    } else {
+        point = -e;
+        var k = point;
+        while k > 0 {
+            let s = min(k, 13);
+            format_flt_mul(limbs, float_text::POW5[s]);
+            k -= s;
+        }
+    }
+    // The digits, most significant first, with at least one before the
+    // point.
+    var digits: u8[>..] = [];
+    var top = limbs.len - 1;
+    while top > 0 && limbs[top] == 0 { top -= 1; }
+    format_uint(digits, limbs[top], 10, 0, ' ');
+    var i = top;
+    while i > 0 {
+        i -= 1;
+        format_uint(digits, limbs[i], 10, 9, '0');
+    }
+    if digits.len <= point {
+        var lead: u8[>..] = [];
+        push_n(lead, '0', point + 1 - digits.len);
+        lead.append(digits);
+        digits.resize(0);
+        digits.append(lead);
+    }
+    // Keep d places; a dropped first digit of 5 or more rounds up, carrying
+    // through nines, and past the first digit as a new leading 1.
+    let whole = digits.len - point;
+    var keep = whole + min(d, point);
+    if d < point && digits[keep] >= '5' {
+        var j = keep;
+        loop {
+            if j == 0 {
+                insert_at(digits, 0, '1');
+                keep += 1;
+                break;
+            }
+            j -= 1;
+            if digits[j] != '9' {
+                digits[j] += 1;
+                break;
+            }
+            digits[j] = '0';
+        }
+    }
+    let int_end = keep - min(d, point);
+    out.append(digits[..int_end]);
+    if d > 0 {
         out.push('.');
-        format_uint(out, (scaled % iscale) as u64, 10, decimals, '0');
+        out.append(digits[int_end..keep]);
+        push_n(out, '0', d - min(d, point));
     }
 }
 
-// An optionally signed whole-string integer; false on anything else, including a value outside i64.
+// limbs * f, for f below 2^31: each limb is below 10^9, so limb * f plus
+// the carry stays below 2^63.
+fn format_flt_mul(limbs: u64[>..]&, f: u64) {
+    var carry: u64 = 0;
+    for i in limbs.len {
+        let t = limbs[i] * f + carry;
+        limbs[i] = t % 1000000000;
+        carry = t / 1000000000;
+    }
+    while carry > 0 {
+        limbs.push(carry % 1000000000);
+        carry /= 1000000000;
+    }
+}
+
+// The value of digit c in base, with letters of either case from 10; -1 if
+// c is not a digit below base.
+fn parse_digit(c: u8, base: i64) -> i64 {
+    let x = c as i64;
+    var d = -1;
+    if x >= '0' && x <= '9' { d = x - '0'; }
+    else if x >= 'a' && x <= 'z' { d = x - 'a' + 10; }
+    else if x >= 'A' && x <= 'Z' { d = x - 'A' + 10; }
+    if d >= base { return -1; }
+    return d;
+}
+
+// An optionally signed whole-string integer; false on anything else,
+// including a value outside i64 or a base outside 2..36.
 fn parse_int(s: u8[:], base: i64 = 10) -> i64, bool {
+    if base < 2 || base > 36 { return 0, false; }
     var i = 0;
     var neg = false;
     if s.len > 0 && (s[0] == '-' || s[0] == '+') {
@@ -1109,12 +1361,8 @@ fn parse_int(s: u8[:], base: i64 = 10) -> i64, bool {
     let min = -9223372036854775807 - 1;
     var v = 0;
     while i < s.len {
-        let c = s[i] as i64;
-        var d = -1;
-        if c >= '0' && c <= '9' { d = c - '0'; }
-        else if c >= 'a' && c <= 'z' { d = c - 'a' + 10; }
-        else if c >= 'A' && c <= 'Z' { d = c - 'A' + 10; }
-        if d < 0 || d >= base { return 0, false; }
+        let d = parse_digit(s[i], base);
+        if d < 0 { return 0, false; }
         if v < (min + d) / base { return 0, false; }
         v = v * base - d;
         i += 1;
@@ -1126,14 +1374,46 @@ fn parse_int(s: u8[:], base: i64 = 10) -> i64, bool {
     return v, true;
 }
 
-// A decimal float with optional sign, fraction and exponent, correctly
-// rounded; false otherwise.
+// A whole-string integer with an optional '+'; false on anything else,
+// including '-' or a value outside u64, or a base outside 2..36.
+fn parse_uint(s: u8[:], base: i64 = 10) -> u64, bool {
+    if base < 2 || base > 36 { return 0, false; }
+    var i = 0;
+    if s.len > 0 && s[0] == '+' { i = 1; }
+    if i >= s.len { return 0, false; }
+    let max: u64 = 18446744073709551615;
+    var v: u64 = 0;
+    while i < s.len {
+        let d = parse_digit(s[i], base);
+        if d < 0 { return 0, false; }
+        let b = base as u64;
+        let du = d as u64;
+        if v > (max - du) / b { return 0, false; }
+        v = v * b + du;
+        i += 1;
+    }
+    return v, true;
+}
+
+// A decimal float with optional sign, fraction and exponent, or the inf,
+// -inf and nan that print writes; correctly rounded, false otherwise.
 fn parse_flt(s: u8[:]) -> f64, bool {
     var i = 0;
     var neg = false;
     if s.len > 0 && (s[0] == '-' || s[0] == '+') {
         neg = s[0] == '-';
         i = 1;
+    }
+    // The non-finite spellings print and format write: inf and -inf, and
+    // nan, which they never write negative.
+    if i < s.len {
+        let rest = s[i..];
+        if rest == "inf" {
+            return if neg { -1.0 / 0.0 } else { 1.0 / 0.0 }, true;
+        }
+        if i == 0 && rest == "nan" {
+            return 0.0 / 0.0, true;
+        }
     }
     // The significant digits as one integer, with the decimal exponent
     // adjusted for the digits after the point, so the value is
@@ -1225,6 +1505,24 @@ fn compare(a: u8[:], b: u8[:]) -> i64 {
 
 fn is_space(c: u8) -> bool { c == ' ' || c == '\t' || c == '\n' || c == '\r' }
 
+// ASCII character classes, as C's <ctype.h> has them in the C locale: no
+// byte from 0x80 up is in any of them. They are declared into a namespace
+// of their own, `ascii`, which keeps such common names out of the global
+// one. u8 arithmetic wraps, so each range test is one subtraction and one
+// compare, and `c | 32` folds an upper-case letter onto its lower case.
+fn ascii::is_digit(c: u8) -> bool { c - '0' < 10 }
+fn ascii::is_alpha(c: u8) -> bool { (c | 32) - 'a' < 26 }
+fn ascii::is_alnum(c: u8) -> bool { is_digit(c) || is_alpha(c) }
+
+// The value of a hexadecimal digit, either case: 0 to 15, -1 for any other
+// byte.
+fn ascii::hex_value(c: u8) -> i64 {
+    if c - '0' < 10 { return c - '0'; }
+    let lower = c | 32;
+    if lower - 'a' < 6 { return lower - 'a' + 10; }
+    return -1;
+}
+
 // ASCII whitespace trimmed: a sub-slice of s, no copy.
 fn trim_start(s: u8[:]) -> u8[:] {
     var i = 0;
@@ -1304,6 +1602,20 @@ fn each_split<F>(s: u8[:], sep: u8[:]) {
         }
     }
     F(s[start..]);
+}
+
+// The parts before and after the first sep, as slices into s, and true; or
+// s whole, an empty slice and false when sep is not in s. An empty sep is
+// never found, as split has it: s, "", false.
+fn split_once(s: u8[:], sep: u8) -> const u8[:], const u8[:], bool {
+    let i = position(s, sep);
+    if i < 0 { return s, s[s.len..], false; }
+    return s[..i], s[i + 1..], true;
+}
+fn split_once(s: u8[:], sep: u8[:]) -> const u8[:], const u8[:], bool {
+    let i = if sep.len == 0 { -1 } else { find(s, sep) };
+    if i < 0 { return s, s[s.len..], false; }
+    return s[..i], s[i + sep.len..], true;
 }
 
 // The words of s, as slices into it: the runs of bytes between ASCII
@@ -1612,6 +1924,12 @@ fn float_text::eisel_lemire(mant: u64, exp10: i64) -> f64, bool {
 // of two, and its inverse.
 extern fn float_text::frexp(x: f64, e: i32&) -> f64;
 extern fn float_text::ldexp(x: f64, e: i32) -> f64;
+
+// The digits of the shortest form of x, finite and not zero, by magnitude:
+// the runtime's own, what print writes, into out, which holds at least 17.
+// Their count, and in `point` the power of ten they are a fraction of:
+// 0.d1 d2 ... dn * 10^point.
+extern fn float_text::shortest_digits(x: f64, out: u8[:], point: i64&) -> i64 = "gs_f64_digits";
 
 // The double nearest to D * 10^e10, D the decimal digits text[from..to]
 // (a point among them is passed over), given an estimate v within a few

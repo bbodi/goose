@@ -5,6 +5,7 @@
   "patterns": [
     { "include": "#comments" },
     { "include": "#strings" },
+    { "match": "\\broot\\b(?=\\s+struct\\b)", "name": "storage.modifier.goose" },
     { "include": "#declarations" },
     { "match": "\\b(?:bool|varint|[iu](?:8|16|32|64)|f(?:32|64))\\b", "name": "storage.type.goose" },
     { "match": "\\b(?:true|false|null)\\b", "name": "constant.language.goose" },
@@ -14,7 +15,7 @@
     { "match": "\\b(?:struct|enum|type|fn|thread_fn|let|var|const)\\b", "name": "storage.type.goose" },
     { "match": "\\b(?:export|extern|simd|recursive|pad|reusable)\\b", "name": "storage.modifier.goose" },
     { "include": "#numbers" },
-    { "match": "\\b(?:print|str|format|assert|abort|exit|hardware_threads|thread_spawn|thread_spawn_contained|thread_wait|qput|qget|qpoll|qlimit|default|copy|to_bytes|bytes_of|from_bytes|embed_shader|embed_file|index_of|push|append|pop|pop_n|resize|clear|alloc_index|alloc_ref|free|alloc_slice|realloc_slice|free_slice)\\b(?=\\s*[<(])", "name": "support.function.goose" },
+    { "match": "\\b(?:print|str|format|assert|abort|exit|hardware_threads|thread_spawn|thread_spawn_contained|thread_wait|qput|qget|qpoll|qlimit|default|copy|move_from|to_bytes|bytes_of|from_bytes|embed_shader|embed_file|src_file|src_line|index_of|range_index|check_length|push|append|pop|pop_n|resize|clear|alloc_index|alloc_ref|free|alloc_slice|realloc_slice|free_slice)\\b(?=\\s*[<(])", "name": "support.function.goose" },
     { "match": "(?<=\\.)\\b(?:len|cap)\\b", "name": "support.variable.property.goose" },
     { "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*::)", "name": "entity.name.namespace.goose" },
     { "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*\\()", "name": "entity.name.function.goose" },
@@ -42,13 +43,14 @@
     "declarations": { "patterns": [
       { "match": "\\b(fn|thread_fn)\\s+((?:::)?(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Za-z_][A-Za-z0-9_]*)", "captures": { "1": { "name": "storage.type.function.goose" }, "2": { "name": "entity.name.function.goose" } } },
       { "match": "\\b(struct|enum|type)\\s+((?:::)?(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Za-z_][A-Za-z0-9_]*)", "captures": { "1": { "name": "storage.type.goose" }, "2": { "name": "entity.name.type.goose" } } },
+      { "match": "\\b(namespace)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(=)\\s*([A-Za-z_][A-Za-z0-9_]*)", "captures": { "1": { "name": "keyword.other.goose" }, "2": { "name": "entity.name.namespace.goose" }, "3": { "name": "keyword.operator.goose" }, "4": { "name": "entity.name.namespace.goose" } } },
       { "match": "\\b(namespace)\\s+([A-Za-z_][A-Za-z0-9_]*)", "captures": { "1": { "name": "keyword.other.goose" }, "2": { "name": "entity.name.namespace.goose" } } }
     ] },
     "numbers": { "patterns": [
-      { "match": "\\b0[xX][0-9a-fA-F]+(?:\\.[0-9a-fA-F]+)?[pP][+-]?[0-9]+\\b", "name": "constant.numeric.float.hex.goose" },
-      { "match": "\\b0[xX][0-9a-fA-F]+\\b", "name": "constant.numeric.integer.hex.goose" },
-      { "match": "\\b[0-9]+(?:\\.[0-9]+(?:[eE][+-]?[0-9]+)?|[eE][+-]?[0-9]+)\\b", "name": "constant.numeric.float.goose" },
-      { "match": "\\b[0-9]+\\b", "name": "constant.numeric.integer.goose" }
+      { "match": "\\b0[xX][0-9a-fA-F]+(?:_[0-9a-fA-F]+)*(?:\\.[0-9a-fA-F]+(?:_[0-9a-fA-F]+)*)?[pP][+-]?[0-9]+(?:_[0-9]+)*", "name": "constant.numeric.float.hex.goose" },
+      { "match": "\\b0[xX][0-9a-fA-F]+(?:_[0-9a-fA-F]+)*", "name": "constant.numeric.integer.hex.goose" },
+      { "match": "\\b[0-9]+(?:_[0-9]+)*(?:\\.[0-9]+(?:_[0-9]+)*(?:[eE][+-]?[0-9]+(?:_[0-9]+)*)?|[eE][+-]?[0-9]+(?:_[0-9]+)*)", "name": "constant.numeric.float.goose" },
+      { "match": "\\b[0-9]+(?:_[0-9]+)*", "name": "constant.numeric.integer.goose" }
     ] }
   }
 }

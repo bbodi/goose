@@ -334,7 +334,26 @@ struct Analysis {
                 o.kind = Occurrence::IDENT;
                 o.node = n;
                 o.callee = callee;
-                at(o, n->line, id->name);
+                // A qualified name as written, which a namespace alias makes
+                // differ from Ident::name (`g::x` read as `image::x`). One
+                // whose text there does not end in its leaf (`g :: x`, with
+                // spaces) is left out rather than given the wrong extent.
+                auto spelled = id->name;
+                if (spelled.find("::") != string_view::npos) {
+                    auto leaf = [](string_view s) {
+                        auto q = s.rfind("::");
+                        return q == string_view::npos ? s : s.substr(q + 2);
+                    };
+                    spelled = {};
+                    if (infile(fileidx) && n->line.line > 0) {
+                        auto &text = files[(size_t)fileidx].text;
+                        auto start = text.OffsetOf(n->line.line, n->line.col);
+                        auto len = start < 0 ? 0 : text.NameLengthAt((size_t)start);
+                        auto written = text.text.substr((size_t)max<int64_t>(start, 0), len);
+                        if (len && leaf(written) == leaf(id->name)) spelled = written;
+                    }
+                }
+                at(o, n->line, spelled);
             } else if (auto d = Is<Dot>(n)) {
                 Occurrence o;
                 o.kind = Occurrence::DOT;
@@ -372,17 +391,24 @@ struct Analysis {
                     o.index = 1;
                     view(o, fileidx, fl->idxvar);
                 }
-            } else if (Is<MatchExpr>(n) || Is<ConstFor>(n)) {
-                // A match's arms, or those a const for in its arm list
-                // generates.
-                auto &arms = Is<MatchExpr>(n) ? Is<MatchExpr>(n)->arms : Is<ConstFor>(n)->arms;
-                for (size_t i = 0; i < arms.size(); i++) {
-                    if (arms[i].pat.binder.empty()) continue;
-                    auto o = decl(Occurrence::BINDER);
-                    o.node = n;
-                    o.index = (int)i;
-                    o.isvar = arms[i].pat.byref;
-                    view(o, fileidx, arms[i].pat.binder);
+            } else if (Is<MatchExpr>(n) || Is<ConstFor>(n) || Is<ConstIf>(n)) {
+                // A match's arms, or those a const for or const if in its arm
+                // list supplies. The index counts across a const if's branches.
+                vector<const vector<MatchArm> *> lists;
+                if (auto m = Is<MatchExpr>(n)) lists.push_back(&m->arms);
+                else if (auto cf = Is<ConstFor>(n)) lists.push_back(&cf->arms);
+                else for (auto &br : Is<ConstIf>(n)->branches) lists.push_back(&br.arms);
+                int index = 0;
+                for (auto arms : lists) {
+                    for (auto &arm : *arms) {
+                        auto i = index++;
+                        if (arm.pat.binder.empty()) continue;
+                        auto o = decl(Occurrence::BINDER);
+                        o.node = n;
+                        o.index = i;
+                        o.isvar = arm.pat.byref;
+                        view(o, fileidx, arm.pat.binder);
+                    }
                 }
             } else if (auto fv = Is<FunVal>(n)) {
                 funvals[fv->body] = fv;

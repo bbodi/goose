@@ -242,7 +242,10 @@ struct TypeEnum : TypeDetail {       // TY_ENUM
 struct TypeName : TypeDetail {       // TY_UNRESOLVED and TY_GENERIC
     int expansionbinding = 0;       // Lexical const-for binding, never a name lookup.
     string_view expansionerror;     // Invalid substitution, diagnosed only when instantiated.
-    string_view name;                // As written: `Name`, `ns::Name` or `::Name`.
+    string_view name;                // `Name`, `ns::Name` or `::Name`: as written, but
+                                     // for a namespace alias, read as its target.
+    string_view written;             // The source text of a qualified name, which an
+                                     // alias makes differ from `name`; empty if not known.
     string_view ns;                  // Where an unqualified name resolves first: the
                                      // namespace of the declaration it was written in
                                      // (docs/design/namespaces.md).
@@ -506,6 +509,11 @@ struct RootAlt {
     // where every value has it, and a bound, a reference crossed and a back
     // edge's result drop it.
     bool classread = false;
+    // Within this root component's own storage, even when its owner is only
+    // lifetime-bounded (for example an owner loaded from a caller's holder).
+    // This excludes sibling fields without claiming one exact owner instance.
+    // Reading an ordinary reference out of the component loses this proof.
+    bool projected = false;
     bool operator==(const RootAlt &) const = default;
 };
 
@@ -537,7 +545,7 @@ struct Roots {
             return false;
         auto key = [how](RootAlt a) {
             if (how == Compare::Cycle) a.from = nullptr;
-            if (how == Compare::GlobalReach) a.slotread = a.classread = false;
+            if (how == Compare::GlobalReach) a.slotread = a.classread = a.projected = false;
             return a;
         };
         for (auto &a : alts)
@@ -550,6 +558,14 @@ struct Roots {
     bool operator==(const Roots &o) const { return Same(o); }
 
     bool None() const { return alts.empty(); }
+    // No place at all, or static data alone (an exact null root): a null or
+    // a string literal, which point into no storage a shrink could free. A
+    // null root that only bounds is the globals' depth, which a global's
+    // storage may be, so it is not static data.
+    bool OnlyStatic() const {
+        for (auto &a : alts) if (a.root || !a.exact) return false;
+        return true;
+    }
     bool Unknown() const { return alts.empty() && unknown; }
     void Clear() {
         alts.clear();
@@ -579,6 +595,7 @@ struct Roots {
             b.exact = b.exact && a.exact;
             b.slotread = b.slotread && a.slotread;
             b.classread = b.classread && a.classread;
+            b.projected = b.projected && a.projected;
             if (b.from != a.from) b.from = nullptr;
             return b != before;
         }
@@ -597,6 +614,7 @@ struct Roots {
         for (auto &a : alts) {
             a.exact = false;
             a.classread = false;
+            a.projected = false;
         }
     }
     // Where a value was read out of (slotread, classread): nothing a
@@ -819,6 +837,8 @@ enum NodeKind : uint8_t {
     NK_LoopExpr,
     NK_ForLoop,
     NK_ConstFor,
+    NK_ConstIf,
+    NK_ConstQuery,
     NK_Return,
     NK_Break,
     NK_Continue,
@@ -1043,6 +1063,9 @@ NODE(Dot)
     string_view name;
     string_view ns;                 // For a UFCS call: the namespace of the declaration
                                     // this was written in, where the function resolves first.
+    // `Name<T>.Variant`, a payload-less variant constant of a generic enum:
+    // the enum type as written (obj is the Ident `Name`).
+    TypeExpr *enumtype = nullptr;
     // Filled by typecheck: field access, builtin property (.len/.cap), or a
     // payload-less variant constant (obj names the enum type).
     int fieldidx = -1;
@@ -1096,9 +1119,12 @@ NODE(Call)
     // them, and checking the call again starts from it as written.
     int firstdefault = 0;
     int ndefaults = 0;
-    // free_slice/realloc_slice: the slice handed back is not provably the pool's,
+    // range_index/free_slice/realloc_slice: the slice is not provably the receiver's,
     // so codegen checks at run time that it lies inside the pool (§5.4).
     bool poolcheck = false;
+    // pop: the array is provably non-empty here (bce.h); codegen omits the
+    // emptiness check.
+    bool nobc = false;
     TypeExpr *qtype = nullptr;  // qlimit<T>: T, which names the queue (§11.2).
     const string *shaderblob = nullptr;  // embed_shader's compiled blob or embed_file's bytes, in Ast::shaders.
     Call(Line l, Node *_callee) : Node(l, NKind), callee(_callee) {}
@@ -1317,6 +1343,38 @@ NODE(ConstFor)
     ConstFor(Line l) : Node(l, NKind) {}
 NODE_END
 
+// A compile-time query, valid in a `const if` condition only (const_for.md
+// §11.3): `has_default<A>` of a fields<T> accessor binding, or `same<T1, T2>`
+// of two types.
+enum QueryKind { Q_HAS_DEFAULT, Q_SAME };
+
+NODE(ConstQuery)
+    QueryKind query;
+    string_view name;               // has_default: the accessor binding, as written.
+    vector<TypeExpr *> types;       // same: the two types.
+    // Filled by cloning under an expansion, as a Dot's accessor is: the
+    // field the binding stands for, in its owning struct or variant type.
+    TypeExpr *owner = nullptr;
+    string_view field;
+    ConstQuery(Line l, QueryKind _query, string_view _name)
+        : Node(l, NKind), query(_query), name(_name) {}
+NODE_END
+
+// One branch of a `const if`: its condition, null for the final else, and
+// fragments of the enclosing list's category, as a ConstFor's are.
+struct ConstIfBranch {
+    Node *cond = nullptr;
+    Block *body = nullptr;          // Statement fragments, or null for initializer or arm fragments.
+    vector<FieldInit> inits;
+    vector<MatchArm> arms;
+};
+
+NODE(ConstIf)
+    vector<ConstIfBranch> branches;
+    bool armfragments = false;      // Its fragments are match arms (in a match's arm list).
+    ConstIf(Line l) : Node(l, NKind) {}
+NODE_END
+
 NODE(Return)
     BCE_WALK
     vector<Node *> vals;
@@ -1448,6 +1506,10 @@ struct SFunction {
     // (os.trim_memory): each caller, and transitively theirs, publishes all
     // of its cached tops before the call (CodeGen::CollectSpecs, SyncReach).
     bool readsalltops = false;
+    // A runtime entry point that reports a failure where the program called
+    // the standard library: it takes a trailing const gs_loc * (runtime.h),
+    // which its callers pass as they do a library function's (CodeGen::CallerLoc).
+    bool takesloc = false;
     bool isnested = false;
     SFunction *outer = nullptr;     // The function a nested one is declared in.
     Block *body = nullptr;
@@ -1479,6 +1541,7 @@ struct SStruct {
     Line line;
     Line end;                   // As SFunction::end.
     string_view doc;            // As SFunction::doc.
+    bool isroot = false;       // Explicit owning layout (docs/design/root_structs.md).
     vector<GenericParam> generics;
     vector<Field> fields;
     vector<StructInst *> insts;  // Instantiations (typecheck), owned by Ast.
@@ -1595,7 +1658,10 @@ NODE_END
 // because later phases (optimization/codegen) consume it alongside the AST.
 
 // Size classes (§1.1): the max over a compound's parts, subject to placement.
-enum SizeClass { SC_FIXED, SC_VARIABLE, SC_RESIZABLE };
+// A root owner is not a packed value of any size. Its control record can
+// have a fixed native size while its components occupy independent stacks.
+// Keep that distinction even for roots with no resizable fields.
+enum SizeClass { SC_FIXED, SC_VARIABLE, SC_RESIZABLE, SC_ROOT };
 
 // One checked variable: a global, local, parameter, or binding (for/match/
 // function value). Created per specialization, so generic code has concrete
@@ -1611,7 +1677,18 @@ struct VarDef {
     // allowed (§6.5, §8.1).
     bool copybind = false;
     bool isglobal = false;
+    // A global's position in ast.globals' definitions (TypeCheck::NoteNarrowed).
+    int globalindex = 0;
     bool isparam = false;
+    // Independently owned fields of a root declaration. These synthetic
+    // variables have the owner's scope and stable identities across loop
+    // checking passes, but are not source-level bindings.
+    vector<VarDef *> components;
+    VarDef *componentowner = nullptr;
+    int componentfield = -1;
+    // The root-owner type projected here. A parameter class has no concrete
+    // storage type; its components remain classes, with this path attached.
+    TypeExpr *componentbase = nullptr;
     // One of the results of `a, b = f();` (VarDecl::results), which its one
     // assignment takes as the call's value: constructed at the target, as
     // `a = f()` would construct it (TypeCheck::CheckAssign).
@@ -1651,8 +1728,8 @@ struct VarDef {
     // from the cycle store rule.
     VarDef *classfrom = nullptr;
     bool poolclass = false;
-    // The global pool every call site's argument for this class is rooted in
-    // (§3.9); null where there is none, which is the usual case.
+    // The global pool, or owner of named pool components, every call site's
+    // argument for this class is rooted in (§3.9); usually null.
     VarDef *classpool = nullptr;
     // Synthetic class roots only: the call-site root holds a grow-shrink
     // array, so the shrink rules follow the class into the body (§5.2);
@@ -1701,6 +1778,9 @@ struct VarDef {
     // that class's storage holds (RootAlt::classread).
     Roots contents;
     bool contentbyteview = false; // A stored reference may view raw typed storage.
+    // A store other than a parameter's binding has been made into it, in
+    // any round of a cycle's check (TypeCheck::HeldParam).
+    bool storedinto = false;
     // A literal parameter (§7.7): reads as a constant of unknown value.
     // A function-value parameter bound from one stands for that one.
     bool unsized = false;
@@ -1842,12 +1922,39 @@ template<typename R> bool HasRelRefOf(TypeExpr *t, bool inpool, R runs) {
     }
 }
 
+// Named storage used implicitly by a checked type: relative-reference bases
+// and index/bound lengths. The callback's flag distinguishes mutable lengths
+// from stable bases. The caller retains seen across a body if desired.
+template<typename F> void NamedArraysIn(TypeExpr *t, set<TypeExpr *> &seen, F f) {
+    if (!t || !seen.insert(t).second) return;
+    auto visit = [&](TypeExpr *ft) { NamedArraysIn(ft, seen, f); };
+    switch (t->kind) {
+        case TY_INT: if (t->ix && t->ix->arr) f(t->ix->arr, true); break;
+        case TY_REF:
+            if (t->ref->pool) f(t->ref->pool, false);
+            visit(t->ref->sub);
+            break;
+        case TY_SLICE: visit(t->sub); break;
+        case TY_ARRAY: visit(t->arr->sub); break;
+        case TY_STRUCT:
+            if (t->struc->inst) EachFieldOf(RunsOf(t->struc->inst), visit);
+            break;
+        case TY_ENUM:
+            if (t->enu->inst) EachFieldOf(RunsOf(t->enu->inst), visit);
+            break;
+        case TY_VARIANT: visit(t->var->adt); break;
+        default: break;
+    }
+}
+
 // Call-site facts about one reference/slice or holder parameter, part of the
 // specialization key (§10.2): the relative-outlives class of its root among
 // the call's reference arguments (0 = static, 1 = outermost, ...), where
 // its depth stands, and the provenance bits.
 struct RootArg {
     int cls = 0;
+    int ownerparam = -1;
+    int ownerfield = -1;
     bool writable = true;
     int reusable = 0;
     // The argument may point into a grow-shrink array (§5.2): some root of
@@ -1915,8 +2022,9 @@ struct RootArg {
     // concrete and exact, which SettleParamRootExactness settles.
     vector<pair<FnSpec *, int>> via;
     // The global pool the argument is exactly rooted in, where that global is
-    // named by some `T&<w in pool>` type in the program (§3.9); null
-    // otherwise, which is every argument of a program that has no such type.
+    // named by some `T&<w in pool>` type in the program (§3.9), or the owner
+    // of named pool components; null otherwise, which is every argument of
+    // a program that has no such type.
     // Unlike `exact` this *is* part of the key: a relative store measures from
     // this pool's base, so a call site passing a different one is a different
     // specialization rather than a fact to weaken afterwards.
@@ -1936,7 +2044,8 @@ struct RootArg {
     // whose classes differ only here still passes the arrays they describe.
     int depthkey = 0;
     bool operator==(const RootArg &o) const {
-        return cls == o.cls && writable == o.writable && reusable == o.reusable &&
+        return cls == o.cls && ownerparam == o.ownerparam && ownerfield == o.ownerfield &&
+               writable == o.writable && reusable == o.reusable &&
                growshrink == o.growshrink && gsvia == o.gsvia && slotread == o.slotread &&
                byteview == o.byteview && pool == o.pool && heldexact == o.heldexact &&
                unknown == o.unknown;
@@ -2004,6 +2113,10 @@ struct StoreEvent {
     // rooted at the class still names it as the container it was read out
     // of (RootAlt::from).
     bool classread = false;
+    // The contents a by-value holder parameter was passed, where they are not
+    // one array exactly (RootArg::heldexact): its class only bounds them, and
+    // no store in the body put them there.
+    bool incoming = false;
 };
 
 // A shrink, and a reference, slice or holder still used after it that only
@@ -2019,6 +2132,7 @@ struct LiveShrink {
     TypeExpr *bound = nullptr;
     VarDef *live = nullptr;      // The root of what is still used.
     bool liveexact = true;
+    bool liveprojected = false;
     TypeExpr *pointee = nullptr; // What it points at; null: unknown.
     bool byteview = false;
     bool growonly = false;       // The shrink is §5.1's, else §5.2's.
@@ -2046,6 +2160,11 @@ struct RetRoot {
     bool byteview = false;
     bool freshview = false;    // Prov::freshview.
     bool set = false;          // A non-null return has recorded its root.
+    // The by-value holder parameter every return gives as it was passed,
+    // nothing stored into it since its binding: the result holds what the
+    // argument held (TypeCheck::CallResult). -1 where any return gives
+    // something else.
+    int heldparam = -1;
 };
 
 // A literal parameter's contact with a type (§7.7): what the literal at
@@ -2149,6 +2268,14 @@ struct FnRecord {
     vector<ShrinkOrder> shrinkorders;
     size_t eventstart = 0;         // storeevents.size() when the body's check began.
     size_t eventend = 0;           // And when it ended.
+    // Where those events pointed as the check left them, at the body's
+    // classes: each call maps them afresh, where a call before it left them
+    // mapped for its own arguments (TypeCheck::ApplyCalleeStores).
+    struct BodyEvent {
+        VarDef *container, *root, *src;
+        bool exact, classread;
+    };
+    vector<BodyEvent> bodyevents;
 };
 
 // One monomorphic specialization of a function: the unit of typechecking and
@@ -2339,7 +2466,7 @@ struct Package {
     // its native part (§5), and the rest of its settings.
     string sidecar;
     bool hassidecar = false;
-    vector<string> csources, cincludes;     // Absolute.
+    vector<string> csources, cincludes, cheaders;     // Absolute.
     vector<string> cdefines, cflags_cc, cflags_msvc, clibs;
     string cmake_target;
     vector<string> cmake_options;
@@ -2390,20 +2517,32 @@ struct Ast {
     struct ImportSite { Line line; Line end; string path; };
     vector<ImportSite> imports;
 
-    // The text the terminal shows for d (RenderDiagnostic), the source line
-    // it is on included where `withsource`: an error echoes its line, a
-    // warning does not.
-    string DiagnosticText(const Diagnostic &d, bool withsource) const {
+    // Every namespace alias, `namespace name = target;`, with the file that
+    // declares it and where its target is written: the parser rewrites
+    // `name::x` to `target::x` in that file alone, and the driver checks the
+    // targets once every file is parsed (docs/design/namespaces.md).
+    struct NsAlias { int fileidx; string_view name, target; Line targetline; };
+    vector<NsAlias> nsaliases;
+    // The namespace `name` stands for in a file: an alias's target, else
+    // the name itself.
+    string_view ResolveNsAlias(int fileidx, string_view name) const {
+        for (auto &a : nsaliases)
+            if (a.fileidx == fileidx && a.name == name) return a.target;
+        return name;
+    }
+
+    // The text the terminal shows for d (RenderDiagnostic), with the source
+    // line it is on and a caret under its range.
+    string DiagnosticText(const Diagnostic &d) const {
         auto known = d.where.fileidx >= 0 && d.where.fileidx < (int)sources.size();
         return RenderDiagnostic(d, known ? sources[d.where.fileidx].first : string(),
-                                known && withsource ? string_view(*sources[d.where.fileidx].second)
-                                                    : string_view(),
-                                false);
+                                known ? string_view(*sources[d.where.fileidx].second)
+                                      : string_view());
     }
 
     void Warn(Diagnostic d) {
         d.warning = true;
-        d.text = DiagnosticText(d, false);
+        d.text = DiagnosticText(d);
         Emit(d);
     }
 
@@ -2411,7 +2550,7 @@ struct Ast {
     // as text or through the sink, and kept in `errors`.
     void Report(Diagnostic d) {
         d.warning = false;
-        if (d.text.empty()) d.text = DiagnosticText(d, true);
+        if (d.text.empty()) d.text = DiagnosticText(d);
         errors.push_back(d);
         Emit(d);
     }
@@ -2430,6 +2569,11 @@ struct Ast {
     }
     vector<Package> packages;
     vector<int> filepkg;                                // Per source, its package.
+    bool StdlibFile(int fileidx) const {
+        if (fileidx < 0 || fileidx >= (int)filepkg.size()) return false;
+        auto pkg = filepkg[fileidx];
+        return pkg >= 0 && pkg < (int)packages.size() && packages[pkg].stdlib;
+    }
 
     vector<Node *> allnodes;
     vector<TypeExpr *> alltypes;

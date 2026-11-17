@@ -73,6 +73,7 @@ to a process.
 """
 
 import argparse
+import ctypes
 import json
 import concurrent.futures
 import os
@@ -116,6 +117,11 @@ def debug_fixture(f, line):
     """Whether a fixture also runs with GS_DEBUG: codegen_exec.goose and
     those whose first line asks for it."""
     return f.stem == "codegen_exec" or "runtime-debug" in line
+
+
+def fixture_levels(levels, line):
+    """Selected optimizer regressions exercise O1 as well as the profile levels."""
+    return tuple(sorted(set(levels) | {"1"})) if "all-levels" in line else levels
 
 
 def has_bce_annotations(f):
@@ -760,11 +766,11 @@ class Runner:
         program in-process: --jit with -o."""
         name = f.stem
         res.modules = modules = native_modules(f, self.native)
-        levels = self.levels if self.cc else ()
+        levels = fixture_levels(self.levels, line) if self.cc else ()
         # A native module's fixture runs in-process only where the package
         # is compiled in; the compiler would otherwise build the package.
         available = all(self.native[m] for m in modules)
-        res.jitlevels = jitlevels = ("0", "2") if self.jit and available and \
+        res.jitlevels = jitlevels = fixture_levels(("0", "2"), line) if self.jit and available and \
             "no-jit" not in line else ()
         gen, cfiles = res.gen, res.c
         with self.into(res.cgen):
@@ -819,7 +825,7 @@ class Runner:
         judges the program's TinyCC runs."""
         name = f.stem
         modules = res.modules
-        levels = self.levels if self.cc else ()
+        levels = fixture_levels(self.levels, first_line(f)) if self.cc else ()
         jitlevels, gen, cfiles = res.jitlevels, res.gen, res.c
         if levels:
             with self.into(res.cgen):
@@ -1016,6 +1022,7 @@ class Runner:
         # Guarded base-case inlining: a copy of the body's first statement
         # per self-call site the rewrite took.
         copies = {
+            "gb_callback": 3 if optimized else 1,
             "gb_build": 3 if optimized else 1,
             "gb_walk": 2 if optimized else 1,
             "gb_count": 3 if optimized else 1,
@@ -1069,6 +1076,36 @@ class Runner:
                           f"left out of line: got {name in live}, want {want}")
                 valid = False
         return valid
+
+    def check_abandoned_accumulator(self, level, specs):
+        bodies = {}
+        for spec in specs.split("// spec ")[1:]:
+            match = re.search(r"^fn (\w+)\([^\n]*\) \{\n", spec, re.MULTILINE)
+            if match:
+                bodies[match[1]] = spec[match.end():]
+        optimized = level != "-O0"
+        shapes = {
+            "leave_arg": (False, True),
+            "leave_block": (optimized, True),
+            "leave_mixed": (optimized, True),
+            "leave_sequence": (optimized, True),
+            "safe_block": (optimized, not optimized),
+            "safe_plain_block": (optimized, not optimized),
+        }
+        valid = True
+        for name, want in shapes.items():
+            body = bodies.get(name)
+            got = None if body is None else (
+                bool(re.search(r"\bloop \{", body)),
+                bool(re.search(rf"\b{name}\(", body)),
+            )
+            if got != want:
+                self.fail(f"abandoned-accumulator {level} {name}",
+                          f"(loop, self call): got {got}, want {want}")
+                valid = False
+        return valid
+
+    # --- the Goose-written compiler ---------------------------------------
 
     def goose_in_goose(self, cc, profile, extra, jit):
         """Exercise the compiler as a large program, then execute its output.
@@ -1591,6 +1628,16 @@ def main():
     for lvl in ("-O0", "-O1", "-O2"):
         r.show_task(optimize, lvl)
 
+    def abandoned_accumulator(lvl):
+        code, out, err = r.goose(lvl, "--check", "--specs",
+                                 HERE / "optimizer" / "tre_abandoned_accumulator.goose")
+        if code != 0:
+            r.fail(f"abandoned-accumulator {lvl}", out + err)
+        elif r.check_abandoned_accumulator(lvl, out):
+            r.ok(f"abandoned-accumulator {lvl}")
+    for lvl in ("-O0", "-O1", "-O2"):
+        r.show_task(abandoned_accumulator, lvl)
+
     # The data stack report (--stacks): a program with a worker, whose
     # first-line budget caps the workers at one, a recursive one whose
     # first-line GS_MAX_STACKS the compiler checks the count against, and one
@@ -1627,7 +1674,7 @@ def main():
     ])
 
     # Every annotated regression, including the expected-abort cases. These
-    # describe the default O1 pass; O0/O2 execution checks semantics.
+    # describe the O1 pass; O0/O2 execution checks semantics.
     r.section("bounds-check annotations")
     for f in tests:
         r.show(lambda f=f: fixtures[f].result().bce)
@@ -1656,11 +1703,11 @@ def main():
         # Algebraic properties of the compiler's root domain are easier to
         # exhaust over small abstract states than to express in Goose, and
         # its containers to compare with the standard ones directly.
-        def compiler_unit(name):
+        def compiler_unit(name, sources=(), flags=()):
             out_exe = gendir / f"{name}{tc.EXE_SUFFIX}"
-            ok, log = cc.compile(HERE / f"{name}.cpp", out_exe, cpp=True,
+            ok, log = cc.compile([HERE / f"{name}.cpp", *sources], out_exe, cpp=True,
                                  opt=2 if args.profile == "baseline" else 1,
-                                 extra=extra, log=gendir / f"{name}.cc.log")
+                                 extra=[*extra, *flags], log=gendir / f"{name}.cc.log")
             if not ok:
                 r.fail(f"compiler-cc {name}", log)
             else:
@@ -1671,6 +1718,10 @@ def main():
                     r.ok(f"compiler {name}")
         for name in ("compiler_roots", "compiler_containers"):
             r.show_task(compiler_unit, name)
+        r.show_task(compiler_unit, "compiler_process",
+                    [HERE.parent / "src" / name for name in ("process.cpp", "progress.cpp")],
+                    [("/I" if cc.style == "msvc" else "-I") +
+                     str(HERE.parent / "third_party" / "subprocess")])
 
         # Direct runtime lifecycle checks use small region limits and allocator
         # instrumentation that cannot be expressed by a Goose program. Keep
@@ -1689,6 +1740,31 @@ def main():
                     r.ok(f"runtime {name}")
         r.show_task(runtime_lifecycle, "runtime_threads_lifecycle", "threads")
         r.show_task(runtime_lifecycle, "runtime_trim_memory", "runtime")
+
+        # A library build's C host: goose_exit ends the program and goose_init
+        # starts it again over fresh globals and queues, and ending it while a
+        # worker still runs is a runtime error.
+        def host_exit():
+            src = HERE / "threads" / "host_exit.goose"
+            cfile = gendir / "host_exit.c"
+            code, out, err = r.goose("-O1", "--header", gendir / "host_exit.h", "-o", cfile, src)
+            if code != 0:
+                r.fail("host-exit cgen host_exit.goose", out + err)
+                return
+            # Beside the header it includes.
+            host = gendir / "host_exit_main.c"
+            shutil.copyfile(HERE / "threads" / "host_exit.c", host)
+            out_exe = gendir / f"host_exit{tc.EXE_SUFFIX}"
+            ok, log = cc.compile([host, cfile], out_exe, opt=1, extra=extra, strict_decls=True,
+                                 runtime=r.runtime, log=gendir / "host_exit.cc.log")
+            if not ok:
+                r.fail("host-exit cc host_exit", "\n".join(log.splitlines()[:8]))
+                return
+            for name, argv in (("host_exit_c", []), ("host_exit_live", ["live"])):
+                out = r.run_expected([out_exe] + argv, name, name)
+                if out is not None and r.check_stdout(name, name, out):
+                    r.ok(f"host {name}")
+        r.show_task(host_exit)
 
         # The same coverage test through clang, release and debug. A compiler
         # that accepts more C than the standard does is not what checks the
@@ -1817,6 +1893,17 @@ def main():
         code, out, err = tc.run_capture([exe, "check", "--stack-reserve", "5000", probe])
         checks.append(("check --stack-reserve 5000 (refused)",
                        code == 1 and "from 64 KB" in err, out + err))
+        # --no-bce warns that the program's checkfree functions go unverified,
+        # and not about the standard library's.
+        nobce = gendir / "verbs_nobce.goose"
+        tc.write_text(nobce, "import std;\nfn main() { print(min(1, 2)); }\n")
+        code, out, err = tc.run_capture([exe, "check", "--no-bce", nobce])
+        checks.append(("check --no-bce, std's checkfree", code == 0 and not out and not err, out + err))
+        tc.write_text(nobce, "import std;\ncheckfree fn f(x: i64) -> i64 { min(x, 2) }\n"
+                             "fn main() { print(f(1)); }\n")
+        code, out, err = tc.run_capture([exe, "check", "--no-bce", nobce])
+        checks.append(("check --no-bce, a checkfree fn", code == 0 and
+                       "checkfree is not verified under --no-bce" in err, out + err))
         # The help: `goose --help` on the commands, `goose <command> --help`
         # and `goose help <topic>` on each, which between them name every
         # option the driver reads, but for the hidden shader ones.
@@ -1887,9 +1974,13 @@ def main():
         nowhere = gendir / "nowhere"
         nowhere.mkdir(exist_ok=True)
         env = {k: v for k, v in os.environ.items()
-               if k.upper() not in ("GOOSE_CC", "PATH", "PROGRAMFILES(X86)")}
-        # Nothing on PATH, and no Visual Studio where vswhere would be.
+               if k.upper() not in ("GOOSE_CC", "PATH", "PROGRAMFILES", "PROGRAMW6432",
+                                     "PROGRAMFILES(X86)")}
+        # Nothing on PATH, no Visual Studio where vswhere would be, and no
+        # LLVM where its installer puts it. Windows gives a 64-bit process
+        # ProgramFiles from ProgramW6432, so that one is hidden too.
         env.update({"PATH": str(nowhere), "GOOSE_HOME": str(nowhere / "home"),
+                    "PROGRAMFILES": str(nowhere), "PROGRAMW6432": str(nowhere),
                     "PROGRAMFILES(X86)": str(nowhere)})
         nocc = subprocess.run([str(exe), "toolchain"], capture_output=True, text=True,
                               errors="replace", env=env)
@@ -1917,6 +2008,81 @@ def main():
                 good = code == 0 and out2.strip() == "verbs"
                 out, err = out + out2, err + err2
             checks.append(("build", good, out + err))
+
+            shared_src = gendir / "verbs_shared.goose"
+            tc.write_text(shared_src,
+                          'export "goose_add" fn add(a: i32, b: i32) -> i32 { a + b }\n')
+            shared_suffix = ".dll" if tc.IS_WINDOWS else ".dylib" if tc.IS_MACOS else ".so"
+            shared_out = gendir / ("verbs_shared" + shared_suffix)
+            code, out, err = tc.run_capture(
+                [exe, "build", "--shared", "-o", str(shared_out), shared_src])
+            good = code == 0 and shared_out.exists()
+            detail = out + err
+            if good:
+                try:
+                    lib = ctypes.CDLL(str(shared_out.resolve()))
+                    lib.goose_init.argtypes = [ctypes.c_int,
+                                               ctypes.POINTER(ctypes.c_char_p)]
+                    lib.goose_init.restype = None
+                    lib.goose_add.argtypes = [ctypes.c_int32, ctypes.c_int32]
+                    lib.goose_add.restype = ctypes.c_int32
+                    lib.goose_exit.argtypes = []
+                    lib.goose_exit.restype = None
+                    lib.goose_init(0, None)
+                    good = lib.goose_add(20, 22) == 42
+                    lib.goose_exit()
+                except (AttributeError, OSError) as e:
+                    good = False
+                    detail += str(e)
+            checks.append(("build --shared", good, detail))
+
+            # A shared build can also emit the C host header. Exercise the
+            # documented host surface and make sure the declarations are there.
+            shared_header = gendir / "verbs_shared.h"
+            shared_header_out = gendir / ("verbs_shared_header" + shared_suffix)
+            code, out, err = tc.run_capture(
+                [exe, "build", "--shared", "--header", str(shared_header),
+                 "-o", str(shared_header_out), shared_src])
+            good = code == 0 and shared_header_out.exists() and shared_header.exists()
+            detail = out + err
+            if good:
+                header_text = shared_header.read_text(encoding="utf-8", errors="replace")
+                good = all(name in header_text
+                           for name in ("goose_init", "goose_exit", "goose_add"))
+            checks.append(("build --shared --header", good, detail))
+
+            # Without -o, the platform's normal shared-library spelling is used.
+            default_src = gendir / "verbs_shared_default.goose"
+            tc.write_text(default_src,
+                          'export "goose_add" fn add(a: i32, b: i32) -> i32 { a + b }\n')
+            default_out = gendir / (
+                "verbs_shared_default.dll" if tc.IS_WINDOWS else
+                "libverbs_shared_default.dylib" if tc.IS_MACOS else
+                "libverbs_shared_default.so")
+            if default_out.exists():
+                default_out.unlink()
+            code, out, err = tc.run_capture([exe, "build", "--shared", default_src])
+            checks.append(("build --shared default output",
+                           code == 0 and default_out.exists(), out + err))
+
+            # Shared-library mode, like --header, requires something for the
+            # host to call.
+            no_export = gendir / "verbs_shared_no_export.goose"
+            tc.write_text(no_export, "fn helper() -> i32 { 1 }\n")
+            no_export_out = gendir / ("verbs_shared_no_export" + shared_suffix)
+            code, out, err = tc.run_capture(
+                [exe, "build", "--shared", "-o", str(no_export_out), no_export])
+            checks.append(("build --shared without export (refused)",
+                           code == 1 and
+                           "--header and --shared require at least one export fn"
+                           in out + err,
+                           out + err))
+
+            code, out, err = tc.run_capture([exe, "check", "--shared", probe])
+            checks.append(("check --shared (refused)",
+                           code == 1 and "--shared is an option of goose build" in err,
+                           out + err))
+
             dry = gendir / ("verbs_dry" + tc.EXE_SUFFIX)
             code, out, err = tc.run_capture([exe, "build", "--dry-run", "-o", str(dry), probe])
             checks.append(("build --dry-run", code == 0 and not dry.exists() and
@@ -1948,10 +2114,31 @@ def main():
             check_cli_paths(exe, cc, gendir)
             r.ok("command line paths: new -o directories, \".\" and \"..\" sources, rooted "
                  "--include, unresolved imports, a directory as a source or an embed_file, "
-                 "no standard library, no runtime sources")
+                 "the configured standard library, no runtime sources")
         except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
             r.fail("command line paths", str(e))
     r.show_task(cli_paths)
+
+    def emit_order():
+        from emit_order import check_emit_order
+        try:
+            n = check_emit_order(HERE.parent / "src")
+            r.ok(f"emit order: no two of the code generator's {n} emitting members in one "
+                 "unsequenced expression, so the C it writes is the same whichever C++ "
+                 "compiler built it")
+        except RuntimeError as e:
+            r.fail("emit order", str(e))
+    r.show_task(emit_order)
+
+    def deep_expressions():
+        from deep_expressions import check_deep_expressions
+        try:
+            check_deep_expressions(exe, cc, gendir)
+            r.ok("deep expressions: sums thousands of terms long, written as C a compiler "
+                 "takes, run" + (" and built" if cc else "") + ", operands still in order")
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+            r.fail("deep expressions", str(e))
+    r.show_task(deep_expressions)
 
     def diagnostics_json():
         from diagnostics_json import check_diagnostics_json
@@ -2085,7 +2272,8 @@ def main():
         try:
             check_runtime_io(exe, gendir, jit=jit)
             r.ok("runtime io: stdin's bytes as they came, read_line into a builder holding a "
-                 "carriage return, write_file_atomic keeping a file's permissions")
+                 "carriage return, a NUL byte and a 70,000-byte line, write_file_atomic "
+                 "keeping a file's permissions")
         except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
             r.fail("runtime io", str(e))
     if cc:
@@ -2113,6 +2301,19 @@ def main():
             r.fail("huge pages", str(e))
     if cc:
         r.show_task(huge_pages)
+
+    def libm_calls():
+        from libm_calls import check_libm_calls
+        try:
+            skipped = check_libm_calls(exe, [cc, clang], gendir)
+            if skipped:
+                r.say(f"skip libm calls ({skipped})")
+            else:
+                r.ok("libm calls: math's functions known to gcc and clang as libm's")
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+            r.fail("libm calls", str(e))
+    if cc or clang:
+        r.show_task(libm_calls)
 
     def commit_limit():
         from commit_limit import check_commit_limit

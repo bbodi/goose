@@ -5,7 +5,8 @@ have printed; the progress lines go to stderr. Checks the two modes agree, and
 the places: a lexer error's column is its caret's, the errors after a raw
 string the lexer rejected are at their own lines, a typecheck error ranges
 over the node it is at with its instantiation chain at the calls, a warning
-has a range too, an import error covers the whole import, a checkfree
+has a range too, the text of either shows its source line with a `^~~` under
+that range, an import error covers the whole import, a checkfree
 function's kept checks are several errors at once, and an error with no
 place in the program is reported as its text alone."""
 import json
@@ -116,12 +117,29 @@ def check_diagnostics_json(exe, base):
                 diags[0]["endLine"] == 1 and
                 diags[0]["endCol"] == lines[0].index("a.nope") + 1 + len("a.nope"),
                 "typecheck error over its node", err + "\n" + json.dumps(diags))
+        require(err.splitlines()[1:3] ==
+                [lines[0], " " * lines[0].index("a.nope") + "^" + "~" * (len("a.nope") - 1)],
+                "a typecheck error's source line and caret", err)
         related = diags[0].get("related", [])
         require(len(related) == 2 and "instantiated from chain.goose:4" in related[0]["message"]
                 and related[0]["file"] == "chain.goose" and related[0]["line"] == 4 and
                 related[0]["col"] == lines[3].index("get(1)") + 1 and
                 related[1]["line"] == 3,
                 "the instantiation chain at its calls", json.dumps(diags))
+
+        library = ("import slot_pool;\n"
+                   "struct Node { next: Node&<u32>? }\n"
+                   "fn main() {\n"
+                   "    var pool = slot_pool<Node> {};\n"
+                   "    pool.alloc_ref(Node { null });\n"
+                   "}\n")
+        diags, err = both("library.goose", library)
+        require(len(diags) == 1 and diags[0]["line"] == 5 and
+                "contains self-relative references" in diags[0]["message"] and
+                any(r["file"].endswith("slot_pool.goose") and
+                    r["message"] == "while checking this standard library expression"
+                    for r in diags[0].get("related", [])),
+                "stdlib errors point to the user's call and retain the definition", err)
 
         # A warning, with the program accepted.
         warn = ("fn main() {\n"
@@ -136,6 +154,9 @@ def check_diagnostics_json(exe, base):
                 diags[0]["line"] == 3 and diags[0]["col"] == lines[2].index("x as i64") + 1 and
                 diags[0]["endCol"] == lines[2].index("x as i64") + 1 + len("x as i64"),
                 "a warning over its cast", err + "\n" + json.dumps(diags))
+        require(err.splitlines()[1:] ==
+                [lines[2], " " * lines[2].index("x as i64") + "^" + "~" * (len("x as i64") - 1)],
+                "a warning's source line and caret", err)
 
         # An import error, over the whole import.
         diags, err = both("imp.goose", "import no_such_module;\nfn main() {}\n")

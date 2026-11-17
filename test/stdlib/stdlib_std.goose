@@ -6,9 +6,15 @@ import std;
 fn scalars() {
     print(min(3, 7), " ", max(3, 7), " ", clamp(15, 0, 10), " ", clamp(-2, 0, 10));   // 3 7 10 0
     print(abs(-4), " ", abs(-2.5), " ", abs(1.5));                                     // 4 2.5 1.5
+    let nz: f64 = -0.0;
+    let nzf: f32 = -0.0;
+    print(abs(nz), " ", abs(nzf), " ", 1.0 / abs(nz), " ", 1.0 / abs(nzf));              // 0.0 0.0 inf inf
     print(sign(-9), " ", sign(0), " ", sign(4), " ", sign(-0.5), " ", sign(2.0));        // -1 0 1 -1.0 1.0
     print(lerp(0.0, 10.0, 0.25));                                                      // 2.5
-    print(next_pow2(0), " ", next_pow2(1), " ", next_pow2(5), " ", next_pow2(64));     // 1 1 8 64
+    let max_pow2: i64 = 1 << 62;
+    print(next_pow2(-10), " ", next_pow2(0), " ", next_pow2(1), " ", next_pow2(5), " ",
+          next_pow2(64));                                                              // 1 1 1 8 64
+    print(next_pow2(max_pow2 - 1) == max_pow2, " ", next_pow2(max_pow2) == max_pow2);  // true true
     print(popcount(255), " ", popcount(0), " ", clz(1), " ", ctz(8), " ", clz(0));      // 8 0 63 3 64
     let top: u64 = 0x8000000000000000;
     let ones: u64 = 0xffffffffffffffff;
@@ -134,6 +140,76 @@ fn random() {
     print(low > 19400 && low < 20600);                // true
 }
 
+// The fixed-seed draws follow splitmix64 and rand_int's rejection by hand
+// (or in a few lines of Python with 64-bit masks).
+fn random_helpers() {
+    var r = rng { 1 };
+    var a: i64[8];
+    for i in 8 { a[i] = r.rand_range(-10, 21); }
+    // -8 -3 5 4 2 -8 -10 -7
+    print(a[0], " ", a[1], " ", a[2], " ", a[3], " ", a[4], " ", a[5], " ", a[6], " ", a[7]);
+    // Without lo, rand_range starts at 0 and draws as rand_int does.
+    var b = rng { 2 };
+    var c = rng { 2 };
+    var same_int = true;
+    for i in 100 { if b.rand_range(7) != c.rand_int(7) { same_int = false; } }
+    print(same_int);                                  // true
+    // rand_f32 is the top 24 bits over 2^24, exactly.
+    var f = rng { 3 };
+    let f0 = (f.rand_f32() * 16777216.0) as i64;
+    let f1 = (f.rand_f32() * 16777216.0) as i64;
+    let f2 = (f.rand_f32() * 16777216.0) as i64;
+    print(f0, " ", f1, " ", f2);                      // 1903380 11748975 10284008
+    var g = rng { 4 };
+    print(g.rand_range(-4611686018427387904, 9223372036854775807));   // 3347269030627216074
+
+    // Bounds: a negative lo, a size of 1, the top of i64, a huge size.
+    var ok = true;
+    var seen = [false, false, false];
+    for i in 1000 {
+        let v = r.rand_range(-5, 3);
+        if v < -5 || v > -3 { ok = false; } else { seen[v + 5] = true; }
+        if r.rand_range(-7, 1) != -7 { ok = false; }
+        let t = r.rand_range(9223372036854775806, 2);
+        if t < 9223372036854775806 { ok = false; }
+        let h = r.rand_range(-9223372036854775807 - 1, 9223372036854775807);
+        if h == 9223372036854775807 { ok = false; }
+        let x = r.rand_f32();
+        if x < 0.0 || x >= 1.0 { ok = false; }
+        if x * 16777216.0 != (x * 16777216.0) as i64 { ok = false; }
+    }
+    print(ok, " ", seen[0] && seen[1] && seen[2]);   // true true
+    var low_ok = true;
+    for i in 1000 {
+        let v = r.rand_range(3);
+        if v < 0 || v > 2 { low_ok = false; }
+    }
+    print(low_ok);                                    // true
+
+    // rand_gaussian: the same seed gives the same draws, and 100000 of them
+    // have mean 0 and variance 1 (standard errors 0.0032 and 0.0045), with
+    // 68.3% inside one standard deviation.
+    var n1 = rng { 99 };
+    var n2 = rng { 99 };
+    var same = true;
+    for i in 10 { if n1.rand_gaussian() != n2.rand_gaussian() { same = false; } }
+    print(same);                                      // true
+    let n = 100000;
+    var sum = 0.0;
+    var sum_sq = 0.0;
+    var inside = 0;
+    for i in n {
+        let z = n1.rand_gaussian();
+        sum += z;
+        sum_sq += z * z;
+        if z > -1.0 && z < 1.0 { inside += 1; }
+    }
+    let mean = sum / n;
+    let variance = sum_sq / n - mean * mean;
+    print(abs(mean) < 0.02, " ", abs(variance - 1.0) < 0.03, " ",
+          inside > 67300 && inside < 69300);          // true true true
+}
+
 fn searching() {
     let xs = [5, 3, 9, 1, 7];
     var s = 0;
@@ -143,6 +219,12 @@ fn searching() {
     var tot = 0;
     each_chunk(xs, 2) { c, i => chunks += 1; tot += c.len * (i + 1); };
     print(chunks, " ", tot);                                                   // 3 9
+    var big_chunks = 0; // chunk size larger than slice, 1 chunk containing all elements
+    each_chunk(xs, 10) { c, i => big_chunks += 1; assert(c.len == xs.len); };
+    assert(big_chunks == 1);
+    var empty_chunks = 0; // empty slice, run 0 times
+    each_chunk(xs[..0], 2) { c, i => empty_chunks += 1; };
+    assert(empty_chunks == 0);
     let f = find(xs) { it > 6 };
     if f { print(f); }                                                         // 9
     print(find_index(xs) { it == 1 }, " ", find_index(xs) { it == 2 });        // 3 -1
@@ -157,6 +239,10 @@ fn searching() {
     print(p, " ", found);                                                      // 3 true
     let q, found2 = binary_search(sorted, 4);
     print(q, " ", found2);                                                     // 2 false
+    let desc = [10, 8, 6, 4, 2];
+    let r, found3 = binary_search(desc, 8) {a, b => b < a};
+    let s, found4 = binary_search(desc, 5) { a, b => b < a };
+    print(r, " ", found3, " ", s, " ", found4);                                // 1 true 3 false
     print(find("hello world", "o w"), " ", rfind("hello world", "o"), " ", find("abc", "x"));   // 4 7 -1
     print(find("aab", "ab"), " ", rfind("abab", "ab"), " ", find("ab", ""), " ", rfind("ab", ""),
           " ", find("a", "ab"));                                               // 1 2 0 2 -1
@@ -213,6 +299,21 @@ fn inplace() {
     print(lo);                                                                 // hello world
     to_upper(lo);
     print(lo);                                                                 // HELLO WORLD
+    var lower: u8[258] = [0; 258];
+    var upper: u8[258] = [0; 258];
+    for i in 256 { lower[i + 1] = i as u8; upper[i + 1] = i as u8; }
+    lower[0] = 'A'; lower[257] = 'Z';
+    upper[0] = 'a'; upper[257] = 'z';
+    to_lower(lower[1..257]);
+    to_upper(upper[1..257]);
+    for i in 256 {
+        assert(lower[i + 1] == (if i >= 65 && i <= 90 { i + 32 } else { i }) as u8);
+        assert(upper[i + 1] == (if i >= 97 && i <= 122 { i - 32 } else { i }) as u8);
+    }
+    assert(lower[0] == 'A' && lower[257] == 'Z');
+    assert(upper[0] == 'a' && upper[257] == 'z');
+    to_lower(lower[1..1]);
+    to_upper(upper[1..1]);
 }
 
 fn lengths() {
@@ -265,12 +366,50 @@ fn strings() {
     f.push(' ');
     format_flt(f, 0.005, 2);
     print(f);                                                                  // 3.14 -3 0.01
+    // The exact value rounds, not x * 10^d: 0.49999999999999994 is below a
+    // half, 1e19 and 1.8e19 scale past 2^63, 0.1 has its binary digits at
+    // 25 places, and 5e-324 is the smallest subnormal.
+    var g: u8[>..] = [];
+    format_flt(g, 0.49999999999999994, 0);
+    g.push(' ');
+    format_flt(g, 1e19, 1);
+    g.push(' ');
+    format_flt(g, -1.8e19, 0);
+    g.push(' ');
+    format_flt(g, 0.1, 25);
+    g.push(' ');
+    format_flt(g, 9.995, 2);
+    g.push(' ');
+    format_flt(g, 999.9996, 3);
+    g.push(' ');
+    format_flt(g, 5e-324, 2);
+    print(g);   // 0 10000000000000000000.0 -18000000000000000000 0.1000000000000000055511151 9.99 1000.000 0.00
+    var h: u8[>..] = [];
+    format_flt(h, 5e-324, 330);
+    print(h.len, " ", h[h.len - 7..]);                                         // 332 4940656
+    h.resize(0);
+    format_flt(h, 1.7976931348623157e308, 0);
+    print(h.len, " ", h[..10]);                                                // 309 1797693134
+    let negzero: f64 = -0.0;
+    h.resize(0);
+    format_flt(h, negzero, 0);
+    h.push(' ');
+    format_flt(h, negzero, 2);
+    h.push(' ');
+    format_flt(h, negzero, 20);
+    h.push(' ');
+    format_flt(h, 0.0, 2);
+    print(h);                                                                  // -0 -0.00 -0.00000000000000000000 0.00
     let v, ok = parse_int("-123");
     print(v, " ", ok);                                                         // -123 true
     let v2, ok2 = parse_int("12x");
     print(v2, " ", ok2);                                                       // 0 false
     let v3, ok3 = parse_int("ff", 16);
     print(v3, " ", ok3);                                                       // 255 true
+    let u, oku = parse_uint("18446744073709551615");
+    print(u, " ", oku);                                                        // 18446744073709551615 true
+    let u2, oku2 = parse_uint("-1");
+    print(u2, " ", oku2);                                                      // 0 false
     let fl, okf = parse_flt("-1.5e2");
     print(fl, " ", okf);                                                       // -150.0 true
     let fl2, okf2 = parse_flt("abc");
@@ -278,6 +417,33 @@ fn strings() {
     // 2^53 + 1 takes 54 bits: the mantissa rounds (to even) as it converts.
     let fl3, okf3 = parse_flt("9007199254740993");
     print(fl3 == 9007199254740992.0, " ", okf3);                               // true true
+    // print and format write the non-finite values as inf, -inf and nan, and
+    // parse_flt reads exactly those spellings back.
+    let pinf, piok = parse_flt("inf");
+    let ninf, niok = parse_flt("-inf");
+    let pnan, pnok = parse_flt("nan");
+    print(pinf, " ", ninf, " ", pnan, " ", piok, " ", niok, " ", pnok);        // inf -inf nan true true true
+    let ri, riok = parse_flt(str(pinf));
+    let rni, rniok = parse_flt(str(ninf));
+    let rn, rnok = parse_flt(str(pnan));
+    print(riok, " ", rniok, " ", rnok, " ", ri == pinf, " ", rni == ninf,
+          " ", rn != rn);                                                      // true true true true true true
+    var fb: u8[>..] = [];
+    format(fb, pinf);
+    let fi, fiok = parse_flt(fb);
+    fb.resize(0);
+    format(fb, ninf);
+    let fni, fniok = parse_flt(fb);
+    fb.resize(0);
+    format(fb, pnan);
+    let fnan, fnanok = parse_flt(fb);
+    print(fiok, " ", fniok, " ", fnanok, " ", fi == pinf, " ", fni == ninf,
+          " ", fnan != fnan);                                                  // true true true true true true
+    // Only the spellings above, not strtod's wider set.
+    for bad in ["in", "infx", "infinity", "Inf", "-nan", "nanx", "nan(x)"] {
+        let bv, bok = parse_flt(bad);
+        assert(!bok && bv == 0.0);
+    }
     print(compare("abc", "abd"), " ", compare("b", "a"), " ", compare("a", "a"), " ",
           compare("ab", "abc"));                                               // -1 1 0 -1
     print(trim("  hi \n"), "|", trim_start("  x"), "|", trim_end("y  "), "|");   // hi|x|y|
@@ -296,6 +462,29 @@ fn strings() {
     print(over.len, " ", over[0].len, " ", over[1]);                           // 2 0 a
     let whole = split("a b", "");
     print(whole.len, " ", whole[0]);                                           // 1 a b
+    let key, value, kv = split_once("k=v=w", '=');
+    print(key, "|", value, "|", kv);                                           // k|v=w|true
+    let ka, va, okc = split_once("a::b::c", "::");
+    print(ka, "|", va, "|", okc);                                              // a|b::c|true
+    let nf, nfa, nfok = split_once("abc", "x");
+    print(nf, "|", nfa.len, "|", nfok);                                        // abc|0|false
+    let nb, nba, nbok = split_once("abc", 'x');
+    print(nb, "|", nba.len, "|", nbok);                                        // abc|0|false
+    let lead, rest, lok = split_once("=x", '=');
+    print(lead.len, "|", rest, "|", lok);                                      // 0|x|true
+    let body, tail, tok = split_once("ab--", "--");
+    print(body, "|", tail.len, "|", tok);                                      // ab|0|true
+    let es, esa, esok = split_once("", ',');
+    let es2, esa2, esok2 = split_once("", "--");
+    print(es.len, esa.len, esok, " ", es2.len, esa2.len, esok2);               // 00false 00false
+    let eb, ea, eok = split_once("ab", "");
+    print(eb, "|", ea.len, "|", eok);                                          // ab|0|false
+    let lng, lnga, lngok = split_once("ab", "abc");
+    print(lng, "|", lnga.len, "|", lngok);                                     // ab|0|false
+    var buf: u8[>..] = [];
+    format(buf, "name: goose");
+    let bk, bv, bok = split_once(buf, ": ");
+    print(bk, "|", bv, "|", bok);                                              // name|goose|true
     var line: u8[>..] = [];
     format(line, "  take \t the\r\nsword  ");
     let cmd = words(line);
@@ -325,6 +514,7 @@ fn main() {
     scalars();
     hashing();
     random();
+    random_helpers();
     searching();
     transforming();
     inplace();

@@ -1,8 +1,10 @@
 3 7 10 0
 4 2.5 1.5
+0.0 0.0 inf inf
 -1 0 1 -1.0 1.0
 2.5
-1 1 8 64
+1 1 1 8 64
+true true
 8 0 63 3 64
 64 0 63 64 0
 2 1
@@ -24,6 +26,14 @@ true
 true
 1 8 8
 true
+-8 -3 5 4 2 -8 -10 -7
+true
+1903380 11748975 10284008
+3347269030627216074
+true true
+true
+true
+true true true
 71935
 3 9
 9
@@ -35,6 +45,7 @@ true true false 3
 3
 3 true
 2 false
+1 true 3 false
 4 7 -1
 1 2 0 2 -1
 3 3 -1
@@ -65,12 +76,21 @@ HELLO WORLD
     ff|-0042|00000101
 -007|ff
 3.14 -3 0.01
+0 10000000000000000000.0 -18000000000000000000 0.1000000000000000055511151 9.99 1000.000 0.00
+332 4940656
+309 1797693134
+-0 -0.00 -0.00000000000000000000 0.00
 -123 true
 0 false
 255 true
+18446744073709551615 true
+0 false
 -150.0 true
 false
 true true
+inf -inf nan true true true
+true true true true true true
+true true true true true true
 -1 1 0 -1
 hi|x|y|
 4 ac 0
@@ -79,6 +99,16 @@ hi|x|y|
 5 xyz 00
 2 0 a
 1 a b
+k|v=w|true
+a|b::c|true
+abc|0|false
+abc|0|false
+0|x|true
+ab|0|true
+00false 00false
+ab|0|false
+ab|0|false
+name|goose|true
 3 take|the|sword
 true 0 0
 25

@@ -1,5 +1,11 @@
 # The Goose compiler: implementation notes
 
+> **Deprecated language features:** `reusable` and `reusable[]`. Use
+> [`slot_pool<T>`](stdlib.md#slot_pool) for slots and
+> [`slice_pool<T>`](stdlib.md#slice_pool) for contiguous runs.
+> Builtin behavior and historical examples below remain relevant to existing
+> code; removal is planned separately, after the remaining migration gaps.
+
 <details>
 <summary>Table of contents</summary>
 
@@ -99,7 +105,9 @@ in `main.cpp`). The typechecker recurses as deep as the program's
 compile-time call path (§3.1 below), and the platforms' main threads get
 anything from 1 MB (Windows) to 8 MB (Linux and macOS by default). The stack
 is reserved address space, committed only as deep as a compile goes. A JIT
-run starts the program back on the main thread, because macOS only lets a
+run has TinyCC compile the C on such a thread as well (`CompileJit` in
+`jit.h`), since TinyCC's parser recurses as deep as the C nests, and starts
+the program back on the main thread (`RunJit`), because macOS only lets a
 window be created on the main thread. On Windows and macOS the link also
 reserves 64 MB for the main thread's stack (`CMakeLists.txt`). On Linux the
 main thread has the stack limit the process started with (`ulimit -s`),
@@ -190,6 +198,12 @@ operators can line up under its first operand; and the tokens on a line
 spaced by `format::Space`, with a space wherever two tokens written
 together would lex as something else. Trailing comments keep their column,
 moved with their line; a run of them that shared a column shares one still.
+A table is lined up as gofmt lines one up: on consecutive lines at one depth
+and indentation that each declare a name with its type (`[const|let|var|...]
+name: type [= value]`, a struct's fields, a literal's `name: value`s) after
+the same keywords, the types start one space past the longest name, and a
+run of `=`s one space past the longest type. `Layout` finds these cells in
+a first pass of `Lines` and pads them in a second.
 Before the result is used, `CheckSame` lexes both texts (the same tokens,
 but for a comma before a closing bracket, and the same comments but for
 their whitespace) and parses both (the same `Ast::Dump` and `DumpDocs`).
@@ -411,9 +425,9 @@ location (`DiagLoc`) records the file and the diagnostic's start and end. For a
 node, `LocOf` starts at its earliest token on the anchor's line and ends at the
 node's end. The related lines show the instantiation chain
 (`TypeCheck::InstantiationChain`), with each entry located at the call it names.
-`RenderDiagnostic` produces the terminal output: `file:line: error: message`,
-the source line for an error, and the related lines. Lexer errors also get a
-caret under their column.
+`RenderDiagnostic` produces the terminal output: `file:line: error: message`
+(or `warning:`), the source line, a caret under the column with `~` to the
+end where that is on the same line, and the related lines.
 
 A `CompileError` carries both the text and the data (several diagnostics
 for a `checkfree` function's kept checks, `BCE::CheckfreeError`), and ends
@@ -712,8 +726,8 @@ distinguishes a scope from a later one at the same index. `blockpos` keeps
 the statement index of every open block, which the shrink rules' liveness
 scan (§3.10) reads.
 
-**Diagnostics.** `TypeCheck::Error` appends the offending source line and
-the instantiation chain: every real frame from innermost outward, with the
+**Diagnostics.** `TypeCheck::Error` appends the offending source line, a
+caret under the node, and the instantiation chain: every real frame from innermost outward, with the
 specialization's argument types (literal parameters marked) and the call
 site it was instantiated from (§7.7). The argument types show the binding
 of every type variable that a parameter type names. The rest of `bindings`
@@ -761,14 +775,16 @@ type once per argument list (cached on the `TypeStruct`/`TypeEnum` detail
 and searched by argument equality for clones), substitute the field types,
 validate them, and compute the derived properties every later pass reads:
 
-* the **size class** (`ClassOf`). A resizable field must be last, with no
+* the **size class** (`ClassOf`). An explicit `root struct`
+  (`SStruct::isroot`) is `SC_ROOT` regardless of its fields. In an ordinary
+  struct, a resizable field must be last, with no
   padding after it, and makes the struct resizable. This also applies to a
   payload's resizable field. Any variable-class part makes the type
   variable-class; `varint` fields and varint-width relative references are
   variable-class. A limited array is fixed with a static capacity and variable
   with `[..]`. A fixed-mode enum is fixed; a variable-mode enum uses its
   `varclass`;
-* `flat` (no references anywhere), what threads and queues require;
+* `flat` (no references anywhere, and never a root owner), what threads and queues require;
 * `frameobj` (C.2): a resizable-tailed struct whose other fields are all
   fixed-size and free of relative references, and whose tail is an array or
   itself a frame object. This is the shape that the backend keeps in the frame
@@ -818,6 +834,62 @@ payload that is not itself resizable holds self-relative references. It
 does so at the enum's declaration, once all variants are built. A
 resizable payload, which the backend does not bind at all yet, is left
 alone.
+
+**Root owners and component regions.** Root ownership is valid only at a local
+or global declaration, with an immediate literal initializer (including the
+default initializer of a typed global). `ValidateType` forbids by-value
+containment, arguments and results; construction, assignment, copy, image,
+equality, FFI and worker checks reject operations requiring a whole value.
+References remain ordinary reference types. Recursive-cycle checks use
+`NeedsCycleStack`: a root with nonfixed components needs dynamic stacks, while
+an all-fixed root does not.
+
+`RootComponent` gives each field a synthetic `VarDef`, sharing its owner's
+scope, depth and lifetime but with an independent storage identity. Local
+components participate in the ordinary variable/effect machinery; global
+components are explicitly included in storage candidates and global shrink
+checks. `componentowner`, `componentbase` and `componentfield` identify the
+projection, preserved across loop rechecks and optimizer remapping. The
+descriptor's own region does not contain the component storage (`CanContain`).
+Ordinary packed fields within a component still share that component's region.
+
+A parameter class can also have component projections, without a concrete
+storage type. `ProjectRoots`, `ProjectClass` and `MapClass` carry these paths
+through calls, returns and external growth/shrink/store summaries. Specialization
+keys record when a separate argument is one of another argument's root fields
+(`RootArg::ownerparam`/`ownerfield`). Recursive back edges map every parameter
+sharing a class, and newly discovered component projections inherit earlier
+class uses. Following a stored owner reference collapses the lifetime bound
+back to the enclosing class, so linked owners do not produce infinitely deep
+synthetic paths.
+
+`RootAlt::projected` proves that a view is inside a particular root field's
+own region even when the owner instance is only lifetime-bounded. It permits
+excluding sibling fields without claiming exact owner identity. Joins keep the
+proof only when both alternatives have it, weakening removes it, and reading
+an ordinary reference out of the component loses it. Self-relative reads stay
+within the region. `LiveShrink` carries the same proof across calls; the root
+domain tests cover its join laws. Holders have per-component store records,
+including reference-valued fields, and a whole-owner traversal visits those
+records. An alias of the descriptor must not conceal references stored in its
+components.
+
+The C backend binds every component through the existing local/global storage
+path and constructs a private descriptor of component references. Fixed fields
+use pointers, variable fields their byte representation, and resizables their
+usual header and stack reference. Direct projections use component locations;
+whole-owner references use a descriptor pointer. Reference-valued fields need
+the address of their reference slot in the descriptor. Allocation, partial
+construction and all scope exits use ordinary component watermarks. Captures
+and mutable receivers preserve the existing sampling order.
+
+Immutable exact owner parameters cache component tops and lengths when their
+storage is distinct from other arguments and globals. Potentially aliased
+owner/owner, owner/array and owner/global paths use the shared memory top.
+Call synchronization accounts for all stacks reached through root arguments
+and captures; array-view hoisting recognizes component projections. Generated
+C checks exercise these decisions. See [the design and measurements](design/root_structs.md)
+for v1 boundaries, the repeatable native benchmark and deferred ABI work.
 
 An array literal uses its destination's type when one is available.
 Otherwise it is a `T[k]` for fixed-size elements or a `T[]` for non-fixed
@@ -1362,7 +1434,12 @@ A temporary of the calling statement outlives the call, so its class takes
 the body's own outermost depth instead (`ClassDepth`): the body may keep it
 in its locals, but not in anything of the caller's. Classes are numbered by
 these body depths, so a temporary ranks after every variable here too,
-whatever depth it shares with one at the call site.
+whatever depth it shares with one at the call site. What the class stands
+for is still the caller's, though: where an inexact root bounds what may
+point into an array a body shrinks, a parameter's class bounds none of the
+body's own variables, at its outermost depth or deeper (`WithinDepth`). So
+`fn f(p: P)` called as `f(P { s: [1, 2] })` may clear an array it declares
+at the top of its body while `p` is still used.
 
 Only the call sites know whether two *different* classes are different
 arrays. The growth checks
@@ -1419,7 +1496,9 @@ references in a pool class are exempt from the cycle store rule.
 `classpool` is the global pool every member is rooted in, when all agree
 (§3.13). Any other class whose members are all exactly rooted references or
 slices is a **threaded** candidate (`TypeCheck::ThreadedClass`), exempt in
-the same way while every call back into its cycle passes it on (§3.11). A
+the same way while every call back into its cycle passes it on or gives it
+storage outside the cycle, and so is one whose arguments were each read
+out of such storage (`bounded`, §3.11). A
 synthetic class root is told apart from a variable by its `classfrom`,
 since a variable whose declaration is being checked has no type yet
 either.
@@ -1477,9 +1556,12 @@ references or slices, `HoldsPlainRef`) meets a destination with a root:
    activation's own reference variable is exempt, §7.8):
    * a reference into a global, a pool-class parameter or a local of an
      enclosing non-cycle function (`CycleStorable`);
-   * a reference into a threaded parameter class, where every class among
-     the destination's storages is threaded too (`ThreadStorable`,
-     `ThreadedChain`, §3.11);
+   * a reference into a threaded parameter class whose ultimate root lies
+     outside every cycle (`ThreadStorable`), bounded or not, where every
+     class among the destination's storages is a pool or threaded and not
+     bounded (`ThreadedChain`, §3.11). A holder parameter's class is what
+     its references point at, so a holder whose contents are rooted at a
+     threaded class counts as such a reference;
 5. the store is **recorded** on each of those storages, with one event per
    alternative of the value.
 
@@ -2234,23 +2316,26 @@ included) is on record when the body is checked again (`CheckLoopPasses`,
 the next iteration (`CarriedEvent`).
 
 **Emptied holders** (`Kill`). A whole assignment of a value holding no
-references (`NoteKill` from `CheckAssign`, and from `PointeeAssign` through
-a reference variable) empties the part of a holder its location names
-(`KillPath`): a variable's own storage, or the pointee of a `let` reference
-or a reference parameter, followed by the field names stepped into, in the
-one container the location lies in exactly. The kill keeps the index of the
-event at which the value began to be checked. It is stored in the body state
-(`BodyState::kills`) as part of the flow state (`FlowState::kills`). A
-branch join keeps a kill that both sides made, at the earlier index; a
-loop's head takes the join of its entry with its back edges; and an `&&` or
-`||` keeps a kill that its right operand did not end. A store into the
-container that no event records (`RecordStore`: a holder's own references
-put back into it, a value pointing nowhere yet) ends the container's kills
-(`DropKills`). So does a call that may write into the part a kill names
-(`CallMayWrite` from `ApplyCalleeShrinks`), and a function value's call
-ends them all (`CheckFunValCall`). A call ends kills because a callee's own
-unrecorded stores, and a nested function's stores replayed in place under
-the events of its first check, show in no event after the kill.
+references into storage -- none, or static data alone: nulls and string
+literals, whose one root is an exact null (`Roots::OnlyStatic`) -- empties the
+part of a holder its location names (`NoteKill` from `CheckAssign`, from
+`CheckRebind` through a field path, and from `PointeeAssign` through a
+reference variable). The part (`KillPath`) is a variable's own storage, or the
+pointee of a `let` reference or a reference parameter, followed by the field
+names stepped into, down to a slice's or a reference's own slot, in the one
+container the location lies in exactly. The kill keeps the index of the event
+at which the value began to be checked. It is stored in the body state
+(`BodyState::kills`) as part of the flow state (`FlowState::kills`). A branch
+join keeps a kill that both sides made, at the earlier index; a loop's head
+takes the join of its entry with its back edges; and an `&&` or `||` keeps a
+kill that its right operand did not end. A store into the container that no
+event records (`RecordStore`: a holder's own references put back into it, a
+value pointing nowhere yet) ends the container's kills (`DropKills`). So does
+a call that may write into the part a kill names (`CallMayWrite` from
+`ApplyCalleeShrinks`), and a function value's call ends them all
+(`CheckFunValCall`). A call ends kills because a callee's own unrecorded
+stores, and a nested function's stores replayed in place under the events of
+its first check, show in no event after the kill.
 
 Only a reference to storage holding the part, or lying in it, can write
 there. So a call may write there:
@@ -2953,12 +3038,14 @@ cycle member.
 
 **Threaded parameters.** A parameter class other than a pool is threaded
 (`ThreadedClass`, noted by `NoteThreadedClass`) when the call that created
-it rooted all of its members exactly, as references or slices. It stays
-threaded until a call into its cycle passes one of its parameters
-something other than an exact root at the same ultimate root, reached
-through classes that are themselves pools or threaded
-(`ValidateThreadArgs`, `ThreadedChain`). While the class is threaded, it
-points in every activation to where its creating call's argument did.
+it rooted all of its members exactly, as references or slices. A call into
+its cycle that passes one of its parameters the parameter itself, or an
+exact root at the same ultimate root reached through classes that are
+themselves pools or threaded, keeps it so (`ValidateThreadArgs`,
+`ThreadedChain`). One that passes anything else bounds it (below) where
+what it passes points outside the cycle (`PointsOutside`), and breaks it
+otherwise. While the class is threaded and not bounded, it points in every
+activation to where its creating call's argument did.
 Both back edges and calls that reach a finished member of a cycle still
 being checked are checked this way: the member's body's calls back into
 the cycle were checked with what the member was first given, and they pass
@@ -2986,14 +3073,34 @@ at a threaded class relies on it like any other value: every one of its
 roots must be storable.
 
 A class is also threaded, but `bounded` (`ThreadedClass::bounded`), when
-each of its members' arguments was read through one pool class or one
-class threaded exactly (the argument has one alternative, inexact, rooted
-there). What a bounded class points at lies in storage that the pool or
-threaded class leads to, outside the cycle, which makes it storable. But
-that may be different storage in each activation, so `ThreadedChain`
-accepts it for no destination, and a class created from a bounded class
-is bounded as well. A call into the cycle keeps a bounded class threaded
-if it passes one alternative at the same ultimate root, exact or not.
+each of its members' arguments has one alternative, inexact, rooted at a
+pool class or a class threaded exactly (read through it), or at a
+variable (read out of it, or a reference it holds). A holder parameter's
+class (§3.5) is judged by its argument's contents, exact or not, and is
+threaded only this way. What a bounded class points at lies outside the
+cycle in every activation as long as `ThreadStorable` finds its ultimate
+root there, which makes it storable. But that may be different storage in
+each activation, so `ThreadedChain` accepts it for no destination, and a
+class created from a bounded class is bounded as well.
+
+A call into the cycle keeps a bounded class threaded if it passes one
+alternative at the same ultimate root, exact or not, reached through a
+class `ThreadedChain` accepts. A call that passes a threaded class
+anything else bounds it, and its heirs with it (`BoundThread`, which also
+fills `ThreadedClass::why`), when every alternative of the argument (of
+its contents, for a holder) points outside the cycle and outlives the
+class (`PointsOutside`): the class itself, exactly or as a bound, which is
+what was read through it or out of storage holding only what it points at;
+a root `CycleStorable` accepts, which is what was read out of a global, a
+pool or a free variable; or a class `ThreadStorable` accepts, whose heir
+the class becomes. The cycle store rule is what keeps references to a
+cycle's locals out of all of these, so what is read out of them points
+outside the cycle as well. The depth check (no alternative deeper than the
+class) keeps the argument alive as long as the creating call's, against
+which the body checked its stores, and a store such a call makes in a
+deeper activation reaches its callers through the back edge's mapping of
+the record (`ApplyCalleeStores`), so their shrink scans see where it went.
+Any other argument breaks the class (`Unthread`).
 
 A recursion whose types never repeat has no back edge: each level of the
 recursion is a new specialization, checked inside the one before, until
@@ -3016,7 +3123,12 @@ annotated body stay in `FnSpec`. Wherever a call applies its callee's
 record while the callee is in progress, `RecordOf` reads the previous
 record: `CallResult`, `ApplyCalleeShrinks`, `ApplyCalleeStores`,
 `ApplyCalleeGrows`, `ApplyCalleeLiveShrinks`, `ApplyCalleeRebinds`,
-`NamedOutside`.
+`NamedOutside`. Since the body was checked against the first call's
+arguments, a call into the cycle that maps a store through an argument
+checks the store's depth there even where the argument is exact, which
+elsewhere only an inexact one needs: a back edge may hand a parameter a
+global where the entry call gave it a local that outlives what the body
+stores there.
 
 The round marks the members `stale` and checks the head's body again on
 the same clone. A stale member is checked again when a call reaches it
@@ -3045,7 +3157,8 @@ it:
 * changed no member's record (`SameRecord`: normal completion, return
   roots, shrinks and their balances, growths, stores through classes,
   pairs, rebinds);
-* broke no threaded class; and
+* broke or bounded no threaded class (`threadbounds` counts the latter);
+  and
 * noted no fact about a variable declared outside the cycle's activations
   (`CycleRound`, marked by `NoteFact`). Such a variable is one variable at
   every level of a nested function's recursion, which a round may have
@@ -3165,6 +3278,21 @@ specialization. But every clone of a node names that node
 (`Node::origin`), and a warning prints once for the node as the source has
 it, at the first check that gives the warning (`PrintWarning`).
 
+A call checked as an argument of a call that is resolving its overload,
+a UFCS receiver included, leaves its own phase 2 to the outer call's, which
+checks it again in full (`Phase2Waits`). Resolution needs only its result,
+and a phase 2 at every level would double the checks per level of nesting:
+`g(g(...g(x)))` and `x.g().g()...` would take time exponential in their
+depth. The waiting call still does the parts of phase 2 that check nothing:
+it undoes the reference rewrite, marks the copies its parameters take as
+temporaries, and warns about a redundant `&`. Where the outer call takes
+the argument as checked instead (the argument it dispatches on, a member
+builtin's receiver, an argument beside an exemplar's opaque value), it
+checks the argument again in full first (`CheckWaitingArg`). An error that
+only the waiting phase 2 finds is reported when the outer call checks the
+argument again. So another error in that call, in a later argument, its
+resolution or its callee's body, can be reported first.
+
 The tier is the worst match of any argument, not a sum of conversion
 costs. Concrete exact matches beat generic exact matches, which beat any
 candidate requiring adaptation; two candidates at the same best tier are
@@ -3242,8 +3370,9 @@ leftover generics may follow as few as the parameters without a default.
 Each parameter left out has the type that the arguments and explicit type
 arguments give it, so a default decides no type variable and plays no part
 in ranking. `AddParamDefaults` clones each missing default into
-`Call::args` where its argument would be (`firstdefault`, `ndefaults`). It
-checks the default as a written argument is checked: in the discovery
+`Call::args` where its argument would be (`firstdefault`, `ndefaults`).
+It checks the default as a written
+argument is checked: in the discovery
 phase for the specialization's key, where `UnifyArg` must accept it at its
 parameter's type, and against its parameter in phase 2. But it checks the
 default in a frame of its own (`InParamDefault`, the `DefaultScope` a
@@ -3255,6 +3384,10 @@ field default gets):
 * its lookups hide every local of the calling code;
 * its effects and the values live around it are the caller's, as a
   written argument's are.
+
+A `src_file()` or `src_line()` resolved in that frame takes the frame's
+call line, the call that left the argument out
+(`docs/design/call_location.md`).
 
 `DefaultScopeName` rejects a name that the declaration's own scope would
 make a parameter or a type parameter bound to a function value. For a
@@ -3606,12 +3739,9 @@ bounds-check pass set `AsCast::nobc`. The optimizer folds no such
 conversion, and the optimizer and BCE treat one as the check it is.
 
 `checkfree` (spec §7.14) is a parse-time flag on `SFunction`, inherited by
-nested functions. The typechecker's half is the call rule
-(`CheckfreeCallee`), applied at a direct call, to each case of a dispatch
-and each `format` overload a print reaches, and, at a block call, to the
-function the block was written in. All of these are judged against the
-function whose text the call is in (`TextFn`: a block's frame names its
-writer). The bounds-check pass does the rest (§5.11).
+nested functions. The typechecker does nothing else with it: what runs
+inside a `checkfree` function, its callees and blocks included, is judged
+by the bounds-check pass after inlining (§5.11).
 
 ### 3.14 Arithmetic, constants, and the rest
 
@@ -3926,7 +4056,12 @@ presence of aliases (snapshots, indexing, slicing, assignment and dispatch):
   Because the store is written like the loads of the same element, gcc's
   loop invariant motion also sees it as one location. Only then does gcc
   keep an element that a loop reads and writes (`a[i] = a[i] + x` in a
-  loop over `j`) in a register, which lets the loop vectorize. Whole
+  loop over `j`) in a register, which lets the loop vectorize. A right
+  side that runs nothing, writes nothing and cannot fail (a variable, a
+  constant: `QuietValue`) cannot move any destination either, and is
+  stored as written too; a destination used before any statement runs
+  keeps an index variable in place rather than reading it into a
+  temporary (`GenLocNow`). Whole
   resizable assignment has the clear-before-construction semantics of
   spec §4.4; overlapping permitted copies have memmove semantics.
 * A range/count `for` samples its bounds once, before iteration, and runs
@@ -4080,7 +4215,10 @@ pointee, or a slice where a limited array is wanted. There the destination
 loads or adapts the value as its type asks. Every
 lvalue destination an inlined body can reach names that type (`Dst::t`),
 including the temporary that receives a function value's call's value and
-the global an initializer sets.
+the global an initializer sets. A standard library body copied into the
+program's own code has its library nodes anchored at the call
+(`Inliner::AtCallSite`), so a check in the copy fails at the line that called
+the library, as a check in a call left standing does (§6.4, `gs_at`).
 
 At each call site of a callee K, K is inlined if it is used once, or its
 post-optimization node count is below NC, or count times uses is below NCU
@@ -4212,6 +4350,20 @@ scopes the backend opens around runtime work, which are not counted. Ordinary
 programs stay far below the limit: the deepest inline in the tests,
 samples and benchmarks is 18 blocks deep.
 
+Expressions are bounded in codegen. The 256 brackets of clang count the
+expression in a statement together with the blocks around it, and MSVC
+(around 1,200 brackets), clang-cl (around 750, where its stack runs out)
+and TinyCC run out of parser stack. A scalar value whose expression nests
+`SPILLDEPTH` (32) levels deep or more, counting a control expression as a
+leaf (`NestsDeep`), is read into a temporary where `GenX` produces it
+(`Spills`), so a sum of 20,000 terms becomes a statement per term past the
+first 32. A level costs at most about 4 brackets once runtime.h's
+arithmetic macros are expanded, so an expression stays near 130 of them,
+which leaves clang room for the 64 blocks of `MAXNEST` around it. `HasStmts` reports such a node as one
+with statements, so operands to its left are read into temporaries
+first, as for a call (§3.15). No program in the tests, samples or
+benchmarks nests that deep; the deepest nests between 16 and 31 levels.
+
 **Base-case inlining** (`BaseCaseInliner`, `optimize_basecase.h`) applies
 to a `recursive fn` whose body *starts* with `if c { return e; }`
 (`SetupLeading`; or the negated `if c { … } else { return e; }` that
@@ -4338,7 +4490,8 @@ known about the old value stays true about the pinned old value. That is what
 makes a `for i in n` loop's entry snapshot sound across iterations, and what
 lets an `Index` compare its receiver's length as it was *before* the index
 expression ran (`Index::BceWalk` drops the length term if evaluating the
-index moved anything).
+index bumped the receiver's place; a kill of anything else, such as the
+locals of a call inlined into the index, leaves it).
 
 A length mutation with known direction bridges the generations: a grow adds
 `old <= new` and a shrink adds `new <= old`. So a bound established before a
@@ -4357,8 +4510,13 @@ recognizes:
 * an integer variable, unless it is a `varint` or a `u64` that is not of
   an index type (`IntBaseVar`, §5.11);
 * `.len` of a place (a fixed array's length is a constant);
-* `x + c`/`x - c` at `i64` only (narrower widths wrap below the 64-bit math
-  the facts are stated in);
+* `x + c`/`x - c` at `i64`. A narrower width wraps below the 64-bit math
+  the facts are stated in, so there the sum is a fresh base in the type's
+  range (`NarrowStepTerm`): equal to `x + c` where the facts show it fits,
+  and otherwise on the side a wrap cannot cross, at most `x + c` for
+  `c >= 0` and at least it for `c <= 0` (`x` lies in the type and `|c|`
+  below `2^N`, so a wrap moves the result by `2^N` against `c`). The `u32`
+  `e + 1` of an index of `a` is so at most `a.len`;
 * `a % b` and `a & b`, which lie in `[0, b]` on a fresh base when `b` is
   provably non-negative. A negative signed mask proves nothing, so a mask's
   term must also be one that cannot have wrapped (`n + 1` at i64's top is
@@ -4383,7 +4541,8 @@ recognizes:
   in `[i * 4, i * 4 + 3]`);
 * the value of a bare block or of an `InlineBlock` (its tail or final
   return), where no other return leaves the inlined body with a value of
-  its own (`BlockValueTerm`).
+  its own (`BlockValueTerm`). Where one does, a block of an index type is
+  still a value of that type (`IndexTypeTerm`), as the call was.
 
 An operation's width is its operands' type (`OpType`), not its `exprtype`,
 which is the possibly wider slot that receives the value (§3.3). Derived
@@ -4530,9 +4689,11 @@ type (array kinds do not convert at a reference). So a grow or shrink
 resizes no place whose array type is surely another (`DistinctTypes` in
 `GrowShrinkKill`; the elements a refill stores are a separate kill).
 Likewise, a callee's write through an argument that is an array of
-scalars, which holds no other array, kills only places of that array's type
-(`OtherArray` in `KillArgStorage`). A shrink of a reference parameter's
-array thus leaves a global of another type alone.
+scalars, or of any element type holding no length and no reference (a
+struct of scalars), which holds no other array and leads to none, kills
+only places of that array's type (`OtherArray` in `KillArgStorage`). A
+shrink of a reference parameter's array thus leaves a global of another
+type alone.
 
 A directional bump records that the new length is at least (or at most) the
 old one only where a fact names the old length (`BumpPlace`). A growth
@@ -4556,7 +4717,9 @@ nothing (`HasKillEffects`), since the comparison ran against pre-kill
 values. Changes to locals that the condition declares itself, such as the
 parameter of a predicate inlined into it, do not count, since its
 comparisons cannot name them. A completed `pop` proves the old length was
-at least one. A completed `pop_n(n)` proves `0 <= n <= old length`
+at least one, and a `pop` where the facts already put the length at one or
+more loses its emptiness check (`Call::nobc`), as after
+`if s.len != 0 { s.pop() }`. A completed `pop_n(n)` proves `0 <= n <= old length`
 (`CheckedFacts`), and a constant `n` steps the length down exactly. A
 `resize` states the new length when the count's term survived the
 evaluation of the fill value. Neither `pop_n` nor `resize` states anything
@@ -4572,7 +4735,23 @@ outside `[0, 2^48]`, which the check rejects.
 
 Joins are the **meet** of the branch states (`Meet`: a fact survives with the
 weaker constant, generations take the maximum); a branch that diverges
-contributes nothing.
+contributes nothing. A variable one branch re-binds is named after the join
+by the later generation, which the other branch never mentions, and an `if`
+value of integer type by a fresh base neither does (`Phi`; `TermOf` reads it
+back while no generation has advanced). For those the meet compares what
+each branch *implies*: the shortest paths from and to every base either
+branch names that is still current after the join (zero, lengths and
+variables at the joined generations, the phis), in a copy of the branch
+where the phi equals the branch's own term. The bounds both imply go in
+front of the joined facts, where `AddFactB` evicts first, so the facts both
+branches state, the guards a join sits under among them, outlast them. So
+`let k = if k0 < n { k0 } else { n - 1 }` keeps `k >= 0` from
+`n > 0`, and `if k > last { k = last; }` keeps `k <= last`. A variable a
+branch states nothing about is no phi: that branch knows only its axioms,
+which hold of the joined value too. The cost is two shortest-path runs per
+phi and branch, at joins that re-bind or yield an integer only. A block
+with a `defer` has no value term (`BlockValueTerm`): its deferred bodies
+run after the value is read and their kills come first.
 
 ### 5.7 Loops and invariants
 
@@ -4607,8 +4786,13 @@ three modes (`RunSpec`):
   write other than `±constant`), it checks that every write preserves
   `v >= 0` and that no write can wrap at the variable's width. It also
   checks that `v <= len(P) + c` survives for each place `P` that the
-  variable indexes or bounds and that is never shrunk or re-bound in the
-  body (growth alone never breaks it). The declaration decides `c`: what
+  variable indexes or bounds and that is never shrunk in the body (growth
+  alone never breaks it). A place re-bound in the body, such as an inlined
+  slice parameter declared anew in each iteration of the caller's loop,
+  still qualifies, but its bound holds in the judging walk only of the
+  variable's current value, and only while a write that the facts place
+  below that length (`StateLeLen`) is more recent than the place's last
+  rebind (`Flow::lestated`, `LeLenHolds`). The declaration decides `c`: what
   its value needs, but at least 0 (`var j = 1` before
   `while j + 4 <= a.len { ...; j += 4; }` stays within `len + 1`, which
   keeps `j + 4` from wrapping). Where the value starts below the length, a
@@ -4771,7 +4955,9 @@ a select (the merge step
 such a line must have the annotated outcome. The `test/optimizer/bce*.goose`
 fixtures check these decisions and also run as ordinary programs, allowing
 output checks to catch incorrect elimination. `--bce-lines` prints the
-per-line counts for comparing two builds of the pass; `bench/bce_ab.py`
+per-line counts for comparing two builds of the pass; a check in standard
+library code inlined into the program's counts on the line of the call
+(`Inliner::AtCallSite`). `bench/bce_ab.py`
 measures the whole pass against `--no-bce`. `bench/bce_fuzz.py` runs random
 programs built from loop shapes the pass targets, with off-by-one
 mutations, through the JIT with the pass on and off. An elided check that
@@ -4785,27 +4971,39 @@ its length reaches it. A variable of an index type gets the axioms
 `0 <= v` and `v <= len(a) - 1` (`<= len(a)` for a bound type) against the
 length's *current* generation (`IndexBoundOf` in `DistsFrom`). So does a
 one-shot base standing for a value of an index type that is read out of
-storage or comes from a call, a branch or a conversion (`IndexTypeTerm`,
-`tmplen`). The array never shrinks, so a value below any earlier length is
-below the current one, and no bridge facts are involved. A `u64` of an
-index type is a base, since it is below a length. So every write of one
-kills it, as it does any other integer variable (`IntBaseVar`): an
-assignment, a callee's write to it through a reference or as a global, or a
-write through a reference that may name it. `JudgeIndexCast` judges a
-conversion into an index type as `a[x]` would be judged, sets
-`AsCast::nobc`, and states the completed check's facts.
+storage or comes from a call (inlined or not), a branch or a conversion
+(`IndexTypeTerm`, `tmplen`). The array never shrinks, so a value below any
+earlier length is below the current one, and no bridge facts are involved.
+A `u64` of an index type is a base, since it is below a length. So every
+write of one kills it, as it does any other integer variable
+(`IntBaseVar`): an assignment, a callee's write to it through a reference or
+as a global, or a write through a reference that may name it.
+`JudgeIndexCast` judges a conversion into an index type as `a[x]` would be
+judged, sets `AsCast::nobc`, and states the completed check's facts.
 
 **checkfree.** A kept check belongs to the source text it is written in, as
 for `--bce-test`. The source lines that each `checkfree` function spans
 (`CheckfreeSpans`) cover every specialization and every inlined copy of the
-function, and whatever the optimizer restated the check as. A caller's
-argument inlined into the callee's block still belongs to the caller. Each
-kept check on such a line is recorded once, with the reason it was kept
-(`KeptInCheckfree`, `KeptWhy`): a value read out of storage, a `u64`
-variable, a term the domain cannot relate, the lower or the upper bound,
-and, for an index of another array, the length relation an `assert` would
-state. The driver reports them all as errors (`CheckfreeReport`). Under
-`--no-bce` nothing is judged, and the driver warns about that.
+function, and whatever the optimizer restated the check as. What else runs
+inside a `checkfree` function is judged by where it runs. `VerifiedSpecs`
+scans the bodies after inlining for the specializations that code inside
+one calls (calls, dispatch cases and the `format` overloads a print reaches,
+not a thread spawn), each with the chain of calls to it (`verified`). Code
+is inside one where the body being judged is verified (`judging`) or an
+`InlineBlock` around it came from a `checkfree` function (`inlined`,
+`ChainOf`); a callee's copy inlined anywhere else is not. An inlined call's
+parameter bindings (`VarDecl::inline_arg`) are the caller's code, so their
+initializers are judged and scanned without the `InlineBlock` they open.
+Each kept check is recorded once per line and reason, with the reason it
+was kept (`KeptInCheckfree`, `KeptWhy`): a value read out of storage, a
+`u64` variable, a term the domain cannot relate, the lower or the upper
+bound, and, for an index of another array, the length relation an `assert`
+would state. Outside a `checkfree` function's own lines the message names
+the chain of calls, and the function whose lines hold the check where that
+is another (a block, or what was inlined; `fnspans`). The driver reports
+them all as errors (`CheckfreeError`). Under
+`--no-bce` nothing is judged, and the driver warns about that where the
+program has a `checkfree` function outside the standard library.
 
 ### 5.12 Known gaps
 
@@ -5269,14 +5467,15 @@ which functions the program calls.
 **The foreign boundary.** `CheckExternSpec` admits scalars and flat
 fixed-size values by value, including fixed-mode ADTs and limited arrays
 of static capacity. Parameters additionally admit plain non-optional
-references and slices of those values, and `u8[>..]&` builders. Results
-are at most one by-value scalar or flat fixed-size value: references,
-slices and builders cannot be returned by an extern. A builder argument
-uses `gs_rref { hdr, stk }`; C may append through `gs_bld_append` but may
-not shrink it, retain borrowed arguments beyond the call, or invalidate
-Goose's types, roots or lengths. These are obligations on C, not proofs
-the Goose compiler performs. Effect analysis assumes C may write passed
-storage and append to passed builders, but does not mutate unrelated
+references and slices of those values, and builders (`T[>..]&`) of them.
+Results are at most one by-value scalar or flat fixed-size value:
+references, slices and builders cannot be returned by an extern. A builder
+argument uses `gs_rref { hdr, stk }`, whatever its elements; C may write
+its elements and append whole ones at the stack top (`gs_bld_append` for
+bytes) but may not shrink it, retain borrowed arguments beyond the call, or
+invalidate Goose's types, roots or lengths. These are obligations on C, not
+proofs the Goose compiler performs. Effect analysis assumes C may write
+passed storage and append to passed builders, but does not mutate unrelated
 Goose globals. The builtin runtime shims obey the same boundary.
 
 `return ... from` uses one thread-local `int32_t gs_rf` (zero except between
@@ -5475,11 +5674,17 @@ forms use `Type { ` and ` }`, without field labels. Nested byte strings
 escape quote, backslash, newline, carriage return and tab, while other
 bytes remain literal; top-level byte strings are unquoted. Values are
 rendered in argument order, so an argument's rendering hook runs before
-the next argument is evaluated. Hook discovery currently accepts only
-top-level, non-generic two-parameter `format` functions with a
-`u8[>..]&` destination and an exact value or plain-reference parameter for
-the rendered type. This is narrower than ordinary generic overload
-resolution. Reference rendering follows pointees and has no cycle
+the next argument is evaluated. Hook discovery (`UserFormatIn`) accepts
+top-level two-parameter `format` functions with a `u8[>..]&` destination.
+It tries the non-generic ones first, whose value or plain-reference
+parameter must be exactly the rendered type, then generic ones whose
+parameter is a struct, ADT or variant pattern, matched as a call is
+(`TryMatch`) and kept when it binds to exactly the rendered type. The
+first match in declaration order wins; two overloads matching equally
+are not reported as ambiguous, as a direct call would be. A bare type
+variable, or an array or slice pattern, is never a hook: it would take
+over the rendering of strings and every other value, its own body's
+included. Reference rendering follows pointees and has no cycle
 detection: a cyclic value recurses through its render functions until the
 native stack runs out (§7, **Native stacks**). An integer's text comes
 from the runtime's digit loop (`gs_fmt_i64`, `gs_fmt_u64`): the digit
@@ -5507,7 +5712,10 @@ which C float literals and dumps use, is the same text, with its digits
 from `std::to_chars`. Infinities and NaNs are written by the runtime
 (`inf`, `-inf`, `nan`) rather than by the C library, which differs between
 backends: msvcrt writes `1.#INF` and `-1.#IND`, and others print a NaN's
-sign.
+sign. The same digits, without the layout, are what `gs_f64_digits` hands
+`std`'s `float_text::shortest_digits`: `json::format_number` finds the
+digits of doubles from about 1e-10 to 2^51 with ryu's loop on exact 128-bit
+values in Goose, and takes the runtime's for the rest.
 
 **Output.** `print` renders its whole line, including the newline, into a
 statement-stack builder and hands it to one `fwrite` (`gs_out_bytes`) on an
@@ -5696,8 +5904,24 @@ enforced. Workers that hold no regions leave `hardware_threads()` uncapped.
 built with `-DGS_STACK_STATS=1` reports each thread program's stacks and
 regions on stderr as that thread program ends.
 
+**Ending a program.** A library build (`--header`) ends with `goose_exit`,
+which gives back what `goose_init` took, so that a host can start a program
+in the process again (one it has rebuilt and reloaded, say): main's stack
+block; then `gs_rt_stop`, which refuses while a worker still runs, drops
+the records of the workers that aborted, releases main's regions and
+registry as a worker's end does (`gs_release_regions`) and puts back the
+fault handling the runtime found (`gs_fault_uninstall`); then the queues
+(`gs_qfree`). The JIT host does the same after each run (`gs_rt_release`),
+without the worker check: a program it runs may return from `main` with
+workers running, which the process ends. Where programs share a runtime
+object, `gs_rt_start` refuses to start one while another's regions are
+live, rather than forget them.
+
 **Native stacks.** Recursion consumes only the native call stack (spec
-§7.8), whose size is set when its thread starts. Running out of it ends the
+§7.8), whose size is set when its thread starts. A worker reserves
+`GS_THREAD_STACK` (8 MB) where the system's default is less, as on macOS
+(512 KB) and Windows (1 MB), so that a worker has the stack a main thread
+has; it is address space, committed as the stack grows. Running out of it ends the
 program with `goose runtime error: native call stack overflow` and exit
 status 1, as a data stack overrun does. The thread of every thread program
 prepares for this as it starts (`gs_native_stack_init`, called from
@@ -5802,6 +6026,29 @@ returned to the stack: emptied nodes are chained for reuse, which keeps node
 numbers valid, and with them a worker's copy of the freelist. The backend's
 code itself keeps the element region's count and top, and fills in the
 default values.
+
+std's `slice_pool` (docs/stdlib.md) keeps the same tree in its `nodes` field,
+with the header in its `tree` field and node 0 left zero, and calls a copy of
+these functions: its externs `gs_slice_pool_*` and their `gs_spc_*` helpers,
+in `runtime_os.h`, where `gs_rref` is defined. Those fields are the
+program's to write, so the copy checks
+what it reads before it uses it: a node number must be one of the nodes past
+node 0, an entry count must fit the node it is read from as a leaf or inner
+node, the height must fit a path, and an entry moved into or out of a node
+must be one the node has room for or holds. A node reached at two levels of
+a path, or one the chain hands out while it is still in the tree, keeps
+every access inside the nodes: each count the copy writes fits a leaf, and
+the counts that index an inner node's children are checked where they are
+read. A check that fails aborts with `GS_E_SPANTREE` at the `gs_loc` the
+extern was passed (`SFunction::takesloc`), the program's call into
+`slice_pool`, which `gs_spcpath` carries. A wrong tree that passes them hands
+out wrong spans, which `slice_pool`'s own check against its length catches
+where they start past it. Sums of stored indices and counts wrap rather than
+overflow, and new nodes past the last are zeroed, as a pushed `node { .. }`
+would be. A `reusable[]` pool's freelist is out of the program's reach, so
+it keeps the unchecked functions, which measured 3-5% faster on fragmented
+and resize workloads under TinyCC and the JIT; the copy goes when
+`reusable[]` does.
 
 **The native layers** behind `gfx`, `audio`, `ui` and `physics` are not part
 of this runtime. They are packages (`docs/design/packages.md`) in
@@ -6207,8 +6454,9 @@ in place of, what the specification allows, and the shapes the backend refuses o
   rooted at globals or static data (TODO 0d); a long-distance return out of
   a function value's body is mapped through the calls it leaves (§3.12).
 * Inside a recursive cycle, a reference rooted at a caller's fixed-size local
-  is pass-down only unless the parameter it came through is threaded (§3.11).
-  The spec's cycle store rule is stated the same way and is marked for
+  is pass-down only unless the parameter it came through is threaded (§3.11):
+  every call into the cycle passes it on or gives it storage outside the
+  cycle. The spec's cycle store rule is stated the same way and is marked for
   refinement (TODO 5). Beyond the spec's rule, a merged value or a rebound
   variable that may be rooted at a threaded class is pass-down only; the
   spec stores such a value where each of its roots could be.

@@ -219,6 +219,16 @@ static void *gs_thread_main(void *p)
     #endif
 }
 
+/* The native stack a worker thread reserves: as much as the main thread
+   gets by default on macOS and Linux. The system's default for a thread
+   is far less on some (512 KB on macOS, 1 MB on Windows), which a few
+   native frames holding large fixed values can exhaust: a TLS handshake
+   on a worker thread does. Reserved, not committed: pages are touched as
+   the stack grows. A system default above this is kept. */
+#ifndef GS_THREAD_STACK
+#define GS_THREAD_STACK ((size_t)8 << 20)
+#endif
+
 GS_API int64_t gs_thread_start(void (*run)(void (*)(uint8_t *), uint8_t *),
                                void (*release)(void), void (*entry)(uint8_t *),
                                const void *args, int64_t argsize, int contained) {
@@ -244,7 +254,8 @@ GS_API int64_t gs_thread_start(void (*run)(void (*)(uint8_t *), uint8_t *),
     gs_threads = t;
     int failed;
     #ifdef _WIN32
-        HANDLE handle = CreateThread(NULL, 0, gs_thread_main, t, 0, NULL);
+        HANDLE handle = CreateThread(NULL, GS_THREAD_STACK, gs_thread_main, t,
+                                      STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
         failed = handle == NULL;
         /* Closing the handle does not stop the worker. Completion is tracked
            above, so callers never need to retain or join a native handle. */
@@ -254,7 +265,10 @@ GS_API int64_t gs_thread_start(void (*run)(void (*)(uint8_t *), uint8_t *),
         pthread_attr_t attr;
         failed = pthread_attr_init(&attr);
         if (!failed) {
+            size_t size = 0;
             failed = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+            if (!failed && !pthread_attr_getstacksize(&attr, &size) && size < GS_THREAD_STACK)
+                failed = pthread_attr_setstacksize(&attr, GS_THREAD_STACK);
             if (!failed) failed = pthread_create(&handle, &attr, gs_thread_main, t);
             pthread_attr_destroy(&attr);
         }
@@ -434,4 +448,41 @@ GS_API void gs_qlimit(gs_queue *q, int64_t n, const char *file, int line) {
     gs_mutex_unlock(&s->mutex);
 }
 
+/* No lock: nothing else can use the queue once no thread program runs. */
+GS_API void gs_qfree(gs_queue *q) {
+    struct gs_qstate *s = *q;
+    if (!s) return;
+    while (s->head) free(gs_qtake(s));
+    #ifndef _WIN32
+        pthread_mutex_destroy(&s->mutex);
+        pthread_cond_destroy(&s->cond);
+    #endif
+    free(s);
+    *q = NULL;
+}
+
 #endif  /* GS_NEED_THREADS */
+
+/* The records of the thread programs that aborted go with the program
+   whose workers they were, so that a program started next in the process
+   gets ids and thread_wait answers of its own; then main's part
+   (gs_rt_release). */
+GS_API void gs_rt_stop(void) {
+#if GS_NEED_THREADS
+    gs_mutex_lock(&gs_threads_mutex);
+    if (gs_threads) {
+        gs_mutex_unlock(&gs_threads_mutex);
+        gs_panic("goose_exit: a thread program is still running");
+    }
+    for (int64_t i = 0; i < gs_naborted; i++) free(gs_aborted[i].msg);
+    free(gs_aborted);
+    gs_aborted = NULL;
+    gs_naborted = gs_abortedcap = 0;
+    free(gs_abortbits);
+    gs_abortbits = NULL;
+    gs_abortbytes = 0;
+    gs_numthreads = 0;
+    gs_mutex_unlock(&gs_threads_mutex);
+#endif
+    gs_rt_release();
+}

@@ -28,11 +28,24 @@ GOLDEN = [
      "fn f<T>(x:T)->bool{let p=Pair<i64,Foo<Bar<i64>>>{1,g<i64>(2)};x<y&&y>z}\n",
      "struct Pair<A, B> { a: A, b: B }\n"
      "fn f<T>(x: T) -> bool { let p = Pair<i64, Foo<Bar<i64>>> { 1, g<i64>(2) }; x < y && y > z }\n"),
+    ("UFCS type arguments and field comparisons",
+     "fn f() -> bool { let n = x.f<i64,Foo<Bar<i64>>>(1).g<u8>(); x.y<z||z>x.y }\n",
+     "fn f() -> bool { let n = x.f<i64, Foo<Bar<i64>>>(1).g<u8>(); x.y < z || z > x.y }\n"),
+    ("generic variant constants",
+     "fn f() { let a = Opt<u8>.None; let b = Opt<u8>.Some{1}; if a==Opt<Opt<u8>>.None{} }\n",
+     "fn f() { let a = Opt<u8>.None; let b = Opt<u8>.Some { 1 }; if a == Opt<Opt<u8>>.None {} }\n"),
     ("types",
      "fn f(p: Node&<u32 in pool>, q: u8 [ : ], r: i32 [ > .. < ], s: Shape .. ?, t: u8[ ..16 ]) "
      "{ let x = y as ! u8; let z = w [1 ..] [.. ^1]; }\n",
      "fn f(p: Node&<u32 in pool>, q: u8[:], r: i32[>..<], s: Shape..?, t: u8[..16]) "
      "{ let x = y as! u8; let z = w[1..][..^1]; }\n"),
+    ("root structs and component paths",
+     "root  struct State<T>{items:T[>..],scratch:i64[>..<]}\n"
+     "var pool=State<Node>{[],[]};\n"
+     "fn f(p:Node&<u32 in pool . items>,i:u32 in pool.items){let root=pool.items[i];}\n",
+     "root struct State<T> { items: T[>..], scratch: i64[>..<] }\n"
+     "var pool = State<Node> { [], [] };\n"
+     "fn f(p: Node&<u32 in pool.items>, i: u32 in pool.items) { let root = pool.items[i]; }\n"),
     ("imports, const for, initializers and qualified names",
      "import .a.b;\n"
      "fn f() { const for <k,v> in fields<P> { print(k); } let p = P{x:1,..}; let q = ::a + ns :: b; "
@@ -123,6 +136,19 @@ GOLDEN = [
     ("multi-line string moves with its line",
      'fn f() {\n  let s = """\n    text\n      \n    more\n    """;\n}\n',
      'fn f() {\n    let s = """\n      text\n        \n      more\n      """;\n}\n'),
+    ("a table of declarations lines up",
+     "const QUIC_FRAME_PADDING: u64 = 0x00;\nconst QUIC_FRAME_PING: u64 = 0x01;\n"
+     "const QUIC_FRAME_ACK:  u64 = 0x02;\nconst QUIC_FRAME_ACK_ECN: u64 = 0x03;\n"
+     "\nconst A: u8 = 1; // a\nconst BBBB: u64 = 2; // b\nconst C: Foo<i64> = 3;\n"
+     "struct P {\n    x: i64,\n    longer: u8, // c\n    z: Foo<T>,\n}\n"
+     "fn f() {\n    let p = P {\n        x: 1,\n        longer: 2,\n    };\n"
+     "    let a: i64 = 1;\n    let bbb: i64 = 1;\n    var c: i64 = 1;\n}\n",
+     "const QUIC_FRAME_PADDING: u64 = 0x00;\nconst QUIC_FRAME_PING:    u64 = 0x01;\n"
+     "const QUIC_FRAME_ACK:     u64 = 0x02;\nconst QUIC_FRAME_ACK_ECN: u64 = 0x03;\n"
+     "\nconst A:    u8       = 1; // a\nconst BBBB: u64      = 2; // b\nconst C:    Foo<i64> = 3;\n"
+     "struct P {\n    x:      i64,\n    longer: u8, // c\n    z:      Foo<T>,\n}\n"
+     "fn f() {\n    let p = P {\n        x:      1,\n        longer: 2,\n    };\n"
+     "    let a:   i64 = 1;\n    let bbb: i64 = 1;\n    var c: i64 = 1;\n}\n"),
     ("a table of statements after semicolons",
      "let a = 1;      let b = 2;\nlet cc = 3;     let d = 4;\n",
      None),
@@ -260,14 +286,58 @@ def check_docs(exe, root):
         raise RuntimeError(f"format: the documentation comments changed:\n{after}{err}\nnot:\n{before}")
 
 
+def check_deep_indent_cap(exe):
+    depth = 1000
+    src = "fn f() -> i64 {\n" + "(\n" * depth + "1\n" + ")\n" * depth + "}\n"
+    code, out, err = run(exe, [], src.encode("utf-8"))
+    if code != 0:
+        raise RuntimeError(f"format deep indentation: exit {code}: {err}")
+    text = out.decode("utf-8")
+    max_indent = max((len(line) - len(line.lstrip(" ")) for line in text.splitlines()), default=0)
+    if max_indent > 256:
+        raise RuntimeError(f"format deep indentation: {max_indent} > 256")
+    # At a 256-column cap this line-per-bracket case has about
+    # 2 * depth output lines. Bound the output linearly in depth.
+    linear_bound = 2 * depth * 256 + 4096
+    if len(out) > linear_bound:
+        raise RuntimeError(
+            f"format deep indentation output too large: {len(out)} > {linear_bound}"
+        )
+    code, again, err = run(exe, [], out)
+    if code != 0 or again != out:
+        raise RuntimeError("format deep indentation result is not idempotent")
+
+
+def check_deep_block_dump(exe, root):
+    """A deeply nested block's dump is linear in depth. The formatter's
+    self-check dumps its input and output in full, so an uncapped dump would
+    make formatting quadratic in time and memory."""
+    depth = 10000
+    src = root / "deep_blocks.goose"
+    src.write_text("fn main() { " + "{" * depth + "}" * depth + " }\n", encoding="utf-8")
+    code, out, err = tc.run_capture([exe, "check", "--dump", src], timeout=60)
+    if code != 0:
+        raise RuntimeError(f"format deep block dump: exit {code}:\n{err}")
+    # Two lines per block, each indented by no more than 256 columns plus its
+    # brace: linear in depth, not the ~4*depth^2 of an uncapped dump.
+    linear_bound = 2 * depth * (256 + 16) + 4096
+    if len(out) > linear_bound:
+        raise RuntimeError(f"format deep block dump too large: {len(out)} > {linear_bound}")
+    code, out, err = run(exe, [src])
+    if code != 0:
+        raise RuntimeError(f"format deep block dump: formatting failed: exit {code}:\n{err}")
+
+
 def check_format(exe, base):
     """Raises RuntimeError on a failure."""
+    check_deep_indent_cap(exe)
     for name, src, want in GOLDEN:
         check_golden(exe, name, src, want)
     base = Path(base).resolve()
     base.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="format-", dir=base) as tmp:
         root = Path(tmp)
+        check_deep_block_dump(exe, root)
         check_cli(exe, root)
         check_docs(exe, root)
 

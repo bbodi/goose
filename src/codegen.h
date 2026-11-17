@@ -76,6 +76,7 @@ struct CodeGen {
     }
     bool usesthreads = false;
     bool library = false;
+    bool sharedlibrary = false;
     // Measurement only, and unsound: emit the whole `return ... from`
     // machinery but none of the post-call discriminant checks, so a program
     // that never takes a long-distance return still prints the right answer
@@ -146,12 +147,16 @@ struct CodeGen {
 
     bool IsFix(TypeExpr *t)  { return Cls(t) == SC_FIXED; }
     bool IsResz(TypeExpr *t) { return Cls(t) == SC_RESIZABLE; }
-    bool IsBytesT(TypeExpr *t) { return Cls(t) != SC_FIXED; }
+    bool IsRoot(TypeExpr *t) { return Cls(t) == SC_ROOT; }
+    bool IsBytesT(TypeExpr *t) { auto c = Cls(t); return c == SC_VARIABLE || c == SC_RESIZABLE; }
     // This is a C backend storage/ABI choice, not a language size class:
     // packed layout, copying, indexing and lifetime rules stay unchanged.
     static constexpr int64_t NATIVE_VALUE_LIMIT = 4096;
     bool IsLargeFixed(TypeExpr *t) { return IsFix(t) && FixedSize(t) > NATIVE_VALUE_LIMIT; }
-    bool NeedsStack(TypeExpr *t) { return IsBytesT(t) || IsLargeFixed(t); }
+    bool NeedsStack(TypeExpr *t) {
+        return IsBytesT(t) || IsLargeFixed(t) ||
+               (IsRoot(t) && AnyField(t, [&](TypeExpr *ft) { return NeedsStack(ft); }));
+    }
     // A limited array of static capacity, `T[..k]`: a C value of a length
     // and k slots, which any other array or slice of T constructs by copy
     // (§4.2, AdaptToFixed).
@@ -180,7 +185,7 @@ struct CodeGen {
 
     static int64_t IntSize(IntStorage s) { return IntBits(s) / 8; }
 
-    static const char *IntCT(IntStorage s);
+    static const char *IntCT(IntStorage s, bool unaligned = true);
     static const char *IntSfx(IntStorage s);
 
     IntStorage TagStore(SEnum *en) { return en->variants.size() <= 256 ? IS_U8 : IS_U16; }
@@ -229,7 +234,7 @@ struct CodeGen {
     bool corebuiltins = false;
 
     void EmitCoreTypes();
-    string CT(TypeExpr *t);
+    string CT(TypeExpr *t, bool unaligned = true);
     static bool StructLike(TypeExpr *t);
     string NameCT(TypeExpr *t);
     set<string> cdefined;    // Mangled names whose C body CT has written.
@@ -280,7 +285,8 @@ struct CodeGen {
     //   [free-variable references, §7.5]
     //   [out-pointers for fixed returns after the first]
     //   [destination stacks for nonfixed returns]
-    //   [int64_t gs_sp].
+    //   [int64_t gs_sp]
+    //   [const gs_loc *gs_at, for a standard library function].
     // The C return value is the first fixed return, else void; a `return ...
     // from` discriminant travels in the thread-local gs_rf, not the signature.
 
@@ -291,6 +297,7 @@ struct CodeGen {
         bool needssp = false;
         bool hasrf = false;
         bool readsalltops = false;   // Transitively reads every data-stack top.
+        bool located = false;        // Takes its caller's location (CallerLoc).
         int cret = -1;               // Ret index returned as the C value.
     };
     unordered_map<FnSpec *, SpecInfo> sinfo;
@@ -382,6 +389,7 @@ struct CodeGen {
     // A fixed type holding relative references at any depth, whose values are built where they
     // end up (§3.9).
     bool HasRelRef(TypeExpr *t);
+    bool IsFlatFixed(TypeExpr *t);
     bool NeedsResultLocation(TypeExpr *t) { return IsFix(t) && t->kind != TY_REF && HasRelRef(t); }
     TypeExpr *AdtFrom(Node *n);
     // How many elements an array literal writes: its fill count, which the

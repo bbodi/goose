@@ -36,7 +36,7 @@ goose file.goose [options] [-- program args...]
 | Command | What it does |
 |---|---|
 | `goose run file.goose` | Compile the program and run it in this process ([§2](#2-running-a-program)). `goose file.goose` is the same. |
-| `goose build file.goose` | Build an executable with a C compiler on this machine ([§3](#3-building-an-executable)). |
+| `goose build file.goose` | Build an executable, or with `--shared` a shared library, using a C compiler on this machine ([§3](#3-building-an-executable)). |
 | `goose check file.goose` | Parse and typecheck the program, and write and run nothing ([§4](#4-checking-a-program)). |
 | `goose fetch file.goose` | Fetch the packages the program declares ([§7](#7-packages)). |
 | `goose format file.goose\|dir...` | Rewrite files in the standard layout ([§9](#9-formatting)). |
@@ -97,6 +97,11 @@ What a run cannot do, a build can:
   `goose run` refuses it.
 * TinyCC does not optimize, so a run is for trying things out, and
   timing is done on a build.
+* An `extern fn` that binds a C library function resolves in a run only
+  for the C99 `<math.h>` functions, in both widths (all but
+  `nexttoward`). Any other is not found when the run links; it needs a
+  build, the program's own C, or an `extern "lib" { ... }` block naming
+  the library ([reference.md](reference.md#24-calling-c-and-being-called-from-c)).
 * A run keeps its data relative to the root file: `resource_dir()`
   returns the root file's directory, where a built program's is the
   executable's ([stdlib.md](stdlib.md#os)). Relative paths are relative to
@@ -121,6 +126,7 @@ goose build hello.goose && ./hello
 goose build -o out/hello hello.goose     # the executable elsewhere
 goose build --debug hello.goose          # checked, with debug information
 goose build --dry-run hello.goose        # print the commands and run none
+goose build --shared hello.goose         # libhello.so/.dylib, or hello.dll
 ```
 
 `goose build` writes the program's C, compiles it with a C compiler on the
@@ -158,6 +164,7 @@ beyond those in [§5](#5-options-for-run-build-and-check):
 | `--cc name\|path` | The C compiler, as above. |
 | `--standalone` | Compile the runtime into the program, rather than linking the runtime object built once per C compiler. tinygen's C then holds the whole runtime in its one file; with `--debug` (tinygen's machine code) the runtime is compiled from its source in the program's build directory and linked. |
 | `--backend name` | Without it, goose builds through tinygen's C (`tinygen-c`), or with `--debug` through tinygen's machine code (`tinygen`); either can be asked for. A construct tinygen does not support yet is a compile error that names it. `-o x.c` writes the C, as the flag form does ([§8](#8-writing-the-c-yourself)), and builds nothing. |
+| `--shared` | Build a self-contained shared library (`lib<stem>.so`, `lib<stem>.dylib` or `<stem>.dll`) instead of an executable. The library has no C `main`; `goose_init`, `goose_exit` and the program's `export fn` symbols are its host API ([reference §24](reference.md#24-calling-c-and-being-called-from-c)). This implies `--standalone`; `--header out.h` ([§8](#8-writing-the-c-yourself)) writes the host's header too. |
 | `-v` | Print each command the build runs, and what it prints. |
 | `--dry-run` | Print the commands the build would run, with their paths, and run none of them. A Makefile or CMake project can take them from here. |
 
@@ -195,7 +202,7 @@ These options have the same meaning for `goose run`, `goose build`,
 | `--stack-reserve size` | The address space reserved for each data stack, from 64K up to 256T with a `K`, `M`, `G` or `T` suffix. The default is 2G. The address space is committed as it is used, so a large reservation costs nothing until it is used. |
 | `--stacks` | Report how many data stacks the program and each of its workers use, what that adds up to, and the cap it puts on `hardware_threads()`. |
 | `--bce-lines` | Report, for each source line, how many bounds checks the compiler removed and how many it kept. |
-| `--no-bce` | Keep every bounds check. `checkfree` functions are then not verified, and the compiler warns about that. |
+| `--no-bce` | Keep every bounds check. The program's `checkfree` functions are then not verified, and the compiler warns about that. |
 | `--specs` | Print every specialization of each function, after optimization, as source. |
 | `--stats` | Print a few lines about what the compile did: the declarations parsed, the specializations and optimizations, the bounds checks removed, and the files written. |
 | `--color auto\|always\|never` | Whether errors and warnings are in color ([§6](#6-what-goose-prints)). |
@@ -213,6 +220,7 @@ The `-D` macros that the runtime reads, which configure a program:
 | `GS_DEBUG` | 0 | 1 is what `--debug` sets: the overflow, range and tag checks. |
 | `GS_STACK_STATS` | 0 | 1 makes each thread program report its data stack use on stderr as it ends. |
 | `GS_STACK_RESERVE` | 2 GB | The address space reserved per data stack, which `--stack-reserve` sets. |
+| `GS_THREAD_STACK` | 8 MB | The native stack each worker thread reserves, where the system's default is less (512 KB on macOS, 1 MB on Windows). |
 | `GS_STACK_GAP` | 1 MB | The unmapped gap after each data stack, which makes runaway growth abort. |
 | `GS_STACK_BUDGET` | 32 TB | The address space all thread programs together are meant to take; `hardware_threads()` is capped at what it has room for. |
 | `GS_MAX_STACKS` | 1024 | The most data stacks one thread program may use. A program that needs more fails to compile. |
@@ -227,9 +235,17 @@ notes](implementation.md#7-the-runtime) explain how they are reserved.
 
 A run prints only what the program prints. A check that succeeds prints
 nothing, and a build prints only the `built` line. Errors and warnings go to
-stderr, each with the line of source it is about. `--stats` adds a few lines
-about the compile, on stdout, or on stderr for a run, whose stdout is the
-program's.
+stderr, each with the line of source it is about and, where the compiler
+knows the column, a `^~~~` under the code it is about:
+
+```
+x.goose:5: warning: redundant `as i64`: an i32 converts to i64 implicitly here
+    xs.push(((r as i64) << 32) | (c as i64));
+                                  ^~~~~~~~
+```
+
+`--stats` adds a few lines about the compile, on stdout, or on stderr for a
+run, whose stdout is the program's.
 
 Errors and warnings are in color on a terminal. `--color never`, or a
 non-empty `NO_COLOR`, turns color off. `--color always`, or a
@@ -452,7 +468,9 @@ or, for the shell at hand, `source <(goose completion bash)`.
 Without `--stdlib` or `GOOSE_STDLIB`, the compiler looks for the standard
 library in a `stdlib` directory beside its executable, then in the parent
 directories up to three levels above it, which finds a release's and a
-source tree's, and last in `./stdlib`.
+source tree's, then in the directory it was built to use (the `stdlib`
+of its source tree, wherever the build directory is, or where a package
+installs it, CMake's `GOOSE_STDLIB_PATH`), and last in `./stdlib`.
 
 `GOOSE_HOME/config` holds settings that apply to every build. It is written
 like a sidecar, and its one setting is the C compiler:

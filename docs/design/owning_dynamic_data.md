@@ -1,5 +1,11 @@
 # Independently owned dynamic data: an editor's open documents
 
+> **Deprecated language features:** `reusable` and `reusable[]`. Use
+> [`slot_pool<T>`](../stdlib.md#slot_pool) for slots and
+> [`slice_pool<T>`](../stdlib.md#slice_pool) for contiguous runs.
+> Builtin behavior and historical examples below remain relevant to existing
+> code; removal is planned separately, after the remaining migration gaps.
+
 <details>
 <summary>Table of contents</summary>
 
@@ -17,8 +23,7 @@
 This note is a research example. The requirement is a runtime-sized set of
 independently editable buffers, with memory reclaimed when each document
 closes. The difficulty is independent growth and release in arbitrary order,
-not the representation of a list of strings. `reusable[]` slice pools (spec
-5.4) now express this inside the language. This note shows that
+not the representation of a list of strings. Stdlib `slice_pool<T>` expresses this with root-owned storage. This note shows that
 representation and what it costs, which earlier workarounds remain useful, and
 two possible future extensions that cover what slice pools leave out: bounded
 independent dynamic stacks and opaque API resources. Neither extension is an
@@ -46,17 +51,20 @@ or tokens too, but one buffer per document already exposes the issue.
 
 ## Documents as runs in a slice pool
 
-A document is a descriptor in a `reusable` pool of slots, and its text is one
-run of bytes in a `reusable[]` pool. The open documents are a list of links
+A document is a descriptor in a stdlib `slot_pool`, and its text is
+one run of bytes in a stdlib `slice_pool<u8>`. The open documents are a list of links
 into the descriptor pool (§3.9), which is also what lets the operations take a
 `Document&`:
 
 ```goose
+import slice_pool;
+import slot_pool;
+
 struct Document { id: u64, text: u8[:] }   // the document's current run of bytes
 
-reusable var docs: Document[>..] = [];
-reusable[] var bytes: u8[>..] = [];
-var open: Document&<u32 in docs>?[>..] = [];   // in tab order; pruned elsewhere
+var docs = slot_pool<Document> {};
+var bytes = slice_pool<u8> {};
+var open: Document&<u32 in docs.items>?[>..] = [];   // in tab order; pruned elsewhere
 
 fn open_doc(id: u64, size: i64) -> Document& {
     let d .= docs.alloc_ref(Document { id: id, text: bytes.alloc_slice(size) });
@@ -70,9 +78,12 @@ fn grow(d: Document&, extra: i64) {
 
 fn close(d: Document&) {
     bytes.free_slice(d.text);
-    docs.free(docs.index_of(d));
+    docs.free(docs.items.index_of(d));
 }
 ```
+
+The compact `in docs.items` links name the descriptor pool's array component.
+The descriptor and byte pools both use ordinary library APIs.
 
 `alloc_slice` places a run in the first free span (in index order) that can
 hold it, or else at the end of the array. `realloc_slice` grows a run in place
@@ -91,7 +102,7 @@ the growth fits there; otherwise it is at the end of the array, starting in
 the 4 MB left free after C. Closing C merges its bytes with whichever free
 bytes border them.
 
-Views keep the `reusable` semantics (spec 9.4). A slice or byte reference
+Views keep the pool's reuse semantics (spec 9.4). A slice or byte reference
 taken before a move or a close keeps its original range, and reads whatever
 bytes a later allocation puts there; it never reaches outside the array.
 Editing code therefore reads the document's `text` again after anything that
@@ -123,8 +134,10 @@ invalid pool assignment earlier.
   reservation (`GS_STACK_RESERVE`, 2 GB by default; spec 10.4 allows up to
   2^48 bytes). Exceeding it aborts at the guard region: there is no recoverable
   allocation failure.
-* **The array never shrinks.** Closed documents' runs are reused, but the
-  array's high-water length stays committed and is never returned to the OS.
+* **The array never shrinks.** Closed documents' runs are reused, and the
+  array's high-water length stays reserved. For a `u8` pool, `trim` returns
+  the pages of free runs to the OS (see "Extending slice pools" below);
+  otherwise they stay committed.
 * **A move copies.** Growth that cannot happen in place is O(current length),
   and a document grown in small steps while another follows it can be copied
   at each step. Whether to grow by a factor is up to the caller.
@@ -165,7 +178,7 @@ The following approaches remain useful:
 
 | Approach | Where it still fits |
 |---|---|
-| Inline limited arrays, `u8[..MAX]`, as fixed-size slots in a `reusable` pool | A real and small bound. Nothing is ever copied or fragmented, and each document is one fixed slot. Every slot pays the full capacity, and exceeding it cannot grow that buffer. |
+| Inline limited arrays, `u8[..MAX]`, as fixed-size slots in a `slot_pool` | A real and small bound. Nothing is ever copied or fragmented, and each document is one fixed slot. Every slot pays the full capacity, and exceeding it cannot grow that buffer. |
 | Reusable fixed-size chunks linked by indices or relative references, possibly as a rope or piece table | Very large documents, or frequent inserts in the middle, which a contiguous run copies on every move. Chunks never move, so references into them stay current, growth copies at most a chunk, and fragmentation is bounded by the chunk size. It needs chunk addressing, cross-chunk iteration and a stale-slot policy, which a library could hide. |
 | A worker owning each document | Document actors wanted anyway. Reclamation happens at worker exit, at the cost of a message protocol, an OS thread per document and copying whatever crosses a queue. |
 | Foreign owning storage | Memory the program does not own. Option C below gives it a typed representation. |
@@ -173,8 +186,9 @@ The following approaches remain useful:
 ## Future option A: bounded independent dynamic stacks
 
 A slice pool has several limits: element addresses can change during growth,
-growth can copy data, and closing a document does not return its memory to the
-OS. Documents also share fragmentation and are limited to one reservation's
+growth can copy data, and closing a document returns its memory to the OS
+only through `trim`, for `u8` pools, a page at a time and without shrinking the
+array. Documents also share fragmentation and are limited to one reservation's
 total storage.
 
 This option extends the dynamic stacks idea in spec 11.3. It proposes a
@@ -293,10 +307,17 @@ costs above:
 * **Recoverable allocation:** a form of `alloc_slice` and `realloc_slice` that
   reports a run the reservation cannot hold instead of aborting, leaving the
   original run intact.
-* **Returning free memory:** whole pages inside free spans could be decommitted
+* **Returning free memory:** whole pages inside free spans can be decommitted
   and recommitted zeroed on the next touch. Stale views can still read those
   pages, so this is sound only for element types whose all-zero bytes are a
   valid value, such as `u8`; a type holding a non-optional reference has none.
+  `trim(pool: slice_pool<u8>&)` does this for `u8` pools, when the program
+  asks, as `trim_memory` does for stack tops. Other element types whose zero
+  bytes are valid could follow: fixed-size, with no index or bound type, and
+  with no non-optional reference, self-relative ones included. An optional
+  relative reference reads offset 0 as null, but a non-optional self-relative
+  one has no null sentinel: offset 0 is the address of its own field (spec
+  §3.9), so a zeroed one would refer to its own offset field as a `T`.
 * **Per-pool reservations:** a pool on a stack of its own size, or on a stack
   from option A.
 * **Relocating self-relative references:** tracking the region a relative

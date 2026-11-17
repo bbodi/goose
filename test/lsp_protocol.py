@@ -235,12 +235,20 @@ def check_lsp_protocol(exe, base):
                         got["activeParameter"] != int(active)):
                     fail(f"signature {pos}", got)
             elif kind == "complete":
-                # `complete L:C has NAME` / `lacks NAME`: the labels offered.
-                pos, mode, name = rest.split()
+                # `has NAME` / `lacks NAME`: labels; optional text checks detail.
+                # `inserts NAME`: the item inserts that spelling, as a client would.
+                pos, mode, name, detail = re.match(r'(\S+) (has|lacks|inserts) (\S+)(?: "(.*)")?$', rest).groups()
                 got = client.request("textDocument/completion", {**doc, "position": position(pos)})
-                labels = {item["label"] for item in (got or {}).get("items", [])}
-                if (name in labels) != (mode == "has"):
-                    fail(f"completion {pos} {mode} {name}", sorted(labels))
+                items = {item["label"]: item for item in (got or {}).get("items", [])}
+                if mode == "inserts":
+                    item = items.get(name, {})
+                    insert = item.get("textEdit", {}).get("newText", item.get("insertText", item.get("label")))
+                    if insert != name:
+                        fail(f"completion {pos} inserts {name}", item)
+                elif (name in items) != (mode == "has"):
+                    fail(f"completion {pos} {mode} {name}", sorted(items))
+                if detail and detail not in items[name].get("detail", ""):
+                    fail(f"completion {pos} {name}'s detail lacks {detail}", items[name])
             elif kind == "token":
                 # `none`: no token at the place.
                 pos, want = rest.split()
@@ -404,6 +412,25 @@ def check_lsp_protocol(exe, base):
     client.send("textDocument/didChange", {"textDocument": {"uri": main_uri, "version": 7},
                                            "contentChanges": [{"text": text}]}, request=False)
     client.diagnostics_for(main_uri, lambda d: len(d) == 0)
+    # An incremental edit (a range plus its fragment, as a client with
+    # incremental sync sends) applies where the range says, and never
+    # reads as the whole file: the line it adds above shifts the hint
+    # below it down by one. The sleep lets the debounce and the analysis
+    # run, so the hints answer from them rather than from the analysis
+    # before the edit (which a client taking the refresh is served).
+    client.send("textDocument/didChange", {"textDocument": {"uri": main_uri, "version": 8},
+                                           "contentChanges": [{"range": {
+                                               "start": {"line": 0, "character": 0},
+                                               "end": {"line": 0, "character": 0}},
+                                               "text": "// a comment above\n"}]}, request=False)
+    time.sleep(2)
+    got = client.request("textDocument/inlayHint", {**doc, "range": {
+        "start": {"line": 0, "character": 0}, "end": {"line": len(text.splitlines()) + 1, "character": 0}}})
+    if not any(h["position"] == position("31:10") and h["label"] == ": Point" for h in got or []):
+        fail("hint after an incremental edit", got)
+    client.send("textDocument/didChange", {"textDocument": {"uri": main_uri, "version": 9},
+                                           "contentChanges": [{"text": text}]}, request=False)
+    client.diagnostics_for(main_uri, lambda d: len(d) == 0)
     # A program with errors in two functions, opened as a root of its own,
     # its symbols asked at once: they are its analysis's, not none from
     # before it. Both errors are published, and the queries answer from
@@ -433,6 +460,11 @@ def check_lsp_protocol(exe, base):
     ufcs = fixtures / "ufcs_ns.goose"
     utext = ufcs.read_text(encoding="utf-8")
     queries(ufcs, utext, open_fixture(ufcs, utext))
+    # Names spelled through a namespace alias, `g::x` for geo::x: the
+    # occurrence is the spelling as written, not the name it is read as.
+    alias = fixtures / "ns_alias.goose"
+    atext = alias.read_text(encoding="utf-8")
+    queries(alias, atext, open_fixture(alias, atext))
 
     # Statements with errors inside the braces of a struct literal or a
     # match they opened: each published where it is, and nothing after
@@ -445,6 +477,11 @@ def check_lsp_protocol(exe, base):
     complete = fixtures / "complete.goose"
     ctext = complete.read_text(encoding="utf-8")
     queries(complete, ctext, open_fixture(complete, ctext))
+    # Root structs and the stdlib pools: the generic functions taking an
+    # instantiation of a generic struct first are its value's members.
+    pools = fixtures / "pools.goose"
+    ptext = pools.read_text(encoding="utf-8")
+    queries(pools, ptext, open_fixture(pools, ptext))
     # Generic functions nothing calls, which the server checks as exemplars:
     # the queries answer from them, and one whose body no binding could make
     # right reports nothing, as `goose check` does not (its errors_tc
@@ -510,7 +547,10 @@ def check_lsp_protocol(exe, base):
         starts = [0]
         for line in lines:
             starts.append(starts[-1] + len(line) + 1)
-        offset = lambda pos: min(starts[pos["line"]] + pos["character"], len(text))
+        def offset(pos):
+            line = pos["line"]
+            prefix = (lines[line] if line < len(lines) else "").encode("utf-16-le")[:pos["character"] * 2]
+            return min(starts[line] + len(prefix.decode("utf-16-le")), len(text))
         for e in sorted(edits, key=lambda e: offset(e["range"]["start"]), reverse=True):
             text = text[:offset(e["range"]["start"])] + e["newText"] + text[offset(e["range"]["end"]):]
         return text
@@ -540,6 +580,16 @@ def check_lsp_protocol(exe, base):
     close_doc(unsaved)
     if fmt() is not None:
         fail("formatting a document that is not open", fmt())
+
+    # A lone surrogate is one UTF-16 unit, as is the escape after it, which
+    # json.dumps writes as é and which is no low surrogate to pair with.
+    surrogates = fixtures / "lone_surrogate.goose"
+    line = '    let s = "\ud800é"; let y: i64 = true;'
+    diags = open_fixture(surrogates, "fn main() {\n" + line + "\n}\n")
+    col = len(line[:line.index("true")].encode("utf-16-le", "surrogatepass")) // 2
+    if [d["range"]["start"]["character"] for d in diags] != [col]:
+        fail(f"a diagnostic after a lone surrogate is not at column {col}", diags)
+    close_doc(surrogates)
 
     client.request("shutdown", None)
     client.send("exit", request=False)
@@ -588,8 +638,101 @@ def check_lsp_protocol(exe, base):
             ("incoming 8:4", callers("8:4"), ["two_shared.goose:apply@13"])):
         if got != want:
             fail(f"two entry files: {what} are not {want}", got)
+    safety = base / "rename_safety.goose"
+    source = ("import std;\nfn main() {\n"
+              "    /* 🪿 */ let first = 1; let second = 2;\n"
+              "    fn inner(value) { let stop: i64 = value; return capture_name; }\n"
+              "    print(first + second);\n}\n"
+              "fn unrelated(value) { let stop: i64 = value; return q; }\n")
+    safety.write_text(source, encoding="utf-8")
+    two.send("textDocument/didClose", sdoc, request=False)
+    two.send("workspace/didChangeConfiguration", {"settings": {"goose": {"entryFiles": [str(safety)]}}}, request=False)
+    body, uri = "// unsaved\n" + source, uri_of(safety)
+    two.send("textDocument/didOpen", {"textDocument": {
+        "uri": uri, "languageId": "goose", "version": 1, "text": body}}, request=False)
+    if two.diagnostics_for(uri):
+        fail("rename safety fixture has diagnostics", two.published.get(uri.lower()))
+    before = body[:body.index("first")]
+    params = {"textDocument": {"uri": uri}, "position": {
+        "line": before.count("\n"), "character": len(before.rsplit("\n", 1)[-1].encode("utf-16-le")) // 2}}
+    for name in ("second", "capture_name", "q"):
+        result = two.request("textDocument/rename", {**params, "newName": name}, raw=True)
+        if (result.get("error", {}).get("code") != -32803 or
+                "already used at" not in result.get("error", {}).get("message", "")):
+            fail(f"colliding rename to {name} was not refused with its location", result)
+    result = two.request("textDocument/rename", {**params, "newName": "renamed_value"})
+    edits = result.get("changes", {}).get(uri, [])
+    if len(edits) != 2:
+        fail("safe Unicode-position rename has wrong edits", result)
+    renamed_body = apply(body, edits)
+    before = body[:body.index("unrelated")]
+    function_params = {"textDocument": {"uri": uri}, "position": {
+        "line": before.count("\n"), "character": len(before.rsplit("\n", 1)[-1].encode("utf-16-le")) // 2}}
+    result = two.request("textDocument/rename", {**function_params, "newName": "x"})
+    function_body = apply(body, result.get("changes", {}).get(uri, []))
+    if function_body != body.replace("fn unrelated(", "fn x("):
+        fail("function rename to a stdlib parameter name has wrong edits", result)
+    result = two.request("textDocument/rename", {**function_params, "newName": "abs"}, raw=True)
+    if result.get("error", {}).get("code") != -32803:
+        fail("function rename to a stdlib declaration was not refused", result)
+    for candidate, expected in ((body, "3\n"), (body.replace("first", "second"), "4\n"),
+                               (renamed_body, "3\n"), (function_body, "3\n")):
+        safety.write_text(candidate, encoding="utf-8")
+        code, out, err = tc.run_capture([exe, "run", str(safety), "--offline"])
+        if code or out != expected:
+            fail("rename runtime output", {"exit": code, "out": out, "err": err, "expected": expected})
     two.request("shutdown", None)
     two.send("exit", request=False)
     code = two.p.wait(timeout=30)
     if code != 0:
         raise RuntimeError(f"goose lsp exited with {code}:\n{tc.decode(two.p.stderr.read())}")
+    check_buffer_imports(exe, base / "buffer_imports")
+
+
+def check_buffer_imports(exe, base):
+    """Unsaved modules take the same import precedence as saved ones."""
+    base = Path(base).resolve()
+    for case, name in (("plain", "buffer_module"), ("local", "math"), ("blessed", "gfx"),
+                       ("stdlib", "math"), ("empty", "math"), ("package", "buffer_pkg")):
+        directory = base / case
+        directory.mkdir(parents=True, exist_ok=True)
+        root = directory / "main.goose"
+        libdir = directory / "stdlib" if case == "stdlib" else directory
+        libdir.mkdir(exist_ok=True)
+        module = libdir / f"{name}.goose"
+        if module.exists():
+            raise RuntimeError(f"buffer import fixture must not exist on disk: {module}")
+        options = {"entryFiles": [str(root)]}
+        if case == "stdlib":
+            options["stdlib"] = str(libdir)
+        declaration = f"namespace {name};\nfn buffered_value() -> i64 {{ 42 }}\n"
+        text = f"import {name};\nfn main() {{ let value = {name}::buffered_value(); }}\n"
+        if case == "empty":
+            declaration = ""
+            text = f"import {name};\nfn main() {{}}\n"
+        if case == "package":
+            package = directory / "package"
+            package.mkdir(exist_ok=True)
+            (package / f"{name}.goose").write_text(declaration, encoding="utf-8")
+            text = f'import {name} from "./package";\nimport {name};\nfn main() {{}}\n'
+        client = Client(exe, directory)
+        try:
+            client.request("initialize", {"capabilities": {}, "initializationOptions": options})
+            client.send("initialized", {}, request=False)
+            for path, body in ((module, declaration), (root, text)):
+                client.send("textDocument/didOpen", {"textDocument": {
+                    "uri": uri_of(path), "languageId": "goose", "version": 1, "text": body}}, request=False)
+            doc = {"textDocument": {"uri": uri_of(root)}}
+            target = client.request("textDocument/definition", {**doc, "position": {"line": 0, "character": 7}})
+            errors = [d for d in client.published.get(uri_of(root).lower(), []) if d.get("severity") == 1]
+            if case == "package":
+                if not any("is both a file of this package" in d["message"] for d in errors):
+                    raise RuntimeError(f"unsaved package conflict was not diagnosed: {errors}")
+            elif errors or not target or target["uri"].lower() != uri_of(module).lower():
+                raise RuntimeError(f"{case} buffer import: errors={errors}, definition={target}")
+        finally:
+            client.request("shutdown", None)
+            client.send("exit", request=False)
+            code = client.p.wait(timeout=30)
+            if code != 0:
+                raise RuntimeError(f"buffer import server exited with {code}:\n{tc.decode(client.p.stderr.read())}")

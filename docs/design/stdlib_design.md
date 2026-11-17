@@ -273,6 +273,8 @@ constant (§2): `format(out, 'x')` appends `120`, and a byte is appended with
 | `stdlib/math.goose` | — | libm as `extern fn`, `PI`/`TAU`, `radians`/`degrees`, `is_nan`/`is_inf` | `extern fn` |
 | `stdlib/dictionary.goose` | `std` | `dictionary<K, V>` and its functions | `default<T>()` |
 | `stdlib/vec.goose` | `std`, `math` | `vec2/3/4<T>`, `float*`, `double*`, `int*`, vector functions | — |
+| `stdlib/mat.goose` | `vec`, `math` | `float2x2`…`double4x4` (fixed arrays of columns), transforms, cameras | §6.1 elementwise math on fixed arrays |
+| `stdlib/quat.goose` | `mat`, `vec`, `math` | `quat<T>`, `floatq`, `doubleq`, rotations, slerp, conversions to and from matrices | — |
 | `stdlib/os.goose` | `std` | files, stdio, arguments, environment, time, sleep, entropy | `extern fn`, runtime C in `src/runtime/runtime_os.h` |
 
 `import std;` must be written explicitly; nothing is imported
@@ -312,6 +314,12 @@ fn next_pow2(x: i64) -> i64     // smallest power of two >= max(x, 1)
 fn popcount(x: u64) -> i64
 fn clz(x: u64) -> i64           // 64 for x == 0
 fn ctz(x: u64) -> i64           // 64 for x == 0
+fn rotl<N>(x: u32, n: N) -> u32 // and u64, and rotr; n modulo the width
+fn byte_swap(x: u32) -> u32     // and u16, u64
+fn is_pow2<T>(x: T) -> bool
+fn ilog2<T>(x: T) -> i64        // -1 for x <= 0
+fn isqrt<T>(x: T) -> T          // aborts for x < 0
+fn gcd<T>(a: T, b: T) -> T      // and lcm; assert the result fits
 fn swap<T>(a: T&, b: T&)
 ```
 
@@ -327,6 +335,19 @@ uses `/` for its initial quotient, preserving its overflow checks.
 
 `abs` and `sign` have explicit float overloads. `popcount`/`clz`/`ctz` use
 the runtime's `extern` intrinsics (§8.4).
+
+Rotations and byte swaps are runtime functions too, so that speed does not
+rest on the C compiler recognizing a shift idiom: they use MSVC's
+intrinsics and GCC's and clang's byte-swap builtins, and the rotate idiom
+GCC and clang both turn into `rol`/`ror`. The count is generic so that a `u32` count, as hashes keep them,
+picks the `u32` overload exactly; an `i64` one would make every
+non-`i64` count a conversion that ties the two overloads; it is masked to
+the width before it goes to the runtime. The other bit helpers are Goose.
+`ilog2` follows the -1-for-none convention of positions rather than
+aborting. `gcd` and `lcm` reduce their operands to `u64` magnitudes, so
+`MIN` needs no case of its own, and `assert` that the result fits back into
+`T`: a wrapped divisor or multiple is meaningless, so unlike `*` they check
+for overflow at unsigned types too.
 
 ### 4.2 Hashing
 
@@ -523,7 +544,7 @@ fn format_uint(out: u8[>..]&, v: u64, base: i64, width: i64, pad: u8)
 fn format_flt(out: u8[>..]&, v: f64, decimals: i64)   // fixed decimals
 fn parse_int(s: u8[:]) -> i64, bool              // optional sign, base 10, whole string
 fn parse_int(s: u8[:], base: i64) -> i64, bool
-fn parse_flt(s: u8[:]) -> f64, bool              // sign, fraction, exponent; correctly rounded
+fn parse_flt(s: u8[:]) -> f64, bool              // sign, fraction, exponent, or inf/-inf/nan; correctly rounded
 fn compare(a: u8[:], b: u8[:]) -> i64            // bytewise lexicographic: -1, 0, 1
 fn trim(s: u8[:]) -> u8[:]                       // ASCII whitespace; a sub-slice, no copy
 fn trim_start(s: u8[:]) -> u8[:]
@@ -538,6 +559,10 @@ fn join<T>(out: u8[>..]&, parts: T[:], sep: u8[:])   // T any u8 array/slice typ
 fn format_replaced(out: u8[>..]&, s: u8[:], old: u8[:], with: u8[:])   // `from` is a keyword
 fn each_utf8<F>(s: u8[:])                        // F(cp: i64); malformed bytes yield 0xFFFD
 fn push_utf8(out: u8[>..]&, cp: i64)             // the UTF-8 bytes of a code point
+fn ascii::is_digit(c: u8) -> bool                // ASCII only, as <ctype.h> in the C locale
+fn ascii::is_alpha(c: u8) -> bool
+fn ascii::is_alnum(c: u8) -> bool
+fn ascii::hex_value(c: u8) -> i64                // 0-15, -1 if not a hex digit
 ```
 
 Plain rendering of scalars and strings is the builtin `format` (§8.1); the
@@ -642,9 +667,9 @@ different, well-typed slot. Bind such references in their own block, or use
   second implementation.
 * Owned string keys: keep a `u8[>..]` text pool next to the
   `dictionary<u8[:], V>` (two locals of one scope, or a global pool); keys
-  are slices into the pool. A struct cannot hold both (one resizable per
-  struct, §3.4), which is spec TODO 8. An interner built on this idiom is a
-  candidate for a later module.
+  are slices into the pool. A `root struct` can now own both components in
+  one declaration (spec §3.4); an ordinary packed struct still cannot.
+  An interner built on this idiom is a candidate for a later module.
 * Insertion order: `dictionary` does not keep it. Where order matters, store
   values in the user's own `[>..]` and keep indices in the dictionary, which
   is what `lru.goose` does.
@@ -793,7 +818,8 @@ Both are diverging calls: code after them is unreachable, so a branch that
 ends in one gives no value (§6.4). `abort` prints `goose runtime error:
 <msg>` and exits nonzero, like the checked aborts of §9.3; `exit` flushes
 and exits with the code. The library uses `abort` for contract violations
-that are not plain `assert`s (an unknown base in `format_int`).
+that are not plain `assert`s (an unknown base in `format_int` or
+`format_uint`).
 
 ### 8.4 `extern fn` (spec §7.10)
 
@@ -1076,7 +1102,8 @@ These operations can be expressed using existing functions and short loops:
   `each_split(s, ' ')` keeps the empty parts that repeated spaces leave, and
   a command line wants them dropped.)
 * Multiple-resizable containers (a deque, an owning string dictionary): the
-  language has one resizable per struct (§3.4); idioms in §5.3.
+  language now supports their state through `root struct` (spec §3.4); the
+  library APIs remain to be designed. See §5.3.
 * Binary serialization: Goose data is already its own serialized form
   (`bench/design.md`); `read_file` into a `u8[>..]` and spec TODO 16's
   whole-region copy are the way to do it, and typed `read_u32_le`-style
