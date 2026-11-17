@@ -9600,11 +9600,7 @@ struct TinyGenBackend {
     }
     // A zero-filled data symbol, thread-local if tls.
     tyg_sym DataSym(const string &name, int64_t size, int64_t align, bool tls) {
-        // In C a static thread-local is declared, then defined, which gcc takes for two
-        // definitions (a thread-local has no tentative one): there it is the image's own global.
-        auto sym = tyg_symbol(mod->m, name.c_str(),
-                              !tls ? 0 : coutput ? TYG_SYM_TLS | TYG_SYM_GLOBAL | TYG_SYM_HIDDEN
-                                                 : TYG_SYM_TLS);
+        auto sym = tyg_symbol(mod->m, name.c_str(), tls ? TYG_SYM_TLS : 0);
         tyg_data(mod->m, sym, tls ? TYG_SECTION_TBSS : TYG_SECTION_BSS, nullptr,
                  std::max<int64_t>(size, 1), align);
         return sym;
