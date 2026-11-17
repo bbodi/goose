@@ -692,7 +692,11 @@ string TinygenUnit(string text, const string &filename, const string &defines, b
                                 : "   Link it with the runtime that `goose --emit-runtime` writes. */\n\n",
                      // Before tinygen's prelude includes the first system header (runtime.h).
                      "#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)\n#define _DEFAULT_SOURCE 1\n"
-                     "#endif\n");
+                     "#endif\n"
+                     // The runtime's and the headers' C reads and writes, under its own types, the
+                     // memory tinygen's C holds under tinygen's: gcc must not tell them apart by type.
+                     "#if defined(__GNUC__) && !defined(__clang__)\n"
+                     "#pragma GCC optimize(\"no-strict-aliasing\")\n#endif\n");
     // The checks of GS_DEBUG are in tinygen's code, written or not as the file was.
     if (!checks)
         Append(pre, "#if defined(GS_DEBUG) && GS_DEBUG\n#error this file was written without "
