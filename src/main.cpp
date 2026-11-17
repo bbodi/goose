@@ -2031,7 +2031,8 @@ int Main(int argc, char **argv) {
             tgb->DeclareHeaderSymbols();
             tgb->CHeader(TinygenUnitHeader(standalone && !tgjit,
                                            tgb->externunit ? cg.types : string(), includes,
-                                           tgb->externunit ? tgb->ExternTrampolines(cg) : string()));
+                                           cat(tgb->externunit ? tgb->ExternTrampolines(cg) : string(),
+                                               tgb->MemTrampolines(cg))));
             string text, err;
             if (!tgb->CText(text, err))
                 throw CompileError { cat("tinygen: cannot write the C: ", err) };
