@@ -539,8 +539,9 @@ def check_shared_fills(exe, base, ok, fail):
 
 
 def check_no_text_relocs(exe, base, ok, fail):
-    """A caller-location record holds its file name's address, so in the native object it is
-    writable data: in read-only data the linker would patch the image's text pages (DT_TEXTREL)."""
+    """A caller-location record is read-only data that holds its file name's address. tinygen
+    writes such data where the loader fills it in and then protects it, so the linked image
+    needs no text relocations (DT_TEXTREL)."""
     readelf = shutil.which("readelf") if sys.platform.startswith("linux") else None
     if not readelf:
         return
