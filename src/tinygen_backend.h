@@ -182,8 +182,13 @@ inline string TgSupportBody(string_view runtimeh) {
             codes.insert(code).second)
             s += TgFixedShim(cat("gs_tg_abort_", code));
     }
+    // Static in tinygen's C unit, where a C compiler then keeps none it inlined: gcc knows libm's
+    // functions through them, and no copy calls sin where the program's calls became sincos.
+    s += "#ifdef GS_TG_UNIT\n#if defined(__GNUC__) || defined(__clang__)\n"
+         "#define GS_TG_X __attribute__((unused)) static\n#else\n#define GS_TG_X static\n#endif\n"
+         "#else\n#define GS_TG_X\n#endif\n";
     for (auto &x : TgSupportExterns())
-        Append(s, x.ret, " gs_tg_x_", x.name, "(", x.params, ") { ",
+        Append(s, "GS_TG_X ", x.ret, " gs_tg_x_", x.name, "(", x.params, ") { ",
                string(x.ret) == "void" ? "" : "return ", x.name, "(", x.args, "); }\n");
     // gs_stks is thread-local only in a program built with GS_NEED_THREADS, which this object is not,
     // so a thread-local of its own holds the block the procedures reach; a worker's thunk opens one and
@@ -9469,7 +9474,10 @@ struct TinyGenBackend {
     // prototype of the extern when `proto`.
     static string Trampoline(CodeGen &cg, FnSpec *sp, bool proto) {
         auto &name = sp->sf->cname;
-        auto ret = sp->rets.empty() ? string("void") : cg.CT(sp->rets[0]);
+        // A scalar result under its plain C name: gcc warns of a prototype that returns the
+        // aligned alias (gs_u32) after a header's definition returning uint32_t.
+        auto rt = sp->rets.empty() ? nullptr : sp->rets[0];
+        auto ret = !rt ? string("void") : cg.CT(rt, rt->kind != TY_INT && rt->kind != TY_FLT);
         string params, args, types;
         for (size_t i = 0; i < sp->argtypes.size(); i++) {
             Append(types, i ? ", " : "", cg.CT(sp->argtypes[i]));
@@ -9547,7 +9555,7 @@ struct TinyGenBackend {
         for (auto &e : mod->memexterns) {
             auto sp = e.sp;
             auto scalar = [&](TypeExpr *t) -> string {
-                if (t->kind == TY_INT) return CodeGen::IntCT(t->intstorage);
+                if (t->kind == TY_INT) return CodeGen::IntCT(t->intstorage, false);
                 if (t->kind == TY_FLT) return t->fltstorage == FS_F32 ? "float" : "double";
                 if (t->kind == TY_BOOL) return "uint8_t";
                 if (!TgModule::IsRel(t)) return "void *";

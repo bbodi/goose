@@ -696,7 +696,9 @@ string TinygenUnit(string text, const string &filename, const string &defines, b
                      // The runtime's and the headers' C reads and writes, under its own types, the
                      // memory tinygen's C holds under tinygen's: gcc must not tell them apart by type.
                      "#if defined(__GNUC__) && !defined(__clang__)\n"
-                     "#pragma GCC optimize(\"no-strict-aliasing\")\n#endif\n");
+                     "#pragma GCC optimize(\"no-strict-aliasing\")\n#endif\n"
+                     // The support body's extern trampolines are this unit's own (TgSupportBody).
+                     "#define GS_TG_UNIT 1\n");
     // The checks of GS_DEBUG are in tinygen's code, written or not as the file was.
     if (!checks)
         Append(pre, "#if defined(GS_DEBUG) && GS_DEBUG\n#error this file was written without "
