@@ -5377,7 +5377,10 @@ struct TgFn {
         if (Holds(n->exprtype, arr)) return false;
         // A value of an index type of the array (`u32 in a`, `upto a`, §3.11), which a conversion
         // checks against its length.
-        if (auto t = n->exprtype; t && t->ix && t->ix->arr && defs.count(t->ix->arr)) return false;
+        // The array may be one a reference in defs names.
+        if (auto t = n->exprtype; t && t->ix && t->ix->arr &&
+            (defs.count(t->ix->arr) || Holds(t->ix->arr->type, arr)))
+            return false;
         if (auto c = Is<Call>(n)) {
             auto an = c->ArgNodes();
             if ((c->builtin == B_PUSH || c->builtin == B_APPEND) && an.size() == 2 && pooled(an[0]) &&
