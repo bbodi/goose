@@ -182,8 +182,12 @@ inline string TgSupportBody(string_view runtimeh) {
             codes.insert(code).second)
             s += TgFixedShim(cat("gs_tg_abort_", code));
     }
+    // In a program's one C unit (TinygenUnit) the trampolines are the unit's own: one nothing calls
+    // is left out, and the C compiler sees through the others to the callee (libm's sin, pow).
+    s += "#if !defined(GS_TG_UNIT)\n#define GS_TG_X\n#elif defined(_MSC_VER)\n"
+         "#define GS_TG_X static __inline\n#else\n#define GS_TG_X static inline\n#endif\n";
     for (auto &x : TgSupportExterns())
-        Append(s, x.ret, " gs_tg_x_", x.name, "(", x.params, ") { ",
+        Append(s, "GS_TG_X ", x.ret, " gs_tg_x_", x.name, "(", x.params, ") { ",
                string(x.ret) == "void" ? "" : "return ", x.name, "(", x.args, "); }\n");
     // gs_stks is thread-local only in a program built with GS_NEED_THREADS, which this object is not,
     // so a thread-local of its own holds the block the procedures reach; a worker's thunk opens one and
@@ -250,6 +254,7 @@ struct TgModule {
     tyg_module *m = nullptr;
     map<int, tyg_file> files;
     map<int, tyg_sym> filenames;
+    map<pair<int, int>, tyg_sym> locsyms;
     map<string, tyg_sym> strings;
     map<string, tyg_sym> syms;
     map<string, const tyg_dtype *> dtypes;
@@ -358,6 +363,18 @@ struct TgModule {
             if (c == '\\') c = '/';
         f.push_back('\0');
         return filenames[fileidx] = Bytes(f);
+    }
+    // A static gs_loc { file, line }: what a call at l hands a callee that takes its caller's
+    // location (SpecInfo::located).
+    tyg_sym LocSym(Line l) {
+        auto key = make_pair(l.fileidx, l.line);
+        if (auto it = locsyms.find(key); it != locsyms.end()) return it->second;
+        uint8_t bytes[16] = {};
+        memcpy(bytes + 8, &l.line, 4);
+        auto s = tyg_symbol(m, cat("gs_tg_loc", locsyms.size()).c_str(), 0);
+        tyg_data(m, s, TYG_SECTION_RODATA, bytes, 16, 8);
+        tyg_data_reloc(m, s, 0, 8, FileName(l.fileidx), 0);
+        return locsyms[key] = s;
     }
 
     void NeedShim(const string &name, const string &text) {
@@ -1613,6 +1630,7 @@ struct TgModule {
             else if (IsImg(sp->rets[i]) || (int)i != si.cret) ptrs(1);
         }
         if (!sp->sf->isextern && si.needssp) ps.push_back(tyg_type_int(m, TYG_I64, 1));
+        if (!sp->sf->isextern && si.located) ptrs(1);   // gs_at
         const tyg_type *ret = si.cret < 0 ? nullptr : AT(sp->rets[si.cret]);
         return sigs[sp] = tyg_sig_new(m, ret, ps.data(), (int)ps.size(), 0);
     }
@@ -1620,6 +1638,7 @@ struct TgModule {
         if (auto it = sigs.find(sp); it != sigs.end()) return it->second;
         vector<const tyg_type *> ps;
         for (auto t : sp->argtypes) ps.push_back(AT(t));
+        if (sp->sf->takesloc) ps.push_back(tyg_type_ptr(m));
         const tyg_type *ret = sp->rets.empty() ? nullptr : AT(sp->rets[0]);
         return sigs[sp] = tyg_sig_new(m, ret, ps.data(), (int)ps.size(), 0);
     }
@@ -1909,6 +1928,8 @@ struct TgFn {
     // taken.
     tyg_local spl = 0, stksl = 0;
     bool hassp = false;   // spl holds gs_sp (a local's id may be 0).
+    tyg_local atl = 0;    // gs_at, the caller's gs_loc, of a located function (hasat).
+    bool hasat = false;
     int live = 0, maxown = 0;
     vector<CodeGen::StackCall> stackcalls;
     struct Mark {
@@ -3429,6 +3450,15 @@ struct TgFn {
     // ---- Expressions ----------------------------------------------------------------------------
 
     InlineBlock *adapting = nullptr;
+    // How deep n's operators nest: 0 for what is none.
+    unordered_map<const Node *, int> nestings;
+    int Nesting(Node *n) {
+        if (!n || !(Is<Binary>(n) || Is<Unary>(n) || Is<AsCast>(n))) return 0;
+        if (auto it = nestings.find(n); it != nestings.end()) return it->second;
+        int h = 0;
+        n->Children([&](Node *ch) { h = std::max(h, Nesting(ch)); });
+        return nestings[n] = h + 1;
+    }
     V Gen(Node *n) {
         // An inlined call the checker typed as an image or resizable other than its callee's result
         // (a return's type): built as that, from the result where it lies (LimCallResult).
@@ -3443,6 +3473,14 @@ struct TgFn {
             if (built) return w;
         }
         auto x = Gen1(n);
+        // An expression nested deeper than C compilers take (TinyCC's value stack, clang's
+        // brackets): tinygen's C folds single-use values into one, so its operands go through locals.
+        if (!Ended() && x.v && !x.mem && Is<Binary>(n) && Nesting(n) % 64 == 0) {
+            auto sc = tyg_val_type(p, x.v);
+            auto at = tyg_at_local(tyg_local_new(p, 8, 8), 0);
+            tyg_store(p, sc, at, x.v, 0);
+            x.v = tyg_load(p, sc, at, 0);
+        }
         // After a return or break the code using this value is still built: it needs a value.
         if (Ended() && !x.v && !x.mem && n->exprtype && M.IsScalar(n->exprtype))
             return Dummy(n->exprtype);
@@ -3605,8 +3643,17 @@ struct TgFn {
     }
 
     // A file name and line for the runtime's abort messages.
-    tyg_val FileArg(Line l) { return AddrOf(tyg_at_sym(M.FileName(l.fileidx), 0)); }
-    tyg_val LineArg(Line l) { return I32(l.line); }
+    // A check on a standard library line of a function that takes its caller's location (gs_at)
+    // fails there.
+    bool AtCaller(Line l) { return hasat && M.ast.StdlibFile(l.fileidx); }
+    tyg_val FileArg(Line l) {
+        return AtCaller(l) ? Ld(AtV(LdL(atl))) : AddrOf(tyg_at_sym(M.FileName(l.fileidx), 0));
+    }
+    tyg_val LineArg(Line l) {
+        return AtCaller(l) ? tyg_load(p, TYG_I32, AtV(LdL(atl), 8), 0) : I32(l.line);
+    }
+    // What a call at l hands a callee that takes its caller's location.
+    tyg_val CallerLoc(Line l) { return AtCaller(l) ? LdL(atl) : AddrOf(tyg_at_sym(M.LocSym(l), 0)); }
 
     // Calls a C shim or runtime function by name with scalar arguments (types for the signature).
     tyg_val CallC(const string &name, const vector<const tyg_type *> &pts,
@@ -4230,6 +4277,8 @@ struct TgFn {
     V GenStructLit(StructLit *sl) {
         auto t = sl->exprtype;
         if (V x; InPlaceValue(sl, t, sl->line, x)) return x;
+        // A frame object or a resizable struct nothing names.
+        if (M.FoOk(t) || M.RsOk(t)) return BuildTemp(sl, t, sl->line);
         auto adt = t->kind == TY_VARIANT || t->kind == TY_ENUM;
         if (!M.TypeOk(t) || (adt ? t->kind == TY_ENUM && !sl->variant : !sl->sinst || sl->variant ||
                              t->kind != TY_STRUCT))
@@ -5072,6 +5121,68 @@ struct TgFn {
             auto ix = Bin(TYG_SDIV, Sub(r.v, v.elems), esz);
             return ValV(c->exprtype, Conv(ix, M.ast.inttypes[IS_I64], c->exprtype, line));
         }
+        if (b == B_MOVE_FROM && nargs == 2) {
+            // The slice's elements over the receiver's, which they may overlap; the lengths must match.
+            auto v = ViewOf(Place(an[0]), line);
+            auto base = Local(v.elems), count = Local(v.len);
+            auto src = GenAs(an[1], M.ast.SliceOf(v.elem, an[1]->line));
+            if (Ended()) return V {};
+            auto data = Ld(src.a), n = Ld(AddrPlus(src.a, 8));
+            FailUnless(Cmp(TYG_EQ, LdL(count), n), "move_from lengths differ", line);
+            if (auto size = cg.FixedSize(v.elem))
+                tyg_move_dyn(p, LdL(base), data, Mul(LdL(count), I64(size)));
+            return V {};
+        }
+        if (b == B_CHECK_LENGTH && nargs >= 2) {
+            // A count of elements a data stack could hold (CodeGen's SliceLen), else an abort.
+            auto v = ViewOf(Place(an[0]), line, false);
+            auto nl = Local(Index64(an[1]));
+            if (Ended()) return Dummy(c->exprtype);
+            auto esz = cg.FixedSize(v.elem);
+            auto ok = esz ? Cmp(TYG_ULE, LdL(nl), I64((int64_t)(cg.stackcfg.reserve / (uint64_t)esz)))
+                          : Cmp(TYG_SGE, LdL(nl), I64(0));
+            FailUnless(ok, "ARRAYLEN", nargs > 2 ? an[2] : nullptr, line);
+            return ValV(c->exprtype, Conv(LdL(nl), M.ast.inttypes[IS_I64], c->exprtype, line));
+        }
+        if (b == B_RANGE_INDEX && nargs >= 2) {
+            // The index of a slice's first element in the receiver: 0 for an empty one; else, where
+            // the checker cannot root it here, checked to lie wholly inside.
+            auto v = ViewOf(Place(an[0]), line);
+            auto elems = Local(v.elems), len = Local(v.len);
+            auto sv = GenAs(an[1], M.ast.SliceOf(v.elem, an[1]->line));
+            if (Ended()) return Dummy(c->exprtype);
+            auto data = Local(Ld(sv.a)), n = Local(Ld(AddrPlus(sv.a, 8)));
+            auto msg = nargs > 2 ? an[2] : nullptr;
+            auto esz = cg.FixedSize(v.elem);
+            auto il = Local(I64(0));
+            if (!esz) {
+                FailUnless(Cmp(TYG_ULE, LdL(n), LdL(len)), "ARRAYSLICE", msg, line);
+            } else {
+                If(Cmp(TYG_NE, LdL(n), I64(0)), [&] {
+                    auto off = Sub(LdL(data), LdL(elems));
+                    if (c->poolcheck) {
+                        auto k = Bin(TYG_UDIV, off, I64(esz));
+                        auto bad = Bin(TYG_OR, Cmp(TYG_NE, Bin(TYG_UREM, off, I64(esz)), I64(0)),
+                                       Bin(TYG_OR, Cmp(TYG_UGE, k, LdL(len)),
+                                           Cmp(TYG_UGT, LdL(n), Sub(LdL(len), k))));
+                        FailUnless(Cmp(TYG_EQ, bad, I8(0)), "ARRAYSLICE", msg, line);
+                        StL(il, k);
+                    } else {
+                        StL(il, Bin(TYG_SDIV, off, I64(esz)));
+                    }
+                });
+            }
+            return ValV(c->exprtype, Conv(LdL(il), M.ast.inttypes[IS_I64], c->exprtype, line));
+        }
+        if (b == B_FILE) {
+            // The last path segment, not the path the aborts name: no directory in a log line.
+            auto path = M.SourceName(line.fileidx);
+            auto slash = path.find_last_of("/\\");
+            auto name = slash == string::npos ? path : path.substr(slash + 1);
+            return PairV(c->rettypes[0], BytesAddr(name), I64((int64_t)name.size()));
+        }
+        if (b == B_LINE)
+            return ValV(c->exprtype, Conv(I64(line.line), M.ast.inttypes[IS_I64], c->exprtype, line));
         if ((b == B_ALLOC_INDEX || b == B_ALLOC_REF || b == B_FREE) && nargs == 2) return GenPool(c);
         if (b == B_ALLOC_SLICE || b == B_REALLOC_SLICE || b == B_FREE_SLICE) return GenSlicePool(c);
         if (b == B_COPY && nargs == 1 && (!cg.IsFix(c->rettypes[0]) || M.TypeOk(c->rettypes[0]))) {
@@ -5187,6 +5298,7 @@ struct TgFn {
         }
         auto rets = RetChans(callee, ci, idst, dst, rdst, args, line);
         if (ci.needssp) args.push_back(ArgOfVal(CalleeSp(callee, line)));
+        if (ci.located) args.push_back(ArgOfVal(CallerLoc(line)));
         auto sym = M.FnSym(ci.cname);
         auto x = Result(callee, ci.cret, M.Sig(callee), tyg_direct(sym), args);
         RfCheck(callee);
@@ -5400,7 +5512,10 @@ struct TgFn {
         if (Holds(n->exprtype, arr)) return false;
         // A value of an index type of the array (`u32 in a`, `upto a`, §3.11), which a conversion
         // checks against its length.
-        if (auto t = n->exprtype; t && t->ix && t->ix->arr && defs.count(t->ix->arr)) return false;
+        // The array may be one a reference in defs names.
+        if (auto t = n->exprtype; t && t->ix && t->ix->arr &&
+            (defs.count(t->ix->arr) || Holds(t->ix->arr->type, arr)))
+            return false;
         if (auto c = Is<Call>(n)) {
             auto an = c->ArgNodes();
             if ((c->builtin == B_PUSH || c->builtin == B_APPEND) && an.size() == 2 && pooled(an[0]) &&
@@ -5799,6 +5914,7 @@ struct TgFn {
         }
         if (!poolval) args.push_back(v);
         if (ci.needssp) args.push_back(ArgOfVal(CalleeSp(sp, l)));
+        if (ci.located) args.push_back(ArgOfVal(CallerLoc(l)));
         auto sym = M.FnSym(ci.cname);
         Result(sp, ci.cret, M.Sig(sp), tyg_direct(sym), args);
         RfCheck(sp);
@@ -6086,6 +6202,21 @@ struct TgFn {
         tyg_if_not(p, cond);
         Abort(what, l);
         tyg_endif(p);
+    }
+
+    // An abort with `text` as its message unless `cond`.
+    void FailUnless(tyg_val cond, const string &text, Line l) {
+        tyg_if_not(p, cond);
+        CallC("gs_abort_msg", { tyg_type_ptr(m), IT(TYG_I64), tyg_type_ptr(m), IT(TYG_I32) },
+              { BytesAddr(text), I64((int64_t)text.size()), FileArg(l), LineArg(l) }, nullptr);
+        tyg_unreachable(p);
+        tyg_endif(p);
+    }
+    // The runtime's message for GS_E_<what>, or the string literal a range_index or check_length
+    // was given in its place (CodeGen's FailCall).
+    void FailUnless(tyg_val cond, const string &what, Node *msg, Line l) {
+        if (auto s = msg ? Is<StrLit>(msg) : nullptr) FailUnless(cond, s->val, l);
+        else AbortUnless(cond, what, l);
     }
 
     // pop, pop_n, resize and clear of a resizable: the elements end at the stack's
@@ -6766,6 +6897,7 @@ struct TgFn {
             SetBlock(call);
             target = tyg_indirect(addr);
         }
+        if (callee->sf->takesloc) args.push_back(ArgOfVal(CallerLoc(c->line)));
         return Result(callee, callee->rets.empty() ? -1 : 0, M.ExternSig(callee), target, args);
     }
 
@@ -7536,6 +7668,7 @@ struct TgFn {
             FvArgs(c, ci, args);
             args.insert(args.end(), chanargs.begin(), chanargs.end());
             if (ci.needssp) args.push_back(ArgOfVal(CalleeSp(sp, c->line)));
+            if (ci.located) args.push_back(ArgOfVal(CallerLoc(c->line)));
             auto sym = M.FnSym(ci.cname);
             auto x = Result(sp, ci.cret, M.Sig(sp), tyg_direct(sym), args);
             if (rt) Store(P { AtL(res), rt }, x);
@@ -8912,6 +9045,10 @@ struct TgFn {
             spl = param();
             hassp = true;
         }
+        if (si.located) {
+            atl = param();
+            hasat = true;
+        }
         // Each destination's top on entry: a return builds its result there, also one nested in another
         // return's half-built value.
         for (size_t i = 0; i < sp->rets.size(); i++) {
@@ -9855,6 +9992,8 @@ struct TinyGenBackend {
                 fn.StL(cur, fn.Add(img, sz));
             }
             if (ki.needssp) args.push_back(TgFn::ArgOfVal(fn.I64(0)));
+            // A worker has no caller: its function's failures report its declaration.
+            if (ki.located) args.push_back(TgFn::ArgOfVal(fn.CallerLoc(sp->sf->line)));
             mod->SplitArgs(p, sp, args, false);
             CallArgs(p, mod->Sig(sp), mod->FnSym(ki.cname), args);
             tyg_ret(p, 0);
