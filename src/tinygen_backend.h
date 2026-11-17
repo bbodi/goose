@@ -4144,6 +4144,8 @@ struct TgFn {
     V GenStructLit(StructLit *sl) {
         auto t = sl->exprtype;
         if (V x; InPlaceValue(sl, t, sl->line, x)) return x;
+        // A frame object or a resizable struct nothing names.
+        if (M.FoOk(t) || M.RsOk(t)) return BuildTemp(sl, t, sl->line);
         auto adt = t->kind == TY_VARIANT || t->kind == TY_ENUM;
         if (!M.TypeOk(t) || (adt ? t->kind == TY_ENUM && !sl->variant : !sl->sinst || sl->variant ||
                              t->kind != TY_STRUCT))
