@@ -213,6 +213,10 @@ addresses of its globals once, on entry. How it reads them depends on threads:
 * limited arrays `T[..k]`, variable-size structs, frame objects;
 * fixed-mode and variable-mode ADTs, `match`, and case-function dispatch;
 * optionals, relative references and pools;
+* root structs: the owner is a descriptor of one reference per field
+  (`TgModule::RootOf`), each field a local or global of its own; a field of
+  an owner named outright is that variable (`RootComponent`), through a
+  reference it is what the descriptor says (`RootField`);
 * free variables of nested functions, and function values, spliced at the
   call;
 * `print`, `str` and `format` of composites, through `RenderInto`, or through
