@@ -2036,6 +2036,28 @@ def main():
                     detail += str(e)
             checks.append(("build --shared", good, detail))
 
+            # The native tinygen path (--debug) links one too, from position
+            # independent runtime and support objects.
+            if not tc.IS_WINDOWS:
+                native_out = gendir / ("verbs_shared_native" + shared_suffix)
+                code, out, err = tc.run_capture(
+                    [exe, "build", "--shared", "--debug", "-o", str(native_out), shared_src])
+                good = code == 0 and native_out.exists()
+                detail = out + err
+                if good:
+                    try:
+                        lib = ctypes.CDLL(str(native_out.resolve()))
+                        lib.goose_init(0, None)
+                        good = lib.goose_add(20, 22) == 42
+                        lib.goose_exit()
+                        lib.goose_init(0, None)
+                        good = good and lib.goose_add(1, 2) == 3
+                        lib.goose_exit()
+                    except (AttributeError, OSError) as e:
+                        good = False
+                        detail += str(e)
+                checks.append(("build --shared --debug", good, detail))
+
             # A shared build can also emit the C host header. Exercise the
             # documented host surface and make sure the declarations are there.
             shared_header = gendir / "verbs_shared.h"

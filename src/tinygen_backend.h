@@ -230,7 +230,15 @@ inline string TgSupportBody(string_view runtimeh) {
          "    gs_tg_tstks = gs_stks;\n"
          "    gs_gl = &gs_tg_noglobals;\n"
          "}\n"
-         "void gs_tg_end(void) { gs_rt_stats(); }\n";
+         "void gs_tg_end(void) { gs_rt_stats(); }\n"
+         // A library's goose_exit: what gs_tg_start took, given back (the queues are the program's).
+         "void gs_tg_exit(void) {\n"
+         "    gs_rt_stop();\n"
+         "    free(gs_stks);\n"
+         "    gs_stks = NULL;\n"
+         "    gs_nstks = 0;\n"
+         "    gs_tg_tstks = NULL;\n"
+         "}\n";
     return s;
 }
 
@@ -1641,6 +1649,30 @@ struct TgModule {
         if (sp->sf->takesloc) ps.push_back(tyg_type_ptr(m));
         const tyg_type *ret = sp->rets.empty() ? nullptr : AT(sp->rets[0]);
         return sigs[sp] = tyg_sig_new(m, ret, ps.data(), (int)ps.size(), 0);
+    }
+
+    // In C output, an extern fn that takes or returns a struct of a C type of the unit's header
+    // (the runtime's, an --include header's), which no struct of tinygen's converts to, is called
+    // through gs_tg_mx_<name> (TinyGenBackend::MemTrampolines): each such value by its address, a
+    // result's first, the scalars as they are. `direct`: it calls the C symbol, not gs_tg_x_<name>.
+    struct MemExtern { FnSpec *sp; bool direct; };
+    vector<MemExtern> memexterns;
+    map<string, tyg_sig *> memsigs;
+    tyg_sig *MemSig(FnSpec *sp) {
+        auto &sig = memsigs[sp->sf->cname];
+        if (sig) return sig;
+        vector<const tyg_type *> ps;
+        auto rt = sp->rets.empty() ? nullptr : sp->rets[0];
+        if (rt && !IsScalar(rt)) ps.push_back(tyg_type_ptr(m));
+        for (auto t : sp->argtypes) ps.push_back(IsScalar(t) ? AT(t) : tyg_type_ptr(m));
+        return sig = tyg_sig_new(m, rt && IsScalar(rt) ? AT(rt) : nullptr, ps.data(), (int)ps.size(), 0);
+    }
+    // Whether the unit's header has the C type of the struct t: the program's types come with an
+    // extern unit's headers, and the runtime's own are always there.
+    bool MemTypeKnown(TypeExpr *t) {
+        if (externunit) return true;
+        auto ct = cg.CT(t);
+        return ct == "sl_u8" || ct == "gs_rref";
     }
 };
 
@@ -6890,6 +6922,31 @@ struct TgFn {
         for (auto t : callee->argtypes) aggregate = aggregate || !M.IsScalar(t);
         for (auto t : callee->rets) aggregate = aggregate || !M.IsScalar(t);
         auto target = tyg_direct(sym);
+        // The header's own C types: by address through gs_tg_mx_<name>, which a C compiler inlines.
+        auto headers = direct || M.externunit;
+        for (auto &x : TgSupportExterns()) headers = headers || callee->sf->cname == x.name;
+        auto bymem = M.cout && aggregate && headers && !M.Defines(callee->sf->cname);
+        for (auto t : callee->argtypes) bymem = bymem && (M.IsScalar(t) || M.MemTypeKnown(t));
+        for (auto t : callee->rets) bymem = bymem && (M.IsScalar(t) || M.MemTypeKnown(t));
+        if (bymem) {
+            known = false;
+            for (auto &e : M.memexterns) known = known || e.sp->sf->cname == callee->sf->cname;
+            if (!known) M.memexterns.push_back({ callee, direct });
+            auto rt = callee->rets.empty() ? nullptr : callee->rets[0];
+            auto mem = rt && !M.IsScalar(rt);
+            vector<tyg_arg> margs;
+            auto ra = mem ? AtL(Temp(rt)) : tyg_addr {};
+            if (mem) margs.push_back(ArgOfVal(AddrOf(ra)));
+            for (size_t i = 0; i < args.size(); i++)
+                margs.push_back(M.IsScalar(callee->argtypes[i]) ? args[i]
+                                                                : ArgOfVal(AddrOf(args[i].mem)));
+            PoolFlush();
+            auto v = tyg_call(p, M.MemSig(callee),
+                              tyg_direct(M.FnSym(cat("gs_tg_mx_", callee->sf->cname))),
+                              margs.data(), (int)margs.size(), nullptr, nullptr);
+            PoolReload();
+            return mem ? MemV(rt, ra) : rt ? ValV(rt, v) : V {};
+        }
         if (M.cout && aggregate && !M.Defines(callee->sf->cname)) {
             auto addr = AddrOf(tyg_at_sym(sym, 0));
             auto call = NewBlock();
@@ -9541,7 +9598,11 @@ struct TinyGenBackend {
     }
     // A zero-filled data symbol, thread-local if tls.
     tyg_sym DataSym(const string &name, int64_t size, int64_t align, bool tls) {
-        auto sym = tyg_symbol(mod->m, name.c_str(), tls ? TYG_SYM_TLS : 0);
+        // In C a static thread-local is declared, then defined, which gcc takes for two
+        // definitions (a thread-local has no tentative one): there it is the image's own global.
+        auto sym = tyg_symbol(mod->m, name.c_str(),
+                              !tls ? 0 : coutput ? TYG_SYM_TLS | TYG_SYM_GLOBAL | TYG_SYM_HIDDEN
+                                                 : TYG_SYM_TLS);
         tyg_data(mod->m, sym, tls ? TYG_SECTION_TBSS : TYG_SECTION_BSS, nullptr,
                  std::max<int64_t>(size, 1), align);
         return sym;
@@ -9636,6 +9697,10 @@ struct TinyGenBackend {
         mod->rtdecls = runtime_decls;
         mod->fixedaddrs = !UsesThreads(cg);
         mod->externunit = externunit;
+        // A shared library's externs make the unit one too (WholeProgram): known before a record
+        // is named.
+        for (auto sf : ast.functions)
+            if (sf->isextern && !sf->dylib.empty() && !sf->specs.empty()) mod->externunit = true;
         if (!mod->m) throw CompileError { "tinygen backend: this target is not supported yet" };
         if (coutput)
             for (auto sp : cg.livespecs)
@@ -9714,7 +9779,10 @@ struct TinyGenBackend {
     // prototype of the extern when `proto`.
     static string Trampoline(CodeGen &cg, FnSpec *sp, bool proto) {
         auto &name = sp->sf->cname;
-        auto ret = sp->rets.empty() ? string("void") : cg.CT(sp->rets[0]);
+        // A scalar result under its plain C name: gcc warns of a prototype that returns the
+        // aligned alias (gs_u32) after a header's definition returning uint32_t.
+        auto rt = sp->rets.empty() ? nullptr : sp->rets[0];
+        auto ret = !rt ? string("void") : cg.CT(rt, rt->kind != TY_INT && rt->kind != TY_FLT);
         string params, args, types;
         for (size_t i = 0; i < sp->argtypes.size(); i++) {
             Append(types, i ? ", " : "", cg.CT(sp->argtypes[i]));
@@ -9784,13 +9852,51 @@ struct TinyGenBackend {
         return s + DylibBinding(cg);
     }
 
+    // gs_tg_mx_<name> for each extern fn tinygen's C calls by address (TgModule::memexterns): the
+    // structs copied into and out of the header's C types, which is all C lets two struct types
+    // share, and the call made with those.
+    string MemTrampolines(CodeGen &cg) {
+        string s;
+        for (auto &e : mod->memexterns) {
+            auto sp = e.sp;
+            auto scalar = [&](TypeExpr *t) -> string {
+                if (t->kind == TY_INT) return CodeGen::IntCT(t->intstorage, false);
+                if (t->kind == TY_FLT) return t->fltstorage == FS_F32 ? "float" : "double";
+                if (t->kind == TY_BOOL) return "uint8_t";
+                if (!TgModule::IsRel(t)) return "void *";
+                return cat("uint", TgModule::ScalSize(mod->RelScal(t)) * 8, "_t");
+            };
+            auto rt = sp->rets.empty() ? nullptr : sp->rets[0];
+            auto mem = rt && !mod->IsScalar(rt);
+            string params = mem ? "void *r" : "", args, copies;
+            for (size_t i = 0; i < sp->argtypes.size(); i++) {
+                auto t = sp->argtypes[i];
+                Append(args, i ? ", " : "", mod->IsScalar(t) ? "a" : "b", i);
+                if (mod->IsScalar(t)) {
+                    Append(params, params.empty() ? "" : ", ", scalar(t), " a", i);
+                    continue;
+                }
+                Append(params, params.empty() ? "" : ", ", "const void *a", i);
+                Append(copies, cg.CT(t), " b", i, "; memcpy(&b", i, ", a", i, ", sizeof b", i, "); ");
+            }
+            auto call = cat(e.direct ? "" : "gs_tg_x_", sp->sf->cname, "(", args, ")");
+            Append(s, "static ", !rt || mem ? "void" : scalar(rt), " gs_tg_mx_", sp->sf->cname, "(",
+                   params.empty() ? "void" : params, ") { ", copies,
+                   mem ? cat(cg.CT(rt), " b = ", call, "; memcpy(r, &b, sizeof b); }\n")
+                       : cat(rt ? "return " : "", call, "; }\n"));
+        }
+        return s;
+    }
+
     // The names a whole program's one C unit declares before tinygen's C (TinygenUnit in main.cpp):
     // the runtime's exported functions (RuntimeApi, but not the C library's math, whose names tinygen
     // keeps to itself), what the support body defines (TgSupportBody), and the extern trampolines,
     // the support body's or, with --include, those of ExternTrampolines.
     bool HeaderDeclares(const string &name) {
+        if (name.rfind("gs_tg_mx_", 0) == 0) return true;
         if (name.rfind("gs_tg_x_", 0) == 0) return externunit || SupportHolds(name.substr(8));
-        static const set<string> support = { "gs_tg_start", "gs_tg_end", "gs_tg_stack_block" };
+        static const set<string> support = { "gs_tg_start", "gs_tg_end", "gs_tg_exit",
+                                             "gs_tg_stack_block" };
         if (support.count(name) || !TgFixedShim(name).empty()) return true;
         if (name.rfind("gs_", 0) != 0) return false;
         return mod->RuntimeApi(name);
@@ -9798,8 +9904,8 @@ struct TinyGenBackend {
 
     // In that unit, every symbol the header declares is TYG_SYM_DECLARED: tinygen's C then prints no
     // declaration of its own, which would clash with the header's C types, and calls it by name. A
-    // call whose arguments a header type would not take from tinygen's goes through the callee's
-    // address (GenExternCall).
+    // call whose arguments a header type would not take from tinygen's goes through gs_tg_mx_<name>
+    // (GenExternCall, MemTrampolines).
     void DeclareHeaderSymbols() {
         for (auto &[name, sym] : mod->syms)
             if (HeaderDeclares(name)) tyg_symbol_add_flags(mod->m, sym, TYG_SYM_DECLARED);
@@ -9826,7 +9932,7 @@ struct TinyGenBackend {
             if (sf->isexport) CheckExport(cg, sf);
         // A shared library's externs are bound by a table in a unit of the program's own, which the
         // trampolines and the table's function (gs_tg_dlbind) go into with the --include headers'.
-        if (HasDylibs()) externunit = mod->externunit = true;
+        if (mod->externunit) externunit = true;
         for (auto sp : mod->externs)
             if (!ExternHeld(sp)) return Refuse(why, cat("extern ", sp->sf->cname));
         if (!GlobalsOk(cg, why)) return false;
@@ -9846,6 +9952,7 @@ struct TinyGenBackend {
                 if (d->reusable) mod->PoolAccessors(d);
             }
         EmitGlobalStorage(cg);
+        sharedlibrary = cg.sharedlibrary;
         if (cg.library) initflag = DataSym("gs_tg_program_initialized", 1, 1, false);
         EmitExports(cg);
         ForwardExterns();
@@ -10048,7 +10155,7 @@ struct TinyGenBackend {
             for (auto t : sp->argtypes) ps.push_back(mod->AT(t));
             if (slice) ps.push_back(ptr);
             auto sig = SigOf(!rt ? nullptr : slice ? ptr : mod->AT(rt), ps);
-            auto p = tyg_proc_begin(mod->m, mod->FnSym(sf->cname), sig);
+            auto p = tyg_proc_begin(mod->m, HostSym(sf->cname), sig);
             // A library's C host calls an export only once goose_init has started the program, and
             // takes a slice's length through a pointer it must give.
             if (initflag != TYG_NO_SYM) {
@@ -10204,7 +10311,8 @@ struct TinyGenBackend {
         auto library = initflag != TYG_NO_SYM;
         // C requires main's argv to be a char **, which a tinygen pointer prints as void *: in C
         // output the procedure is gs_tg_main, and Write adds the main that calls it.
-        auto p = tyg_proc_begin(m, mod->FnSym(library ? "goose_init" : coutput ? "gs_tg_main" : "main"),
+        auto p = tyg_proc_begin(m, library ? HostSym("goose_init")
+                                           : mod->FnSym(coutput ? "gs_tg_main" : "main"),
                                 SigOf(library ? nullptr : i32, { i32, ptr }));
         cmain = coutput && !library;
         Line line;
@@ -10248,11 +10356,39 @@ struct TinyGenBackend {
         if (library) {
             tyg_ret(p, 0);
             EndProc(p, "goose_init");
+            EmitExit();
             return;
         }
         fn.CallC("gs_tg_end", {}, {}, nullptr);
         tyg_ret(p, tyg_iconst(p, TYG_I32, 0));
         EndProc(p, "main");
+    }
+
+    // A library's goose_exit, the inverse of goose_init: ends a started program, its stack block,
+    // regions and queues released, so that goose_init can start one in the process again.
+    void EmitExit() {
+        auto m = mod->m;
+        auto ptr = tyg_type_ptr(m);
+        auto p = tyg_proc_begin(m, HostSym("goose_exit"), SigOf(nullptr, {}));
+        TgFn fn(*mod, nullptr);
+        fn.p = p;
+        auto flag = tyg_at_sym(initflag, 0);
+        fn.If(tyg_cmp(p, TYG_EQ, tyg_load(p, TYG_I8, flag, 0), tyg_iconst(p, TYG_I8, 0)),
+              [&] { tyg_ret(p, 0); });
+        fn.CallC("gs_tg_exit", {}, {}, nullptr);
+        for (auto &[acc, q] : mod->queueacc)
+            fn.CallC("gs_qfree", { ptr }, { fn.CallC(acc, {}, {}, ptr) }, nullptr);
+        tyg_store(p, TYG_I8, flag, tyg_iconst(p, TYG_I8, 0), 0);
+        tyg_ret(p, 0);
+        EndProc(p, "goose_exit");
+    }
+
+    // A symbol a library's C host calls: exported from a shared library (--shared).
+    bool sharedlibrary = false;
+    tyg_sym HostSym(const string &name) {
+        auto sym = mod->FnSym(name);
+        if (sharedlibrary) tyg_symbol_add_flags(mod->m, sym, TYG_SYM_EXPORT);
+        return sym;
     }
 
     // The C main of C output, which calls the gs_tg_main EmitMain made.

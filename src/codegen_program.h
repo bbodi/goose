@@ -604,7 +604,8 @@ inline string CodeGen::ExportHeader() {
     header += tdecls;
     header += "#pragma pack(pop)\n\n";
     header += "#ifdef __cplusplus\nextern \"C\" {\n#endif\n"
-              "void goose_init(int argc, char **argv);\n";
+              "void goose_init(int argc, char **argv);\n"
+              "void goose_exit(void);\n";
     header += exportprotos;
     header += "#ifdef __cplusplus\n}\n#endif\n";
     return header;

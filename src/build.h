@@ -56,6 +56,12 @@ struct Builder {
         vector<string> f = TargetFlags();
         if (opts.debug) f.push_back("-O0"), f.push_back("-g");
         else f.push_back("-O2");
+        // A shared library's objects, the runtime's and the support's among them. Not on
+        // Windows, where clang rejects the flag for its target (the code is position
+        // independent regardless).
+        #ifndef _WIN32
+            if (opts.shared) f.push_back("-fPIC");
+        #endif
         return f;
     }
 
@@ -175,12 +181,12 @@ struct Builder {
             for (auto &r : rsps) argv.push_back(cat("@", r));
         } else {
             if (opts.shared) {
-                // Not on Windows, where clang rejects the flag for its
-                // target (the code is position independent regardless).
-                #ifndef _WIN32
-                    argv.push_back("-fPIC");
-                #endif
                 argv.push_back("-shared");
+                // The library's own definitions serve its references: no other image's runtime
+                // or program, and tinygen's object reaches them without the GOT.
+                #ifdef __linux__
+                    argv.push_back("-Wl,-Bsymbolic");
+                #endif
             }
             if (!src.empty()) argv.push_back(src);
             for (auto &o : objects) argv.push_back(o);
@@ -201,7 +207,7 @@ struct Builder {
 inline string CachedObject(const Builder &b, const string &name, const std::function<string()> &source,
                            const string &what, const string &logname) {
     auto dir = cat(GooseHome(), "/build/runtime/", RuntimeVersion(), "/", b.tc.id, "-",
-                   b.opts.debug ? "debug" : "release");
+                   b.opts.debug ? "debug" : "release", b.opts.shared ? "-pic" : "");
     auto ext = b.tc.style == "msvc" ? "obj" : "o";
     auto obj = cat(dir, "/", name, ".", ext);
     if (PathExists(obj) && !b.opts.dryrun) return obj;
