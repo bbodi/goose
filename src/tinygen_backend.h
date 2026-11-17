@@ -296,7 +296,7 @@ struct TgModule {
     TgModule(Ast &_ast, CodeGen &_cg, bool _checks, const string &source, bool _cout = false)
         : ast(_ast), cg(_cg), checks(_checks), cout(_cout) {
         auto t = tyg_host_target();
-        t.debug_info = 1;
+        t.debug_info = TYG_DEBUG_DEFAULT;
         if (cout) t.output = TYG_OUTPUT_C;
         m = tyg_module_new(t, source.c_str());
         // C11: lldb formats the same under every language code tinygen offers, and the object, the
@@ -1603,7 +1603,7 @@ struct TgFn {
     tyg_val BytesAddr(const string &b) { return AddrOf(tyg_at_sym(M.Bytes(b), 0)); }
     // An uninitialised 8-byte (i64), 16-byte (header) or 32-byte (pool reference) local; the first
     // an int64_t in tinygen's C.
-    tyg_local Slot() { return tyg_local_typed(p, tyg_type_int(m, TYG_I64, 1)); }
+    tyg_local Slot() { return tyg_local_typed(p, tyg_type_int(m, TYG_I64, 1), 0); }
     tyg_local Slot16() { return tyg_local_new(p, 16, 8); }
     tyg_local Slot32() { return tyg_local_new(p, 32, 8); }
     // The size-byte integer at `at`, widened to i64 (signed or not); the low byte of v stored at `at`.
@@ -1995,7 +1995,7 @@ struct TgFn {
     tyg_local FrameTyped(const tyg_type *t) {
         framebytes += tyg_type_size(t);
         CheckFrame();
-        return tyg_local_typed(p, t);
+        return tyg_local_typed(p, t, 0);
     }
     tyg_local Frame(int64_t size, int64_t align) {
         framebytes += size;
@@ -2010,7 +2010,7 @@ struct TgFn {
     tyg_local HdrLocal() {
         framebytes += 16;
         CheckFrame();
-        auto l = tyg_local_typed_align(p, M.SliceAT(), 8);   // gs_hdr is packed: aligned to 1
+        auto l = tyg_local_typed(p, M.SliceAT(), 8);   // gs_hdr is packed: aligned to 1
         hdrlocals.insert(l);
         return l;
     }
@@ -2706,7 +2706,7 @@ struct TgFn {
             tags.push_back((int64_t)vi);
             cases.push_back((int)vi);
         }
-        tyg_switch_begin(p, LdL(tag), (int)n, tags.data(), cases.data(), (int)n);
+        tyg_switch(p, LdL(tag), (int)n, tags.data(), cases.data(), (int)n);
         for (size_t vi = 0; vi < n; vi++) {
             tyg_case(p, (int)vi);
             arm(vi);
@@ -3518,7 +3518,7 @@ struct TgFn {
     V GenBinary(Binary *b) {
         auto op = b->op;
         if (op == T_ANDAND || op == T_OROR) {
-            auto t = tyg_local_typed(p, tyg_type_int(m, TYG_I8, 0));
+            auto t = tyg_local_typed(p, tyg_type_int(m, TYG_I8, 0), 0);
             auto lb = Cmp(TYG_NE, Truth(b->left), I8(0));
             tyg_store(p, TYG_I8, AtL(t), lb, 0);
             If(op == T_ANDAND ? lb : Cmp(TYG_EQ, lb, I8(0)), [&] {
@@ -7193,7 +7193,7 @@ struct TgFn {
         else tyg_zero(p, to, 1);
     }
 
-    // One switch on the tag with the arms inside (tinygen's tyg_switch_begin, a C switch with its
+    // One switch on the tag with the arms inside (tinygen's tyg_switch, a C switch with its
     // cases in tinygen's C), a wildcard's or a corrupt tag's arm the default.
     V GenAdtMatch(MatchExpr *me, TypeExpr *adt, const Ctl &k, const InPlace *ip) {
         auto s = AdtScrutinee(me->scrutinee, adt);
@@ -7226,7 +7226,7 @@ struct TgFn {
             else BadTag(me->line);
             return CtlValue(k, me->line);
         }
-        tyg_switch_begin(p, LdL(s.tag), (int)tags.size(), tags.data(), cases.data(), (int)armof.size());
+        tyg_switch(p, LdL(s.tag), (int)tags.size(), tags.data(), cases.data(), (int)armof.size());
         for (size_t c = 0; c < armof.size(); c++) {
             tyg_case(p, (int)c);
             body(armof[c]);
@@ -7372,7 +7372,7 @@ struct TgFn {
             tags.push_back((int64_t)vi);
             cases.push_back((int)vi);
         }
-        tyg_switch_begin(p, LdL(s.tag), (int)nvar, tags.data(), cases.data(), (int)nvar);
+        tyg_switch(p, LdL(s.tag), (int)nvar, tags.data(), cases.data(), (int)nvar);
         for (size_t vi = 0; vi < nvar; vi++) {
             tyg_case(p, (int)vi);
             auto sp = c->dispatch[vi];
@@ -8098,7 +8098,7 @@ struct TgFn {
         auto s = M.Scal(ct);
         auto lo = r ? GenAs(r->lo, ct).v : tyg_iconst(p, s, 0);
         auto hi = GenAs(r ? r->hi : f->iter, ct).v;
-        auto ctr = tyg_local_typed(p, M.AT(ct)), hiv = tyg_local_typed(p, M.AT(ct));
+        auto ctr = tyg_local_typed(p, M.AT(ct), 0), hiv = tyg_local_typed(p, M.AT(ct), 0);
         tyg_store(p, s, AtL(ctr), lo, 0);
         tyg_store(p, s, AtL(hiv), hi, 0);
         tyg_local ix = 0;
@@ -8667,7 +8667,7 @@ struct TgFn {
         auto cret = si.cret;
         auto fdt = tyg_dt_func(m, cret < 0 ? tyg_dt_void(m) : M.DT(sp->rets[cret]), pdt.data(),
                                (int)pdt.size(), 0);
-        tyg_debug_proc(p, string(sp->sf->qname).c_str(), file, sp->sf->line.line, fdt);
+        tyg_debug_proc(p, string(sp->sf->qname).c_str(), fdt, file, sp->sf->line.line);
         Loc(sp->sf->line);
         int pi = 0;
         for (size_t i = 0; i < sp->argtypes.size(); i++) {
@@ -9114,8 +9114,8 @@ struct TgFn {
     // the function's own results (return, return from) is unsupported.
     void EmitInit(tyg_sym sym, Line line) {
         NewProcBegin(sym, tyg_sig_new(m, nullptr, nullptr, 0, 0), line);
-        tyg_debug_proc(p, "gs_init_globals", M.File(line.fileidx), line.line,
-                       tyg_dt_func(m, tyg_dt_void(m), nullptr, 0, 0));
+        tyg_debug_proc(p, "gs_init_globals", tyg_dt_func(m, tyg_dt_void(m), nullptr, 0, 0),
+                       M.File(line.fileidx), line.line);
         Loc(line);
         spl = Local(I64(0));
         hassp = true;
@@ -9886,8 +9886,8 @@ struct TinyGenBackend {
         auto file = mod->File(line.fileidx);
         auto dint = tyg_dt_base(m, "int", 4, TYG_DT_SIGNED);
         const tyg_dtype *pdt[] = { dint, tyg_dt_pointer(m, tyg_dt_void(m)) };
-        tyg_debug_proc(p, library ? "goose_init" : "main", file, line.line,
-                       tyg_dt_func(m, library ? nullptr : dint, pdt, 2, 0));
+        tyg_debug_proc(p, library ? "goose_init" : "main",
+                       tyg_dt_func(m, library ? nullptr : dint, pdt, 2, 0), file, line.line);
         tyg_loc(p, file, line.line, 0);
         TgFn fn(*mod, nullptr);
         fn.p = p;
