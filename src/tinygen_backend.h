@@ -1665,6 +1665,7 @@ struct TgModule {
         auto rt = sp->rets.empty() ? nullptr : sp->rets[0];
         if (rt && !IsScalar(rt)) ps.push_back(tyg_type_ptr(m));
         for (auto t : sp->argtypes) ps.push_back(IsScalar(t) ? AT(t) : tyg_type_ptr(m));
+        if (sp->sf->takesloc) ps.push_back(tyg_type_ptr(m));
         return sig = tyg_sig_new(m, rt && IsScalar(rt) ? AT(rt) : nullptr, ps.data(), (int)ps.size(), 0);
     }
     // Whether the unit's header has the C type of the struct t: the program's types come with an
@@ -6940,6 +6941,7 @@ struct TgFn {
             for (size_t i = 0; i < args.size(); i++)
                 margs.push_back(M.IsScalar(callee->argtypes[i]) ? args[i]
                                                                 : ArgOfVal(AddrOf(args[i].mem)));
+            if (callee->sf->takesloc) margs.push_back(ArgOfVal(CallerLoc(c->line)));
             PoolFlush();
             auto v = tyg_call(p, M.MemSig(callee),
                               tyg_direct(M.FnSym(cat("gs_tg_mx_", callee->sf->cname))),
@@ -9878,6 +9880,11 @@ struct TinyGenBackend {
                 }
                 Append(params, params.empty() ? "" : ", ", "const void *a", i);
                 Append(copies, cg.CT(t), " b", i, "; memcpy(&b", i, ", a", i, ", sizeof b", i, "); ");
+            }
+            // The caller's location, as the runtime's located functions take it last.
+            if (sp->sf->takesloc) {
+                Append(params, params.empty() ? "" : ", ", "const void *at");
+                Append(args, args.empty() ? "" : ", ", "at");
             }
             auto call = cat(e.direct ? "" : "gs_tg_x_", sp->sf->cname, "(", args, ")");
             Append(s, "static ", !rt || mem ? "void" : scalar(rt), " gs_tg_mx_", sp->sf->cname, "(",
