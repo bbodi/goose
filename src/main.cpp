@@ -1768,7 +1768,7 @@ int Main(int argc, char **argv) {
         }
         if (tinygen) {
             tgrun = true;
-            buildopts = BuildOptions { debug || !tinygenc, verbose, dryrun, false, "" };
+            buildopts = BuildOptions { debug || !tinygenc, verbose, dryrun, false, false, "" };
         } else {
             forcejit = true;
         }
