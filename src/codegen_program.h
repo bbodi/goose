@@ -25,6 +25,9 @@ inline void CodeGen::CollectSpecs() {
         if (namecount[sp->sf->qname] > 1) Append(base, "_", sp->id);
         si.cname = Unique(base);
         si.hasrf = !sp->needs.empty();
+        // An export's C signature is the host's, and main has no caller.
+        si.located = ast.StdlibFile(sp->sf->line.fileidx) && !sp->sf->isexport &&
+                     sp->sf != ast.MainFunction();
         for (size_t i = 0; i < sp->rets.size(); i++)
             if (si.cret < 0 && IsFix(sp->rets[i]) && !IsLargeFixed(sp->rets[i]) &&
                 !NeedsResultLocation(sp->rets[i]))

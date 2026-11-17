@@ -250,6 +250,7 @@ struct TgModule {
     tyg_module *m = nullptr;
     map<int, tyg_file> files;
     map<int, tyg_sym> filenames;
+    map<pair<int, int>, tyg_sym> locsyms;
     map<string, tyg_sym> strings;
     map<string, tyg_sym> syms;
     map<string, const tyg_dtype *> dtypes;
@@ -358,6 +359,18 @@ struct TgModule {
             if (c == '\\') c = '/';
         f.push_back('\0');
         return filenames[fileidx] = Bytes(f);
+    }
+    // A static gs_loc { file, line }: what a call at l hands a callee that takes its caller's
+    // location (SpecInfo::located).
+    tyg_sym LocSym(Line l) {
+        auto key = make_pair(l.fileidx, l.line);
+        if (auto it = locsyms.find(key); it != locsyms.end()) return it->second;
+        uint8_t bytes[16] = {};
+        memcpy(bytes + 8, &l.line, 4);
+        auto s = tyg_symbol(m, cat("gs_tg_loc", locsyms.size()).c_str(), 0);
+        tyg_data(m, s, TYG_SECTION_RODATA, bytes, 16, 8);
+        tyg_data_reloc(m, s, 0, 8, FileName(l.fileidx), 0);
+        return locsyms[key] = s;
     }
 
     void NeedShim(const string &name, const string &text) {
@@ -1556,6 +1569,7 @@ struct TgModule {
             else if (IsImg(sp->rets[i]) || (int)i != si.cret) ptrs(1);
         }
         if (!sp->sf->isextern && si.needssp) ps.push_back(tyg_type_int(m, TYG_I64, 1));
+        if (!sp->sf->isextern && si.located) ptrs(1);   // gs_at
         const tyg_type *ret = si.cret < 0 ? nullptr : AT(sp->rets[si.cret]);
         return sigs[sp] = tyg_sig_new(m, ret, ps.data(), (int)ps.size(), 0);
     }
@@ -1563,6 +1577,7 @@ struct TgModule {
         if (auto it = sigs.find(sp); it != sigs.end()) return it->second;
         vector<const tyg_type *> ps;
         for (auto t : sp->argtypes) ps.push_back(AT(t));
+        if (sp->sf->takesloc) ps.push_back(tyg_type_ptr(m));
         const tyg_type *ret = sp->rets.empty() ? nullptr : AT(sp->rets[0]);
         return sigs[sp] = tyg_sig_new(m, ret, ps.data(), (int)ps.size(), 0);
     }
@@ -1852,6 +1867,8 @@ struct TgFn {
     // taken.
     tyg_local spl = 0, stksl = 0;
     bool hassp = false;   // spl holds gs_sp (a local's id may be 0).
+    tyg_local atl = 0;    // gs_at, the caller's gs_loc, of a located function (hasat).
+    bool hasat = false;
     int live = 0, maxown = 0;
     vector<CodeGen::StackCall> stackcalls;
     struct Mark {
@@ -3493,8 +3510,17 @@ struct TgFn {
     }
 
     // A file name and line for the runtime's abort messages.
-    tyg_val FileArg(Line l) { return AddrOf(tyg_at_sym(M.FileName(l.fileidx), 0)); }
-    tyg_val LineArg(Line l) { return I32(l.line); }
+    // A check on a standard library line of a function that takes its caller's location (gs_at)
+    // fails there.
+    bool AtCaller(Line l) { return hasat && M.ast.StdlibFile(l.fileidx); }
+    tyg_val FileArg(Line l) {
+        return AtCaller(l) ? Ld(AtV(LdL(atl))) : AddrOf(tyg_at_sym(M.FileName(l.fileidx), 0));
+    }
+    tyg_val LineArg(Line l) {
+        return AtCaller(l) ? tyg_load(p, TYG_I32, AtV(LdL(atl), 8), 0) : I32(l.line);
+    }
+    // What a call at l hands a callee that takes its caller's location.
+    tyg_val CallerLoc(Line l) { return AtCaller(l) ? LdL(atl) : AddrOf(tyg_at_sym(M.LocSym(l), 0)); }
 
     // Calls a C shim or runtime function by name with scalar arguments (types for the signature).
     tyg_val CallC(const string &name, const vector<const tyg_type *> &pts,
@@ -5075,6 +5101,7 @@ struct TgFn {
         }
         auto rets = RetChans(callee, ci, idst, dst, rdst, args, line);
         if (ci.needssp) args.push_back(ArgOfVal(CalleeSp(callee, line)));
+        if (ci.located) args.push_back(ArgOfVal(CallerLoc(line)));
         auto sym = M.FnSym(ci.cname);
         auto x = Result(callee, ci.cret, M.Sig(callee), tyg_direct(sym), args);
         RfCheck(callee);
@@ -5687,6 +5714,7 @@ struct TgFn {
         }
         if (!poolval) args.push_back(v);
         if (ci.needssp) args.push_back(ArgOfVal(CalleeSp(sp, l)));
+        if (ci.located) args.push_back(ArgOfVal(CallerLoc(l)));
         auto sym = M.FnSym(ci.cname);
         Result(sp, ci.cret, M.Sig(sp), tyg_direct(sym), args);
         RfCheck(sp);
@@ -6640,6 +6668,7 @@ struct TgFn {
             SetBlock(call);
             target = tyg_indirect(addr);
         }
+        if (callee->sf->takesloc) args.push_back(ArgOfVal(CallerLoc(c->line)));
         return Result(callee, callee->rets.empty() ? -1 : 0, M.ExternSig(callee), target, args);
     }
 
@@ -7410,6 +7439,7 @@ struct TgFn {
             FvArgs(c, ci, args);
             args.insert(args.end(), chanargs.begin(), chanargs.end());
             if (ci.needssp) args.push_back(ArgOfVal(CalleeSp(sp, c->line)));
+            if (ci.located) args.push_back(ArgOfVal(CallerLoc(c->line)));
             auto sym = M.FnSym(ci.cname);
             auto x = Result(sp, ci.cret, M.Sig(sp), tyg_direct(sym), args);
             if (rt) Store(P { AtL(res), rt }, x);
@@ -8761,6 +8791,10 @@ struct TgFn {
             spl = param();
             hassp = true;
         }
+        if (si.located) {
+            atl = param();
+            hasat = true;
+        }
         // Each destination's top on entry: a return builds its result there, also one nested in another
         // return's half-built value.
         for (size_t i = 0; i < sp->rets.size(); i++) {
@@ -9682,6 +9716,8 @@ struct TinyGenBackend {
                 fn.StL(cur, fn.Add(img, sz));
             }
             if (ki.needssp) args.push_back(TgFn::ArgOfVal(fn.I64(0)));
+            // A worker has no caller: its function's failures report its declaration.
+            if (ki.located) args.push_back(TgFn::ArgOfVal(fn.CallerLoc(sp->sf->line)));
             mod->SplitArgs(p, sp, args, false);
             CallArgs(p, mod->Sig(sp), mod->FnSym(ki.cname), args);
             tyg_ret(p, 0);
